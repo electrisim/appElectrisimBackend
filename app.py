@@ -87,12 +87,17 @@ def json_example():
         
         if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):      
             pp.create_asymmetric_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
-       
+        #Zero sequence parameters** (Added through std_type For Three phase load flow) :
+            #vk0_percent** - zero sequence relative short-circuit voltage
+            #vkr0_percent** - real part of zero sequence relative short-circuit voltage
+            #mag0_percent** - ratio between magnetizing and short circuit impedance (zero sequence)                                
+            #mag0_rx**  - zero sequence magnetizing r/x  ratio
+            #si0_hv_partial** - zero sequence short circuit impedance  distribution in hv side
+            #vk0_percent=in_data[x]['vk0_percent'], vkr0_percent=in_data[x]['vkr0_percent'], mag0_percent=in_data[x]['mag0_percent'], si0_hv_partial=in_data[x]['si0_hv_partial'],
         if (in_data[x]['typ'].startswith("Transformer")): 
             pp.create_transformer_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), lv_bus = eval(in_data[x]['lv_bus']), sn_mva=in_data[x]['sn_mva'], vn_hv_kv=in_data[x]['vn_hv_kv'], vn_lv_kv=in_data[x]['vn_lv_kv'],
                                                   vkr_percent=in_data[x]['vkr_percent'], vk_percent=in_data[x]['vk_percent'], pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], vector_group=in_data[x]['vector_group'],
-                                                  vk0_percent=in_data[x]['vk0_percent'], vkr0_percent=in_data[x]['vkr0_percent'], mag0_percent=in_data[x]['mag0_percent'], si0_hv_partial=in_data[x]['si0_hv_partial'],
-                                                   parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  tap_phase_shifter=eval(in_data[x]['tap_phase_shifter']),  
+                                                  parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  tap_phase_shifter=eval(in_data[x]['tap_phase_shifter']),  
                                                 )
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
@@ -183,10 +188,16 @@ def json_example():
                 
                 linesList = list()      
                 
-                for index, row in net.res_line.iterrows():    
-                    line = LineOut(name=net.line._get_value(index, 'name'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], i_from_ka=row['i_from_ka'], i_to_ka=row['i_to_ka'], loading_percent=row['loading_percent'])        
-                    linesList.append(line)       
-                    lines = LinesOut(lines = linesList)
+                #jesli nie ma żadnej linii w modelu
+                if(net.res_line.empty):
+                        result = {**busbars.__dict__}                  
+                else:                    
+                        for index, row in net.res_line.iterrows():    
+                            line = LineOut(name=net.line._get_value(index, 'name'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], i_from_ka=row['i_from_ka'], i_to_ka=row['i_to_ka'], loading_percent=row['loading_percent'])        
+                            linesList.append(line) 
+                            lines = LinesOut(lines = linesList)
+                            
+                            result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
                     
                 
                 
