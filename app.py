@@ -19,8 +19,9 @@ import json
 from typing import List
 
 app = Flask(__name__)
-cors = CORS(app)
+cors = CORS(app)#, support_credentials=True
 app.config['CORS_HEADERS'] = 'Content-Type'
+
 
 
 @app.route('/')
@@ -29,6 +30,7 @@ def hello():
 
 #pobieranie danych z frontend
 @app.route('/json-example', methods=['GET','POST'])
+#@cross_origin()#supports_credentials=True
 def json_example():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
@@ -154,10 +156,14 @@ def json_example():
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)    
                 
                 class BusbarOut(object):
-                    def __init__(self, name: str, vm_pu: float, va_degree: float):          
+                    def __init__(self, name: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float):          
                         self.name = name
                         self.vm_pu = vm_pu
-                        self.va_degree = va_degree       
+                        self.va_degree = va_degree   
+                        self.p_mw = p_mw
+                        self.q_mvar = q_mvar  
+                        self.pf = p_mw/math.sqrt(math.pow(p_mw,2)+math.pow(q_mvar,2))  
+                        
                 class BusbarsOut(object):
                     def __init__(self, busbars: List[BusbarOut]):
                         self.busbars = busbars                
@@ -165,7 +171,7 @@ def json_example():
                 busbarList = list()      
                 
                 for index, row in net.res_bus.iterrows():    
-                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
+                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf=pf)         
                     busbarList.append(busbar)
                     busbars = BusbarsOut(busbars = busbarList)
                 
