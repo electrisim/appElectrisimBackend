@@ -23,15 +23,10 @@ cors = CORS(app)#, support_credentials=True
 app.config['CORS_HEADERS'] = 'Content-Type'
 
 
-
-@app.route('/')
-def hello():  
-    return "Hello Spyder!"
-
 #pobieranie danych z frontend
-@app.route('/json-example', methods=['GET','POST'])
+@app.route('/', methods=['GET','POST'])
 #@cross_origin()#supports_credentials=True
-def json_example():
+def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
     print(in_data)    
@@ -113,7 +108,7 @@ def json_example():
                                                     shift_mv_degree=in_data[x]['shift_mv_degree'], shift_lv_degree=in_data[x]['shift_lv_degree'], tap_step_percent=in_data[x]['tap_step_percent'], tap_side=in_data[x]['tap_side'], tap_neutral=in_data[x]['tap_neutral'], tap_min=in_data[x]['tap_min'], tap_max=in_data[x]['tap_max'], tap_pos=in_data[x]['tap_pos'], tap_at_star_point=in_data[x]['tap_at_star_point'])
         
         if (in_data[x]['typ'].startswith("Shunt Reactor")):  
-            pp.create_shunt(net, bus = eval(in_data[x]['bus']), p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])
+            pp.create_shunt(net, bus = eval(in_data[x]['bus']), p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
         
         if (in_data[x]['typ'].startswith("Capacitor")):  
             pp.create_shunt_as_capacitor(net, bus = eval(in_data[x]['bus']), q_mvar=in_data[x]['q_mvar'], loss_factor=in_data[x]['loss_factor'], vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
@@ -145,7 +140,10 @@ def json_example():
         if (in_data[x]['typ'].startswith("DC Line")):
             pp.create_dcline(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'])         
       
-    #print(net.bus)
+    print(net.bus)
+    #print(net.shunt)
+    print(net.ext_grid)
+    
     #print(net.line))
     
         
@@ -155,6 +153,7 @@ def json_example():
             try:
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)    
                 
+                
                 class BusbarOut(object):
                     def __init__(self, name: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float):          
                         self.name = name
@@ -162,7 +161,7 @@ def json_example():
                         self.va_degree = va_degree   
                         self.p_mw = p_mw
                         self.q_mvar = q_mvar  
-                        self.pf = p_mw/math.sqrt(math.pow(p_mw,2)+math.pow(q_mvar,2))  
+                        self.pf = pf #p_mw/math.sqrt(math.pow(p_mw,2)+math.pow(q_mvar,2))  
                         
                 class BusbarsOut(object):
                     def __init__(self, busbars: List[BusbarOut]):
@@ -171,8 +170,8 @@ def json_example():
                 busbarList = list()      
                 
                 for index, row in net.res_bus.iterrows():    
-                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf=pf)         
-                    busbarList.append(busbar)
+                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf = row['p_mw']/math.sqrt(math.pow(row['p_mw'],2)+math.pow(row['q_mvar'],2)))         
+                    busbarList.append(busbar) 
                     busbars = BusbarsOut(busbars = busbarList)
                 
                 
@@ -204,25 +203,44 @@ def json_example():
                             lines = LinesOut(lines = linesList)
                             
                             result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
+                            
+                print(result)           
+                class ExternalGridOut(object):
+                    def __init__(self, name: str, p_mw: float, q_mvar: float, pf: float):          
+                        self.name = name
+                        self.p_mw = p_mw 
+                        self.q_mvar = q_mvar  
+                        self.pf = pf                          
+                       
+                class ExternalGridsOut(object):
+                    def __init__(self, externalgrids: List[ExternalGridOut]):
+                        self.externalgrids = externalgrids                
+                
+                externalgridsList = list()      
+                
+                #if there is no external grid in the model
+                if(net.res_ext_grid.empty):
+                        print("no external grid in the model")                
+                else:                    
+                        for index, row in net.res_ext_grid.iterrows():    
+                            externalgrid = ExternalGridOut(name=net.ext_grid._get_value(index, 'name'), p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf = row['p_mw']/math.sqrt(math.pow(row['p_mw'],2)+math.pow(row['q_mvar'],2)) )        
+                            externalgridsList.append(externalgrid) 
+                            externalgrids = ExternalGridsOut(externalgrids = externalgridsList)
+                            
+                            #result = {**externalgrids.__dict__} #łączenie dwóch dictionaries
                     
+                print(result)
+                result = {**busbars.__dict__,**lines.__dict__, **externalgrids.__dict__} #łączenie dwóch dictionaries 
                 
-                
-                #print(bus_results)
-                    
-                #response = make_response(resultFrame.to_json())
-                #response = make_response(bus_results.to_json())
-                print(type(busbars.__dict__))
-                result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
-                
-                #response1 = json.dumps(busbars.__dict__, default=lambda o: o.__dict__, indent=4) 
-                #response2 = json.dumps(lines.__dict__, default=lambda o: o.__dict__, indent=4)
-                
-                response = json.dumps(result, default=lambda o: o.__dict__, indent=4) #json.dumps - convert a subset of Python objects into a json string
+                           
+                #json.dumps - convert a subset of Python objects into a json string
+                #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
+                #indent - wcięcia
+                response = json.dumps(result, default=lambda o: o.__dict__, indent=4)
             
-                
-                print(type(response))
-                print(response)         
-             
+                print(response)   
+                   
+     
             except:
                 print("An exception occurred")
                 diag_result_dict = pp.diagnostic(net, report_style='compact') 
@@ -256,6 +274,7 @@ def json_example():
                 return error_message      
             else:
                 return response 
+    
             
         if "ShortCircuit" in in_data[x]['typ']:   
             #pandapower - rozpływ mocy      
