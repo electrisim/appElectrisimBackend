@@ -14,13 +14,14 @@ import json
 from typing import List
 
 app = Flask(__name__)
-cors = CORS(app)#, support_credentials=True
-app.config['CORS_HEADERS'] = 'Content-Type'
+#cors = CORS(app)# BYŁO, support_credentials=True
+#app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = '*' #nie było tego
-@cross_origin(origin='*')
+ #nie było tego
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
+@cross_origin(origins=['http://127.0.0.1:5500'])
 #@cross_origin()#supports_credentials=True
 def simulation():
     #in_data = request.get_json()
