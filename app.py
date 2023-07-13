@@ -16,8 +16,8 @@ from typing import List
 app = Flask(__name__)
 cors = CORS(app)#, support_credentials=True
 app.config['CORS_HEADERS'] = 'Content-Type'
-app.config['CORS_ORIGINS'] = '*' #nie było tego
-
+#app.config['CORS_ORIGINS'] = '*' #nie było tego
+@cross_origin(origin='*')
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
