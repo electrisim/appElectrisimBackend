@@ -14,15 +14,16 @@ import json
 from typing import List
 
 app = Flask(__name__)
-#CORS(app)
-cors = CORS(app)# BYŁO, support_credentials=True
-app.config['CORS_HEADERS'] = 'Content-Type' # było
+CORS(app)
+#cors = CORS(app)# BYŁO, support_credentials=True
+#app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
+@cross_origin()
+#@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
