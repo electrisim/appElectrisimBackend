@@ -22,8 +22,8 @@ CORS(app)
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-#@cross_origin(origins=['http://128.0.0.1:5500'])
-@cross_origin()#supports_credentials=True #nie było tego
+#@cross_origin(origins=['http://127.0.0.1:5500'])
+@cross_origin(origins=['http://127.0.0.1:5500'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
