@@ -22,7 +22,7 @@ CORS(app)
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-@cross_origin()
+#@cross_origin()
 #@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
