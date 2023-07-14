@@ -22,7 +22,7 @@ app.config['CORS_HEADERS'] = 'Content-Type' # było
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['content-type, access-control-allow-origin'])#supports_credentials=True #nie było tego
+@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
