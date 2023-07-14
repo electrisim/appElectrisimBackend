@@ -22,7 +22,7 @@ CORS(app)
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-#@cross_origin(origins=['http://127.0.0.1:5500'])
+
 @cross_origin(origins=['http://127.0.0.1:5500'],headers=['Content-Type'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
@@ -720,7 +720,10 @@ def simulation():
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
-                response = json.dumps(result, default=lambda o: o.__dict__, indent=4)
+                #response = json.dumps(result, default=lambda o: o.__dict__, indent=4)
+                # response.headers.add("Access-Control-Allow-Origin", "*") #PROBA TERAZ
+                response = jsonify({'some': 'data'})
+                response.headers.add('Access-Control-Allow-Origin', '*')
             
                 print(response)   
                    
@@ -803,7 +806,7 @@ def simulation():
                 print(type(response))
                 print(response)           
                 
-                response.headers.add("Access-Control-Allow-Origin", "*") #PROBA TERAZ
+                #response.headers.add("Access-Control-Allow-Origin", "*") #PROBA TERAZ
                   
                 return response 
         
