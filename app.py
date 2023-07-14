@@ -16,7 +16,7 @@ from typing import List
 app = Flask(__name__)
 CORS(app)
 #cors = CORS(app)# BYŁO, support_credentials=True
-#app.config['CORS_HEADERS'] = 'Content-Type' # było
+app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
 
