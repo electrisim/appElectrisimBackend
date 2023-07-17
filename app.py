@@ -14,8 +14,9 @@ import json
 from typing import List
 
 app = Flask(__name__)
-cors = CORS(app)# BYŁO, support_credentials=True
-app.config['CORS_HEADERS'] = 'Content-Type' # było
+#cors = CORS(app)# BYŁO, support_credentials=True
+CORS(app, origins=['http://127.0.0.1:5500','https://app.electrisim.com/'] )
+#app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
 
