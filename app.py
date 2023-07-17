@@ -14,7 +14,6 @@ import json
 from typing import List
 
 app = Flask(__name__)
-
 cors = CORS(app)# BYŁO, support_credentials=True
 app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
@@ -27,7 +26,7 @@ app.config['CORS_HEADERS'] = 'Content-Type' # było
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
-    print(in_data)    
+    print(in_data)   
     
     net = pp.create_empty_network()
     
