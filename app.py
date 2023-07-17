@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from flask import Flask, request, jsonify, make_response
-from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors
+from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
 import pandapower as pp
 import pandapower.shortcircuit as sc
 import pandas as pd
@@ -14,9 +14,9 @@ import json
 from typing import List
 
 app = Flask(__name__)
-CORS(app)
-#cors = CORS(app)# BYŁO, support_credentials=True
-#app.config['CORS_HEADERS'] = 'Content-Type' # było
+
+cors = CORS(app)# BYŁO, support_credentials=True
+app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
 
@@ -720,10 +720,7 @@ def simulation():
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
-                response = json.dumps(result, default=lambda o: o.__dict__, indent=4)
-                # response.headers.add("Access-Control-Allow-Origin", "*") #PROBA TERAZ
-                # response = jsonify({'some': 'data'})
-                # response.headers.add('Access-Control-Allow-Origin', '*')
+                response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
             
                 print(response)   
                    
@@ -801,12 +798,10 @@ def simulation():
                 #response2 = json.dumps(lines.__dict__, default=lambda o: o.__dict__, indent=4)
                 
                 response = json.dumps(result, default=lambda o: o.__dict__, indent=4) #json.dumps - convert a subset of Python objects into a json string
-            
-                
+               
                 print(type(response))
                 print(response)           
-                
-                #response.headers.add("Access-Control-Allow-Origin", "*") #PROBA TERAZ
+      
                   
                 return response 
         
