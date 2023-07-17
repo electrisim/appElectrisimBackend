@@ -16,14 +16,14 @@ from typing import List
 app = Flask(__name__)
 #cors = CORS(app)# BYŁO, support_credentials=True
 CORS(app, origins=['http://127.0.0.1:5500','https://app.electrisim.com/'] )
-#app.config['CORS_HEADERS'] = 'Content-Type' # było
+app.config['CORS_HEADERS'] = 'Content-Type' # było
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
+ #@cross_origin()
+#@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 
 #pobieranie danych z frontend
 @app.route('/', methods=['GET','POST'])
-#@cross_origin()
-#@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
@@ -714,17 +714,21 @@ def simulation():
                     
                         
                 print(result)
-               
+
+                response = make_response()
+                response.headers.add("Access-Control-Allow-Origin", "*")
+                response.headers.add("Access-Control-Allow-Headers", "*")
+                response.headers.add("Access-Control-Allow-Methods", "*")
                 
                            
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
-                response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
+                #response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
             
                 print(response)   
                    
-                return response 
+                return response  
            
             
         if "ShortCircuit" in in_data[x]['typ']:   
