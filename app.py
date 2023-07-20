@@ -715,16 +715,16 @@ def simulation():
                         
                 print(result)
 
-                response = make_response()
-                response.headers.add("Access-Control-Allow-Origin", "*")
-                response.headers.add("Access-Control-Allow-Headers", "*")
-                response.headers.add("Access-Control-Allow-Methods", "*")
+                #response = make_response()
+                #response.headers.add("Access-Control-Allow-Origin", "*")
+                #response.headers.add("Access-Control-Allow-Headers", "*")
+                #response.headers.add("Access-Control-Allow-Methods", "*")
                 
                            
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
-                #response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
+                response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
             
                 print(response)   
                    
@@ -810,8 +810,8 @@ def simulation():
                 return response 
         
 #dla produkcji usuwaj te wiersze          
-#if __name__ == '__main__':
-    #app.debug = False
-    #app.run(host = '127.0.0.1', port=5005)
+if __name__ == '__main__':
+    app.debug = False
+    app.run(host = '127.0.0.1', port=5005)
    # app.debug = True
    # app.run(host = '0.0.0.0', port=5005)
