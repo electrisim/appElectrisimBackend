@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
 import pandapower as pp
@@ -23,6 +22,10 @@ app.config['CORS_HEADERS'] = 'Content-Type' # było
 #@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 
 #pobieranie danych z frontend
+@app.route('/')
+def index():
+        return 'Please send data to backend'
+
 @app.route('/', methods=['GET','POST'])
 def simulation():
     #in_data = request.get_json()
@@ -132,6 +135,18 @@ def simulation():
                             lrc_pu=in_data[x]['lrc_pu'], rx=in_data[x]['rx'], vn_kv=in_data[x]['vn_kv'],
                             efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'])         
    
+        
+        if (in_data[x]['typ'].startswith("SVC")):
+            
+            pp.create_svc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+         
+        if (in_data[x]['typ'].startswith("TCSC")):
+            pp.create_tcsc(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+                   
+       # if (in_data[x]['typ'].startswith("SSC")):
+       #     pp.create_ssc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
+        
+
         if (in_data[x]['typ'].startswith("Storage")):
             pp.create_storage(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'])         
    
@@ -450,7 +465,65 @@ def simulation():
                 class MotorsOut(object):
                     def __init__(self, motors: List[MotorOut]):
                         self.motors = motors              
-                motorsList = list() 
+                motorsList = list()
+
+
+
+                class SVCOut(object):
+                    def __init__(self, name: str, firstnumberinid:str, thyristor_firing_angle_degree: float, x_ohm: float, q_mvar: float, vm_pu: float, va_degree: float):          
+                        self.name = name
+                        self.firstnumberinid = firstnumberinid
+                        self.thyristor_firing_angle_degree = thyristor_firing_angle_degree 
+                        self.x_ohm = x_ohm   
+                        self.q_mvar = q_mvar
+                        self.vm_pu = vm_pu
+                        self.va_degree = va_degree      
+                       
+                class SVCsOut(object):
+                    def __init__(self, svcs: List[SVCOut]):
+                        self.svcs = svcs              
+                SVCsList = list()
+
+
+
+                class TCSCOut(object):
+                    def __init__(self, name: str, firstnumberinid:str, thyristor_firing_angle_degree: float, x_ohm: float, p_from_mw: float, q_from_mvar: float, p_to_mw: float, q_to_mvar: float, p_l_mw: float, q_l_mvar: float, vm_from_pu: float, va_from_degree: float, vm_to_pu: float, va_to_degree: float ):          
+                        self.name = name
+                        self.firstnumberinid = firstnumberinid
+                        self.thyristor_firing_angle_degree = thyristor_firing_angle_degree 
+                        self.x_ohm = x_ohm
+                        self.p_from_mw = p_from_mw 
+                        self.q_from_mvar = q_from_mvar
+                        self.p_to_mw = p_to_mw 
+                        self.q_to_mvar = q_to_mvar
+                        self.p_l_mw = p_l_mw 
+                        self.q_l_mvar = q_l_mvar
+                        self.vm_from_pu = vm_from_pu 
+                        self.va_from_degree = va_from_degree
+                        self.vm_to_pu = vm_to_pu 
+                        self.va_to_degree = va_to_degree                        
+                       
+                class TCSCsOut(object):
+                    def __init__(self, tcscs: List[TCSCOut]):
+                        self.tcscs = tcscs              
+                TCSCsList = list()
+
+                '''
+                class SSCOut(object):
+                    def __init__(self, name: str, firstnumberinid:str, q_mvar: float, vm_internal_pu: float, va_internal_degree: float, vm_pu: float, va_degree: float):          
+                        self.name = name
+                        self.firstnumberinid = firstnumberinid
+                        self.q_mvar = q_mvar 
+                        self.vm_internal_pu = vm_internal_pu
+                        self.va_internal_degree = va_internal_degree
+                        self.vm_pu = vm_pu
+                        self.va_degree = va_degree                       
+                       
+                class SSCsOut(object):
+                    def __init__(self, sscs: List[SSCOut]):
+                        self.sscs = sscs              
+                sscsList = list()
+                '''
                 
                 
                 class StorageOut(object):
@@ -565,7 +638,8 @@ def simulation():
                         
                         result = {**result, **asymmetricstaticgenerators.__dict__}
                         
-                print(net.trafo)
+                print(net)
+               
                 #Transformer                     
                 if(net.res_trafo.empty):
                         print("no transformer in the model")                         
@@ -586,7 +660,7 @@ def simulation():
                                     
                 else:                    
                         for index, row in net.res_trafo3w.iterrows():    
-                            transformer3W = Transformer3WOut(name=net.trafo3W._get_value(index, 'name'), firstnumberinid = net.trafo3W._get_value(index, 'firstnumberinid'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_mv_mw=row['p_mv_mw'], q_mv_mvar=row['q_mv_mvar'], p_lv_mw=row['p_lv_mw'], 
+                            transformer3W = Transformer3WOut(name=net.trafo3w._get_value(index, 'name'), firstnumberinid = net.trafo3w._get_value(index, 'firstnumberinid'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_mv_mw=row['p_mv_mw'], q_mv_mvar=row['q_mv_mvar'], p_lv_mw=row['p_lv_mw'], 
                                                          q_lv_mvar=row['q_lv_mvar'], pl_mw=row['pl_mw'], ql_mvar=row['ql_mvar'], i_hv_ka=row['i_hv_ka'], i_mv_ka=row['i_mv_ka'], i_lv_ka=row['i_lv_ka'], vm_hv_pu=row['vm_hv_pu'], vm_mv_pu=row['vm_mv_pu'],
                                                          vm_lv_pu=row['vm_lv_pu'], va_hv_degree=row['va_hv_degree'], va_mv_degree=row['va_mv_degree'], va_lv_degree=row['va_lv_degree'], loading_percent=row['loading_percent'])        
                             transformers3WList.append(transformer3W)
@@ -595,10 +669,7 @@ def simulation():
                         result = {**result, **transformers3W.__dict__}  
                
                
-                print('net.shunt')         
-                print(net.shunt)
-                print('net.res_shunt')         
-                print(net.res_shunt)
+
                 
                 #Shunt reactor
                 if(net.res_shunt.empty):
@@ -623,8 +694,7 @@ def simulation():
                                 capacitors = CapacitorsOut(capacitors = capacitorsList) 
                                 result = {**result, **capacitors.__dict__}  
                 
-                print(net.load)  
-                print(net.res_load)   
+               
                 #Load
                 if(net.res_load.empty):
                         print("no load in the model")                
@@ -699,11 +769,52 @@ def simulation():
                             storage = StorageOut(name=net.storage._get_value(index, 'name'), firstnumberinid = net.storage._get_value(index, 'firstnumberinid'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
                             storagesList.append(storage) 
                             storages = StoragesOut(storages = storagesList) 
-                        result = {**result, **storages.__dict__} 
-                
+                        result = {**result, **storages.__dict__}
+
+
+                #SVC
+                try:                    
+                    for index, row in net.res_svc.iterrows():    
+                        svc = SVCOut(name=net.svc._get_value(index, 'name'), firstnumberinid = net.svc._get_value(index, 'firstnumberinid'), thyristor_firing_angle_degree=row['thyristor_firing_angle_degree'], x_ohm=row['x_ohm'], q_mvar=row['q_mvar'], vm_pu=row['vm_pu'], va_degree=row['va_degree'] )        
+                        SVCsList.append(svc) 
+                        svcs = SVCsOut(svcs = SVCsList) 
+                    result = {**result, **svcs.__dict__}
+                       
+                except AttributeError:  
+                     print("no SVC in the model")
+                except UnboundLocalError:
+                     print("no TCSC in the model")                
+                    
+                        
+                #TCSC   
+                try:
+                    for index, row in net.res_tcsc.iterrows():    
+                            tcsc = TCSCOut(name=net.tcsc._get_value(index, 'name'), firstnumberinid = net.tcsc._get_value(index, 'firstnumberinid'), thyristor_firing_angle_degree=row['thyristor_firing_angle_degree'], x_ohm=row['x_ohm'], p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], p_l_mw=row['p_l_mw'], q_l_mvar=row['q_l_mvar'], vm_from_pu=row['vm_from_pu'], va_from_degree=row['va_from_degree'], vm_to_pu=row['vm_to_pu'], va_to_degree=row['va_to_degree']  )        
+                            TCSCsList.append(tcsc) 
+                            tcscs = TCSCsOut(tcscs = TCSCsList) 
+                    result = {**result, **tcscs.__dict__} 
+                     
+                except AttributeError:  
+                     print("no TCSC in the model")     
+                except UnboundLocalError:
+                     print("no TCSC in the model") 
+
+                                               
+                #SSC
+                ''' 
+                try:
+                    for index, row in net.res_ssc.iterrows():    
+                            ssc = SSCOut(name=net.ssc._get_value(index, 'name'), firstnumberinid = net.ssc._get_value(index, 'firstnumberinid'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
+                            sscsList.append(ssc) 
+                            sscs = SSCsOut(sscs = sscsList) 
+                    result = {**result, **sscs.__dict__}
+                except AttributeError:  
+                     print("no SSC in the model")                       
+                '''        
+                                        
                 #DCLine
                 if(net.res_dcline.empty):
-                        print("no impedance in the model")                
+                        print("no DC line in the model")                
                 else:                    
                         for index, row in net.res_dcline.iterrows():    
                             dcline = ImpedanceOut(name=net.dcline._get_value(index, 'name'), firstnumberinid = net.dcline._get_value(index, 'firstnumberinid'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], pl_mw=row['pl_mw'], vm_from_pu=row['vm_from_pu'], va_from_degree=row['va_from_degree'], vm_to_pu=row['vm_to_pu'], va_to_degree=row['va_to_degree'] )        
@@ -713,8 +824,7 @@ def simulation():
                         
                     
                         
-                print(result)
-
+               
                 #response = make_response()
                 #response.headers.add("Access-Control-Allow-Origin", "*")
                 #response.headers.add("Access-Control-Allow-Headers", "*")
@@ -811,7 +921,7 @@ def simulation():
         
 #dla produkcji usuwaj te wiersze          
 if __name__ == '__main__':
-    app.debug = False
-    app.run(host = '127.0.0.1', port=5005)
-   # app.debug = True
-   # app.run(host = '0.0.0.0', port=5005)
+    #app.debug = False
+    #app.run(host = '127.0.0.1', port=5005)
+    app.debug = True
+    app.run(host = '127.0.0.1', port=5000)
