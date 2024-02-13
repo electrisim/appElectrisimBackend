@@ -32,7 +32,7 @@ def simulation():
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
     print(in_data)   
     
-    net = pp.create_empty_network()
+    
     
    
     Busbars = {} 
@@ -40,9 +40,13 @@ def simulation():
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
         if "PowerFlow" in in_data[x]['typ']:
+            frequency=eval(in_data[x]['frequency'])
             algorithm=in_data[x]['algorithm']
             calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
             init = in_data[x]['initialization']
+
+            net = pp.create_empty_network(f_hz=frequency)
+
         if "ShortCircuit" in in_data[x]['typ']:
             fault=in_data[x]['fault']
             case=in_data[x]['case']
@@ -54,6 +58,9 @@ def simulation():
             r_fault_ohm=float(in_data[x]['r_fault_ohm'])
             x_fault_ohm=float(in_data[x]['x_fault_ohm'])
             inverse_y=in_data[x]['inverse_y']
+
+            net = pp.create_empty_network()
+
         if "Bus" in in_data[x]['typ']:
             Busbars[in_data[x]['name']]=pp.create_bus(net,name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], vn_kv=in_data[x]['vn_kv'], type='b')
           
@@ -919,7 +926,7 @@ def simulation():
                   
                 return response 
         
-#dla produkcji usuwaj te wiersze          
+#DLA PRODUKCJI USUWAJ PONIŻSZE WERSJE        
 #if __name__ == '__main__':
     #app.debug = False
     #app.run(host = '127.0.0.1', port=5005)
