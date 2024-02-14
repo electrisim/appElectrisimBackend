@@ -88,7 +88,7 @@ def simulation():
         
         if (in_data[x]['typ'].startswith("Static Generator")):      
             pp.create_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'],
-                           k=in_data[x]['k'], rx=in_data[x]['rx'], generator_type=in_data[x]['generator_type'], lrc_pu=in_data[x]['lrc_pu'], max_ik_ka=in_data[x]['max_ik_ka'], kappa=in_data[x]['kappa'], current_source=in_data[x]['current_source'])   
+                           k=in_data[x]['k'], rx=in_data[x]['rx'], generator_type=in_data[x]['generator_type'], lrc_pu=in_data[x]['lrc_pu'], max_ik_ka=in_data[x]['max_ik_ka'], current_source=in_data[x]['current_source'])  # kappa=in_data[x]['kappa'],
         
         if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):      
             pp.create_asymmetric_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], firstnumberinid=in_data[x]['firstnumberinid'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
