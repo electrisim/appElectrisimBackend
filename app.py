@@ -39,7 +39,7 @@ def simulation():
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
         if "PowerFlowPandaPower" in in_data[x]['typ']:
-            print('jestem w PowerFlowPandaPower')
+            print('jestem w PowerFlowPandaPower') 
             frequency=eval(in_data[x]['frequency'])
             algorithm=in_data[x]['algorithm']
             calculate_voltage_angles = in_data[x]['calculate_voltage_angles']

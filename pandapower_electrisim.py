@@ -800,7 +800,26 @@ def shortcircuit(net, in_data):
     inverse_y=in_data['inverse_y']
  
     print(diag_result_dict)      
-              
+    
+    print("fault" + fault)
+    print("case" + case)
+    print("lv_tol_percent")
+    print(lv_tol_percent)
+    print("ip")
+    print(ip)
+    print("ith")
+    print(ith)
+    print("topology" + topology)
+    print("tk_s")
+    print(tk_s)
+    print("r_fault_ohm")
+    print(r_fault_ohm)
+    print("x_fault_ohm")
+    print(x_fault_ohm)
+    print("inverse_y")
+    print(inverse_y)
+    
+
     sc.calc_sc(net, fault=fault, case=case, lv_tol_percent=lv_tol_percent, ip=ip, ith=ith, topology=topology, tk_s=tk_s, kappa_method='C', r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, branch_results=True, check_connectivity=True, return_all_currents=True, inverse_y=inverse_y)  
     print(net.res_bus_sc)
                 #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
