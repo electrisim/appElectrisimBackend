@@ -7,9 +7,7 @@ from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać pol
 import pandapower as pp
 import pandas as pd
 
-
 import numpy as np
-
 
 from typing import List
 
@@ -38,8 +36,9 @@ def simulation():
           
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
+        #print(x)
         if "PowerFlowPandaPower" in in_data[x]['typ']:
-            print('jestem w PowerFlowPandaPower') 
+            
             frequency=eval(in_data[x]['frequency'])
             algorithm=in_data[x]['algorithm']
             calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
@@ -67,9 +66,6 @@ def simulation():
             algorithm=in_data[x]['algorithm'] #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
             response = opendss_electrisim.powerflow(in_data, frequency)           
             return response
-
-
-
              
       
     #print(net.bus)

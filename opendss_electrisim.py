@@ -59,8 +59,6 @@ def powerflow(in_data, frequency):
     #przykład przypisania: {''mxCell_88'': 0, ''mxCell_99'': 1}
     for x in in_data:         
         if "Bus" in in_data[x]['typ']:
-            print("jestem w bus")
-            print(in_data[x]['typ'])
             BusbarsDict[in_data[x]['name']]=nBusbar
             BusbarsDictId[in_data[x]['name']] = in_data[x]['id']
             nBusbar=nBusbar+1
@@ -95,7 +93,6 @@ def powerflow(in_data, frequency):
 
     for x in in_data:
         if (in_data[x]['typ'].startswith("External Grid")):
-            #print("jestem w ExternalGrid")
             name=in_data[x]['name']
             id=in_data[x]['id']
             #bus=in_data[x]['bus']
@@ -106,9 +103,7 @@ def powerflow(in_data, frequency):
             for key, value in BusbarsDictVoltage.items():
                 if key == in_data[x]['bus']:
                     basekv=value
-                    
-                    #print("dss.bus.voltages")
-                    #print(dss.bus.voltages)
+       
 
             vm_pu=in_data[x]['vm_pu']
             s_sc_max_mva=eval(in_data[x]['s_sc_max_mva'])
