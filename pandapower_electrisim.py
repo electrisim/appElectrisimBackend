@@ -1,5 +1,7 @@
 import pandapower as pp
 import pandapower.shortcircuit as sc
+import pandapower.plotting as plt
+from pandapower.diagnostic import diagnostic
 from typing import List
 import math
 import json
@@ -53,8 +55,8 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Transformer")): 
             pp.create_transformer_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), lv_bus = eval(in_data[x]['lv_bus']), name=in_data[x]['name'], id=in_data[x]['id'], sn_mva=in_data[x]['sn_mva'], vn_hv_kv=in_data[x]['vn_hv_kv'], vn_lv_kv=in_data[x]['vn_lv_kv'],
                                                   vkr_percent=in_data[x]['vkr_percent'], vk_percent=in_data[x]['vk_percent'], pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], vector_group=in_data[x]['vector_group'],
-                                                  parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  tap_phase_shifter=eval(in_data[x]['tap_phase_shifter']),  
-                                                )
+                                                  parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  
+                                                )#tap_phase_shifter=eval(in_data[x]['tap_phase_shifter'])
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
             pp.create_transformer3w_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), mv_bus = eval(in_data[x]['mv_bus']), lv_bus = eval(in_data[x]['lv_bus']), name=in_data[x]['name'], id=in_data[x]['id'],
@@ -114,15 +116,23 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init):
+            
     #pandapower - rozpływ mocy
             try:
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init) 
             except:
                 print("An exception occurred")
-                diag_result_dict = pp.diagnostic(net, report_style='compact') 
+                diag_result_dict = pp.diagnostic(net, report_style='detailed') 
+                
+                #pp.toolbox.detect_isolated_elements(net)
+                
+                #print(net.bus)
+                #print(net.line)
+                #print(net.trafo)
                 
                 #diag_result_json = json.dumps(diag_result_dict,indent = 3)
                 print(diag_result_dict)
+                plt.simple_plot(net, plot_line_switches=True)
                 
                 if 'overload' in diag_result_dict: 
                     print('błąd overload')  

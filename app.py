@@ -11,6 +11,9 @@ import numpy as np
 
 from typing import List
 
+import warnings
+warnings.filterwarnings("ignore")
+
 app = Flask(__name__)
 #cors = CORS(app)# BYŁO, support_credentials=True
 CORS(app) #, origins=['http://127.0.0.1:5500','https://app.electrisim.com/'] 
@@ -29,10 +32,9 @@ def index():
 def simulation():
     #in_data = request.get_json()
     in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
-    print(in_data)    
-    
+    print(in_data) 
    
-    Busbars = {} 
+    Busbars = {}
           
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
