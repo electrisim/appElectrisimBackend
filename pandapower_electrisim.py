@@ -37,7 +37,7 @@ def create_other_elements(in_data,net,x, Busbars):
        
         if (in_data[x]['typ'].startswith("Generator")):     
             pp.create_gen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], vm_pu=in_data[x]['vm_pu'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],
-                          vn_kv=in_data[x]['vn_kv'], xdss_pu=in_data[x]['xdss_pu'], rdss_ohm=in_data[x]['rdss_ohm'], cos_phi=in_data[x]['cos_phi'], pg_percent=in_data[x]['pg_percent'], power_station_trafo=in_data[x]['power_station_trafo'])    
+                          vn_kv=in_data[x]['vn_kv'], xdss_pu=in_data[x]['xdss_pu'], rdss_ohm=in_data[x]['rdss_ohm'], cos_phi=in_data[x]['cos_phi'], pg_percent=in_data[x]['pg_percent'])    #, power_station_trafo=in_data[x]['power_station_trafo']
         
         if (in_data[x]['typ'].startswith("Static Generator")):      
             pp.create_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'],
@@ -116,7 +116,8 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init):
-            
+            print(net.bus)
+            print(net.trafo) 
     #pandapower - rozpływ mocy
             try:
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init) 
@@ -128,11 +129,11 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 
                 #print(net.bus)
                 #print(net.line)
-                #print(net.trafo)
+                
                 
                 #diag_result_json = json.dumps(diag_result_dict,indent = 3)
                 print(diag_result_dict)
-                plt.simple_plot(net, plot_line_switches=True)
+                #plt.simple_plot(net, plot_line_switches=True)
                 
                 if 'overload' in diag_result_dict: 
                     print('błąd overload')  
@@ -796,9 +797,37 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
 
 
 def shortcircuit(net, in_data):
-    diag_result_dict = pp.diagnostic(net, report_style='compact') 
+    
+    # Add diagnostic prints
+    print("\nNetwork Summary before short circuit calculation:")
+    print(f"Buses: {len(net.bus)}")
+    print(f"Lines: {len(net.line)}")
+    print(f"Transformers: {len(net.trafo)}")
+    print(f"Generators: {len(net.gen)}")
+    print(f"External Grids: {len(net.ext_grid)}")
+        
+    # Print key parameters
+    print("\nBus Data:")
+    print(net.bus)
+        
+    print("\nGenerator Data:")
+    print(net.gen)
+        
+    print("\nTransformer Data:")
+    print(net.trafo)
+        
+    print("\nExternal Grid Data:")
+    print(net.ext_grid)
+    
+    # Validate network before running calculations
+    pp.runpp(net, calculate_voltage_angles=True)
+    print("\nPower flow calculation successful")
+    
+    # Set important parameters for short circuit calculation
+    net.sn_mva = 100
 
-    fault=in_data['fault']
+    
+    fault=in_data['fault']  # Using first bus as fault location    #
     case=in_data['case']
     lv_tol_percent=eval(in_data['lv_tol_percent'])
     ip=True
@@ -809,7 +838,7 @@ def shortcircuit(net, in_data):
     x_fault_ohm=float(in_data['x_fault_ohm'])
     inverse_y=in_data['inverse_y']
  
-    print(diag_result_dict)      
+        
     
     #print("fault" + fault)
     #print("case" + case)
@@ -830,7 +859,7 @@ def shortcircuit(net, in_data):
     #print(inverse_y)
     
 
-    sc.calc_sc(net, fault=fault, case=case, lv_tol_percent=lv_tol_percent, ip=ip, ith=ith, topology=topology, tk_s=tk_s, kappa_method='C', r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, branch_results=True, check_connectivity=True, return_all_currents=True, inverse_y=inverse_y)  
+    sc.calc_sc(net, fault=fault, case=case,  ip=ip, ith=ith, tk_s=tk_s, r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, branch_results=True, check_connectivity=True, return_all_currents=True)  #kappa_method='C', , inverse_y=inverse_y,  topology=topology, lv_tol_percent=lv_tol_percent,
     print(net.res_bus_sc)
     #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
                 
@@ -874,7 +903,7 @@ def shortcircuit(net, in_data):
             
     response = json.dumps(result, default=lambda o: o.__dict__, indent=4) #json.dumps - convert a subset of Python objects into a json string
         
-                 
+              
     print(type(response))
     print(response)                                   
     return response 

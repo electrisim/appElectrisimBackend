@@ -74,8 +74,7 @@ def simulation():
     #print(net.shunt)
     #print(net.ext_grid)
     
-    #print(net.line))
-    
+    #print(net.line))   
         
     
 
