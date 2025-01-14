@@ -799,25 +799,25 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
 def shortcircuit(net, in_data):
     
     # Add diagnostic prints
-    print("\nNetwork Summary before short circuit calculation:")
-    print(f"Buses: {len(net.bus)}")
-    print(f"Lines: {len(net.line)}")
-    print(f"Transformers: {len(net.trafo)}")
-    print(f"Generators: {len(net.gen)}")
-    print(f"External Grids: {len(net.ext_grid)}")
+    #print("\nNetwork Summary before short circuit calculation:")
+    #print(f"Buses: {len(net.bus)}")
+    #print(f"Lines: {len(net.line)}")
+    #print(f"Transformers: {len(net.trafo)}")
+    #print(f"Generators: {len(net.gen)}")
+    #print(f"External Grids: {len(net.ext_grid)}")
         
     # Print key parameters
     print("\nBus Data:")
     print(net.bus)
         
-    print("\nGenerator Data:")
-    print(net.gen)
+    #print("\nGenerator Data:")
+    #print(net.gen)
         
-    print("\nTransformer Data:")
-    print(net.trafo)
+    #print("\nTransformer Data:")
+    #print(net.trafo)
         
-    print("\nExternal Grid Data:")
-    print(net.ext_grid)
+    #print("\nExternal Grid Data:")
+    #print(net.ext_grid)
     
     # Validate network before running calculations
     pp.runpp(net, calculate_voltage_angles=True)
