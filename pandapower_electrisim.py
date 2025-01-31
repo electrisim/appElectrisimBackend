@@ -2,6 +2,7 @@ import pandapower as pp
 import pandapower.shortcircuit as sc
 import pandapower.plotting as plt
 from pandapower.diagnostic import diagnostic
+import pandapower.topology as top
 from typing import List
 import math
 import json
@@ -25,7 +26,7 @@ def create_other_elements(in_data,net,x, Busbars):
     for x in in_data:
         #eval - rozwiazuje problem z wartosciami NaN
         if (in_data[x]['typ'].startswith("Line")):  
-            pp.create_line_from_parameters(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm_per_km=in_data[x]['r_ohm_per_km'], x_ohm_per_km=in_data[x]['x_ohm_per_km'], c_nf_per_km= in_data[x]['c_nf_per_km'], g_us_per_km= in_data[x]['g_us_per_km'], 
+            pp.create_line_from_parameters(net,  from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm_per_km=in_data[x]['r_ohm_per_km'], x_ohm_per_km=in_data[x]['x_ohm_per_km'], c_nf_per_km= in_data[x]['c_nf_per_km'], g_us_per_km= in_data[x]['g_us_per_km'], 
                                            r0_ohm_per_km=1, x0_ohm_per_km=1, c0_nf_per_km=0, endtemp_degree= in_data[x]['endtemp_degree'],
                                            max_i_ka= in_data[x]['max_i_ka'],type= in_data[x]['type'], length_km=in_data[x]['length_km'], parallel=in_data[x]['parallel'], df=in_data[x]['df'])
             #w specyfikacji zapisano, że poniższe parametry są typu nan. Wartosci składowych zerowych mogą być wprowadzone przez funkcję create line.
@@ -41,7 +42,7 @@ def create_other_elements(in_data,net,x, Busbars):
         
         if (in_data[x]['typ'].startswith("Static Generator")):      
             pp.create_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'],
-                           k=in_data[x]['k'], rx=in_data[x]['rx'], generator_type=in_data[x]['generator_type'], lrc_pu=in_data[x]['lrc_pu'], max_ik_ka=in_data[x]['max_ik_ka'], current_source=in_data[x]['current_source'])  # kappa=in_data[x]['kappa'],
+                           k=1, rx=in_data[x]['rx'], generator_type=in_data[x]['generator_type'], lrc_pu=in_data[x]['lrc_pu'], max_ik_ka=in_data[x]['max_ik_ka'], current_source=in_data[x]['current_source'])   #, kappa=in_data[x]['kappa']
         
         if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):      
             pp.create_asymmetric_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
@@ -116,13 +117,36 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init):
+            print("\nBus Data:")
             print(net.bus)
-            print(net.trafo) 
-    #pandapower - rozpływ mocy
+        
+            print("\nStatic Generator Data:")
+            print(net.sgen)
+    
+            print("\nShunt reactor Data:")
+            print(net.shunt)
+        
+            print("\nTransformer Data:")
+            print(net.trafo)
+    
+            print("\nThree-winding transformer Data:")
+            print(net.trafo3w)
+        
+            print("\nExternal Grid Data:")
+            print(net.ext_grid)
+    
+            print("\nLine Data:")
+            print(net.line)
+            #pandapower - rozpływ mocy
             try:
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init) 
             except:
                 print("An exception occurred")
+                
+                # Access initial voltage magnitudes and angles
+             
+                              
+                
                 diag_result_dict = pp.diagnostic(net, report_style='detailed') 
                 
                 #pp.toolbox.detect_isolated_elements(net)
@@ -805,23 +829,52 @@ def shortcircuit(net, in_data):
     #print(f"Transformers: {len(net.trafo)}")
     #print(f"Generators: {len(net.gen)}")
     #print(f"External Grids: {len(net.ext_grid)}")
+    
+    net.ext_grid.loc[0, 's_sc_max_mva'] = 100  # Maximum short-circuit power
+    net.ext_grid.loc[0, 'rx_max'] = 0.1       # R/X ratio
+    net.sgen['k'] = 2 
         
     # Print key parameters
     print("\nBus Data:")
     print(net.bus)
         
-    #print("\nGenerator Data:")
-    #print(net.gen)
+    print("\nStatic Generator Data:")
+    print(net.sgen)
+    
+    print("\nShunt reactor Data:")
+    print(net.shunt)
         
-    #print("\nTransformer Data:")
-    #print(net.trafo)
+    print("\nTransformer Data:")
+    print(net.trafo)
+    
+    print("\nThree-winding transformer Data:")
+    print(net.trafo3w)
         
-    #print("\nExternal Grid Data:")
-    #print(net.ext_grid)
+    print("\nExternal Grid Data:")
+    print(net.ext_grid)
+    
+    print("\nLine Data:")
+    print(net.line)
+    
+    print("\nLoad Data:")
+    print(net.load)
+    
+    print(net.bus.isna().sum())          # Check buses
+    print(net.line.isna().sum())         # Check lines
+    print(net.trafo.isna().sum())        # Check transformers
+    print(net.load.isna().sum())         # Check loads
+    print(net.sgen.isna().sum())         # Check static generators
+  
+    print(net.line[net.line.isna().any(axis=1)])
+    
+    isolated_buses = top.unsupplied_buses(net)
+    print(f"Isolated buses: {isolated_buses}")
+    
+    pp.diagnostic(net)
     
     # Validate network before running calculations
-    pp.runpp(net, calculate_voltage_angles=True)
-    print("\nPower flow calculation successful")
+    #pp.runpp(net, calculate_voltage_angles=True)
+    #print("\nPower flow calculation successful")
     
     # Set important parameters for short circuit calculation
     net.sn_mva = 100
