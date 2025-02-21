@@ -97,15 +97,14 @@ def create_other_elements(in_data,net,x, Busbars):
                             efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'])         
    
         
-        if (in_data[x]['typ'].startswith("SVC")):
-            
+        if (in_data[x]['typ'].startswith("SVC")):            
             pp.create_svc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
          
         if (in_data[x]['typ'].startswith("TCSC")):
             pp.create_tcsc(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
                    
-       # if (in_data[x]['typ'].startswith("SSC")):
-       #     pp.create_ssc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
+        if (in_data[x]['typ'].startswith("SSC")):
+            pp.create_ssc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
         
 
         if (in_data[x]['typ'].startswith("Storage")):
@@ -490,7 +489,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                         self.tcscs = tcscs              
                 TCSCsList = list()
 
-                '''
+                
                 class SSCOut(object):
                     def __init__(self, name: str, id:str, q_mvar: float, vm_internal_pu: float, va_internal_degree: float, vm_pu: float, va_degree: float):          
                         self.name = name
@@ -505,7 +504,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                     def __init__(self, sscs: List[SSCOut]):
                         self.sscs = sscs              
                 sscsList = list()
-                '''
+                
                 
                 
                 class StorageOut(object):
@@ -783,7 +782,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
 
                                                
                 #SSC
-                ''' 
+                
                 try:
                     for index, row in net.res_ssc.iterrows():    
                             ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
@@ -792,7 +791,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                     result = {**result, **sscs.__dict__}
                 except AttributeError:  
                      print("no SSC in the model")                       
-                '''        
+                       
                                         
                 #DCLine
                 if(net.res_dcline.empty):
