@@ -783,14 +783,24 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                                                
                 #SSC
                 
-                try:
+                #try:
+                #    for index, row in net.res_ssc.iterrows():    
+                #            ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
+                #            sscsList.append(ssc) 
+                #            sscs = SSCsOut(sscs = sscsList) 
+                #    result = {**result, **sscs.__dict__}
+                #except AttributeError:  
+                #SSC    print("no SSC in the model")  
+                     
+                #SSC
+                if(net.res_ssc.empty):
+                        print("no SSC in the model")                
+                else:                    
                     for index, row in net.res_ssc.iterrows():    
-                            ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
-                            sscsList.append(ssc) 
-                            sscs = SSCsOut(sscs = sscsList) 
-                    result = {**result, **sscs.__dict__}
-                except AttributeError:  
-                     print("no SSC in the model")                       
+                        ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
+                        sscsList.append(ssc) 
+                        sscs = SSCsOut(sscs = sscsList) 
+                    result = {**result, **sscs.__dict__}                    
                        
                                         
                 #DCLine
