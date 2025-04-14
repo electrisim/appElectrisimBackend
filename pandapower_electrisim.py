@@ -6,6 +6,9 @@ import pandapower.topology as top
 from typing import List
 import math
 import json
+import numpy as np
+import pandas as pd
+
 
 
 
@@ -142,19 +145,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
             except:
                 print("An exception occurred")
                 
-                # Access initial voltage magnitudes and angles
-             
-                              
+                # Access initial voltage magnitudes and angles  
                 
-                diag_result_dict = pp.diagnostic(net, report_style='detailed') 
+                diag_result_dict = pp.diagnostic(net, report_style='detailed')             
                 
-                #pp.toolbox.detect_isolated_elements(net)
-                
-                #print(net.bus)
-                #print(net.line)
-                
-                
-                #diag_result_json = json.dumps(diag_result_dict,indent = 3)
                 print(diag_result_dict)
                 #plt.simple_plot(net, plot_line_switches=True)
                 
@@ -832,17 +826,6 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
 def shortcircuit(net, in_data):
     
     # Add diagnostic prints
-    #print("\nNetwork Summary before short circuit calculation:")
-    #print(f"Buses: {len(net.bus)}")
-    #print(f"Lines: {len(net.line)}")
-    #print(f"Transformers: {len(net.trafo)}")
-    #print(f"Generators: {len(net.gen)}")
-    #print(f"External Grids: {len(net.ext_grid)}")
-    
-    net.ext_grid.loc[0, 's_sc_max_mva'] = 100  # Maximum short-circuit power
-    net.ext_grid.loc[0, 'rx_max'] = 0.1       # R/X ratio
-    net.sgen['k'] = 2 
-        
     # Print key parameters
     print("\nBus Data:")
     print(net.bus)
@@ -882,11 +865,7 @@ def shortcircuit(net, in_data):
     pp.diagnostic(net)
     
     # Validate network before running calculations
-    #pp.runpp(net, calculate_voltage_angles=True)
-    #print("\nPower flow calculation successful")
-    
-    # Set important parameters for short circuit calculation
-    net.sn_mva = 100
+    #pp.runpp(net, calculate_voltage_angles=True)    
 
     
     fault=in_data['fault']  # Using first bus as fault location    #
@@ -900,26 +879,6 @@ def shortcircuit(net, in_data):
     x_fault_ohm=float(in_data['x_fault_ohm'])
     inverse_y=in_data['inverse_y']
  
-        
-    
-    #print("fault" + fault)
-    #print("case" + case)
-    #print("lv_tol_percent")
-    #print(lv_tol_percent)
-    #print("ip")
-    #print(ip)
-    #print("ith")
-    #print(ith)
-    #print("topology" + topology)
-    #print("tk_s")
-    #print(tk_s)
-    #print("r_fault_ohm")
-    #print(r_fault_ohm)
-    #print("x_fault_ohm")
-    #print(x_fault_ohm)
-    #print("inverse_y")
-    #print(inverse_y)
-    
 
     sc.calc_sc(net, fault=fault, case=case,  ip=ip, ith=ith, tk_s=tk_s, r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, branch_results=True, check_connectivity=True, return_all_currents=True)  #kappa_method='C', , inverse_y=inverse_y,  topology=topology, lv_tol_percent=lv_tol_percent,
     print(net.res_bus_sc)
