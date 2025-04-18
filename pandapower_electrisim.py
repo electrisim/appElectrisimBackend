@@ -1,4 +1,5 @@
 import pandapower as pp
+
 import pandapower.shortcircuit as sc
 import pandapower.plotting as plt
 from pandapower.diagnostic import diagnostic
@@ -28,10 +29,63 @@ def create_other_elements(in_data,net,x, Busbars):
 
     for x in in_data:
         #eval - rozwiazuje problem z wartosciami NaN
-        if (in_data[x]['typ'].startswith("Line")):  
-            pp.create_line_from_parameters(net,  from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm_per_km=in_data[x]['r_ohm_per_km'], x_ohm_per_km=in_data[x]['x_ohm_per_km'], c_nf_per_km= in_data[x]['c_nf_per_km'], g_us_per_km= in_data[x]['g_us_per_km'], 
-                                           r0_ohm_per_km=1, x0_ohm_per_km=1, c0_nf_per_km=0, endtemp_degree=in_data[x]['endtemp_degree'],
-                                           max_i_ka= in_data[x]['max_i_ka'],type= in_data[x]['type'], length_km=in_data[x]['length_km'], parallel=in_data[x]['parallel'], df=in_data[x]['df'])
+        if (in_data[x]['typ'].startswith("Line")):
+            # Create a base parameters dict with required parameters     
+            line_params = {
+                "from_bus": eval(in_data[x]['busFrom']), 
+                "to_bus": eval(in_data[x]['busTo']), 
+                "name": in_data[x]['name'], 
+                "id": in_data[x]['id'], 
+                "r_ohm_per_km": float(in_data[x]['r_ohm_per_km']), 
+                "x_ohm_per_km": float(in_data[x]['x_ohm_per_km']), 
+                "c_nf_per_km": float(in_data[x]['c_nf_per_km']), 
+                "g_us_per_km": float(in_data[x]['g_us_per_km']), 
+                "max_i_ka": float(in_data[x]['max_i_ka']),
+                "type": in_data[x]['type'], 
+                "length_km": float(in_data[x]['length_km']), 
+                "parallel": int(in_data[x]['parallel']), 
+                "df": float(in_data[x]['df'])
+            }
+
+            # Make sure zero sequence parameters are explicitly converted to float
+            # This should solve the isnan() issue
+            try:
+                if 'r0_ohm_per_km' in in_data[x] and in_data[x]['r0_ohm_per_km'] is not None:
+                    line_params["r0_ohm_per_km"] = float(in_data[x]['r0_ohm_per_km'])
+                else:
+                    line_params["r0_ohm_per_km"] = 1.0  # Default as float
+                    
+                if 'x0_ohm_per_km' in in_data[x] and in_data[x]['x0_ohm_per_km'] is not None:
+                    line_params["x0_ohm_per_km"] = float(in_data[x]['x0_ohm_per_km'])
+                else:
+                    line_params["x0_ohm_per_km"] = 1.0  # Default as float
+                    
+                if 'c0_nf_per_km' in in_data[x] and in_data[x]['c0_nf_per_km'] is not None:
+                    line_params["c0_nf_per_km"] = float(in_data[x]['c0_nf_per_km'])
+                else:
+                    line_params["c0_nf_per_km"] = 0.0  # Default as float
+            except (ValueError, TypeError) as e:
+                print(f"Error converting zero sequence parameters for line {in_data[x]['name']}: {e}")
+                # Set to defaults if conversion fails
+                line_params["r0_ohm_per_km"] = 1.0
+                line_params["x0_ohm_per_km"] = 1.0
+                line_params["c0_nf_per_km"] = 0.0
+
+            # Handle endtemp_degree separately as it's truly optional
+            if 'endtemp_degree' in in_data[x] and in_data[x]['endtemp_degree'] is not None:
+                try:
+                    line_params["endtemp_degree"] = float(in_data[x]['endtemp_degree'])
+                except (ValueError, TypeError):
+                    # Skip adding this parameter if conversion fails
+                    pass
+
+            # Call the function with the prepared parameters
+            pp.create_line_from_parameters(net, **line_params)  
+            
+            
+            #pp.create_line_from_parameters(net,  from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm_per_km=in_data[x]['r_ohm_per_km'], x_ohm_per_km=in_data[x]['x_ohm_per_km'], c_nf_per_km= in_data[x]['c_nf_per_km'], g_us_per_km= in_data[x]['g_us_per_km'], 
+            #                               r0_ohm_per_km=1, x0_ohm_per_km=1, c0_nf_per_km=0, endtemp_degree=in_data[x]['endtemp_degree'],
+            #                               max_i_ka= in_data[x]['max_i_ka'],type= in_data[x]['type'], length_km=in_data[x]['length_km'], parallel=in_data[x]['parallel'], df=in_data[x]['df'])
             #w specyfikacji zapisano, że poniższe parametry są typu nan. Wartosci składowych zerowych mogą być wprowadzone przez funkcję create line.
             #r0_ohm_per_km= in_data[x]['r0_ohm_per_km'], x0_ohm_per_km= in_data[x]['x0_ohm_per_km'], c0_nf_per_km= in_data[x]['c0_nf_per_km'], max_loading_percent=in_data[x]['max_loading_percent'], endtemp_degree=in_data[x]['endtemp_degree'],
         
@@ -40,12 +94,12 @@ def create_other_elements(in_data,net,x, Busbars):
                                s_sc_max_mva=eval(in_data[x]['s_sc_max_mva']), s_sc_min_mva=eval(in_data[x]['s_sc_min_mva']), rx_max=eval(in_data[x]['rx_max']), rx_min=eval(in_data[x]['rx_min']), r0x0_max=eval(in_data[x]['r0x0_max']), x0x_max=eval(in_data[x]['x0x_max']))
        
         if (in_data[x]['typ'].startswith("Generator")):     
-            pp.create_gen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], vm_pu=in_data[x]['vm_pu'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],
-                          vn_kv=in_data[x]['vn_kv'], xdss_pu=in_data[x]['xdss_pu'], rdss_ohm=in_data[x]['rdss_ohm'], cos_phi=in_data[x]['cos_phi'], pg_percent=in_data[x]['pg_percent'])    #, power_station_trafo=in_data[x]['power_station_trafo']
+            pp.create_gen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=float(in_data[x]['p_mw']), vm_pu=float(in_data[x]['vm_pu']), sn_mva=float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
+                          vn_kv=float(in_data[x]['vn_kv']), xdss_pu=float(in_data[x]['xdss_pu']), rdss_ohm=float(in_data[x]['rdss_ohm']), cos_phi=float(in_data[x]['cos_phi']), pg_percent=float(in_data[x]['pg_percent']))    #, power_station_trafo=in_data[x]['power_station_trafo']
         
         if (in_data[x]['typ'].startswith("Static Generator")):      
-            pp.create_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'],
-                           k=1, rx=in_data[x]['rx'], generator_type=in_data[x]['generator_type'], lrc_pu=in_data[x]['lrc_pu'], max_ik_ka=in_data[x]['max_ik_ka'], current_source=in_data[x]['current_source'])   #, kappa=in_data[x]['kappa']
+            pp.create_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=float(in_data[x]['p_mw']), q_mvar=float(in_data[x]['q_mvar']), sn_mva=float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'], type=in_data[x]['type'],
+                           k=1.1, rx=float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=float(in_data[x]['lrc_pu']), max_ik_ka=float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5)
         
         if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):      
             pp.create_asymmetric_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
@@ -119,17 +173,18 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init):
-            print("\nBus Data:")
-            print(net.bus)
+            #print("\nBus Data:")
+            #print(net.bus)
         
             print("\nStatic Generator Data:")
-            print(net.sgen)
+            #print(net.sgen)
+            #print(net.sgen["k"])
     
-            print("\nShunt reactor Data:")
-            print(net.shunt)
+            #print("\nShunt reactor Data:")
+            #print(net.shunt)
         
-            print("\nTransformer Data:")
-            print(net.trafo)
+            #print("\nTransformer Data:")
+            #print(net.trafo)
     
             print("\nThree-winding transformer Data:")
             print(net.trafo3w)
@@ -213,7 +268,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 linesList = list()                              
                          
                 class ExternalGridOut(object):
-                    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, pf: float, q_p:float):          
+                    def __init__(self,  name: str, id: str, p_mw: float, q_mvar: float, pf: float, q_p:float):        
                         self.name = name
                         self.id = id
                         self.p_mw = p_mw 
@@ -827,42 +882,47 @@ def shortcircuit(net, in_data):
     
     # Add diagnostic prints
     # Print key parameters
-    print("\nBus Data:")
-    print(net.bus)
+    # print("\nBus Data:")
+    # print(net.bus)
         
     print("\nStatic Generator Data:")
     print(net.sgen)
+    net.sgen["k"] = 1.1
+    #print(net.sgen["k"])
+    print(pp.__version__)
     
-    print("\nShunt reactor Data:")
-    print(net.shunt)
+    
+    # print("\nShunt reactor Data:")
+    # print(net.shunt)
         
-    print("\nTransformer Data:")
-    print(net.trafo)
+    # print("\nTransformer Data:")
+    # print(net.trafo)
     
-    print("\nThree-winding transformer Data:")
-    print(net.trafo3w)
+    #print("\nThree-winding transformer Data:")
+    # print(net.trafo3w)
         
-    print("\nExternal Grid Data:")
-    print(net.ext_grid)
+    #print("\nExternal Grid Data:")
+    #print(net.ext_grid)
     
-    print("\nLine Data:")
-    print(net.line)
+    #print("\nLine Data:")
+    #print(net.line)
     
-    print("\nLoad Data:")
-    print(net.load)
+    #print("\nLoad Data:")
+    #print(net.load)
     
-    print(net.bus.isna().sum())          # Check buses
-    print(net.line.isna().sum())         # Check lines
-    print(net.trafo.isna().sum())        # Check transformers
-    print(net.load.isna().sum())         # Check loads
-    print(net.sgen.isna().sum())         # Check static generators
+    #print(net.bus.isna().sum())          # Check buses
+    #print(net.line.isna().sum())         # Check lines
+    #print(net.trafo.isna().sum())        # Check transformers
+    #print(net.load.isna().sum())         # Check loads
+   # print(net.sgen.isna().sum())         # Check static generators
   
-    print(net.line[net.line.isna().any(axis=1)])
+    #print(net.line[net.line.isna().any(axis=1)])
     
     isolated_buses = top.unsupplied_buses(net)
-    print(f"Isolated buses: {isolated_buses}")
+    #print(f"Isolated buses: {isolated_buses}")
     
     pp.diagnostic(net)
+    
     
     # Validate network before running calculations
     #pp.runpp(net, calculate_voltage_angles=True)    
@@ -870,7 +930,7 @@ def shortcircuit(net, in_data):
     
     fault=in_data['fault']  # Using first bus as fault location    #
     case=in_data['case']
-    lv_tol_percent=eval(in_data['lv_tol_percent'])
+    lv_tol_percent=int(in_data['lv_tol_percent'])
     ip=True
     ith=True
     topology=in_data['topology']
