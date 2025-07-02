@@ -14,10 +14,17 @@ import pandas as pd
 
 
 Busbars = {} 
-def create_busbars(in_data,net,x):
+def create_busbars(in_data, net):
+    Busbars = {}
     for x in in_data:
-         if "Bus" in in_data[x]['typ']:
-             Busbars[in_data[x]['name']]=pp.create_bus(net,name=in_data[x]['name'], id=in_data[x]['id'], vn_kv=in_data[x]['vn_kv'], type='b')           
+        if "Bus" in in_data[x]['typ']:
+            Busbars[in_data[x]['name']] = pp.create_bus(
+                net,
+                name=in_data[x]['name'],
+                id=in_data[x]['id'],
+                vn_kv=float(in_data[x]['vn_kv']),
+                type='b'
+            )
     return Busbars
 
 
@@ -89,9 +96,24 @@ def create_other_elements(in_data,net,x, Busbars):
             #w specyfikacji zapisano, że poniższe parametry są typu nan. Wartosci składowych zerowych mogą być wprowadzone przez funkcję create line.
             #r0_ohm_per_km= in_data[x]['r0_ohm_per_km'], x0_ohm_per_km= in_data[x]['x0_ohm_per_km'], c0_nf_per_km= in_data[x]['c0_nf_per_km'], max_loading_percent=in_data[x]['max_loading_percent'], endtemp_degree=in_data[x]['endtemp_degree'],
         
-        if (in_data[x]['typ'].startswith("External Grid")):     
-            pp.create_ext_grid(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], vm_pu=in_data[x]['vm_pu'], va_degree=in_data[x]['va_degree'],
-                               s_sc_max_mva=eval(in_data[x]['s_sc_max_mva']), s_sc_min_mva=eval(in_data[x]['s_sc_min_mva']), rx_max=eval(in_data[x]['rx_max']), rx_min=eval(in_data[x]['rx_min']), r0x0_max=eval(in_data[x]['r0x0_max']), x0x_max=eval(in_data[x]['x0x_max']))
+        if (in_data[x]['typ'].startswith("External Grid")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                raise ValueError(f"Bus {in_data[x]['bus']} not found for External Grid")
+            pp.create_ext_grid(
+                net,
+                bus=bus_idx,
+                name=in_data[x]['name'],
+                id=in_data[x]['id'],
+                vm_pu=float(in_data[x]['vm_pu']),
+                va_degree=float(in_data[x]['va_degree']),
+                s_sc_max_mva=float(in_data[x]['s_sc_max_mva']),
+                s_sc_min_mva=float(in_data[x]['s_sc_min_mva']),
+                rx_max=float(in_data[x]['rx_max']),
+                rx_min=float(in_data[x]['rx_min']),
+                r0x0_max=float(in_data[x]['r0x0_max']),
+                x0x_max=float(in_data[x]['x0x_max'])
+            )
        
         if (in_data[x]['typ'].startswith("Generator")):     
             pp.create_gen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=float(in_data[x]['p_mw']), vm_pu=float(in_data[x]['vm_pu']), sn_mva=float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
@@ -123,8 +145,8 @@ def create_other_elements(in_data,net,x, Busbars):
                                                     vk_hv_percent=in_data[x]['vk_hv_percent'], vk_mv_percent=in_data[x]['vk_mv_percent'], vk_lv_percent=in_data[x]['vk_lv_percent'], 
                                                     vkr_hv_percent=in_data[x]['vkr_hv_percent'], vkr_mv_percent=in_data[x]['vkr_mv_percent'], vkr_lv_percent=in_data[x]['vkr_lv_percent'], 
                                                     pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], 
-                                                    vk0_hv_percent=in_data[x]['vk0_hv_percent'], vk0_mv_percent=in_data[x]['vk0_mv_percent'], vk0_lv_percent=in_data[x]['vk0_lv_percent'], vkr0_hv_percent=in_data[x]['vkr0_hv_percent'], vkr0_mv_percent=in_data[x]['vkr0_mv_percent'], vkr0_lv_percent=in_data[x]['vkr0_lv_percent'], vector_group=in_data[x]['vector_group'],                                                    
-                                                    shift_mv_degree=in_data[x]['shift_mv_degree'], shift_lv_degree=in_data[x]['shift_lv_degree'], tap_step_percent=in_data[x]['tap_step_percent'], tap_side=in_data[x]['tap_side'], tap_neutral=in_data[x]['tap_neutral'], tap_min=in_data[x]['tap_min'], tap_max=in_data[x]['tap_max'], tap_pos=in_data[x]['tap_pos'], tap_at_star_point=in_data[x]['tap_at_star_point'])
+                                                     vector_group=in_data[x]['vector_group'],                                                    
+                                                    shift_mv_degree=in_data[x]['shift_mv_degree'], shift_lv_degree=in_data[x]['shift_lv_degree'], tap_step_percent=in_data[x]['tap_step_percent'], tap_side=in_data[x]['tap_side'],  tap_min=in_data[x]['tap_min'], tap_max=in_data[x]['tap_max'], tap_pos=in_data[x]['tap_pos']) #tap_neutral=in_data[x]['tap_neutral'],, tap_at_star_point=in_data[x]['tap_at_star_point'], vk0_hv_percent=in_data[x]['vk0_hv_percent'], vk0_mv_percent=in_data[x]['vk0_mv_percent'], vk0_lv_percent=in_data[x]['vk0_lv_percent'], vkr0_hv_percent=in_data[x]['vkr0_hv_percent'], vkr0_mv_percent=in_data[x]['vkr0_mv_percent'], vkr0_lv_percent=in_data[x]['vkr0_lv_percent'],
         
         if (in_data[x]['typ'].startswith("Shunt Reactor")):  
             pp.create_shunt(net, typ = "shuntreactor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
@@ -173,29 +195,13 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init):
-            #print("\nBus Data:")
-            #print(net.bus)
-        
-            print("\nStatic Generator Data:")
-            #print(net.sgen)
-            #print(net.sgen["k"])
-    
-            #print("\nShunt reactor Data:")
-            #print(net.shunt)
-        
-            #print("\nTransformer Data:")
-            #print(net.trafo)
-    
-            print("\nThree-winding transformer Data:")
-            print(net.trafo3w)
-        
-            print("\nExternal Grid Data:")
-            print(net.ext_grid)
-    
-            print("\nLine Data:")
-            print(net.line)
+               
+         
             #pandapower - rozpływ mocy
             try:
+                isolated_buses = top.unsupplied_buses(net)
+                if len(isolated_buses) > 0:
+                    raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init) 
             except:
                 print("An exception occurred")
@@ -731,9 +737,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 else:                    
                         for index, row in net.res_load.iterrows():    
                             load = LoadOut(name=net.load._get_value(index, 'name'), id = net.load._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
-                            print(load) 
+                            # print(load)  # Comment out this debug line
                             loadsList.append(load) 
-                            print(loadsList) 
+                            # print(loadsList)  # Comment out this debug line
                             loads = LoadsOut(loads = loadsList) 
                         result = {**result, **loads.__dict__}        
                         
@@ -869,7 +875,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 
                            
                 #json.dumps - convert a subset of Python objects into a json string
-                #default: If specified, default should be a function that gets called for objects that can’t otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
+                #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
                 response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
             
@@ -907,9 +913,6 @@ def shortcircuit(net, in_data):
     #print("\nLine Data:")
     #print(net.line)
     
-    #print("\nLoad Data:")
-    #print(net.load)
-    
     #print(net.bus.isna().sum())          # Check buses
     #print(net.line.isna().sum())         # Check lines
     #print(net.trafo.isna().sum())        # Check transformers
@@ -919,7 +922,8 @@ def shortcircuit(net, in_data):
     #print(net.line[net.line.isna().any(axis=1)])
     
     isolated_buses = top.unsupplied_buses(net)
-    #print(f"Isolated buses: {isolated_buses}")
+    if len(isolated_buses) > 0:
+        raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
     
     pp.diagnostic(net)
     

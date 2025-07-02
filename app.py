@@ -48,17 +48,19 @@ def simulation():
 
             net = pp.create_empty_network(f_hz=frequency)
        
-            Busbars = pandapower_electrisim.create_busbars(in_data, net, x)                 
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
 
             response = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init)  
+
+   
 
             return response
         
         if "ShortCircuitPandaPower" in in_data[x]['typ']:                     
 
             net = pp.create_empty_network()
-            Busbars = pandapower_electrisim.create_busbars(in_data, net, x)                 
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
             response = pandapower_electrisim.shortcircuit(net, in_data[x])
             return response
