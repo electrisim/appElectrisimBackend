@@ -70,15 +70,35 @@ def simulation():
             algorithm=in_data[x]['algorithm'] #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
             response = opendss_electrisim.powerflow(in_data, frequency)           
             return response
+        
+        if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
+            # Extract contingency analysis parameters
+            contingency_params = {
+                'contingency_type': in_data[x]['contingency_type'],
+                'element_type': in_data[x]['element_type'],
+                'elements_to_analyze': in_data[x]['elements_to_analyze'],
+                'voltage_limits': in_data[x]['voltage_limits'],
+                'thermal_limits': in_data[x]['thermal_limits'],
+                'min_vm_pu': in_data[x]['min_vm_pu'],
+                'max_vm_pu': in_data[x]['max_vm_pu'],
+                'max_loading_percent': in_data[x].get('max_loading_percent', '100'),
+                'post_contingency_actions': in_data[x].get('post_contingency_actions', 'none'),
+                'analysis_mode': in_data[x].get('analysis_mode', 'fast')
+            }
+            
+            # Create network
+            net = pp.create_empty_network()
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+            
+            # Run contingency analysis
+            response = pandapower_electrisim.contingency_analysis(net, contingency_params)
+            return response            
              
-      
     #print(net.bus)
     #print(net.shunt)
-    #print(net.ext_grid)
-    
+    #print(net.ext_grid)    
     #print(net.line))   
-        
-    
 
 #DLA PRODUKCJI USUWAJ PONIŻSZE WERSJE        
 if __name__ == '__main__':
