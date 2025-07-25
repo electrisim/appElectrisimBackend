@@ -114,10 +114,11 @@ def create_other_elements(in_data,net,x, Busbars):
             #w specyfikacji zapisano, że poniższe parametry są typu nan. Wartosci składowych zerowych mogą być wprowadzone przez funkcję create line.
             #r0_ohm_per_km= in_data[x]['r0_ohm_per_km'], x0_ohm_per_km= in_data[x]['x0_ohm_per_km'], c0_nf_per_km= in_data[x]['c0_nf_per_km'], max_loading_percent=in_data[x]['max_loading_percent'], endtemp_degree=in_data[x]['endtemp_degree'],
         
-        if (in_data[x]['typ'].startswith("External Grid")):
+        if (in_data[x]['typ'].startswith("External Grid") or in_data[x]['typ'].startswith("ExternalGrid")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for External Grid")
+            print(f"Creating External Grid on bus {bus_idx} (name: {in_data[x]['bus']})")
             pp.create_ext_grid(
                 net,
                 bus=bus_idx,
@@ -1346,3 +1347,414 @@ def contingency_analysis(net, contingency_params):
         error_message = f"Contingency analysis failed: {str(e)}"
         print(error_message)
         return json.dumps({'error': error_message}) 
+
+
+def optimalPowerFlow(net, opf_params):
+    """
+    Run optimal power flow using pandapower.runopp (AC) or pandapower.rundcopp (DC)
+    
+    Args:
+        net: pandapower network
+        opf_params: dictionary containing OPF parameters from frontend
+    
+    Returns:
+        JSON response with optimal power flow results or error message
+    """
+    
+    try:
+        # Extract OPF parameters
+        opf_type = opf_params.get('opf_type', 'ac')
+        algorithm = opf_params.get('ac_algorithm', 'pypower') if opf_type == 'ac' else opf_params.get('dc_algorithm', 'pypower')
+        calculate_voltage_angles = opf_params.get('calculate_voltage_angles', 'auto')
+        init = opf_params.get('init', 'pf')
+        delta = float(opf_params.get('delta', 1e-8))
+        trafo_model = opf_params.get('trafo_model', 't')
+        trafo_loading = opf_params.get('trafo_loading', 'current')
+        ac_line_model = opf_params.get('ac_line_model', 'pi')
+        numba = opf_params.get('numba', True)
+        suppress_warnings = opf_params.get('suppress_warnings', True)
+        cost_function = opf_params.get('cost_function', 'none')
+        
+        # Check for isolated buses
+        isolated_buses = top.unsupplied_buses(net)
+        if len(isolated_buses) > 0:
+            raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
+        
+        # Set up cost functions if specified and not already present
+        if cost_function != 'none':
+            setup_default_cost_functions(net, cost_function)
+        
+        # Check if any cost functions are defined
+        if len(net.poly_cost) == 0 and len(net.pwl_cost) == 0:
+            print('Warning: No cost functions defined. Using default costs for optimization.')
+            setup_default_cost_functions(net, 'polynomial')
+        
+        # Ensure min/max p_mw columns exist for OPF
+        if 'min_p_mw' not in net.gen.columns:
+            net.gen['min_p_mw'] = 0.0
+        if 'max_p_mw' not in net.gen.columns:
+            net.gen['max_p_mw'] = net.gen['p_mw'] * 1.2
+        # Optionally ensure min_q_mvar/max_q_mvar as well
+        if 'min_q_mvar' not in net.gen.columns:
+            net.gen['min_q_mvar'] = -9999.0
+        if 'max_q_mvar' not in net.gen.columns:
+            net.gen['max_q_mvar'] = 9999.0
+        
+        # Run optimal power flow based on type
+        if opf_type == 'ac':
+            print(f"Running AC Optimal Power Flow with algorithm: {algorithm}")
+            pp.runopp(net, 
+                     verbose=not suppress_warnings,
+                     suppress_warnings=suppress_warnings,
+                     delta=delta,
+                     trafo_model=trafo_model,
+                     trafo_loading=trafo_loading,
+                     ac_line_model=ac_line_model,
+                     calculate_voltage_angles=calculate_voltage_angles,
+                     init=init,
+                     numba=numba)
+        else:  # dc
+            print(f"Running DC Optimal Power Flow with algorithm: {algorithm}")
+            pp.rundcopp(net,
+                       verbose=not suppress_warnings,
+                       suppress_warnings=suppress_warnings,
+                       delta=delta,
+                       trafo_model=trafo_model,
+                       trafo_loading=trafo_loading,
+                       calculate_voltage_angles=calculate_voltage_angles,
+                       init=init,
+                       numba=numba)
+        
+        print("Optimal Power Flow completed successfully")
+        
+    except Exception as e:
+        print(f"Optimal Power Flow failed: {str(e)}")
+        
+        # Try to get diagnostic information
+        try:
+            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            print(diag_result_dict)
+            
+            if 'overload' in diag_result_dict: 
+                print('Error: overload')  
+                error_message = []
+                error_message.insert(0, "overload")   
+                return error_message
+            
+            if 'invalid_values' in diag_result_dict: 
+                if 'line' in diag_result_dict['invalid_values']:
+                    error_message = diag_result_dict['invalid_values']['line']  
+                    error_message.insert(0, "line")      
+                    return error_message
+                if 'bus' in diag_result_dict['invalid_values']:
+                    error_message = diag_result_dict['invalid_values']['bus']
+                    error_message.insert(0, "bus")
+                    return error_message
+                if 'ext_grid' in diag_result_dict['invalid_values']:
+                    error_message = diag_result_dict['invalid_values']['ext_grid']
+                    error_message.insert(0, "ext_grid")
+                    return error_message
+                    
+            if 'nominal_voltages_dont_match' in diag_result_dict:        
+                if 'trafo3w' in diag_result_dict['nominal_voltages_dont_match']:
+                    error_message = [('trafo3w', 'trafo3w'), diag_result_dict['nominal_voltages_dont_match']['trafo3w']]
+                    return error_message
+                    
+        except Exception as diag_error:
+            print(f"Diagnostic failed: {diag_error}")
+        
+        # Return generic OPF failure message
+        error_message = [['opf_failed']]
+        return error_message
+    
+    # Build response with OPF results
+    else:
+        # Define output classes (similar to powerflow function)
+        class BusbarOut(object):
+            def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, 
+                        pf: float, q_p: float, lam_p: float = 0.0, lam_q: float = 0.0):          
+                self.name = name
+                self.id = id
+                self.vm_pu = vm_pu
+                self.va_degree = va_degree   
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar  
+                self.pf = pf
+                self.q_p = q_p
+                self.lam_p = lam_p  # Lagrange multiplier for active power
+                self.lam_q = lam_q  # Lagrange multiplier for reactive power
+        
+        class LineOut(object):
+            def __init__(self, name: str, id: str, p_from_mw: float, q_from_mvar: float, p_to_mw: float, q_to_mvar: float, 
+                        i_from_ka: float, i_to_ka: float, loading_percent: float, mu_sf: float = 0.0, mu_st: float = 0.0):          
+                self.name = name 
+                self.id = id                      
+                self.p_from_mw = p_from_mw
+                self.q_from_mvar = q_from_mvar 
+                self.p_to_mw = p_to_mw 
+                self.q_to_mvar = q_to_mvar            
+                self.i_from_ka = i_from_ka 
+                self.i_to_ka = i_to_ka               
+                self.loading_percent = loading_percent
+                self.mu_sf = mu_sf  # Shadow price for from-side flow limit
+                self.mu_st = mu_st  # Shadow price for to-side flow limit
+        
+        class GeneratorOut(object):
+            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, va_degree: float, vm_pu: float,
+                        gen_cost: float = 0.0, marginal_cost: float = 0.0):          
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw 
+                self.q_mvar = q_mvar  
+                self.va_degree = va_degree 
+                self.vm_pu = vm_pu
+                self.gen_cost = gen_cost        # Total generation cost
+                self.marginal_cost = marginal_cost  # Marginal cost
+        
+        # Similar classes for other components (simplified for space)
+        class ExternalGridOut(object):
+            def __init__(self,  name: str, id: str, p_mw: float, q_mvar: float, pf: float, q_p:float):        
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw 
+                self.q_mvar = q_mvar  
+                self.pf = pf            
+                self.q_p = q_p
+        
+        class LoadOut(object):
+            def __init__(self, name: str, id:str, p_mw: float, q_mvar: float):          
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw 
+                self.q_mvar = q_mvar 
+        
+        # Initialize result lists
+        busbarList = list()
+        linesList = list()
+        generatorsList = list()
+        externalgridsList = list()
+        loadsList = list()
+        
+        # Process bus results with OPF-specific data
+        for index, row in net.res_bus.iterrows():
+            try:
+                bus_name = net.bus.loc[index, 'name']
+                bus_id = net.bus.loc[index, 'id'] if 'id' in net.bus.columns else str(index)
+                
+                # Calculate power factor and Q/P ratio
+                p_mw = row['p_mw'] if not pd.isna(row['p_mw']) else 0.0
+                q_mvar = row['q_mvar'] if not pd.isna(row['q_mvar']) else 0.0
+                
+                if p_mw != 0 or q_mvar != 0:
+                    pf = p_mw / math.sqrt(p_mw**2 + q_mvar**2) if (p_mw**2 + q_mvar**2) > 0 else 0
+                    q_p = q_mvar / p_mw if p_mw != 0 else float('inf')
+                else:
+                    pf = 0
+                    q_p = 0
+                
+                # Get Lagrange multipliers if available
+                lam_p = 0.0
+                lam_q = 0.0
+                if hasattr(net, 'res_bus_opf') and not net.res_bus_opf.empty:
+                    if index in net.res_bus_opf.index:
+                        lam_p = net.res_bus_opf.loc[index, 'lam_p'] if 'lam_p' in net.res_bus_opf.columns else 0.0
+                        lam_q = net.res_bus_opf.loc[index, 'lam_q'] if 'lam_q' in net.res_bus_opf.columns else 0.0
+                
+                busbar = BusbarOut(
+                    name=bus_name,
+                    id=bus_id,
+                    vm_pu=row['vm_pu'],
+                    va_degree=row['va_degree'],
+                    p_mw=p_mw,
+                    q_mvar=q_mvar,
+                    pf=pf,
+                    q_p=q_p,
+                    lam_p=lam_p,
+                    lam_q=lam_q
+                )
+                busbarList.append(busbar)
+                
+            except Exception as e:
+                print(f"Error processing bus {index}: {e}")
+                continue
+        
+        # Process line results with OPF-specific data
+        for index, row in net.res_line.iterrows():
+            try:
+                line_name = net.line.loc[index, 'name']
+                line_id = net.line.loc[index, 'id'] if 'id' in net.line.columns else str(index)
+                
+                # Get shadow prices if available
+                mu_sf = 0.0
+                mu_st = 0.0
+                if hasattr(net, 'res_line_opf') and not net.res_line_opf.empty:
+                    if index in net.res_line_opf.index:
+                        mu_sf = net.res_line_opf.loc[index, 'mu_sf'] if 'mu_sf' in net.res_line_opf.columns else 0.0
+                        mu_st = net.res_line_opf.loc[index, 'mu_st'] if 'mu_st' in net.res_line_opf.columns else 0.0
+                
+                line = LineOut(
+                    name=line_name,
+                    id=line_id,
+                    p_from_mw=row['p_from_mw'],
+                    q_from_mvar=row['q_from_mvar'],
+                    p_to_mw=row['p_to_mw'],
+                    q_to_mvar=row['q_to_mvar'],
+                    i_from_ka=row['i_from_ka'],
+                    i_to_ka=row['i_to_ka'],
+                    loading_percent=row['loading_percent'],
+                    mu_sf=mu_sf,
+                    mu_st=mu_st
+                )
+                linesList.append(line)
+                
+            except Exception as e:
+                print(f"Error processing line {index}: {e}")
+                continue
+        
+        # Process generator results with OPF-specific data
+        for index, row in net.res_gen.iterrows():
+            try:
+                gen_name = net.gen.loc[index, 'name']
+                gen_id = net.gen.loc[index, 'id'] if 'id' in net.gen.columns else str(index)
+                
+                # Calculate generation costs if available
+                gen_cost = 0.0
+                marginal_cost = 0.0
+                
+                # Get costs from poly_cost table
+                poly_costs = net.poly_cost[net.poly_cost['element'] == index]
+                if not poly_costs.empty:
+                    poly_cost_row = poly_costs.iloc[0]
+                    p_gen = row['p_mw']
+                    # Assuming quadratic cost: cost = c2*P^2 + c1*P + c0
+                    if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                        c2 = poly_cost_row['cp2_eur_per_mw2']
+                        c1 = poly_cost_row['cp1_eur_per_mw']
+                        c0 = poly_cost_row['cp0_eur']
+                        gen_cost = c2 * p_gen**2 + c1 * p_gen + c0
+                        marginal_cost = 2 * c2 * p_gen + c1
+                
+                generator = GeneratorOut(
+                    name=gen_name,
+                    id=gen_id,
+                    p_mw=row['p_mw'],
+                    q_mvar=row['q_mvar'],
+                    va_degree=row['va_degree'],
+                    vm_pu=row['vm_pu'],
+                    gen_cost=gen_cost,
+                    marginal_cost=marginal_cost
+                )
+                generatorsList.append(generator)
+                
+            except Exception as e:
+                print(f"Error processing generator {index}: {e}")
+                continue
+        
+        # Process external grid results
+        for index, row in net.res_ext_grid.iterrows():
+            try:
+                ext_grid_name = net.ext_grid.loc[index, 'name']
+                ext_grid_id = net.ext_grid.loc[index, 'id'] if 'id' in net.ext_grid.columns else str(index)
+                
+                p_mw = row['p_mw'] if not pd.isna(row['p_mw']) else 0.0
+                q_mvar = row['q_mvar'] if not pd.isna(row['q_mvar']) else 0.0
+                
+                if p_mw != 0 or q_mvar != 0:
+                    pf = p_mw / math.sqrt(p_mw**2 + q_mvar**2) if (p_mw**2 + q_mvar**2) > 0 else 0
+                    q_p = q_mvar / p_mw if p_mw != 0 else float('inf')
+                else:
+                    pf = 0
+                    q_p = 0
+                
+                ext_grid = ExternalGridOut(
+                    name=ext_grid_name,
+                    id=ext_grid_id,
+                    p_mw=p_mw,
+                    q_mvar=q_mvar,
+                    pf=pf,
+                    q_p=q_p
+                )
+                externalgridsList.append(ext_grid)
+                
+            except Exception as e:
+                print(f"Error processing external grid {index}: {e}")
+                continue
+        
+        # Process load results
+        for index, row in net.res_load.iterrows():
+            try:
+                load_name = net.load.loc[index, 'name']
+                load_id = net.load.loc[index, 'id'] if 'id' in net.load.columns else str(index)
+                
+                load = LoadOut(
+                    name=load_name,
+                    id=load_id,
+                    p_mw=row['p_mw'],
+                    q_mvar=row['q_mvar']
+                )
+                loadsList.append(load)
+                
+            except Exception as e:
+                print(f"Error processing load {index}: {e}")
+                continue
+        
+        # Create response dictionary
+        response_data = {
+            'busbars': [busbar.__dict__ for busbar in busbarList],
+            'lines': [line.__dict__ for line in linesList],
+            'generators': [gen.__dict__ for gen in generatorsList],
+            'externalgrids': [ext_grid.__dict__ for ext_grid in externalgridsList],
+            'loads': [load.__dict__ for load in loadsList]
+        }
+        
+        # Add optimization results summary if available
+        if hasattr(net, 'OPF_converged') and net.OPF_converged:
+            response_data['opf_converged'] = True
+            if hasattr(net, 'res_cost'):
+                response_data['total_cost'] = float(net.res_cost)
+        else:
+            response_data['opf_converged'] = False
+        
+        print(f"OPF Results: {len(busbarList)} buses, {len(linesList)} lines, {len(generatorsList)} generators")
+        
+        return response_data
+
+
+def setup_default_cost_functions(net, cost_type='polynomial'):
+    """
+    Set up default cost functions for generators if none exist
+    
+    Args:
+        net: pandapower network
+        cost_type: 'polynomial' or 'piecewise_linear'
+    """
+    
+    if cost_type == 'polynomial':
+        # Add polynomial costs for generators without costs
+        for gen_idx in net.gen.index:
+            # Check if this generator already has a cost function
+            existing_costs = net.poly_cost[net.poly_cost['element'] == gen_idx]
+            if existing_costs.empty:
+                # Default quadratic cost function: 0.01*P^2 + 20*P + 0
+                pp.create_poly_cost(net, element=gen_idx, et='gen',
+                                   cp2_eur_per_mw2=0.01,    # Quadratic term
+                                   cp1_eur_per_mw=20,       # Linear term  
+                                   cp0_eur=0)               # Constant term
+                print(f"Added default polynomial cost to generator {gen_idx}")
+    
+    elif cost_type == 'piecewise_linear':
+        # Add piecewise linear costs for generators without costs
+        for gen_idx in net.gen.index:
+            # Check if this generator already has a cost function
+            existing_costs = net.pwl_cost[net.pwl_cost['element'] == gen_idx]
+            if existing_costs.empty:
+                # Get generator capacity
+                gen_max_p = net.gen.loc[gen_idx, 'max_p_mw'] if 'max_p_mw' in net.gen.columns else 100
+                gen_min_p = net.gen.loc[gen_idx, 'min_p_mw'] if 'min_p_mw' in net.gen.columns else 0
+                
+                # Create simple 2-point piecewise linear cost
+                # From min to max power with cost increasing from 15 to 25 $/MWh
+                pp.create_pwl_cost(net, element=gen_idx, et='gen',
+                                  points=[[gen_min_p, gen_min_p * 15],    # [P_min, Cost_min]
+                                         [gen_max_p, gen_max_p * 25]])    # [P_max, Cost_max]
+                print(f"Added default PWL cost to generator {gen_idx}") 

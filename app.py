@@ -39,6 +39,33 @@ def simulation():
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
         #print(x)
+        if "OptimalPowerFlowPandaPower" in in_data[x]['typ']:
+            # Extract OPF parameters
+            opf_params = {
+                'opf_type': in_data[x]['opf_type'],
+                'frequency': eval(in_data[x]['frequency']),
+                'ac_algorithm': in_data[x]['ac_algorithm'],
+                'dc_algorithm': in_data[x]['dc_algorithm'],
+                'calculate_voltage_angles': in_data[x]['calculate_voltage_angles'],
+                'init': in_data[x]['init'],
+                'delta': in_data[x]['delta'],
+                'trafo_model': in_data[x]['trafo_model'],
+                'trafo_loading': in_data[x]['trafo_loading'],
+                'ac_line_model': in_data[x]['ac_line_model'],
+                'numba': in_data[x]['numba'],
+                'suppress_warnings': in_data[x]['suppress_warnings'],
+                'cost_function': in_data[x]['cost_function']
+            }
+            
+            # Create network
+            net = pp.create_empty_network(f_hz=opf_params['frequency'])
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+            
+            # Run optimal power flow
+            response = pandapower_electrisim.optimalPowerFlow(net, opf_params)
+            return jsonify(response) # Changed to jsonify for direct dict return
+        
         if "PowerFlowPandaPower" in in_data[x]['typ']:
             
             frequency=eval(in_data[x]['frequency'])
@@ -56,6 +83,8 @@ def simulation():
    
 
             return response
+
+        
         
         if "ShortCircuitPandaPower" in in_data[x]['typ']:                     
 
