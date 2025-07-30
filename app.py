@@ -40,6 +40,10 @@ def simulation():
     for x in in_data:    
         #print(x)
         if "OptimalPowerFlowPandaPower" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== OPTIMAL POWER FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
+            
             # Extract OPF parameters
             opf_params = {
                 'opf_type': in_data[x]['opf_type'],
@@ -67,6 +71,9 @@ def simulation():
             return jsonify(response) # Changed to jsonify for direct dict return
         
         if "PowerFlowPandaPower" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
             
             frequency=eval(in_data[x]['frequency'])
             algorithm=in_data[x]['algorithm']
@@ -86,7 +93,11 @@ def simulation():
 
         
         
-        if "ShortCircuitPandaPower" in in_data[x]['typ']:                     
+        if "ShortCircuitPandaPower" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== SHORT CIRCUIT SIMULATION REQUESTED BY USER: {user_email} ===")
+                    
 
             net = pp.create_empty_network()
             Busbars = pandapower_electrisim.create_busbars(in_data, net)
@@ -94,13 +105,21 @@ def simulation():
             response = pandapower_electrisim.shortcircuit(net, in_data[x])
             return response
            
-        if "PowerFlowOpenDss" in in_data[x]['typ']:            
+        if "PowerFlowOpenDss" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== OPEN DSS LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
+            
             frequency=eval(in_data[x]['frequency'])
             algorithm=in_data[x]['algorithm'] #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
             response = opendss_electrisim.powerflow(in_data, frequency)           
             return response
         
         if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== CONTINGENCY ANALYSIS SIMULATION REQUESTED BY USER: {user_email} ===")
+            
             # Extract contingency analysis parameters
             contingency_params = {
                 'contingency_type': in_data[x]['contingency_type'],
@@ -122,12 +141,66 @@ def simulation():
             
             # Run contingency analysis
             response = pandapower_electrisim.contingency_analysis(net, contingency_params)
-            return response            
+            return response
+            
+        if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== CONTROLLER SIMULATION REQUESTED BY USER: {user_email} ===")
+            
+            # Extract controller simulation parameters
+            controller_params = {
+                'voltage_control': in_data[x].get('voltage_control', False),
+                'tap_control': in_data[x].get('tap_control', False),
+                'discrete_tap_control': in_data[x].get('discrete_tap_control', False),
+                'continuous_tap_control': in_data[x].get('continuous_tap_control', False),
+                'frequency': eval(in_data[x].get('frequency', '50')),
+                'algorithm': in_data[x].get('algorithm', 'nr'),
+                'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
+                'init': in_data[x].get('init', 'dc')
+            }
+            
+            # Create network
+            net = pp.create_empty_network(f_hz=controller_params['frequency'])
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+            
+            # Run controller simulation
+            response = pandapower_electrisim.controller_simulation(net, controller_params)
+            return jsonify(response)
+            
+        if "TimeSeriesSimulationPandaPower Parameters" in in_data[x]['typ']:
+            # Extract user email for logging
+            user_email = in_data[x].get('user_email', 'unknown@user.com')
+            print(f"=== TIME SERIES SIMULATION REQUESTED BY USER: {user_email} ===")
+            
+            # Extract time series simulation parameters
+            timeseries_params = {
+                'time_steps': int(in_data[x].get('time_steps', 24)),
+                'load_profile': in_data[x].get('load_profile', 'constant'),
+                'generation_profile': in_data[x].get('generation_profile', 'constant'),
+                'frequency': eval(in_data[x].get('frequency', '50')),
+                'algorithm': in_data[x].get('algorithm', 'nr'),
+                'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
+                'init': in_data[x].get('init', 'dc')
+            }
+            
+            # Create network
+            net = pp.create_empty_network(f_hz=timeseries_params['frequency'])
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+            
+            # Run time series simulation
+            response = pandapower_electrisim.time_series_simulation(net, timeseries_params)
+            return jsonify(response)            
              
     #print(net.bus)
     #print(net.shunt)
     #print(net.ext_grid)    
-    #print(net.line))   
+    #print(net.line))
+    
+    # If no simulation type matches, return error
+    return jsonify({'error': 'No valid simulation type found in request data'})   
 
 #DLA PRODUKCJI USUWAJ PONIŻSZE WERSJE        
 if __name__ == '__main__':
