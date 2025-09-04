@@ -14,8 +14,6 @@ import pandapower.timeseries as ts
 from pandapower.timeseries import DFData
 
 
-
-
 Busbars = {} 
 def create_busbars(in_data, net):
     Busbars = {}
@@ -44,21 +42,19 @@ def create_busbars(in_data, net):
 def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
-    print(f"Setting up bus variables from Busbars: {Busbars}")
+
     for name,value in Busbars.items():
         globals()[name] = value    
-        print(f"Set global variable: {name} = {value}")
-
+       
     for x in in_data:
-        print(f"Processing element: {in_data[x]['typ']} - {in_data[x].get('name', 'no_name')}")
+      
         #eval - rozwiazuje problem z wartosciami NaN
         if (in_data[x]['typ'].startswith("Line")):
             try:
                 # Lines have busFrom and busTo fields directly
                 bus_from = in_data[x].get('busFrom')
-                bus_to = in_data[x].get('busTo')
-                
-                print(f"Processing Line: busFrom='{bus_from}', busTo='{bus_to}'")
+                bus_to = in_data[x].get('busTo')                
+             
                 from_bus_idx = Busbars.get(bus_from)
                 to_bus_idx = Busbars.get(bus_to)
                 
@@ -67,27 +63,36 @@ def create_other_elements(in_data,net,x, Busbars):
                 if to_bus_idx is None:
                     raise ValueError(f"Bus {bus_to} not found for Line to_bus")
                     
-                print(f"Found bus indices: from_bus={from_bus_idx}, to_bus={to_bus_idx}")
+         
             except Exception as e:
                 print(f"ERROR finding bus references for line: {e}")
                 continue
                 
-            # Create a base parameters dict with required parameters     
+            # Create a base parameters dict with required parameters
             line_params = {
-                "from_bus": from_bus_idx, 
-                "to_bus": to_bus_idx, 
-                "name": in_data[x]['name'], 
-                "id": in_data[x]['id'], 
-                "r_ohm_per_km": float(in_data[x]['r_ohm_per_km']), 
-                "x_ohm_per_km": float(in_data[x]['x_ohm_per_km']), 
-                "c_nf_per_km": float(in_data[x]['c_nf_per_km']), 
-                "g_us_per_km": float(in_data[x]['g_us_per_km']), 
+                "from_bus": from_bus_idx,
+                "to_bus": to_bus_idx,
+                "name": in_data[x]['name'],
+                "id": in_data[x]['id'],
+                "r_ohm_per_km": float(in_data[x]['r_ohm_per_km']),
+                "x_ohm_per_km": float(in_data[x]['x_ohm_per_km']),
+                "c_nf_per_km": float(in_data[x]['c_nf_per_km']),
+                "g_us_per_km": float(in_data[x]['g_us_per_km']),
                 "max_i_ka": float(in_data[x]['max_i_ka']),
-                "type": in_data[x]['type'], 
-                "length_km": float(in_data[x]['length_km']), 
-                "parallel": int(in_data[x]['parallel']), 
-                "df": float(in_data[x]['df'])
+                "type": in_data[x]['type'],
+                "length_km": float(in_data[x]['length_km'])
             }
+
+            # Handle optional parameters with proper None checking
+            if 'parallel' in in_data[x] and in_data[x]['parallel'] is not None:
+                line_params["parallel"] = int(in_data[x]['parallel'])
+            else:
+                line_params["parallel"] = 1  # Default value for parallel
+
+            if 'df' in in_data[x] and in_data[x]['df'] is not None:
+                line_params["df"] = float(in_data[x]['df'])
+            else:
+                line_params["df"] = 1.0  # Default value for df
 
             # Make sure zero sequence parameters are explicitly converted to float
             # This should solve the isnan() issue
@@ -142,29 +147,36 @@ def create_other_elements(in_data,net,x, Busbars):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for External Grid")
-            print(f"Creating External Grid on bus {bus_idx} (name: {in_data[x]['bus']})")
+
             pp.create_ext_grid(
                 net,
                 bus=bus_idx,
                 name=in_data[x]['name'],
                 id=in_data[x]['id'],
-                vm_pu=float(in_data[x]['vm_pu']),
-                va_degree=float(in_data[x]['va_degree']),
-                s_sc_max_mva=float(in_data[x]['s_sc_max_mva']),
-                s_sc_min_mva=float(in_data[x]['s_sc_min_mva']),
-                rx_max=float(in_data[x]['rx_max']),
-                rx_min=float(in_data[x]['rx_min']),
-                r0x0_max=float(in_data[x]['r0x0_max']),
-                x0x_max=float(in_data[x]['x0x_max'])
+                vm_pu=safe_float(in_data[x]['vm_pu']),
+                va_degree=safe_float(in_data[x]['va_degree']),
+                s_sc_max_mva=safe_float(in_data[x]['s_sc_max_mva']),
+                s_sc_min_mva=safe_float(in_data[x]['s_sc_min_mva']),
+                rx_max=safe_float(in_data[x]['rx_max']),
+                rx_min=safe_float(in_data[x]['rx_min']),
+                r0x0_max=safe_float(in_data[x]['r0x0_max']),
+                x0x_max=safe_float(in_data[x]['x0x_max'])
             )
+            
+            # Store user-friendly name for external grid
+            ext_grid_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', ext_grid_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[ext_grid_name] = user_friendly_name
        
         if (in_data[x]['typ'].startswith("Generator")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Generator")
-            print(f"Creating Generator on bus {bus_idx} (name: {in_data[x]['bus']})")
-            pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=float(in_data[x]['p_mw']), vm_pu=float(in_data[x]['vm_pu']), sn_mva=float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
-                          vn_kv=float(in_data[x]['vn_kv']), xdss_pu=float(in_data[x]['xdss_pu']), rdss_ohm=float(in_data[x]['rdss_ohm']), cos_phi=float(in_data[x]['cos_phi']), pg_percent=float(in_data[x]['pg_percent']))    #, power_station_trafo=in_data[x]['power_station_trafo']
+    
+            pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=safe_float(in_data[x]['vm_pu']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
+                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']))    #, power_station_trafo=in_data[x]['power_station_trafo']
             
             # Store user-friendly name for generator
             gen_name = in_data[x]['name']
@@ -177,9 +189,9 @@ def create_other_elements(in_data,net,x, Busbars):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Static Generator")
-            print(f"Creating Static Generator on bus {bus_idx} (name: {in_data[x]['bus']})")
-            pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=float(in_data[x]['p_mw']), q_mvar=float(in_data[x]['q_mvar']), sn_mva=float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'], type=in_data[x]['type'],
-                           k=1.1, rx=float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=float(in_data[x]['lrc_pu']), max_ik_ka=float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5)
+           
+            pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'], type=in_data[x]['type'],
+                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5)
             
             # Store user-friendly name for static generator
             sgen_name = in_data[x]['name']
@@ -202,6 +214,13 @@ def create_other_elements(in_data,net,x, Busbars):
                                                   vkr_percent=in_data[x]['vkr_percent'], vk_percent=in_data[x]['vk_percent'], pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], vector_group=in_data[x]['vector_group'],
                                                   parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  
                                                 )#tap_phase_shifter=eval(in_data[x]['tap_phase_shifter'])
+            
+            # Store user-friendly name for transformer
+            trafo_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', trafo_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[trafo_name] = user_friendly_name
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
             pp.create_transformer3w_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), mv_bus = eval(in_data[x]['mv_bus']), lv_bus = eval(in_data[x]['lv_bus']), name=in_data[x]['name'], id=in_data[x]['id'],
@@ -212,19 +231,26 @@ def create_other_elements(in_data,net,x, Busbars):
                                                     pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], 
                                                      vector_group=in_data[x]['vector_group'],                                                    
                                                     shift_mv_degree=in_data[x]['shift_mv_degree'], shift_lv_degree=in_data[x]['shift_lv_degree'], tap_step_percent=in_data[x]['tap_step_percent'], tap_side=in_data[x]['tap_side'],  tap_min=in_data[x]['tap_min'], tap_max=in_data[x]['tap_max'], tap_pos=in_data[x]['tap_pos']) #tap_neutral=in_data[x]['tap_neutral'],, tap_at_star_point=in_data[x]['tap_at_star_point'], vk0_hv_percent=in_data[x]['vk0_hv_percent'], vk0_mv_percent=in_data[x]['vk0_mv_percent'], vk0_lv_percent=in_data[x]['vk0_lv_percent'], vkr0_hv_percent=in_data[x]['vkr0_hv_percent'], vkr0_mv_percent=in_data[x]['vkr0_mv_percent'], vkr0_lv_percent=in_data[x]['vkr0_lv_percent'],
+            
+            # Store user-friendly name for three-winding transformer
+            trafo3w_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', trafo3w_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[trafo3w_name] = user_friendly_name
         
         if (in_data[x]['typ'].startswith("Shunt Reactor")):  
-            pp.create_shunt(net, typ = "shuntreactor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], q_mvar=in_data[x]['q_mvar'], vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
+            pp.create_shunt(net, typ = "shuntreactor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
         
         if (in_data[x]['typ'].startswith("Capacitor")):  
-            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=float(in_data[x]['q_mvar']), loss_factor=float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
+            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
         
         if (in_data[x]['typ'].startswith("Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Load")
-            print(f"Creating Load on bus {bus_idx} (name: {in_data[x]['bus']})")
-            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],q_mvar=in_data[x]['q_mvar'],const_z_percent=in_data[x]['const_z_percent'],const_i_percent=in_data[x]['const_i_percent'], sn_mva=in_data[x]['sn_mva'],scaling=in_data[x]['scaling'],type=in_data[x]['type'])
+          
+            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=in_data[x]['scaling'],type=in_data[x]['type'])
             
             # Store user-friendly name for load
             load_name = in_data[x]['name']
@@ -275,6 +301,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
          
             #pandapower - rozpływ mocy
             try:
+            
                 # Check for isolated buses before running power flow
                 isolated_buses = pp.topology.unsupplied_buses(net)
                 if len(isolated_buses) > 0:
@@ -284,8 +311,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 print("An exception occurred")
                 print(f"Exception details: {str(e)}")
                 
-                # Initialize error_message
-                error_message = []
+                # Initialize diagnostic response
+                diagnostic_response = {
+                    "error": True,
+                    "message": "Power flow calculation failed",
+                    "exception": str(e),
+                    "diagnostic": {}
+                }
                 
                 # Access initial voltage magnitudes and angles  
                 diag_result_dict = pp.diagnostic(net, report_style='detailed')             
@@ -293,34 +325,20 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 print(diag_result_dict)
                 #plt.simple_plot(net, plot_line_switches=True)
                 
-                if 'overload' in diag_result_dict: 
-                    print('błąd overload')  
-                    error_message.insert(0, "overload")   
+                # Check for isolated buses
+                isolated_buses = pp.topology.unsupplied_buses(net)
+                if len(isolated_buses) > 0:
+                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
                 
-                if 'invalid_values' in diag_result_dict: 
-                    
-                    if 'line' in diag_result_dict['invalid_values']:
-                        error_message = diag_result_dict['invalid_values']['line']  
-                        error_message.insert(0, "line")      
-                        print(error_message)
-                    if 'bus' in diag_result_dict['invalid_values']:
-                        error_message = diag_result_dict['invalid_values']['bus']
-                        error_message.insert(0, "bus")
-                    if 'ext_grid' in diag_result_dict['invalid_values']:
-                        error_message = diag_result_dict['invalid_values']['ext_grid']
-                        error_message.insert(0, "ext_grid")
-                if 'nominal_voltages_dont_match'in diag_result_dict:        
-                    if 'trafo3w' in diag_result_dict['nominal_voltages_dont_match']:
-                        error_message = [('trafo3w', 'trafo3w'),diag_result_dict['nominal_voltages_dont_match']['trafo3w']]
-                        
-                        #error_message["trafo3w"] = "trafo3w"            
-                        print(error_message)
+                # Process diagnostic data to convert element indices to user-friendly names
+                processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+                diagnostic_response["diagnostic"] = processed_diagnostic
                 
-                # If no specific error was found, use the original exception
-                if not error_message:
-                    error_message = [str(e)]
+                # If no specific diagnostic was found, include the original exception
+                if not diagnostic_response["diagnostic"]:
+                    diagnostic_response["diagnostic"]["general_error"] = str(e)
                 
-                return error_message
+                return diagnostic_response
             else:                              
                 
                 class BusbarOut(object):
@@ -950,12 +968,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                             dcline = ImpedanceOut(name=net.dcline._get_value(index, 'name'), id = net.dcline._get_value(index, 'id'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], pl_mw=row['pl_mw'], vm_from_pu=row['vm_from_pu'], va_from_degree=row['va_from_degree'], vm_to_pu=row['vm_to_pu'], va_to_degree=row['va_to_degree'] )        
                             dclinesList.append(dcline) 
                             dclines = ImpedancesOut(dclines = dclinesList) 
-                        result = {**result, **dclines.__dict__} 
-
-                #response = make_response()
-                #response.headers.add("Access-Control-Allow-Origin", "*")
-                #response.headers.add("Access-Control-Allow-Headers", "*")
-                #response.headers.add("Access-Control-Allow-Methods", "*")
+                        result = {**result, **dclines.__dict__}         
                 
                            
                 #json.dumps - convert a subset of Python objects into a json string
@@ -963,7 +976,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 #indent - wcięcia
                 response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
             
-                print(response)   
+                print("Response to FRONTEND CORRECT")   
                    
                 return response  
 
@@ -1016,19 +1029,114 @@ def shortcircuit(net, in_data):
     #pp.runpp(net, calculate_voltage_angles=True)    
 
     
-    fault=in_data['fault']  # Using first bus as fault location    #
-    case=in_data['case']
-    lv_tol_percent=int(in_data['lv_tol_percent'])
-    ip=True
-    ith=True
-    topology=in_data['topology']
-    tk_s=float(in_data['tk_s'])
-    r_fault_ohm=float(in_data['r_fault_ohm'])
-    x_fault_ohm=float(in_data['x_fault_ohm'])
-    inverse_y=in_data['inverse_y']
+    # Extract short circuit parameters with defaults
+    # Frontend sends: fault_type, fault_location, fault_impedance
+    # According to Pandapower docs: fault=fault_type, case=calculation_case
+    fault_type = in_data.get('fault_type', '3ph')  # Frontend 'fault_type' becomes pandapower 'fault'
+    fault_location = in_data.get('fault_location', 'max')  # Frontend 'fault_location' becomes pandapower 'case'
+    
+    # Convert fault_location to bus index for bus parameter (if needed)
+    if isinstance(fault_location, str) and fault_location.isdigit():
+        bus = int(fault_location)
+    elif isinstance(fault_location, str) and fault_location in ['max', 'min']:
+        # If it's 'max' or 'min', use None (calculate for all buses)
+        bus = None
+    else:
+        bus = None  # Default to None (calculate for all buses)
+    
+    # Get other parameters
+    lv_tol_percent = int(in_data.get('fault_impedance', 10))  # Frontend 'fault_impedance' becomes 'lv_tol_percent'
+    ip = True
+    ith = True
+    topology = in_data.get('topology', 'radial')
+    tk_s = float(in_data.get('tk_s', 1.0))
+    r_fault_ohm = float(in_data.get('r_fault_ohm', 0.0))
+    x_fault_ohm = float(in_data.get('x_fault_ohm', 0.0))
+    inverse_y = in_data.get('inverse_y', False)
+    
+    # Debug print to see what parameters are being passed
+    print(f"Short circuit parameters:")
+    print(f"  fault: {fault_type} (type: {type(fault_type)}) - fault type")
+    print(f"  case: {fault_location} (type: {type(fault_location)}) - calculation case")
+    print(f"  bus: {bus} (type: {type(bus)}) - bus index")
+    print(f"  ip: {ip}")
+    print(f"  ith: {ith}")
+    print(f"  tk_s: {tk_s}")
+    print(f"  r_fault_ohm: {r_fault_ohm}")
+    print(f"  x_fault_ohm: {x_fault_ohm}")
+    
+    # Print Pandapower version for debugging
+    print(f"Pandapower version: {pp.__version__}")
+    
+    # Validate fault_type parameter - Pandapower expects specific values
+    valid_fault_types = ['3ph', '2ph', '1ph']
+    if fault_type not in valid_fault_types:
+        print(f"Warning: Invalid fault_type value '{fault_type}'. Valid values are: {valid_fault_types}")
+        fault_type = '3ph'  # Default to 3ph if invalid
+        print(f"Using default fault_type: {fault_type}")
+    
+    # Validate case parameter
+    valid_cases = ['max', 'min']
+    if fault_location not in valid_cases:
+        print(f"Warning: Invalid case value '{fault_location}'. Valid values are: {valid_cases}")
+        fault_location = 'max'  # Default to max if invalid
+        print(f"Using default case: {fault_location}")
  
 
-    sc.calc_sc(net, fault=fault, case=case,  ip=ip, ith=ith, tk_s=tk_s, r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, branch_results=True, check_connectivity=True, return_all_currents=True)  #kappa_method='C', , inverse_y=inverse_y,  topology=topology, lv_tol_percent=lv_tol_percent,
+    try:
+        # Use correct parameter mapping according to Pandapower documentation
+        print(f"Attempting short circuit calculation with fault='{fault_type}', case='{fault_location}', bus={bus}")
+        
+        # Call short circuit calculation with correct parameters including ip and ith
+        sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s)
+        print("Short circuit calculation completed successfully")
+        
+    except Exception as e:
+        print(f"Short circuit calculation failed: {e}")
+        
+        # Capture the diagnostic output and process it
+        import io
+        import sys
+        
+        # Capture stdout to get the diagnostic output
+        captured_output = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured_output
+        
+        try:
+            # Run diagnostic again to capture the output
+            pp.diagnostic(net)
+        except:
+            pass
+        
+        # Restore stdout
+        sys.stdout = old_stdout
+        diagnostic_output = captured_output.getvalue()
+        
+        # Process the diagnostic output to extract structured information
+        processed_diagnostic = process_short_circuit_diagnostic(diagnostic_output, net)
+        
+        # Return a diagnostic response with both raw and processed data
+        diagnostic_response = {
+            "error": True,
+            "message": f"Short circuit calculation failed: {str(e)}",
+            "exception": str(e),
+            "diagnostic": {
+                "raw_output": diagnostic_output,
+                "processed": processed_diagnostic,
+                "fault_type": fault_type,
+                "calculation_case": fault_location,
+                "bus_index": bus,
+                "network_elements": {
+                    "buses": len(net.bus),
+                    "lines": len(net.line),
+                    "transformers": len(net.trafo),
+                    "generators": len(net.gen),
+                    "loads": len(net.load)
+                }
+            }
+        }
+        return json.dumps(diagnostic_response, indent=4)
     print(net.res_bus_sc)
     #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
                 
@@ -1052,30 +1160,111 @@ def shortcircuit(net, in_data):
                 
     for index, row in net.res_bus_sc.iterrows():    
         print('jestem w for') 
-        if math.isnan(row['ip_ka']):
-            row['ip_ka'] = 'NaN'
-        if math.isnan(row['ith_ka']):
-            row['ith_ka'] = 'NaN'
+        
+        # Handle ip_ka column (might not exist if ip=False)
+        if 'ip_ka' in row and not math.isnan(row['ip_ka']):
+            ip_ka = row['ip_ka']
+        else:
+            ip_ka = 'NaN'
+            
+        # Handle ith_ka column (might not exist if ith=False)
+        if 'ith_ka' in row and not math.isnan(row['ith_ka']):
+            ith_ka = row['ith_ka']
+        else:
+            ith_ka = 'NaN'
                     
-        busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), ikss_ka=row['ikss_ka'], ip_ka=row['ip_ka'], ith_ka=row['ith_ka'], rk_ohm=row['rk_ohm'], xk_ohm=row['xk_ohm'])    
+        busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), ikss_ka=row['ikss_ka'], ip_ka=ip_ka, ith_ka=ith_ka, rk_ohm=row['rk_ohm'], xk_ohm=row['xk_ohm'])    
                  
         busbarList.append(busbar)
         busbars = BusbarsOut(busbars = busbarList)  
             
-               
-        print(busbars.__dict__)
-        print(type(busbars.__dict__))
-            #result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
-        result = {**busbars.__dict__}
-            #response1 = json.dumps(busbars.__dict__, default=lambda o: o.__dict__, indent=4) 
-            #response2 = json.dumps(lines.__dict__, default=lambda o: o.__dict__, indent=4)
-            
+    print(busbars.__dict__)
+    print(type(busbars.__dict__))
+    #result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
+    result = {**busbars.__dict__}
+
     response = json.dumps(result, default=lambda o: o.__dict__, indent=4) #json.dumps - convert a subset of Python objects into a json string
+    return response
+
+
+def process_short_circuit_diagnostic(diagnostic_output, net):
+    """
+    Process the raw diagnostic output and extract structured information
+    """
+    processed = {
+        "invalid_values": {},
+        "overload": {},
+        "nominal_voltages_dont_match": {},
+        "isolated_buses": [],
+        "convergence": {},
+        "summary": {}
+    }
+    
+    lines = diagnostic_output.split('\n')
+    current_section = None
+    
+    for line in lines:
+        line = line.strip()
         
-              
-    print(type(response))
-    print(response)                                   
-    return response 
+        # Detect sections
+        if 'Checking for invalid_values' in line:
+            current_section = 'invalid_values'
+        elif 'Checking for overload' in line:
+            current_section = 'overload'
+        elif 'Checking for nominal_voltages_dont_match' in line:
+            current_section = 'nominal_voltages_dont_match'
+        elif 'Checking for isolated_buses' in line:
+            current_section = 'isolated_buses'
+        elif 'SUMMARY:' in line:
+            current_section = 'summary'
+        
+        # Process invalid values
+        elif current_section == 'invalid_values' and ':' in line and '=' in line:
+            # Parse lines like: "Invalid value found: 'trafo 0' with attribute 'vk_percent' = 0.0"
+            if "Invalid value found:" in line:
+                try:
+                    # Extract element type and name
+                    parts = line.split("'")
+                    if len(parts) >= 3:
+                        element_info = parts[1]  # e.g., "trafo 0"
+                        element_parts = element_info.split()
+                        element_type = element_parts[0]  # e.g., "trafo"
+                        
+                        # Extract attribute and value
+                        attr_part = line.split("attribute '")[1].split("'")[0]
+                        value_part = line.split("= ")[1].split(" (")[0]
+                        
+                        if element_type not in processed["invalid_values"]:
+                            processed["invalid_values"][element_type] = []
+                        
+                        # Get user-friendly name if available
+                        element_index = int(element_parts[1]) if len(element_parts) > 1 else 0
+                        display_name = get_element_display_name(net, element_type, element_index)
+                        
+                        processed["invalid_values"][element_type].append(
+                            f"{display_name}: {attr_part} = {value_part}"
+                        )
+                except:
+                    # If parsing fails, add the raw line
+                    if "invalid_values" not in processed:
+                        processed["invalid_values"] = {}
+                    if "general" not in processed["invalid_values"]:
+                        processed["invalid_values"]["general"] = []
+                    processed["invalid_values"]["general"].append(line)
+        
+        # Process summary
+        elif current_section == 'summary' and 'invalid values found' in line:
+            processed["summary"]["invalid_values_count"] = line
+        
+        # Process other error messages
+        elif 'failed' in line.lower() or 'error' in line.lower():
+            if "convergence" not in processed:
+                processed["convergence"] = {}
+            if "errors" not in processed["convergence"]:
+                processed["convergence"]["errors"] = []
+            processed["convergence"]["errors"].append(line)
+    
+    return processed 
 
 def contingency_analysis(net, contingency_params):
     """
@@ -1487,42 +1676,36 @@ def optimalPowerFlow(net, opf_params):
     except Exception as e:
         print(f"Optimal Power Flow failed: {str(e)}")
         
+        # Initialize diagnostic response
+        diagnostic_response = {
+            "error": True,
+            "message": "Optimal Power Flow calculation failed",
+            "exception": str(e),
+            "diagnostic": {}
+        }
+        
         # Try to get diagnostic information
         try:
             diag_result_dict = pp.diagnostic(net, report_style='detailed')
             print(diag_result_dict)
             
-            if 'overload' in diag_result_dict: 
-                print('Error: overload')  
-                error_message = []
-                error_message.insert(0, "overload")   
-                return error_message
+            # Check for isolated buses
+            isolated_buses = pp.topology.unsupplied_buses(net)
+            if len(isolated_buses) > 0:
+                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
             
-            if 'invalid_values' in diag_result_dict: 
-                if 'line' in diag_result_dict['invalid_values']:
-                    error_message = diag_result_dict['invalid_values']['line']  
-                    error_message.insert(0, "line")      
-                    return error_message
-                if 'bus' in diag_result_dict['invalid_values']:
-                    error_message = diag_result_dict['invalid_values']['bus']
-                    error_message.insert(0, "bus")
-                    return error_message
-                if 'ext_grid' in diag_result_dict['invalid_values']:
-                    error_message = diag_result_dict['invalid_values']['ext_grid']
-                    error_message.insert(0, "ext_grid")
-                    return error_message
-                    
-            if 'nominal_voltages_dont_match' in diag_result_dict:        
-                if 'trafo3w' in diag_result_dict['nominal_voltages_dont_match']:
-                    error_message = [('trafo3w', 'trafo3w'), diag_result_dict['nominal_voltages_dont_match']['trafo3w']]
-                    return error_message
+            # Process diagnostic data to convert element indices to user-friendly names
+            processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+            diagnostic_response["diagnostic"] = processed_diagnostic
                     
         except Exception as diag_error:
             print(f"Diagnostic failed: {diag_error}")
         
-        # Return generic OPF failure message
-        error_message = [['opf_failed']]
-        return error_message
+        # If no specific diagnostic was found, include the original exception
+        if not diagnostic_response["diagnostic"]:
+            diagnostic_response["diagnostic"]["general_error"] = str(e)
+        
+        return diagnostic_response
     
     # Build response with OPF results
     else:
@@ -1859,6 +2042,220 @@ def get_display_name(user_friendly_name, technical_id, element_type, element_ind
             # Fallback to type + index if no user-friendly name
             return f"{element_type} no. {element_index + 1} ({technical_id})"
 
+def process_diagnostic_data(net, diag_result_dict):
+    """
+    Process diagnostic data and convert element indices to user-friendly names
+    """
+    processed_diagnostic = {}
+    
+    # Process invalid values
+    if 'invalid_values' in diag_result_dict:
+        processed_invalid = {}
+        for element_type, invalid_items in diag_result_dict['invalid_values'].items():
+            processed_items = []
+            for item in invalid_items:
+                if isinstance(item, (list, tuple)) and len(item) >= 4:
+                    # Format: [element_index, parameter_name, current_value, constraint]
+                    element_index = item[0]
+                    parameter_name = item[1]
+                    current_value = item[2]
+                    constraint = item[3]
+                    
+                    # Get user-friendly name based on element type
+                    element_id = get_element_display_name(net, element_type, element_index)
+                    
+                    # Create formatted message with element type and ID
+                    element_type_display = element_type.capitalize()
+                    if element_type == 'trafo':
+                        element_type_display = 'Transformer'
+                    elif element_type == 'trafo3w':
+                        element_type_display = 'Three-Winding Transformer'
+                    elif element_type == 'ext_grid':
+                        element_type_display = 'External Grid'
+                    elif element_type == 'gen':
+                        element_type_display = 'Generator'
+                    
+                    formatted_item = f"{element_type_display} {element_id}: {parameter_name} = {current_value} (constraint: {constraint})"
+                    processed_items.append(formatted_item)
+                else:
+                    # Keep original format if not in expected format
+                    processed_items.append(str(item))
+            
+            processed_invalid[element_type] = processed_items
+        processed_diagnostic['invalid_values'] = processed_invalid
+    
+    # Process overload data
+    if 'overload' in diag_result_dict:
+        processed_overload = {}
+        for element_type, overload_items in diag_result_dict['overload'].items():
+            processed_items = []
+            for item in overload_items:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # Format: [element_index, loading_percent]
+                    element_index = item[0]
+                    loading_percent = item[1]
+                    
+                    # Get user-friendly name
+                    element_id = get_element_display_name(net, element_type, element_index)
+                    
+                    # Create formatted message with element type and ID
+                    element_type_display = element_type.capitalize()
+                    if element_type == 'trafo':
+                        element_type_display = 'Transformer'
+                    elif element_type == 'trafo3w':
+                        element_type_display = 'Three-Winding Transformer'
+                    elif element_type == 'ext_grid':
+                        element_type_display = 'External Grid'
+                    elif element_type == 'gen':
+                        element_type_display = 'Generator'
+                    
+                    formatted_item = f"{element_type_display} {element_id}: Loading = {loading_percent}%"
+                    processed_items.append(formatted_item)
+                else:
+                    processed_items.append(str(item))
+            
+            processed_overload[element_type] = processed_items
+        processed_diagnostic['overload'] = processed_overload
+    
+    # Process nominal voltage mismatches
+    if 'nominal_voltages_dont_match' in diag_result_dict:
+        processed_voltage = {}
+        for element_type, voltage_items in diag_result_dict['nominal_voltages_dont_match'].items():
+            processed_items = []
+            for item in voltage_items:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # Format: [element_index, voltage_info]
+                    element_index = item[0]
+                    voltage_info = item[1]
+                    
+                    # Get user-friendly name
+                    element_id = get_element_display_name(net, element_type, element_index)
+                    
+                    # Create formatted message with element type and ID
+                    element_type_display = element_type.capitalize()
+                    if element_type == 'trafo':
+                        element_type_display = 'Transformer'
+                    elif element_type == 'trafo3w':
+                        element_type_display = 'Three-Winding Transformer'
+                    elif element_type == 'ext_grid':
+                        element_type_display = 'External Grid'
+                    elif element_type == 'gen':
+                        element_type_display = 'Generator'
+                    
+                    formatted_item = f"{element_type_display} {element_id}: {voltage_info}"
+                    processed_items.append(formatted_item)
+                else:
+                    processed_items.append(str(item))
+            
+            processed_voltage[element_type] = processed_items
+        processed_diagnostic['nominal_voltages_dont_match'] = processed_voltage
+    
+    # Add other diagnostic data as-is
+    for key, value in diag_result_dict.items():
+        if key not in ['invalid_values', 'overload', 'nominal_voltages_dont_match']:
+            processed_diagnostic[key] = value
+    
+    return processed_diagnostic
+
+def get_element_display_name(net, element_type, element_index):
+    """
+    Get user-friendly display name for an element based on its type and index
+    """
+    try:
+        # First, try to get the user-friendly name from net.user_friendly_names
+        if hasattr(net, 'user_friendly_names'):
+            if element_type == 'line':
+                if element_index < len(net.line):
+                    line_name = net.line.iloc[element_index]['name']
+                    if line_name in net.user_friendly_names:
+                        return net.user_friendly_names[line_name]
+            
+            elif element_type == 'bus':
+                if element_index < len(net.bus):
+                    bus_name = net.bus.iloc[element_index]['name']
+                    if bus_name in net.user_friendly_names:
+                        return net.user_friendly_names[bus_name]
+            
+            elif element_type == 'ext_grid':
+                if element_index < len(net.ext_grid):
+                    ext_grid_name = net.ext_grid.iloc[element_index]['name']
+                    if ext_grid_name in net.user_friendly_names:
+                        return net.user_friendly_names[ext_grid_name]
+            
+            elif element_type == 'trafo':
+                if element_index < len(net.trafo):
+                    trafo_name = net.trafo.iloc[element_index]['name']
+                    if trafo_name in net.user_friendly_names:
+                        return net.user_friendly_names[trafo_name]
+            
+            elif element_type == 'trafo3w':
+                if element_index < len(net.trafo3w):
+                    trafo3w_name = net.trafo3w.iloc[element_index]['name']
+                    if trafo3w_name in net.user_friendly_names:
+                        return net.user_friendly_names[trafo3w_name]
+            
+            elif element_type == 'gen':
+                if element_index < len(net.gen):
+                    gen_name = net.gen.iloc[element_index]['name']
+                    if gen_name in net.user_friendly_names:
+                        return net.user_friendly_names[gen_name]
+            
+            elif element_type == 'load':
+                if element_index < len(net.load):
+                    load_name = net.load.iloc[element_index]['name']
+                    if load_name in net.user_friendly_names:
+                        return net.user_friendly_names[load_name]
+        
+        # Fallback to the original name from the network dataframes
+        if element_type == 'line':
+            if element_index < len(net.line):
+                line_name = net.line.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return line_name
+        
+        elif element_type == 'bus':
+            if element_index < len(net.bus):
+                bus_name = net.bus.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return bus_name
+        
+        elif element_type == 'ext_grid':
+            if element_index < len(net.ext_grid):
+                ext_grid_name = net.ext_grid.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return ext_grid_name
+        
+        elif element_type == 'trafo':
+            if element_index < len(net.trafo):
+                trafo_name = net.trafo.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return trafo_name
+        
+        elif element_type == 'trafo3w':
+            if element_index < len(net.trafo3w):
+                trafo3w_name = net.trafo3w.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return trafo3w_name
+        
+        elif element_type == 'gen':
+            if element_index < len(net.gen):
+                gen_name = net.gen.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return gen_name
+        
+        elif element_type == 'load':
+            if element_index < len(net.load):
+                load_name = net.load.iloc[element_index]['name']
+                # Use the name directly (which is the user-provided ID like mxCell_138)
+                return load_name
+        
+        # Fallback for unknown element types
+        return f"{element_type.capitalize()} no. {element_index + 1}"
+        
+    except Exception as e:
+        # Fallback if any error occurs
+        return f"{element_type.capitalize()} no. {element_index + 1}"
+
 def controller_simulation(net, controller_params):
     """
     Run controller simulation using pandapower control module
@@ -2044,7 +2441,37 @@ def controller_simulation(net, controller_params):
         
     except Exception as e:
         print(f"Controller simulation error: {str(e)}")
-        return {'error': f'Controller simulation failed: {str(e)}'}
+        
+        # Initialize diagnostic response
+        diagnostic_response = {
+            "error": True,
+            "message": "Controller simulation failed",
+            "exception": str(e),
+            "diagnostic": {}
+        }
+        
+        # Try to get diagnostic information
+        try:
+            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            print(diag_result_dict)
+            
+            # Check for isolated buses
+            isolated_buses = pp.topology.unsupplied_buses(net)
+            if len(isolated_buses) > 0:
+                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+            
+            # Process diagnostic data to convert element indices to user-friendly names
+            processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+            diagnostic_response["diagnostic"] = processed_diagnostic
+                    
+        except Exception as diag_error:
+            print(f"Diagnostic failed: {diag_error}")
+        
+        # If no specific diagnostic was found, include the original exception
+        if not diagnostic_response["diagnostic"]:
+            diagnostic_response["diagnostic"]["general_error"] = str(e)
+        
+        return diagnostic_response
 
 
 def time_series_simulation(net, timeseries_params):
@@ -2397,4 +2824,34 @@ def time_series_simulation(net, timeseries_params):
         
     except Exception as e:
         print(f"Time series simulation error: {str(e)}")
-        return {'error': f'Time series simulation failed: {str(e)}'}
+        
+        # Initialize diagnostic response
+        diagnostic_response = {
+            "error": True,
+            "message": "Time series simulation failed",
+            "exception": str(e),
+            "diagnostic": {}
+        }
+        
+        # Try to get diagnostic information
+        try:
+            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            print(diag_result_dict)
+            
+            # Check for isolated buses
+            isolated_buses = pp.topology.unsupplied_buses(net)
+            if len(isolated_buses) > 0:
+                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+            
+            # Process diagnostic data to convert element indices to user-friendly names
+            processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+            diagnostic_response["diagnostic"] = processed_diagnostic
+                    
+        except Exception as diag_error:
+            print(f"Diagnostic failed: {diag_error}")
+        
+        # If no specific diagnostic was found, include the original exception
+        if not diagnostic_response["diagnostic"]:
+            diagnostic_response["diagnostic"]["general_error"] = str(e)
+        
+        return diagnostic_response

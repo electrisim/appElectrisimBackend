@@ -15,9 +15,25 @@ import warnings
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
-#cors = CORS(app)# BYŁO, support_credentials=True
-CORS(app) #, origins=['http://127.0.0.1:5500','https://app.electrisim.com/'] 
-app.config['CORS_HEADERS'] = 'Content-Type' # było
+
+# CORS configuration for both development and production
+CORS(app, 
+     origins=[
+         # Development origins
+         'http://127.0.0.1:5500', 
+         'http://127.0.0.1:5501', 
+         'http://localhost:5500', 
+         'http://localhost:5501',
+         # Production origins
+         'https://app.electrisim.com',
+         'https://www.electrisim.com',
+         'https://electrisim.com'
+     ], 
+     methods=['GET', 'POST', 'OPTIONS'],
+     allow_headers=['Content-Type', 'Authorization', 'Access-Control-Allow-Credentials'],
+     supports_credentials=True)
+
+app.config['CORS_HEADERS'] = 'Content-Type'
 #app.config['CORS_ORIGINS'] = 'http://128.0.0.1:5500' #nie było tego
  #nie było tego
  #@cross_origin()
@@ -88,7 +104,6 @@ def simulation():
             response = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init)  
 
    
-
             return response
 
         
@@ -111,8 +126,23 @@ def simulation():
             print(f"=== OPEN DSS LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
             
             frequency=eval(in_data[x]['frequency'])
-            algorithm=in_data[x]['algorithm'] #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
-            response = opendss_electrisim.powerflow(in_data, frequency)           
+            algorithm=in_data[x].get('algorithm', 'Admittance') #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
+            max_iterations=int(in_data[x].get('maxIterations', 100))
+            tolerance=float(in_data[x].get('tolerance', 1e-6))
+            convergence=in_data[x].get('convergence', 'normal')
+            voltage_control=in_data[x].get('voltageControl', True)
+            tap_control=in_data[x].get('tapControl', True)
+            
+            response = opendss_electrisim.powerflow(
+                in_data, 
+                frequency, 
+                algorithm, 
+                max_iterations, 
+                tolerance, 
+                convergence, 
+                voltage_control, 
+                tap_control
+            )           
             return response
         
         if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
