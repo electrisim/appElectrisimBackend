@@ -43,6 +43,23 @@ def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
 
+    # Helper functions for safe type conversion
+    def safe_float(value, default=None):
+        if value is None or value == 'None' or value == '':
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+    
+    def safe_int(value, default=1):
+        if value is None or value == 'None' or value == '':
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
     for name,value in Busbars.items():
         globals()[name] = value    
        
@@ -83,16 +100,29 @@ def create_other_elements(in_data,net,x, Busbars):
                 "length_km": float(in_data[x]['length_km'])
             }
 
-            # Handle optional parameters with proper None checking
-            if 'parallel' in in_data[x] and in_data[x]['parallel'] is not None:
-                line_params["parallel"] = int(in_data[x]['parallel'])
-            else:
-                line_params["parallel"] = 1  # Default value for parallel
-
-            if 'df' in in_data[x] and in_data[x]['df'] is not None:
-                line_params["df"] = float(in_data[x]['df'])
-            else:
-                line_params["df"] = 1.0  # Default value for df
+            # Handle optional parameters - include if they have valid values
+            optional_params = ['parallel', 'df']
+            
+            for param in optional_params:
+                value = in_data[x].get(param)
+                if value is not None and value != 'None' and value != '':
+                    try:
+                        if param == 'parallel':
+                            line_params[param] = int(value)
+                        else:  # df
+                            line_params[param] = float(value)
+                    except (ValueError, TypeError):
+                        # If conversion fails, use default values
+                        if param == 'parallel':
+                            line_params[param] = 1
+                        else:  # df
+                            line_params[param] = 1.0
+                else:
+                    # Use default values when parameter is None or empty
+                    if param == 'parallel':
+                        line_params[param] = 1
+                    else:  # df
+                        line_params[param] = 1.0
 
             # Make sure zero sequence parameters are explicitly converted to float
             # This should solve the isnan() issue
@@ -210,10 +240,66 @@ def create_other_elements(in_data,net,x, Busbars):
             #si0_hv_partial** - zero sequence short circuit impedance  distribution in hv side
             #vk0_percent=in_data[x]['vk0_percent'], vkr0_percent=in_data[x]['vkr0_percent'], mag0_percent=in_data[x]['mag0_percent'], si0_hv_partial=in_data[x]['si0_hv_partial'],
         if (in_data[x]['typ'].startswith("Transformer")): 
-            pp.create_transformer_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), lv_bus = eval(in_data[x]['lv_bus']), name=in_data[x]['name'], id=in_data[x]['id'], sn_mva=in_data[x]['sn_mva'], vn_hv_kv=in_data[x]['vn_hv_kv'], vn_lv_kv=in_data[x]['vn_lv_kv'],
-                                                  vkr_percent=in_data[x]['vkr_percent'], vk_percent=in_data[x]['vk_percent'], pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], vector_group=in_data[x]['vector_group'],
-                                                  parallel=in_data[x]['parallel'], shift_degree=in_data[x]['shift_degree'], tap_side=in_data[x]['tap_side'], tap_pos=in_data[x]['tap_pos'], tap_neutral=in_data[x]['tap_neutral'], tap_max=in_data[x]['tap_max'], tap_min=in_data[x]['tap_min'], tap_step_percent=in_data[x]['tap_step_percent'], tap_step_degree=in_data[x]['tap_step_degree'],  
-                                                )#tap_phase_shifter=eval(in_data[x]['tap_phase_shifter'])
+            # Get values with default fallbacks and proper type conversion
+            parallel_value = safe_int(in_data[x].get('parallel', 1), 1)
+            vector_group = in_data[x].get('vector_group', None)
+            vk0_percent = safe_float(in_data[x].get('vk0_percent', None))
+            vkr0_percent = safe_float(in_data[x].get('vkr0_percent', None))
+            mag0_percent = safe_float(in_data[x].get('mag0_percent', None))
+            si0_hv_partial = safe_float(in_data[x].get('si0_hv_partial', None))
+            
+            # Prepare parameters dict for transformer creation with proper type conversion
+            transformer_params = {
+                'hv_bus': eval(in_data[x]['hv_bus']),
+                'lv_bus': eval(in_data[x]['lv_bus']),
+                'name': in_data[x]['name'],
+                'id': in_data[x]['id'],
+                'sn_mva': safe_float(in_data[x]['sn_mva']),
+                'vn_hv_kv': safe_float(in_data[x]['vn_hv_kv']),
+                'vn_lv_kv': safe_float(in_data[x]['vn_lv_kv']),
+                'vkr_percent': safe_float(in_data[x]['vkr_percent']),
+                'vk_percent': safe_float(in_data[x]['vk_percent']),
+                'pfe_kw': safe_float(in_data[x]['pfe_kw']),
+                'i0_percent': safe_float(in_data[x]['i0_percent']),
+                'parallel': parallel_value,
+                'shift_degree': safe_float(in_data[x]['shift_degree']),
+                'tap_side': in_data[x]['tap_side'],
+                'tap_pos': safe_int(in_data[x]['tap_pos']),
+                'tap_neutral': safe_int(in_data[x]['tap_neutral']),
+                'tap_max': safe_int(in_data[x]['tap_max']),
+                'tap_min': safe_int(in_data[x]['tap_min']),
+                'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
+                'tap_step_degree': safe_float(in_data[x]['tap_step_degree'])
+            }
+            
+            # Add optional parameters with proper defaults
+            if vector_group is not None and vector_group != 'None' and vector_group != '':
+                transformer_params['vector_group'] = vector_group
+            else:
+                transformer_params['vector_group'] = 'Dyn11'  # Default vector group
+            
+            # For zero sequence parameters, use provided values or default to main sequence values
+            if vk0_percent is not None and vk0_percent != 0.0:
+                transformer_params['vk0_percent'] = vk0_percent
+            else:
+                transformer_params['vk0_percent'] = transformer_params['vk_percent']  # Default to main sequence
+            
+            if vkr0_percent is not None and vkr0_percent != 0.0:
+                transformer_params['vkr0_percent'] = vkr0_percent
+            else:
+                transformer_params['vkr0_percent'] = transformer_params['vkr_percent']  # Default to main sequence
+            
+            if mag0_percent is not None:
+                transformer_params['mag0_percent'] = mag0_percent
+            else:
+                transformer_params['mag0_percent'] = 0.0  # Default zero sequence magnetizing current
+            
+            if si0_hv_partial is not None:
+                transformer_params['si0_hv_partial'] = si0_hv_partial
+            else:
+                transformer_params['si0_hv_partial'] = 0.0  # Default zero sequence partial current
+            
+            pp.create_transformer_from_parameters(net, **transformer_params)
             
             # Store user-friendly name for transformer
             trafo_name = in_data[x]['name']
@@ -223,14 +309,46 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[trafo_name] = user_friendly_name
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
-            pp.create_transformer3w_from_parameters(net, hv_bus = eval(in_data[x]['hv_bus']), mv_bus = eval(in_data[x]['mv_bus']), lv_bus = eval(in_data[x]['lv_bus']), name=in_data[x]['name'], id=in_data[x]['id'],
-                                                    sn_hv_mva=in_data[x]['sn_hv_mva'], sn_mv_mva=in_data[x]['sn_mv_mva'], sn_lv_mva=in_data[x]['sn_lv_mva'], 
-                                                    vn_hv_kv=in_data[x]['vn_hv_kv'], vn_mv_kv=in_data[x]['vn_mv_kv'], vn_lv_kv=in_data[x]['vn_lv_kv'], 
-                                                    vk_hv_percent=in_data[x]['vk_hv_percent'], vk_mv_percent=in_data[x]['vk_mv_percent'], vk_lv_percent=in_data[x]['vk_lv_percent'], 
-                                                    vkr_hv_percent=in_data[x]['vkr_hv_percent'], vkr_mv_percent=in_data[x]['vkr_mv_percent'], vkr_lv_percent=in_data[x]['vkr_lv_percent'], 
-                                                    pfe_kw=in_data[x]['pfe_kw'], i0_percent=in_data[x]['i0_percent'], 
-                                                     vector_group=in_data[x]['vector_group'],                                                    
-                                                    shift_mv_degree=in_data[x]['shift_mv_degree'], shift_lv_degree=in_data[x]['shift_lv_degree'], tap_step_percent=in_data[x]['tap_step_percent'], tap_side=in_data[x]['tap_side'],  tap_min=in_data[x]['tap_min'], tap_max=in_data[x]['tap_max'], tap_pos=in_data[x]['tap_pos']) #tap_neutral=in_data[x]['tap_neutral'],, tap_at_star_point=in_data[x]['tap_at_star_point'], vk0_hv_percent=in_data[x]['vk0_hv_percent'], vk0_mv_percent=in_data[x]['vk0_mv_percent'], vk0_lv_percent=in_data[x]['vk0_lv_percent'], vkr0_hv_percent=in_data[x]['vkr0_hv_percent'], vkr0_mv_percent=in_data[x]['vkr0_mv_percent'], vkr0_lv_percent=in_data[x]['vkr0_lv_percent'],
+            # Prepare optional parameters - only include if they are not None
+            transformer_params = {
+                'hv_bus': eval(in_data[x]['hv_bus']),
+                'mv_bus': eval(in_data[x]['mv_bus']),
+                'lv_bus': eval(in_data[x]['lv_bus']),
+                'name': in_data[x]['name'],
+                'id': in_data[x]['id'],
+                'sn_hv_mva': in_data[x]['sn_hv_mva'],
+                'sn_mv_mva': in_data[x]['sn_mv_mva'],
+                'sn_lv_mva': in_data[x]['sn_lv_mva'],
+                'vn_hv_kv': in_data[x]['vn_hv_kv'],
+                'vn_mv_kv': in_data[x]['vn_mv_kv'],
+                'vn_lv_kv': in_data[x]['vn_lv_kv'],
+                'vk_hv_percent': in_data[x]['vk_hv_percent'],
+                'vk_mv_percent': in_data[x]['vk_mv_percent'],
+                'vk_lv_percent': in_data[x]['vk_lv_percent'],
+                'vkr_hv_percent': in_data[x]['vkr_hv_percent'],
+                'vkr_mv_percent': in_data[x]['vkr_mv_percent'],
+                'vkr_lv_percent': in_data[x]['vkr_lv_percent'],
+                'pfe_kw': in_data[x]['pfe_kw'],
+                'i0_percent': in_data[x]['i0_percent'],
+                'shift_mv_degree': in_data[x]['shift_mv_degree'],
+                'shift_lv_degree': in_data[x]['shift_lv_degree'],
+                'tap_step_percent': in_data[x]['tap_step_percent'],
+                'tap_side': in_data[x]['tap_side'],
+                'tap_min': in_data[x]['tap_min'],
+                'tap_max': in_data[x]['tap_max'],
+                'tap_pos': in_data[x]['tap_pos']
+            }
+            
+            # Add optional parameters only if they are not None
+            optional_params = ['vector_group', 'vk0_hv_percent', 'vk0_mv_percent', 'vk0_lv_percent', 
+                             'vkr0_hv_percent', 'vkr0_mv_percent', 'vkr0_lv_percent']
+            
+            for param in optional_params:
+                value = in_data[x].get(param)
+                if value is not None and value != 'None' and value != '':
+                    transformer_params[param] = value
+            
+            pp.create_transformer3w_from_parameters(net, **transformer_params)
             
             # Store user-friendly name for three-winding transformer
             trafo3w_name = in_data[x]['name']
