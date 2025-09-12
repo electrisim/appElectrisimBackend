@@ -43,20 +43,12 @@ def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
 
-    # Helper functions for safe type conversion
-    def safe_float(value, default=None):
+    # Helper function for safe type conversion (local version with different default)
+    def safe_float_local(value, default=None):
         if value is None or value == 'None' or value == '':
             return default
         try:
             return float(value)
-        except (ValueError, TypeError):
-            return default
-    
-    def safe_int(value, default=1):
-        if value is None or value == 'None' or value == '':
-            return default
-        try:
-            return int(value)
         except (ValueError, TypeError):
             return default
 
@@ -242,11 +234,15 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Transformer")): 
             # Get values with default fallbacks and proper type conversion
             parallel_value = safe_int(in_data[x].get('parallel', 1), 1)
-            vector_group = in_data[x].get('vector_group', None)
+            vector_group_raw = in_data[x].get('vector_group', None)
             vk0_percent = safe_float(in_data[x].get('vk0_percent', None))
             vkr0_percent = safe_float(in_data[x].get('vkr0_percent', None))
             mag0_percent = safe_float(in_data[x].get('mag0_percent', None))
+            mag0_rx = safe_float(in_data[x].get('mag0_rx', None))
             si0_hv_partial = safe_float(in_data[x].get('si0_hv_partial', None))
+            
+            # Parse vector group to separate base group from phase shift
+            vector_group, phase_shift_from_group = parse_vector_group(vector_group_raw)
             
             # Prepare parameters dict for transformer creation with proper type conversion
             transformer_params = {
@@ -257,26 +253,26 @@ def create_other_elements(in_data,net,x, Busbars):
                 'sn_mva': safe_float(in_data[x]['sn_mva']),
                 'vn_hv_kv': safe_float(in_data[x]['vn_hv_kv']),
                 'vn_lv_kv': safe_float(in_data[x]['vn_lv_kv']),
-                'vkr_percent': safe_float(in_data[x]['vkr_percent']),
-                'vk_percent': safe_float(in_data[x]['vk_percent']),
-                'pfe_kw': safe_float(in_data[x]['pfe_kw']),
-                'i0_percent': safe_float(in_data[x]['i0_percent']),
+                'vkr_percent': safe_float(in_data[x].get('vkr_percent', 1.0)),
+                'vk_percent': safe_float(in_data[x].get('vk_percent', 6.0)),
+                'pfe_kw': safe_float(in_data[x].get('pfe_kw', 0.0)),
+                'i0_percent': safe_float(in_data[x].get('i0_percent', 0.0)),
                 'parallel': parallel_value,
-                'shift_degree': safe_float(in_data[x]['shift_degree']),
-                'tap_side': in_data[x]['tap_side'],
-                'tap_pos': safe_int(in_data[x]['tap_pos']),
-                'tap_neutral': safe_int(in_data[x]['tap_neutral']),
-                'tap_max': safe_int(in_data[x]['tap_max']),
-                'tap_min': safe_int(in_data[x]['tap_min']),
-                'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
-                'tap_step_degree': safe_float(in_data[x]['tap_step_degree'])
+                'shift_degree': safe_float(in_data[x].get('shift_degree', 0)) + phase_shift_from_group,
+                'tap_side': in_data[x].get('tap_side', 'hv'),
+                'tap_pos': safe_int(in_data[x].get('tap_pos', 0)),
+                'tap_neutral': safe_int(in_data[x].get('tap_neutral', 0)),
+                'tap_max': safe_int(in_data[x].get('tap_max', 0)),
+                'tap_min': safe_int(in_data[x].get('tap_min', 0)),
+                'tap_step_percent': safe_float(in_data[x].get('tap_step_percent', 0)),
+                'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0))
             }
             
             # Add optional parameters with proper defaults
             if vector_group is not None and vector_group != 'None' and vector_group != '':
                 transformer_params['vector_group'] = vector_group
             else:
-                transformer_params['vector_group'] = 'Dyn11'  # Default vector group
+                transformer_params['vector_group'] = 'Dyn'  # Default vector group
             
             # For zero sequence parameters, use provided values or default to main sequence values
             if vk0_percent is not None and vk0_percent != 0.0:
@@ -299,6 +295,11 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['si0_hv_partial'] = 0.0  # Default zero sequence partial current
             
+            if mag0_rx is not None:
+                transformer_params['mag0_rx'] = mag0_rx
+            else:
+                transformer_params['mag0_rx'] = 0.0  # Default zero sequence magnetizing r/x ratio
+            
             pp.create_transformer_from_parameters(net, **transformer_params)
             
             # Store user-friendly name for transformer
@@ -309,6 +310,10 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[trafo_name] = user_friendly_name
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
+            # Parse vector group to separate base group from phase shift
+            vector_group_raw = in_data[x].get('vector_group', None)
+            vector_group, phase_shift_from_group = parse_vector_group(vector_group_raw)
+            
             # Prepare optional parameters - only include if they are not None
             transformer_params = {
                 'hv_bus': eval(in_data[x]['hv_bus']),
@@ -316,27 +321,27 @@ def create_other_elements(in_data,net,x, Busbars):
                 'lv_bus': eval(in_data[x]['lv_bus']),
                 'name': in_data[x]['name'],
                 'id': in_data[x]['id'],
-                'sn_hv_mva': in_data[x]['sn_hv_mva'],
-                'sn_mv_mva': in_data[x]['sn_mv_mva'],
-                'sn_lv_mva': in_data[x]['sn_lv_mva'],
-                'vn_hv_kv': in_data[x]['vn_hv_kv'],
-                'vn_mv_kv': in_data[x]['vn_mv_kv'],
-                'vn_lv_kv': in_data[x]['vn_lv_kv'],
-                'vk_hv_percent': in_data[x]['vk_hv_percent'],
-                'vk_mv_percent': in_data[x]['vk_mv_percent'],
-                'vk_lv_percent': in_data[x]['vk_lv_percent'],
-                'vkr_hv_percent': in_data[x]['vkr_hv_percent'],
-                'vkr_mv_percent': in_data[x]['vkr_mv_percent'],
-                'vkr_lv_percent': in_data[x]['vkr_lv_percent'],
-                'pfe_kw': in_data[x]['pfe_kw'],
-                'i0_percent': in_data[x]['i0_percent'],
-                'shift_mv_degree': in_data[x]['shift_mv_degree'],
-                'shift_lv_degree': in_data[x]['shift_lv_degree'],
-                'tap_step_percent': in_data[x]['tap_step_percent'],
+                'sn_hv_mva': safe_float(in_data[x]['sn_hv_mva']),
+                'sn_mv_mva': safe_float(in_data[x]['sn_mv_mva']),
+                'sn_lv_mva': safe_float(in_data[x]['sn_lv_mva']),
+                'vn_hv_kv': safe_float(in_data[x]['vn_hv_kv']),
+                'vn_mv_kv': safe_float(in_data[x]['vn_mv_kv']),
+                'vn_lv_kv': safe_float(in_data[x]['vn_lv_kv']),
+                'vk_hv_percent': safe_float(in_data[x]['vk_hv_percent']),
+                'vk_mv_percent': safe_float(in_data[x]['vk_mv_percent']),
+                'vk_lv_percent': safe_float(in_data[x]['vk_lv_percent']),
+                'vkr_hv_percent': safe_float(in_data[x]['vkr_hv_percent']),
+                'vkr_mv_percent': safe_float(in_data[x]['vkr_mv_percent']),
+                'vkr_lv_percent': safe_float(in_data[x]['vkr_lv_percent']),
+                'pfe_kw': safe_float(in_data[x]['pfe_kw']),
+                'i0_percent': safe_float(in_data[x]['i0_percent']),
+                'shift_mv_degree': safe_float(in_data[x]['shift_mv_degree']) + phase_shift_from_group,
+                'shift_lv_degree': safe_float(in_data[x]['shift_lv_degree']) + phase_shift_from_group,
+                'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
                 'tap_side': in_data[x]['tap_side'],
-                'tap_min': in_data[x]['tap_min'],
-                'tap_max': in_data[x]['tap_max'],
-                'tap_pos': in_data[x]['tap_pos']
+                'tap_min': safe_int(in_data[x]['tap_min']),
+                'tap_max': safe_int(in_data[x]['tap_max']),
+                'tap_pos': safe_int(in_data[x]['tap_pos'])
             }
             
             # Add optional parameters only if they are not None
@@ -346,7 +351,10 @@ def create_other_elements(in_data,net,x, Busbars):
             for param in optional_params:
                 value = in_data[x].get(param)
                 if value is not None and value != 'None' and value != '':
-                    transformer_params[param] = value
+                    if param == 'vector_group':
+                        transformer_params[param] = vector_group  # Use parsed base group
+                    else:
+                        transformer_params[param] = safe_float(value)  # Convert to float
             
             pp.create_transformer3w_from_parameters(net, **transformer_params)
             
@@ -1206,7 +1214,43 @@ def shortcircuit(net, in_data):
         print(f"Attempting short circuit calculation with fault='{fault_type}', case='{fault_location}', bus={bus}")
         
         # Call short circuit calculation with correct parameters including ip and ith
-        sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s)
+        sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s, 
+                   kappa_method='C', r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, 
+                   check_connectivity=True, return_all_currents=True)
+        
+        # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
+        if fault_type == '1ph' and net.res_bus_sc['ip_ka'].isna().all() and net.res_bus_sc['ith_ka'].isna().all():
+            print("Warning: ip_ka and ith_ka calculations failed for single-phase fault.")
+            print("This is a known limitation in pandapower for single-phase faults.")
+            print("Calculating ip_ka and ith_ka from single-phase ikss_ka using standard formulas...")
+            
+            # Calculate ip_ka and ith_ka from ikss_ka using standard electrical engineering formulas
+            # ip_ka = kappa * sqrt(2) * ikss_ka (peak current)
+            # ith_ka = ikss_ka (for short duration faults, thermal current ≈ initial current)
+            
+            import numpy as np
+            
+            # Kappa factor for peak current calculation (typical value for medium voltage networks)
+            # This can vary from 1.0 to 2.0 depending on network characteristics
+            kappa_factor = 1.8  # Conservative estimate for medium voltage networks
+            
+            # Calculate ip_ka (peak short-circuit current)
+            net.res_bus_sc['ip_ka'] = kappa_factor * np.sqrt(2) * net.res_bus_sc['ikss_ka']
+            
+            # Calculate ith_ka (thermal short-circuit current)
+            # For short duration faults (tk_s = 1.0), ith ≈ ikss
+            # For longer durations, ith would be calculated differently
+            if tk_s <= 1.0:
+                net.res_bus_sc['ith_ka'] = net.res_bus_sc['ikss_ka']
+            else:
+                # For longer fault durations, thermal current is typically lower
+                # ith = ikss * sqrt(thermal_factor) where thermal_factor depends on fault duration
+                thermal_factor = 1.0 / tk_s if tk_s > 1.0 else 1.0
+                net.res_bus_sc['ith_ka'] = net.res_bus_sc['ikss_ka'] * np.sqrt(thermal_factor)
+            
+            print(f"Calculated ip_ka using kappa factor: {kappa_factor}")
+            print(f"Calculated ith_ka for fault duration: {tk_s}s")
+            print("ip_ka and ith_ka values are now based on single-phase ikss_ka results")
         print("Short circuit calculation completed successfully")
         
     except Exception as e:
@@ -1255,7 +1299,12 @@ def shortcircuit(net, in_data):
             }
         }
         return json.dumps(diagnostic_response, indent=4)
+    print("Short circuit results:")
     print(net.res_bus_sc)
+    print("\nColumns in res_bus_sc:")
+    print(net.res_bus_sc.columns.tolist())
+    print("\nFirst few rows:")
+    print(net.res_bus_sc.head())
     #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
                 
     #wyrzuciłem skss_mw bo wyskakiwał błąd przy zwarciu jednofazowym
@@ -1276,20 +1325,19 @@ def shortcircuit(net, in_data):
     
     busbarList = list()      
                 
-    for index, row in net.res_bus_sc.iterrows():    
-        print('jestem w for') 
+    for index, row in net.res_bus_sc.iterrows(): 
         
         # Handle ip_ka column (might not exist if ip=False)
         if 'ip_ka' in row and not math.isnan(row['ip_ka']):
             ip_ka = row['ip_ka']
         else:
-            ip_ka = 'NaN'
+            ip_ka = None
             
         # Handle ith_ka column (might not exist if ith=False)
         if 'ith_ka' in row and not math.isnan(row['ith_ka']):
             ith_ka = row['ith_ka']
         else:
-            ith_ka = 'NaN'
+            ith_ka = None
                     
         busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), ikss_ka=row['ikss_ka'], ip_ka=ip_ka, ith_ka=ith_ka, rk_ohm=row['rk_ohm'], xk_ohm=row['xk_ohm'])    
                  
@@ -2137,6 +2185,46 @@ def safe_float(value):
         return float(value)
     except (ValueError, TypeError):
         return 0.0
+
+def safe_int(value, default=1):
+    """Convert value to int with default fallback"""
+    if value is None or value == 'None' or value == '':
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+def parse_vector_group(vector_group):
+    """Parse vector group to extract base group and phase shift number.
+    
+    Args:
+        vector_group: String like 'Dyn11', 'Yd5', etc.
+        
+    Returns:
+        tuple: (base_group, phase_shift_degrees)
+    """
+    if not vector_group or vector_group == 'None' or vector_group == '':
+        return 'Dyn', 0
+    
+    # Common vector group patterns
+    import re
+    
+    # Pattern to match vector groups with numbers (e.g., Dyn11, Yd5, Yy0)
+    pattern = r'^([A-Za-z]+)(\d+)$'
+    match = re.match(pattern, vector_group)
+    
+    if match:
+        base_group = match.group(1)
+        phase_shift_number = int(match.group(2))
+        
+        # Convert phase shift number to degrees (multiply by 30°)
+        phase_shift_degrees = phase_shift_number * 30
+        
+        return base_group, phase_shift_degrees
+    else:
+        # No number found, return as-is with 0 phase shift
+        return vector_group, 0
 
 def get_display_name(user_friendly_name, technical_id, element_type, element_index, simulation_type='opf'):
     """
