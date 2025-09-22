@@ -128,8 +128,8 @@ class StoragesOut(object):
         self.storages = storages              
 
 # Helper functions for OpenDSS element creation
-# Frontend sends simple mxCell# names (mxCell#126, mxCell#129, etc.)
-# Backend converts # to _ for Python compatibility
+# Frontend sends simple mxCell_ names (mxCell_126, mxCell_129, etc.)
+# Frontend now sends bus names in the correct format (mxCell_126)
 # OpenDSS may convert bus names to 
 def create_busbars(in_data, dss):
     """Create busbars in OpenDSS circuit - Let OpenDSS handle bus creation automatically  when elements are connected"""
@@ -141,9 +141,8 @@ def create_busbars(in_data, dss):
     bus_elements = {}
     for x in in_data:         
         if "Bus" in in_data[x]['typ']:
-            # Frontend sends mxCell#126, convert to mxCell_126 for Python compatibility
-            frontend_bus_name = in_data[x]['name']  # This is mxCell#126
-            bus_name = frontend_bus_name.replace('#', '_')  # Convert to mxCell_126
+            # Frontend now sends bus names in the correct format (mxCell_126)
+            bus_name = in_data[x]['name']  # This is already mxCell_126
             bus_voltage = in_data[x].get('vn_kv', None)
             bus_elements[bus_name] = bus_name  # mxCell_126 -> mxCell_126
             BusbarsDictVoltage[bus_name] = bus_voltage
@@ -212,8 +211,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             # Validate each bus connection
             valid_connections = []
             for field_name, bus_ref in bus_connection_fields:
-                # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-                bus_ref_backend = bus_ref.replace('#', '_')               
+                # Frontend now sends bus names in the correct format (mxCell_126)
+                bus_ref_backend = bus_ref               
                 if bus_ref_backend in BusbarsDictConnectionToName:
                     # Valid bus connection
                     valid_connections.append(f"{field_name}={bus_ref}")
@@ -271,9 +270,9 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
     
     if bus_from_ref and bus_to_ref:
         
-        # Convert frontend bus names (mxCell#126) to backend format (mxCell_126)
-        bus_from_ref_backend = bus_from_ref.replace('#', '_')
-        bus_to_ref_backend = bus_to_ref.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_from_ref_backend = bus_from_ref
+        bus_to_ref_backend = bus_to_ref
         
         # Get bus names from connection mapping
         if bus_from_ref_backend in BusbarsDictConnectionToName:
@@ -327,8 +326,8 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         # Get voltage from the bus data
@@ -378,8 +377,8 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
@@ -440,8 +439,8 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         # Get voltage from the bus data
@@ -500,9 +499,9 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
  
     
     if bus_from_ref and bus_to_ref:
-        # Convert frontend bus names (mxCell#126) to backend format (mxCell_126)
-        bus_from_ref_backend = bus_from_ref.replace('#', '_')
-        bus_to_ref_backend = bus_to_ref.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_from_ref_backend = bus_from_ref
+        bus_to_ref_backend = bus_to_ref
         
         # Resolve bus names from references (could be IDs or names)
         if bus_from_ref_backend in BusbarsDictConnectionToName:
@@ -571,8 +570,8 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         # Get voltage from the bus data
@@ -615,8 +614,8 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
@@ -659,8 +658,8 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
 
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
@@ -701,8 +700,8 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
     
     bus_connection = element_data.get('bus')
     if bus_connection:
-        # Convert frontend bus name (mxCell#126) to backend format (mxCell_126)
-        bus_connection_backend = bus_connection.replace('#', '_')
+        # Frontend now sends bus names in the correct format (mxCell_126)
+        bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)        
@@ -1085,11 +1084,11 @@ def powerflow(in_data, frequency, algorithm, max_iterations, tolerance, converge
                         va_degree = dss.bus.vmag_angle_pu[1]
                         print(f"    Voltage: vm_pu={vm_pu}, va_degree={va_degree}")
 
-                        # Convert back to frontend format (mxCell#126) for the frontend to find cells
-                        frontend_bus_name = expected_bus_name.replace('_', '#')
+                        # Frontend now expects bus names in underscore format (mxCell_126)
+                        frontend_bus_name = expected_bus_name  # Already in correct format
                         busbar = BusbarOut(
-                            name=frontend_bus_name,  # Use frontend format (mxCell#126)
-                            id=frontend_bus_name,   # Use frontend format (mxCell#126) so frontend can find cells
+                            name=frontend_bus_name,  # Use underscore format (mxCell_126)
+                            id=frontend_bus_name,   # Use underscore format (mxCell_126) so frontend can find cells
                             vm_pu=vm_pu,
                             va_degree=va_degree
                         )
@@ -1145,11 +1144,11 @@ def powerflow(in_data, frequency, algorithm, max_iterations, tolerance, converge
                 vm_pu = 1.0
                 va_degree = 0.0
                 
-                # Convert back to frontend format (mxCell#126) for the frontend to find cells
-                frontend_bus_name = bus_name.replace('_', '#')
+                # Frontend now expects bus names in underscore format (mxCell_126)
+                frontend_bus_name = bus_name  # Already in correct format
                 busbar = BusbarOut(
-                    name=frontend_bus_name,  # Use frontend format (mxCell#126)
-                    id=frontend_bus_name,   # Use frontend format (mxCell#126) so frontend can find cells
+                    name=frontend_bus_name,  # Use underscore format (mxCell_126)
+                    id=frontend_bus_name,   # Use underscore format (mxCell_126) so frontend can find cells
                     vm_pu=vm_pu, 
                     va_degree=va_degree
                 )
