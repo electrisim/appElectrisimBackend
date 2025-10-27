@@ -95,13 +95,24 @@ def simulation():
             algorithm=in_data[x]['algorithm']
             calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
             init = in_data[x]['initialization']
+            export_python = in_data[x].get('exportPython', False)  # Export Python code flag
+            
+            # Debug logging for exportPython
+            print(f"🔍 DEBUG - Simulation Parameters received:")
+            print(f"  - All keys in simulation params: {in_data[x].keys()}")
+            print(f"  - exportPython value: {in_data[x].get('exportPython', 'KEY NOT FOUND')}")
+            print(f"  - exportPython type: {type(export_python)}")
+            print(f"  - exportPython == True: {export_python == True}")
+            print(f"  - exportPython is True: {export_python is True}")
+            
+            print(f"Pandapower Parameters: frequency={frequency}, algorithm={algorithm}, calculate_voltage_angles={calculate_voltage_angles}, init={init}, export_python={export_python}")
 
             net = pp.create_empty_network(f_hz=frequency)
        
             Busbars = pandapower_electrisim.create_busbars(in_data, net)
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
 
-            response = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init)  
+            response = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars)  
 
    
             return response
@@ -125,23 +136,29 @@ def simulation():
             user_email = in_data[x].get('user_email', 'unknown@user.com')
             print(f"=== OPEN DSS LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
             
-            frequency=eval(in_data[x]['frequency'])
-            algorithm=in_data[x].get('algorithm', 'Admittance') #'Admittance' (Iterative Load Flow), 'PowerFlow' (Direct solution)
-            max_iterations=int(in_data[x].get('maxIterations', 100))
-            tolerance=float(in_data[x].get('tolerance', 1e-6))
-            convergence=in_data[x].get('convergence', 'normal')
-            voltage_control=in_data[x].get('voltageControl', True)
-            tap_control=in_data[x].get('tapControl', True)
+            # Extract OpenDSS parameters based on OpenDSS documentation
+            # Reference: https://opendss.epri.com/PowerFlow.html
+            frequency = eval(in_data[x]['frequency'])  # Base frequency (50 or 60 Hz)
+            mode = in_data[x].get('mode', 'Snapshot')  # Solution mode (Snapshot, Daily, Dutycycle, Yearly)
+            algorithm = in_data[x].get('algorithm', 'Normal')  # Solution algorithm (Normal, Newton)
+            loadmodel = in_data[x].get('loadmodel', 'Powerflow')  # Load model (Powerflow, Admittance)
+            max_iterations = int(in_data[x].get('maxIterations', 100))  # Maximum iterations
+            tolerance = float(in_data[x].get('tolerance', 0.0001))  # Convergence tolerance
+            controlmode = in_data[x].get('controlmode', 'Static')  # Control mode (Static, Event, Time)
+            export_commands = in_data[x].get('exportCommands', False)  # Export OpenDSS commands flag
+            
+            print(f"OpenDSS Parameters: frequency={frequency}, mode={mode}, algorithm={algorithm}, loadmodel={loadmodel}, max_iterations={max_iterations}, tolerance={tolerance}, controlmode={controlmode}, export_commands={export_commands}")
             
             response = opendss_electrisim.powerflow(
                 in_data, 
                 frequency, 
+                mode,
                 algorithm, 
+                loadmodel,
                 max_iterations, 
                 tolerance, 
-                convergence, 
-                voltage_control, 
-                tap_control
+                controlmode,
+                export_commands
             )           
             return response
         

@@ -1,0 +1,54 @@
+2025-10-24 15:38:47,678 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:38:47,703 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:38:52,144 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\app.py', reloading
+2025-10-24 15:39:00,413 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:39:00,461 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:39:05,955 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\app.py', reloading
+2025-10-24 15:39:14,706 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:39:14,732 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:39:18,723 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\app.py', reloading
+2025-10-24 15:39:26,652 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:39:26,669 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:40:35,527 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\opendss_electrisim.py', reloading
+2025-10-24 15:40:46,646 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:40:46,676 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:40:51,414 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\opendss_electrisim.py', reloading
+2025-10-24 15:41:03,687 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:41:03,720 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:41:15,585 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\opendss_electrisim.py', reloading
+2025-10-24 15:41:28,685 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:41:28,716 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:41:41,300 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:41:49,099 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:41:49,112 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:42:08,768 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:42:18,829 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:42:18,846 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:42:19,680 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:42:27,548 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:42:27,561 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:42:32,218 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:42:39,749 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:42:39,766 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:42:47,863 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:42:59,106 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:42:59,123 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:43:07,235 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:43:17,514 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:43:17,532 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:43:22,299 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:43:28,765 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:43:28,776 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:43:33,599 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:43:40,882 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:43:40,908 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:43:48,350 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:43:55,784 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:43:55,803 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:44:05,962 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\pandapower_electrisim.py', reloading
+2025-10-24 15:44:12,634 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:44:12,647 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:52:57,182 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\opendss_electrisim.py', reloading
+2025-10-24 15:53:09,808 - werkzeug - WARNING -  * Debugger is active!
+2025-10-24 15:53:09,819 - werkzeug - INFO -  * Debugger PIN: 577-939-657
+2025-10-24 15:55:15,742 - werkzeug - INFO -  * Detected change in 'c:\\Users\\DELL\\.vscode\\appElectrisimBackend\\appElectrisimBackend\\opendss_electrisim.py', reloading

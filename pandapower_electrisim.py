@@ -15,6 +15,253 @@ from pandapower.timeseries import DFData
 
 
 Busbars = {} 
+
+def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
+    """Generate Python code to recreate the pandapower network"""
+    lines = []
+    
+    # Add header
+    lines.append("# Pandapower Network Model")
+    lines.append("# Auto-generated code to recreate the network")
+    lines.append("")
+    lines.append("import pandapower as pp")
+    lines.append("")
+    
+    # Get frequency from network
+    frequency = net.f_hz
+    lines.append(f"# Create empty network with {frequency} Hz")
+    lines.append(f"net = pp.create_empty_network(f_hz={frequency})")
+    lines.append("")
+    
+    # Create buses
+    lines.append("# Create buses")
+    for idx, row in net.bus.iterrows():
+        name = row['name'] if 'name' in row else f"Bus_{idx}"
+        vn_kv = row['vn_kv']
+        lines.append(f"bus_{idx} = pp.create_bus(net, vn_kv={vn_kv}, name='{name}')")
+    lines.append("")
+    
+    # Create external grids
+    if not net.ext_grid.empty:
+        lines.append("# Create external grids")
+        for idx, row in net.ext_grid.iterrows():
+            bus = row['bus']
+            vm_pu = row['vm_pu']
+            va_degree = row['va_degree']
+            name = row['name'] if 'name' in row else f"ExtGrid_{idx}"
+            lines.append(f"pp.create_ext_grid(net, bus=bus_{bus}, vm_pu={vm_pu}, va_degree={va_degree}, name='{name}')")
+        lines.append("")
+    
+    # Create lines
+    if not net.line.empty:
+        lines.append("# Create lines")
+        for idx, row in net.line.iterrows():
+            from_bus = row['from_bus']
+            to_bus = row['to_bus']
+            name = row['name'] if 'name' in row else f"Line_{idx}"
+            
+            # Get all line parameters for create_line_from_parameters
+            line_id = row.get('id', name)  # Use name as fallback if id not stored
+            r_ohm_per_km = row.get('r_ohm_per_km', 0.122)
+            x_ohm_per_km = row.get('x_ohm_per_km', 0.112)
+            c_nf_per_km = row.get('c_nf_per_km', 304.0)
+            g_us_per_km = row.get('g_us_per_km', 0.0)
+            max_i_ka = row.get('max_i_ka', 1.0)
+            line_type = row.get('type', 'ol')
+            length_km = row['length_km']
+            
+            # Get optional parameters if they exist
+            parallel = row.get('parallel', 1)
+            df = row.get('df', 1.0)
+            
+            # Build the create_line_from_parameters call with all parameters
+            # Note: 'id' is included as a comment since pandapower doesn't store it natively
+            lines.append(f"# Line ID: {line_id}")
+            line_code = (f"pp.create_line_from_parameters(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, "
+                        f"length_km={length_km}, r_ohm_per_km={r_ohm_per_km}, x_ohm_per_km={x_ohm_per_km}, "
+                        f"c_nf_per_km={c_nf_per_km}, g_us_per_km={g_us_per_km}, max_i_ka={max_i_ka}, "
+                        f"type='{line_type}', parallel={parallel}, df={df}, name='{name}')")
+            lines.append(line_code)
+        lines.append("")
+    
+    # Create transformers
+    if not net.trafo.empty:
+        lines.append("# Create transformers (2-winding)")
+        for idx, row in net.trafo.iterrows():
+            hv_bus = row['hv_bus']
+            lv_bus = row['lv_bus']
+            name = row['name'] if 'name' in row else f"Trafo_{idx}"
+            
+            # Get transformer ID
+            trafo_id = row.get('id', name)
+            
+            # Get all transformer parameters for create_transformer_from_parameters
+            sn_mva = row.get('sn_mva', 1.0)
+            vn_hv_kv = row.get('vn_hv_kv', 110.0)
+            vn_lv_kv = row.get('vn_lv_kv', 20.0)
+            vk_percent = row.get('vk_percent', 6.0)
+            vkr_percent = row.get('vkr_percent', 1.0)
+            pfe_kw = row.get('pfe_kw', 0.0)
+            i0_percent = row.get('i0_percent', 0.0)
+            
+            # Get optional parameters
+            parallel = row.get('parallel', 1)
+            shift_degree = row.get('shift_degree', 0.0)
+            tap_side = row.get('tap_side', 'hv')
+            tap_pos = row.get('tap_pos', 0)
+            tap_neutral = row.get('tap_neutral', 0)
+            tap_max = row.get('tap_max', 0)
+            tap_min = row.get('tap_min', 0)
+            tap_step_percent = row.get('tap_step_percent', 0.0)
+            tap_step_degree = row.get('tap_step_degree', 0.0)
+            vector_group = row.get('vector_group', 'Dyn')
+            
+            # Get zero sequence parameters if available
+            vk0_percent = row.get('vk0_percent', vk_percent)
+            vkr0_percent = row.get('vkr0_percent', vkr_percent)
+            mag0_percent = row.get('mag0_percent', 0.0)
+            mag0_rx = row.get('mag0_rx', 0.0)
+            si0_hv_partial = row.get('si0_hv_partial', 0.0)
+            
+            # Build the create_transformer_from_parameters call
+            lines.append(f"# Transformer ID: {trafo_id}")
+            trafo_code = (f"pp.create_transformer_from_parameters(net, hv_bus=bus_{hv_bus}, lv_bus=bus_{lv_bus}, "
+                         f"sn_mva={sn_mva}, vn_hv_kv={vn_hv_kv}, vn_lv_kv={vn_lv_kv}, "
+                         f"vkr_percent={vkr_percent}, vk_percent={vk_percent}, "
+                         f"pfe_kw={pfe_kw}, i0_percent={i0_percent}, "
+                         f"parallel={parallel}, shift_degree={shift_degree}, "
+                         f"tap_side='{tap_side}', tap_pos={tap_pos}, tap_neutral={tap_neutral}, "
+                         f"tap_max={tap_max}, tap_min={tap_min}, "
+                         f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, "
+                         f"vector_group='{vector_group}', "
+                         f"vk0_percent={vk0_percent}, vkr0_percent={vkr0_percent}, "
+                         f"mag0_percent={mag0_percent}, mag0_rx={mag0_rx}, "
+                         f"si0_hv_partial={si0_hv_partial}, name='{name}')")
+            lines.append(trafo_code)
+        lines.append("")
+    
+    # Create three-winding transformers
+    if hasattr(net, 'trafo3w') and not net.trafo3w.empty:
+        lines.append("# Create transformers (3-winding)")
+        for idx, row in net.trafo3w.iterrows():
+            hv_bus = row['hv_bus']
+            mv_bus = row['mv_bus']
+            lv_bus = row['lv_bus']
+            name = row['name'] if 'name' in row else f"Trafo3W_{idx}"
+            
+            # Get transformer ID
+            trafo3w_id = row.get('id', name)
+            
+            # Get all 3-winding transformer parameters
+            sn_hv_mva = row.get('sn_hv_mva', 1.0)
+            sn_mv_mva = row.get('sn_mv_mva', 1.0)
+            sn_lv_mva = row.get('sn_lv_mva', 1.0)
+            vn_hv_kv = row.get('vn_hv_kv', 110.0)
+            vn_mv_kv = row.get('vn_mv_kv', 30.0)
+            vn_lv_kv = row.get('vn_lv_kv', 10.0)
+            vk_hv_percent = row.get('vk_hv_percent', 10.0)
+            vk_mv_percent = row.get('vk_mv_percent', 10.0)
+            vk_lv_percent = row.get('vk_lv_percent', 10.0)
+            vkr_hv_percent = row.get('vkr_hv_percent', 0.5)
+            vkr_mv_percent = row.get('vkr_mv_percent', 0.5)
+            vkr_lv_percent = row.get('vkr_lv_percent', 0.5)
+            pfe_kw = row.get('pfe_kw', 0.0)
+            i0_percent = row.get('i0_percent', 0.0)
+            
+            # Get optional parameters
+            shift_mv_degree = row.get('shift_mv_degree', 0.0)
+            shift_lv_degree = row.get('shift_lv_degree', 0.0)
+            tap_side = row.get('tap_side', 'hv')
+            tap_pos = row.get('tap_pos', 0)
+            tap_min = row.get('tap_min', 0)
+            tap_max = row.get('tap_max', 0)
+            tap_step_percent = row.get('tap_step_percent', 0.0)
+            vector_group = row.get('vector_group', 'YNyn')
+            
+            # Get zero sequence parameters if available
+            vk0_hv_percent = row.get('vk0_hv_percent', vk_hv_percent)
+            vk0_mv_percent = row.get('vk0_mv_percent', vk_mv_percent)
+            vk0_lv_percent = row.get('vk0_lv_percent', vk_lv_percent)
+            vkr0_hv_percent = row.get('vkr0_hv_percent', vkr_hv_percent)
+            vkr0_mv_percent = row.get('vkr0_mv_percent', vkr_mv_percent)
+            vkr0_lv_percent = row.get('vkr0_lv_percent', vkr_lv_percent)
+            
+            # Build the create_transformer3w_from_parameters call
+            lines.append(f"# Three-Winding Transformer ID: {trafo3w_id}")
+            trafo3w_code = (f"pp.create_transformer3w_from_parameters(net, "
+                           f"hv_bus=bus_{hv_bus}, mv_bus=bus_{mv_bus}, lv_bus=bus_{lv_bus}, "
+                           f"sn_hv_mva={sn_hv_mva}, sn_mv_mva={sn_mv_mva}, sn_lv_mva={sn_lv_mva}, "
+                           f"vn_hv_kv={vn_hv_kv}, vn_mv_kv={vn_mv_kv}, vn_lv_kv={vn_lv_kv}, "
+                           f"vk_hv_percent={vk_hv_percent}, vk_mv_percent={vk_mv_percent}, vk_lv_percent={vk_lv_percent}, "
+                           f"vkr_hv_percent={vkr_hv_percent}, vkr_mv_percent={vkr_mv_percent}, vkr_lv_percent={vkr_lv_percent}, "
+                           f"pfe_kw={pfe_kw}, i0_percent={i0_percent}, "
+                           f"shift_mv_degree={shift_mv_degree}, shift_lv_degree={shift_lv_degree}, "
+                           f"tap_side='{tap_side}', tap_pos={tap_pos}, tap_min={tap_min}, tap_max={tap_max}, "
+                           f"tap_step_percent={tap_step_percent}, vector_group='{vector_group}', "
+                           f"vk0_hv_percent={vk0_hv_percent}, vk0_mv_percent={vk0_mv_percent}, vk0_lv_percent={vk0_lv_percent}, "
+                           f"vkr0_hv_percent={vkr0_hv_percent}, vkr0_mv_percent={vkr0_mv_percent}, vkr0_lv_percent={vkr0_lv_percent}, "
+                           f"name='{name}')")
+            lines.append(trafo3w_code)
+        lines.append("")
+    
+    # Create loads
+    if not net.load.empty:
+        lines.append("# Create loads")
+        for idx, row in net.load.iterrows():
+            bus = row['bus']
+            p_mw = row['p_mw']
+            q_mvar = row['q_mvar']
+            name = row['name'] if 'name' in row else f"Load_{idx}"
+            lines.append(f"pp.create_load(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}')")
+        lines.append("")
+    
+    # Create static generators
+    if not net.sgen.empty:
+        lines.append("# Create static generators")
+        for idx, row in net.sgen.iterrows():
+            bus = row['bus']
+            p_mw = row['p_mw']
+            q_mvar = row['q_mvar']
+            name = row['name'] if 'name' in row else f"SGen_{idx}"
+            lines.append(f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}')")
+        lines.append("")
+    
+    # Create generators
+    if not net.gen.empty:
+        lines.append("# Create generators")
+        for idx, row in net.gen.iterrows():
+            bus = row['bus']
+            p_mw = row['p_mw']
+            vm_pu = row['vm_pu']
+            name = row['name'] if 'name' in row else f"Gen_{idx}"
+            lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw={p_mw}, vm_pu={vm_pu}, name='{name}')")
+        lines.append("")
+    
+    # Create shunts
+    if not net.shunt.empty:
+        lines.append("# Create shunts")
+        for idx, row in net.shunt.iterrows():
+            bus = row['bus']
+            q_mvar = row['q_mvar']
+            p_mw = row['p_mw']
+            name = row['name'] if 'name' in row else f"Shunt_{idx}"
+            lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name='{name}')")
+        lines.append("")
+    
+    # Run power flow
+    lines.append("# Run power flow")
+    lines.append(f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={calculate_voltage_angles}, init='{init}')")
+    lines.append("")
+    
+    # Add results printing
+    lines.append("# Print results")
+    lines.append("print('\\nBus Results:')")
+    lines.append("print(net.res_bus)")
+    lines.append("print('\\nLine Results:')")
+    lines.append("print(net.res_line)")
+    
+    return '\n'.join(lines)
+
 def create_busbars(in_data, net):
     Busbars = {}
     # Store user-friendly names mapping for later use
@@ -422,7 +669,7 @@ def create_other_elements(in_data,net,x, Busbars):
 
 
 
-def powerflow(net, algorithm, calculate_voltage_angles, init):
+def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None):
                
          
             #pandapower - rozpływ mocy
@@ -443,12 +690,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                     "message": "Power flow calculation failed",
                     "exception": str(e),
                     "diagnostic": {}
-                }
+                }               
+                
                 
                 # Access initial voltage magnitudes and angles  
                 diag_result_dict = pp.diagnostic(net, report_style='detailed')             
                 
-                print(diag_result_dict)
+                #print(diag_result_dict)
                 #plt.simple_plot(net, plot_line_switches=True)
                 
                 # Check for isolated buses
@@ -462,7 +710,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                 
                 # If no specific diagnostic was found, include the original exception
                 if not diagnostic_response["diagnostic"]:
-                    diagnostic_response["diagnostic"]["general_error"] = str(e)
+                   diagnostic_response["diagnostic"]["general_error"] = str(e)
                 
                 return diagnostic_response
             else:                              
@@ -1097,6 +1345,12 @@ def powerflow(net, algorithm, calculate_voltage_angles, init):
                         result = {**result, **dclines.__dict__}         
                 
                            
+                # Generate Python code if export is requested
+                if export_python and in_data and Busbars:
+                    python_code = generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init)
+                    result['pandapower_python'] = python_code
+                    print(f"Pandapower Python code export enabled: {len(python_code)} characters")
+                
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 #indent - wcięcia
@@ -1216,7 +1470,7 @@ def shortcircuit(net, in_data):
         # Call short circuit calculation with correct parameters including ip and ith
         sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s, 
                    kappa_method='C', r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, 
-                   check_connectivity=True, return_all_currents=True)
+                   check_connectivity=False, return_all_currents=True)
         
         # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
         if fault_type == '1ph' and net.res_bus_sc['ip_ka'].isna().all() and net.res_bus_sc['ith_ka'].isna().all():
@@ -2257,103 +2511,175 @@ def process_diagnostic_data(net, diag_result_dict):
     # Process invalid values
     if 'invalid_values' in diag_result_dict:
         processed_invalid = {}
-        for element_type, invalid_items in diag_result_dict['invalid_values'].items():
+        invalid_data = diag_result_dict['invalid_values']
+        
+        # Handle different possible formats
+        if isinstance(invalid_data, dict):
+            for element_type, invalid_items in invalid_data.items():
+                processed_items = []
+                if isinstance(invalid_items, (list, tuple)):
+                    for item in invalid_items:
+                        if isinstance(item, (list, tuple)) and len(item) >= 4:
+                            # Format: [element_index, parameter_name, current_value, constraint]
+                            element_index = item[0]
+                            parameter_name = item[1]
+                            current_value = item[2]
+                            constraint = item[3]
+                            
+                            # Get user-friendly name based on element type
+                            element_id = get_element_display_name(net, element_type, element_index)
+                            
+                            # Create formatted message with element type and ID
+                            element_type_display = element_type.capitalize()
+                            if element_type == 'trafo':
+                                element_type_display = 'Transformer'
+                            elif element_type == 'trafo3w':
+                                element_type_display = 'Three-Winding Transformer'
+                            elif element_type == 'ext_grid':
+                                element_type_display = 'External Grid'
+                            elif element_type == 'gen':
+                                element_type_display = 'Generator'
+                            
+                            formatted_item = f"{element_type_display} {element_id}: {parameter_name} = {current_value} (constraint: {constraint})"
+                            processed_items.append(formatted_item)
+                        else:
+                            # Keep original format if not in expected format
+                            processed_items.append(str(item))
+                else:
+                    processed_items.append(str(invalid_items))
+                
+                processed_invalid[element_type] = processed_items
+        elif isinstance(invalid_data, (list, tuple)):
             processed_items = []
-            for item in invalid_items:
+            for item in invalid_data:
                 if isinstance(item, (list, tuple)) and len(item) >= 4:
-                    # Format: [element_index, parameter_name, current_value, constraint]
                     element_index = item[0]
                     parameter_name = item[1]
                     current_value = item[2]
                     constraint = item[3]
-                    
-                    # Get user-friendly name based on element type
-                    element_id = get_element_display_name(net, element_type, element_index)
-                    
-                    # Create formatted message with element type and ID
-                    element_type_display = element_type.capitalize()
-                    if element_type == 'trafo':
-                        element_type_display = 'Transformer'
-                    elif element_type == 'trafo3w':
-                        element_type_display = 'Three-Winding Transformer'
-                    elif element_type == 'ext_grid':
-                        element_type_display = 'External Grid'
-                    elif element_type == 'gen':
-                        element_type_display = 'Generator'
-                    
-                    formatted_item = f"{element_type_display} {element_id}: {parameter_name} = {current_value} (constraint: {constraint})"
+                    element_id = get_element_display_name(net, 'unknown', element_index)
+                    formatted_item = f"Element {element_id}: {parameter_name} = {current_value} (constraint: {constraint})"
                     processed_items.append(formatted_item)
                 else:
-                    # Keep original format if not in expected format
                     processed_items.append(str(item))
-            
-            processed_invalid[element_type] = processed_items
+            processed_invalid['general'] = processed_items
+        else:
+            processed_invalid['status'] = str(invalid_data)
+        
         processed_diagnostic['invalid_values'] = processed_invalid
     
     # Process overload data
     if 'overload' in diag_result_dict:
         processed_overload = {}
-        for element_type, overload_items in diag_result_dict['overload'].items():
+        overload_data = diag_result_dict['overload']
+
+        # Handle different possible formats of overload data
+        if isinstance(overload_data, dict):
+            # Expected format: dictionary with element types as keys
+            for element_type, overload_items in overload_data.items():
+                processed_items = []
+                if isinstance(overload_items, (list, tuple)):
+                    for item in overload_items:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            # Format: [element_index, loading_percent]
+                            element_index = item[0]
+                            loading_percent = item[1]
+
+                            # Get user-friendly name
+                            element_id = get_element_display_name(net, element_type, element_index)
+
+                            # Create formatted message with element type and ID
+                            element_type_display = element_type.capitalize()
+                            if element_type == 'trafo':
+                                element_type_display = 'Transformer'
+                            elif element_type == 'trafo3w':
+                                element_type_display = 'Three-Winding Transformer'
+                            elif element_type == 'ext_grid':
+                                element_type_display = 'External Grid'
+                            elif element_type == 'gen':
+                                element_type_display = 'Generator'
+
+                            formatted_item = f"{element_type_display} {element_id}: Loading = {loading_percent}%"
+                            processed_items.append(formatted_item)
+                        else:
+                            processed_items.append(str(item))
+                else:
+                    # If overload_items is not a list/tuple, just convert to string
+                    processed_items.append(str(overload_items))
+
+                processed_overload[element_type] = processed_items
+        elif isinstance(overload_data, (list, tuple)):
+            # Handle case where overload is a list directly
             processed_items = []
-            for item in overload_items:
+            for item in overload_data:
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    # Format: [element_index, loading_percent]
                     element_index = item[0]
                     loading_percent = item[1]
-                    
-                    # Get user-friendly name
-                    element_id = get_element_display_name(net, element_type, element_index)
-                    
-                    # Create formatted message with element type and ID
-                    element_type_display = element_type.capitalize()
-                    if element_type == 'trafo':
-                        element_type_display = 'Transformer'
-                    elif element_type == 'trafo3w':
-                        element_type_display = 'Three-Winding Transformer'
-                    elif element_type == 'ext_grid':
-                        element_type_display = 'External Grid'
-                    elif element_type == 'gen':
-                        element_type_display = 'Generator'
-                    
-                    formatted_item = f"{element_type_display} {element_id}: Loading = {loading_percent}%"
+                    element_id = get_element_display_name(net, 'unknown', element_index)
+                    formatted_item = f"Element {element_id}: Loading = {loading_percent}%"
                     processed_items.append(formatted_item)
                 else:
                     processed_items.append(str(item))
-            
-            processed_overload[element_type] = processed_items
+            processed_overload['general'] = processed_items
+        else:
+            # Handle boolean or other single values
+            processed_overload['status'] = str(overload_data)
+
         processed_diagnostic['overload'] = processed_overload
     
     # Process nominal voltage mismatches
     if 'nominal_voltages_dont_match' in diag_result_dict:
         processed_voltage = {}
-        for element_type, voltage_items in diag_result_dict['nominal_voltages_dont_match'].items():
+        voltage_data = diag_result_dict['nominal_voltages_dont_match']
+
+        # Handle different possible formats
+        if isinstance(voltage_data, dict):
+            for element_type, voltage_items in voltage_data.items():
+                processed_items = []
+                if isinstance(voltage_items, (list, tuple)):
+                    for item in voltage_items:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            # Format: [element_index, voltage_info]
+                            element_index = item[0]
+                            voltage_info = item[1]
+
+                            # Get user-friendly name
+                            element_id = get_element_display_name(net, element_type, element_index)
+
+                            # Create formatted message with element type and ID
+                            element_type_display = element_type.capitalize()
+                            if element_type == 'trafo':
+                                element_type_display = 'Transformer'
+                            elif element_type == 'trafo3w':
+                                element_type_display = 'Three-Winding Transformer'
+                            elif element_type == 'ext_grid':
+                                element_type_display = 'External Grid'
+                            elif element_type == 'gen':
+                                element_type_display = 'Generator'
+
+                            formatted_item = f"{element_type_display} {element_id}: {voltage_info}"
+                            processed_items.append(formatted_item)
+                        else:
+                            processed_items.append(str(item))
+                else:
+                    processed_items.append(str(voltage_items))
+
+                processed_voltage[element_type] = processed_items
+        elif isinstance(voltage_data, (list, tuple)):
             processed_items = []
-            for item in voltage_items:
+            for item in voltage_data:
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    # Format: [element_index, voltage_info]
                     element_index = item[0]
                     voltage_info = item[1]
-                    
-                    # Get user-friendly name
-                    element_id = get_element_display_name(net, element_type, element_index)
-                    
-                    # Create formatted message with element type and ID
-                    element_type_display = element_type.capitalize()
-                    if element_type == 'trafo':
-                        element_type_display = 'Transformer'
-                    elif element_type == 'trafo3w':
-                        element_type_display = 'Three-Winding Transformer'
-                    elif element_type == 'ext_grid':
-                        element_type_display = 'External Grid'
-                    elif element_type == 'gen':
-                        element_type_display = 'Generator'
-                    
-                    formatted_item = f"{element_type_display} {element_id}: {voltage_info}"
+                    element_id = get_element_display_name(net, 'unknown', element_index)
+                    formatted_item = f"Element {element_id}: {voltage_info}"
                     processed_items.append(formatted_item)
                 else:
                     processed_items.append(str(item))
-            
-            processed_voltage[element_type] = processed_items
+            processed_voltage['general'] = processed_items
+        else:
+            processed_voltage['status'] = str(voltage_data)
+
         processed_diagnostic['nominal_voltages_dont_match'] = processed_voltage
     
     # Add other diagnostic data as-is
