@@ -80,12 +80,20 @@ class LoadsOut(object):
         self.loads = loads             
 
 class TransformerOut(object):
-    def __init__(self, name: str, id: str, i_hv_ka: float, i_lv_ka: float, loading_percent: float):          
+    def __init__(self, name: str, id: str, i_hv_ka: float, i_lv_ka: float, loading_percent: float, 
+                 p_hv_mw: float = 0.0, q_hv_mvar: float = 0.0, p_lv_mw: float = 0.0, q_lv_mvar: float = 0.0, 
+                 pl_mw: float = 0.0, ql_mvar: float = 0.0):          
         self.name = name
         self.id = id           
         self.i_hv_ka = i_hv_ka 
         self.i_lv_ka = i_lv_ka
         self.loading_percent = loading_percent
+        self.p_hv_mw = p_hv_mw
+        self.q_hv_mvar = q_hv_mvar
+        self.p_lv_mw = p_lv_mw
+        self.q_lv_mvar = q_lv_mvar
+        self.pl_mw = pl_mw
+        self.ql_mvar = ql_mvar
                                                              
                        
 class TransformersOut(object):
@@ -437,21 +445,15 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
             gen_name = element_name.replace(' ', '_')
             
             try:
-                # Create static generator command string
-                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar}"
+                # Use simple Generator element with constant P and Q
+                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f}"
 
-                # Create generator using OpenDSS command
+                # Create Generator element
                 execute_dss_command(gen_cmd)
-                print(f"Command: {gen_cmd}")
-
-                # Configure generator to NOT act as voltage source
-                dss.generators.mode = 1  # Power Factor mode
-                # Disable voltage control by setting control mode to 0 (no control)
-                try:
-                    dss.generators.status = 'Variable'  # Set to variable (not fixed)
-                except:
-                    pass  # Ignore if property doesn't exist
+                print(f"✓ Command: {gen_cmd}")
+                print(f"  Created: Generator P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr at {bus_voltage} kV bus")
                 
+                # Store in GeneratorsDict
                 GeneratorsDict[element_name] = gen_name
                 GeneratorsDictId[element_name] = element_id
                 created_elements.add(element_name)
@@ -522,6 +524,48 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
         print(f"    bus_connection: {bus_connection}")
         print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
 
+def vector_group_to_opendss_conns(vector_group):
+    """Convert vector group notation to OpenDSS connection format
+    
+    Vector group examples:
+    - Dyn: Delta (HV) - Wye with neutral (LV)
+    - Yy: Wye (HV) - Wye (LV)
+    - Yd: Wye (HV) - Delta (LV)
+    - Dd: Delta (HV) - Delta (LV)
+    - YNd: Wye with neutral (HV) - Delta (LV)
+    
+    OpenDSS format: (hv_conn lv_conn)
+    Connections: wye, delta, zigzag
+    """
+    if not vector_group:
+        return "wye wye"  # Default
+    
+    # Convert to uppercase for easier parsing
+    vg = vector_group.upper()
+    
+    # Mapping for connection types
+    conn_map = {
+        'Y': 'wye',
+        'D': 'delta',
+        'Z': 'zigzag'
+    }
+    
+    # Parse HV connection (first character)
+    hv_conn = conn_map.get(vg[0], 'wye')
+    
+    # Parse LV connection (after 'N' if present, or second character)
+    if len(vg) >= 2:
+        # Skip 'N' if present (indicates neutral/grounded)
+        lv_start = 2 if len(vg) > 2 and vg[1] == 'N' else 1
+        if lv_start < len(vg):
+            lv_conn = conn_map.get(vg[lv_start], 'wye')
+        else:
+            lv_conn = 'wye'
+    else:
+        lv_conn = 'wye'
+    
+    return f"{hv_conn} {lv_conn}"
+
 def create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command=None):
     """Create a transformer element in OpenDSS"""
   
@@ -563,7 +607,8 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             # Get transformer parameters from frontend data - no defaults
             sn_mva_raw = element_data.get('sn_mva')
             vk_percent_raw = element_data.get('vk_percent')
-            vkr_percent_raw = element_data.get('vkr_percent')           
+            vkr_percent_raw = element_data.get('vkr_percent')
+            vector_group = element_data.get('vector_group', 'Dyn')  # Default to Dyn if not specified
            
             
             # Convert to float
@@ -574,11 +619,38 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             # Convert MVA to kVA
             sn_kva = sn_mva * 1000
             
-                        # Create complete OpenDSS transformer command with all parameters
-            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_from_name} {bus_to_name}) Conns=(wye wye) kVs=({bus_from_voltage} {bus_to_voltage}) kVAs=({sn_kva} {sn_kva}) XHL={vk_percent} %Rs={vkr_percent}"
+            # Convert vector group to OpenDSS connection format
+            conns = vector_group_to_opendss_conns(vector_group)
+            
+            # Get tap parameters from frontend
+            tap_pos_raw = element_data.get('tap_pos', '0')
+            tap_step_percent_raw = element_data.get('tap_step_percent', '1.5')
+            tap_side = element_data.get('tap_side', 'hv')
+            
+            # Convert to numbers
+            tap_pos = float(tap_pos_raw)
+            tap_step_percent = float(tap_step_percent_raw)
+            
+            # Calculate tap values for each winding
+            # Tap is a multiplier: 1.0 = neutral position
+            # tap_pos * tap_step_percent gives the percentage change
+            tap_change = tap_pos * tap_step_percent / 100.0
+            
+            if tap_side.lower() == 'hv':
+                # Tap on HV side (winding 1)
+                tap_hv = 1.0 + tap_change
+                tap_lv = 1.0
+            else:
+                # Tap on LV side (winding 2)
+                tap_hv = 1.0
+                tap_lv = 1.0 + tap_change
+            
+            # Create complete OpenDSS transformer command with calculated taps
+            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_from_name} {bus_to_name}) Conns=({conns}) kVs=({bus_from_voltage} {bus_to_voltage}) kVAs=({sn_kva} {sn_kva}) XHL={vk_percent} %Rs={vkr_percent} Taps=[{tap_hv} {tap_lv}]"
             
             execute_dss_command(transformer_cmd)
             print(f"Command: {transformer_cmd}")
+            print(f"  Tap settings: Position={tap_pos}, Step={tap_step_percent}%, Side={tap_side}, Taps=[{tap_hv} {tap_lv}]")
             
             TransformersDict[element_name] = element_name
             TransformersDictId[element_name] = element_id
@@ -1006,11 +1078,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         BusbarsDict[bus_id] = nBusbar
         nBusbar += 1
     
+    print(f"  Expected user buses from input: {list(BusbarsDict.keys())}")
+    
     # Track which buses have been processed to avoid duplicates
     processed_buses = set()
     
     try:
         all_bus_names = dss.circuit.buses_names
+        print(f"  All buses in OpenDSS circuit: {all_bus_names}")
         
         # Process all buses from OpenDSS circuit
         for bus_name_from_list in all_bus_names:
@@ -1020,8 +1095,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             # Get the actual bus name (might be different from list name)
             actual_bus_name = dss.bus.name
             
-            # Skip sourcebus - it's OpenDSS's internal voltage source, not one of our user buses
-            if actual_bus_name.lower() == 'sourcebus' or bus_name_from_list.lower() == 'sourcebus':
+            # Debug: Print bus names to identify source buses
+            print(f"  Processing bus from list: '{bus_name_from_list}', actual name: '{actual_bus_name}'")
+            
+            # Skip sourcebus and source - OpenDSS's internal voltage source buses created by "New Circuit"
+            # These are NOT the user's buses where External Grid VSources connect
+            if (actual_bus_name.lower() in ['sourcebus', 'source'] or 
+                bus_name_from_list.lower() in ['sourcebus', 'source']):
+                print(f"    ⚠️  Skipping OpenDSS system source bus: {actual_bus_name}")
                 continue
             
             # OpenDSS converts names to lowercase, so try to match against our expected buses (case-insensitive)
@@ -1035,9 +1116,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     matched_bus_id = key
                     matched_bus_name = BusbarsDictConnectionToName[key]
                     bus_number = value
+                    print(f"    ✓ Matched to user bus: {matched_bus_name}")
                     break
             
             if not matched_bus_id:
+                print(f"    ⚠️  No match found - this is not a user bus, skipping '{actual_bus_name}'")
                 continue
             
             # Skip if we've already processed this bus number
@@ -1051,10 +1134,15 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # This matches the notebook approach exactly
                 voltages = dss.bus.voltages  # in Volts: [Va_real, Va_imag, Vb_real, Vb_imag, Vc_real, Vc_imag]
                 
+                # Debug: Print raw voltages
+                print(f"    Raw voltages from OpenDSS (Volts): {voltages[:6] if len(voltages) >= 6 else voltages}")
+                
                 # Convert to kV and create complex numbers
                 Va = complex(voltages[0]/1000, voltages[1]/1000)
                 Vb = complex(voltages[2]/1000, voltages[3]/1000)
                 Vc = complex(voltages[4]/1000, voltages[5]/1000)
+                
+                print(f"    Phase voltages (kV L-N): Va={abs(Va):.3f}, Vb={abs(Vb):.3f}, Vc={abs(Vc):.3f}")
                 
                 # Symmetrical component operator: a = e^(j*2π/3)
                 a = complex(-0.5, math.sqrt(3)/2)
@@ -1067,14 +1155,31 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Convert to line-to-line voltage
                 V1_mag_ll_kv = V1_mag_ln_kv * math.sqrt(3)
                 
-                # Get OpenDSS's base voltage for this bus (kV, line-to-line)
-                base_kv = dss.bus.kv_base * math.sqrt(3)  # Convert L-N to L-L
+                print(f"    Positive sequence: V1_L-N={V1_mag_ln_kv:.3f} kV, V1_L-L={V1_mag_ll_kv:.3f} kV")
                 
-                # Calculate per-unit based on OpenDSS base
+                # Use the user-specified base voltage from input data (not OpenDSS's internal base)
+                # This is the vn_kv from the bus definition
+                base_kv_user = BusbarsDictVoltage.get(matched_bus_id)
+                
+                if base_kv_user is not None:
+                    # User specified voltage in L-L format
+                    base_kv = float(base_kv_user)
+                    print(f"    Base voltage (user-specified): {base_kv:.3f} kV L-L")
+                else:
+                    # Fallback to OpenDSS's base voltage
+                    base_kv_ln = dss.bus.kv_base
+                    base_kv = base_kv_ln * math.sqrt(3)  # Convert L-N to L-L
+                    print(f"    Base voltage (OpenDSS default): {base_kv_ln:.3f} kV L-N, {base_kv:.3f} kV L-L")
+                
+                # Calculate per-unit based on user-specified base voltage
                 vm_pu = V1_mag_ll_kv / base_kv if base_kv > 0 else 1.0
+                
+                print(f"    Calculated vm_pu = {V1_mag_ll_kv:.3f} / {base_kv:.3f} = {vm_pu:.6f}")
                 
                 # Get angle from vmag_angle_pu
                 va_degree = dss.bus.vmag_angle_pu[1] if len(dss.bus.vmag_angle_pu) > 1 else 0.0
+                
+                print(f"    Final result: vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f}")
                 
                 # Create busbar result - convert ID back to hash format for frontend
                 frontend_bus_id = matched_bus_id.replace('_', '#')
@@ -1086,6 +1191,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     va_degree=va_degree
                 )
                 busbarList.append(busbar)
+                print(f"    ✓ Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")
                 
             except Exception as e:
                 print(f"Error calculating voltage for bus {matched_bus_name}: {e}")
@@ -1155,10 +1261,22 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             else:
                                 i_from_ka = i_to_ka = 0.0
 
-                            # Calculate loading percentage (simplified)
+                            # Calculate loading percentage using max_i_ka from input data
                             loading_percent = 0.0
-                            if i_from_ka > 0:
-                                loading_percent = (i_from_ka / 1.0) * 100  # Assuming 1.0 kA is 100% loading
+                            # Find the line in input data to get max_i_ka
+                            max_i_ka = None
+                            for data_key, data_value in in_data.items():
+                                if data_value.get('name') == key and 'Line' in data_value.get('typ', ''):
+                                    max_i_ka_raw = data_value.get('max_i_ka')
+                                    if max_i_ka_raw is not None:
+                                        max_i_ka = float(max_i_ka_raw)
+                                    break
+                            
+                            if max_i_ka and max_i_ka > 0:
+                                loading_percent = (i_from_ka / max_i_ka) * 100
+                            else:
+                                # Fallback if max_i_ka not available
+                                loading_percent = 0.0
 
                             # Convert IDs back to hash format for frontend
                             frontend_name = key.replace('_', '#')
@@ -1186,85 +1304,90 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     
     print(f"  Total lines processed: {len(linesList)}")
     
-    # Process load results
+    # Process load and generator results (static generators are created as Load elements with negative power)
     if dss.loads.count > 0:
         dss.loads.first()
         for _ in range(dss.loads.count):
             try:
                 load_name = dss.loads.name
-                for key, value in LoadsDict.items():
-                    # OpenDSS lowercases names, so compare case-insensitively
-                    if value.lower() == load_name.lower() or key.lower() == load_name.lower():
-                        try:
-                            powers = dss.cktelement.powers
-                            if len(powers) >= 6:
-                                p_raw = powers[0] + powers[2] + powers[4]
-                                q_raw = powers[1] + powers[3] + powers[5]
-                                p_mw = p_raw / 1000.0 if not math.isnan(p_raw) else 0.0
-                                q_mvar = q_raw / 1000.0 if not math.isnan(q_raw) else 0.0
-                            else:
-                                p_mw = q_mvar = 0.0
+                
+                # Process as regular load (static generators are now PVSystem elements)
+                if True:
+                    for key, value in LoadsDict.items():
+                        if value.lower() == load_name.lower() or key.lower() == load_name.lower():
+                            try:
+                                powers = dss.cktelement.powers
+                                if len(powers) >= 6:
+                                    p_raw = powers[0] + powers[2] + powers[4]
+                                    q_raw = powers[1] + powers[3] + powers[5]
+                                    p_mw = p_raw / 1000.0 if not math.isnan(p_raw) else 0.0
+                                    q_mvar = q_raw / 1000.0 if not math.isnan(q_raw) else 0.0
+                                else:
+                                    p_mw = q_mvar = 0.0
 
-                            # Convert IDs back to hash format for frontend
-                            frontend_name = key.replace('_', '#')
-                            frontend_id = LoadsDictId[key].replace('_', '#')
-                            
-                            load = LoadOut(name=frontend_name, id=frontend_id, p_mw=p_mw, q_mvar=q_mvar)
-                            loadsList.append(load)
+                                # Convert IDs back to hash format
+                                frontend_name = key.replace('_', '#')
+                                frontend_id = LoadsDictId[key].replace('_', '#')
+                                
+                                load = LoadOut(name=frontend_name, id=frontend_id, p_mw=p_mw, q_mvar=q_mvar)
+                                loadsList.append(load)
+                                break
+                            except Exception as e:
+                                print(f"    Error processing load {load_name}: {e}")
                             break
-                        except Exception as e:
-                            print(f"    Error processing load {load_name}: {e}")
-                            continue
+                            
             except Exception as e:
-                print(f"  Error processing load: {e}")
+                print(f"  Error processing load/generator: {e}")
             dss.loads.next()
     
-    # Process generator results
-    if dss.generators.count > 0:
-        dss.generators.first()
-        for _ in range(dss.generators.count):
+    # Process static generators (created as PVSystem elements)
+    if dss.pvsystems.count > 0:
+        dss.pvsystems.first()
+        for _ in range(dss.pvsystems.count):
             try:
-                gen_name = dss.generators.name
+                pv_name = dss.pvsystems.name
+                
+                # Check if this PVSystem is one of our static generators
                 for key, value in GeneratorsDict.items():
-                    # OpenDSS lowercases names, so compare case-insensitively
-                    if value.lower() == gen_name.lower() or key.lower() == gen_name.lower():
+                    if value.lower() == pv_name.lower() or key.lower() == pv_name.lower():
                         try:
+                            # Set this PVSystem as the active circuit element
+                            dss.circuit.set_active_element(f"PVSystem.{pv_name}")
+                            
+                            # Get PV powers
                             powers = dss.cktelement.powers
                             if len(powers) >= 6:
+                                # Sum all three phases (powers come in pairs: P1,Q1,P2,Q2,P3,Q3)
                                 p_raw = powers[0] + powers[2] + powers[4]
                                 q_raw = powers[1] + powers[3] + powers[5]
-                                p_mw = p_raw / 1000.0 if not math.isnan(p_raw) else 0.0
-                                q_mvar = q_raw / 1000.0 if not math.isnan(q_raw) else 0.0
+                                # PVSystem reports power flowing OUT as NEGATIVE (like Generator)
+                                # Negate to show positive generation in results
+                                p_mw = -(p_raw / 1000.0) if not math.isnan(p_raw) else 0.0
+                                q_mvar = -(q_raw / 1000.0) if not math.isnan(q_raw) else 0.0
                             else:
                                 p_mw = q_mvar = 0.0
 
-                            # Get voltage values from the generator's bus
+                            # Get voltage from bus
                             vm_pu = 1.0
                             va_degree = 0.0
                             try:
-                                # Get the generator's bus name and find the corresponding bus index
-                                gen_bus_name = dss.generators.bus1
-                                # Find the bus index by name
+                                pv_bus_name = dss.pvsystems.bus1.split('.')[0]
                                 bus_index = None
                                 for i in range(dss.circuit.num_buses):
                                     dss.circuit.set_active_bus(i)
-                                    if dss.bus.name == gen_bus_name:
+                                    if dss.bus.name.lower() == pv_bus_name.lower():
                                         bus_index = i
                                         break
-                                
                                 if bus_index is not None:
                                     dss.circuit.set_active_bus(bus_index)
                                     bus_angles = dss.bus.vmag_angle_pu
                                     if len(bus_angles) >= 2:
                                         vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                                         va_degree = bus_angles[1] if not math.isnan(bus_angles[1]) else 0.0
-                                        print(f"    Generator {gen_name} bus voltage: vm_pu={vm_pu}, va_degree={va_degree}")
-                                else:
-                                    print(f"    Could not find bus index for generator {gen_name} bus {gen_bus_name}")
                             except Exception as e:
-                                print(f"    Error getting voltage values for generator {gen_name}: {e}")
+                                print(f"    Error getting voltage for PVSystem {pv_name}: {e}")
 
-                            # Convert IDs back to hash format for frontend
+                            # Convert IDs back to hash format
                             frontend_name = key.replace('_', '#')
                             frontend_id = GeneratorsDictId[key].replace('_', '#')
                             
@@ -1277,13 +1400,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 vm_pu=vm_pu
                             )
                             generatorsList.append(generator)
-                            break
+                            print(f"    ✓ Added PVSystem (static generator): {frontend_name}, P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr, V={vm_pu:.3f} pu")
                         except Exception as e:
-                            print(f"    Error processing generator {gen_name}: {e}")
-                            continue
+                            print(f"    Error processing PVSystem {pv_name}: {e}")
+                        break
             except Exception as e:
-                print(f"  Error processing generator: {e}")
-            dss.generators.next()
+                print(f"  Error processing PVSystem: {e}")
+            dss.pvsystems.next()
     
     # Process transformer results (matching notebook approach)
     if dss.transformers.count > 0:
@@ -1296,6 +1419,36 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     # OpenDSS lowercases names, so compare case-insensitively
                     if value.lower() == trafo_name.lower() or key.lower() == trafo_name.lower():
                         try:
+                            # Get powers (in kW and kvar) for transformer
+                            powers = dss.cktelement.powers
+                            
+                            # Initialize power values
+                            p_hv_mw = q_hv_mvar = p_lv_mw = q_lv_mvar = pl_mw = ql_mvar = 0.0
+                            
+                            if len(powers) >= 12:
+                                # HV side (Terminal 1): phases 1, 2, 3
+                                p_hv_kw = powers[0] + powers[2] + powers[4]
+                                q_hv_kvar = powers[1] + powers[3] + powers[5]
+                                # LV side (Terminal 2): phases 1, 2, 3
+                                p_lv_kw = powers[6] + powers[8] + powers[10]
+                                q_lv_kvar = powers[7] + powers[9] + powers[11]
+                                
+                                # Convert to MW/MVAr
+                                p_hv_mw = p_hv_kw / 1000.0 if not math.isnan(p_hv_kw) else 0.0
+                                q_hv_mvar = q_hv_kvar / 1000.0 if not math.isnan(q_hv_kvar) else 0.0
+                                p_lv_mw = p_lv_kw / 1000.0 if not math.isnan(p_lv_kw) else 0.0
+                                q_lv_mvar = q_lv_kvar / 1000.0 if not math.isnan(q_lv_kvar) else 0.0
+                                
+                                # Debug: Print raw power values for main transformer
+                                if 'mxCell_160' in key or 'mxCell#160' in key:
+                                    print(f"    DEBUG Transformer {key}: Raw powers array: {powers[:12]}")
+                                    print(f"    P_HV={p_hv_mw:.3f} MW, Q_HV={q_hv_mvar:.3f} MVAr")
+                                    print(f"    P_LV={p_lv_mw:.3f} MW, Q_LV={q_lv_mvar:.3f} MVAr")
+                                
+                                # Calculate losses
+                                pl_mw = p_hv_mw + p_lv_mw
+                                ql_mvar = q_hv_mvar + q_lv_mvar
+                            
                             # Get complex currents [I1_real, I1_imag, I2_real, I2_imag, I3_real, I3_imag, ...] in Amperes
                             currents = dss.cktelement.currents
                             
@@ -1314,10 +1467,21 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             else:
                                 i_hv_ka = i_lv_ka = 0.0
 
-                            # Calculate loading percentage (simplified)
-                            loading_percent = 0.0
-                            if i_hv_ka > 0:
-                                loading_percent = (i_hv_ka / 1.0) * 100  # Assuming 1.0 kA is 100% loading
+                            # Calculate loading percentage based on rated current
+                            # Get transformer rating from OpenDSS properties
+                            try:
+                                # dss.transformers.kva returns total kVA rating
+                                sn_kva = dss.transformers.kva
+                                sn_mva = sn_kva / 1000.0
+                                # Get HV voltage from first winding
+                                dss.transformers.wdg = 1
+                                vn_hv_kv = dss.transformers.kv
+                                # I_rated = S / (sqrt(3) * V)
+                                i_rated_hv_ka = sn_mva / (math.sqrt(3) * vn_hv_kv)
+                                loading_percent = (i_hv_ka / i_rated_hv_ka * 100.0) if i_rated_hv_ka > 0 else 0.0
+                            except Exception as e:
+                                print(f"    Could not calculate loading for {trafo_name}: {e}")
+                                loading_percent = 0.0
 
                             # Convert IDs back to hash format for frontend
                             frontend_name = key.replace('_', '#')
@@ -1328,7 +1492,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 id=frontend_id, 
                                 i_hv_ka=i_hv_ka, 
                                 i_lv_ka=i_lv_ka, 
-                                loading_percent=loading_percent
+                                loading_percent=loading_percent,
+                                p_hv_mw=p_hv_mw,
+                                q_hv_mvar=q_hv_mvar,
+                                p_lv_mw=p_lv_mw,
+                                q_lv_mvar=q_lv_mvar,
+                                pl_mw=pl_mw,
+                                ql_mvar=ql_mvar
                             )
                             transformersList.append(transformer)
                             break
