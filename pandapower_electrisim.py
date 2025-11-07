@@ -469,8 +469,12 @@ def create_other_elements(in_data,net,x, Busbars):
                 net.user_friendly_names = {}
             net.user_friendly_names[sgen_name] = user_friendly_name
         
-        if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):      
-            pp.create_asymmetric_sgen(net, bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
+        if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Static Generator '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
         #Zero sequence parameters** (Added through std_type For Three phase load flow) :
             #vk0_percent** - zero sequence relative short-circuit voltage
             #vkr0_percent** - real part of zero sequence relative short-circuit voltage
@@ -491,10 +495,23 @@ def create_other_elements(in_data,net,x, Busbars):
             # Parse vector group to separate base group from phase shift
             vector_group, phase_shift_from_group = parse_vector_group(vector_group_raw)
             
+            # Get bus indices with error checking
+            hv_bus_name = in_data[x]['hv_bus']
+            lv_bus_name = in_data[x]['lv_bus']
+            hv_bus_idx = Busbars.get(hv_bus_name)
+            lv_bus_idx = Busbars.get(lv_bus_name)
+            
+            if hv_bus_idx is None:
+                print(f"ERROR: HV Bus '{hv_bus_name}' not found for Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if lv_bus_idx is None:
+                print(f"ERROR: LV Bus '{lv_bus_name}' not found for Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            
             # Prepare parameters dict for transformer creation with proper type conversion
             transformer_params = {
-                'hv_bus': eval(in_data[x]['hv_bus']),
-                'lv_bus': eval(in_data[x]['lv_bus']),
+                'hv_bus': hv_bus_idx,
+                'lv_bus': lv_bus_idx,
                 'name': in_data[x]['name'],
                 'id': in_data[x]['id'],
                 'sn_mva': safe_float(in_data[x]['sn_mva']),
@@ -561,11 +578,29 @@ def create_other_elements(in_data,net,x, Busbars):
             vector_group_raw = in_data[x].get('vector_group', None)
             vector_group, phase_shift_from_group = parse_vector_group(vector_group_raw)
             
+            # Get bus indices with error checking
+            hv_bus_name = in_data[x]['hv_bus']
+            mv_bus_name = in_data[x]['mv_bus']
+            lv_bus_name = in_data[x]['lv_bus']
+            hv_bus_idx = Busbars.get(hv_bus_name)
+            mv_bus_idx = Busbars.get(mv_bus_name)
+            lv_bus_idx = Busbars.get(lv_bus_name)
+            
+            if hv_bus_idx is None:
+                print(f"ERROR: HV Bus '{hv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if mv_bus_idx is None:
+                print(f"ERROR: MV Bus '{mv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if lv_bus_idx is None:
+                print(f"ERROR: LV Bus '{lv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            
             # Prepare optional parameters - only include if they are not None
             transformer_params = {
-                'hv_bus': eval(in_data[x]['hv_bus']),
-                'mv_bus': eval(in_data[x]['mv_bus']),
-                'lv_bus': eval(in_data[x]['lv_bus']),
+                'hv_bus': hv_bus_idx,
+                'mv_bus': mv_bus_idx,
+                'lv_bus': lv_bus_idx,
                 'name': in_data[x]['name'],
                 'id': in_data[x]['id'],
                 'sn_hv_mva': safe_float(in_data[x]['sn_hv_mva']),
@@ -612,11 +647,19 @@ def create_other_elements(in_data,net,x, Busbars):
                 net.user_friendly_names = {}
             net.user_friendly_names[trafo3w_name] = user_friendly_name
         
-        if (in_data[x]['typ'].startswith("Shunt Reactor")):  
-            pp.create_shunt(net, typ = "shuntreactor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
+        if (in_data[x]['typ'].startswith("Shunt Reactor")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Shunt Reactor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_shunt(net, typ = "shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
         
-        if (in_data[x]['typ'].startswith("Capacitor")):  
-            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus = eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
+        if (in_data[x]['typ'].startswith("Capacitor")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Capacitor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
         
         if (in_data[x]['typ'].startswith("Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -633,39 +676,91 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[load_name] = user_friendly_name
       
         if (in_data[x]['typ'].startswith("Asymmetric Load")):
-            pp.create_asymmetric_load(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'],p_b_mw=in_data[x]['p_b_mw'],p_c_mw=in_data[x]['p_c_mw'],q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],type=in_data[x]['type'])         
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Load '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_asymmetric_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'],p_b_mw=in_data[x]['p_b_mw'],p_c_mw=in_data[x]['p_c_mw'],q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],type=in_data[x]['type'])         
    
         if (in_data[x]['typ'].startswith("Impedance")):
-            pp.create_impedance(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']),  name=in_data[x]['name'], id=in_data[x]['id'], rft_pu=in_data[x]['rft_pu'],xft_pu=in_data[x]['xft_pu'],sn_mva=in_data[x]['sn_mva'])         
+            from_bus_idx = Busbars.get(in_data[x]['busFrom'])
+            to_bus_idx = Busbars.get(in_data[x]['busTo'])
+            if from_bus_idx is None:
+                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for Impedance '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if to_bus_idx is None:
+                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for Impedance '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_impedance(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], rft_pu=in_data[x]['rft_pu'],xft_pu=in_data[x]['xft_pu'],sn_mva=in_data[x]['sn_mva'])         
          
         if (in_data[x]['typ'].startswith("Ward")):
-            pp.create_ward(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'],qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'])         
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_ward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'],qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'])         
    
         if (in_data[x]['typ'].startswith("Extended Ward")):
-            pp.create_xward(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'], qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], r_ohm =in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'],vm_pu=in_data[x]['vm_pu'])         
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Extended Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_xward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'], qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], r_ohm =in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'],vm_pu=in_data[x]['vm_pu'])         
    
         if (in_data[x]['typ'].startswith("Motor")):
-            pp.create_motor(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], pn_mech_mw=in_data[x]['pn_mech_mw'],
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Motor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], pn_mech_mw=in_data[x]['pn_mech_mw'],
                             cos_phi=in_data[x]['cos_phi'],efficiency_n_percent=in_data[x]['efficiency_n_percent'],
                             lrc_pu=in_data[x]['lrc_pu'], rx=in_data[x]['rx'], vn_kv=in_data[x]['vn_kv'],
                             efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'])         
    
         
-        if (in_data[x]['typ'].startswith("SVC")):            
-            pp.create_svc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+        if (in_data[x]['typ'].startswith("SVC")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SVC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_svc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
          
         if (in_data[x]['typ'].startswith("TCSC")):
-            pp.create_tcsc(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+            from_bus_idx = Busbars.get(in_data[x]['busFrom'])
+            to_bus_idx = Busbars.get(in_data[x]['busTo'])
+            if from_bus_idx is None:
+                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for TCSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if to_bus_idx is None:
+                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for TCSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_tcsc(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
                    
         if (in_data[x]['typ'].startswith("SSC")):
-            pp.create_ssc(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
         
 
         if (in_data[x]['typ'].startswith("Storage")):
-            pp.create_storage(net, bus=eval(in_data[x]['bus']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'])         
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Storage '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'])         
    
         if (in_data[x]['typ'].startswith("DC Line")):
-            pp.create_dcline(net, from_bus=eval(in_data[x]['busFrom']), to_bus=eval(in_data[x]['busTo']), name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'])
+            from_bus_idx = Busbars.get(in_data[x]['busFrom'])
+            to_bus_idx = Busbars.get(in_data[x]['busTo'])
+            if from_bus_idx is None:
+                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for DC Line '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            if to_bus_idx is None:
+                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for DC Line '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
+                continue
+            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'])
 
 
 
