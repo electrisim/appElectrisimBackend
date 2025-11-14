@@ -6,6 +6,8 @@ from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
 import pandapower as pp
 import pandas as pd
+import gzip
+import io
 
 import numpy as np
 
@@ -112,10 +114,21 @@ def simulation():
             Busbars = pandapower_electrisim.create_busbars(in_data, net)
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
 
-            response = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars)  
+            response_data = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars)  
 
-   
-            return response
+            # Check if client accepts gzip compression
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:  # Only compress if > 1KB
+                # Compress response
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                print(f"Pandapower load flow response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
+                return response
+            else:
+                return response_data
 
         
         
@@ -128,8 +141,21 @@ def simulation():
             net = pp.create_empty_network()
             Busbars = pandapower_electrisim.create_busbars(in_data, net)
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
-            response = pandapower_electrisim.shortcircuit(net, in_data[x])
-            return response
+            response_data = pandapower_electrisim.shortcircuit(net, in_data[x])
+            
+            # Check if client accepts gzip compression
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:  # Only compress if > 1KB
+                # Compress response
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                print(f"Short circuit response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
+                return response
+            else:
+                return response_data
            
         if "PowerFlowOpenDss" in in_data[x]['typ']:
             # Extract user email for logging
@@ -149,7 +175,7 @@ def simulation():
             
             print(f"OpenDSS Parameters: frequency={frequency}, mode={mode}, algorithm={algorithm}, loadmodel={loadmodel}, max_iterations={max_iterations}, tolerance={tolerance}, controlmode={controlmode}, export_commands={export_commands}")
             
-            response = opendss_electrisim.powerflow(
+            response_data = opendss_electrisim.powerflow(
                 in_data, 
                 frequency, 
                 mode,
@@ -159,8 +185,21 @@ def simulation():
                 tolerance, 
                 controlmode,
                 export_commands
-            )           
-            return response
+            )
+            
+            # Check if client accepts gzip compression
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:  # Only compress if > 1KB
+                # Compress response
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                print(f"OpenDSS response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
+                return response
+            else:
+                return response_data
         
         if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
             # Extract user email for logging
@@ -187,8 +226,21 @@ def simulation():
             pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
             
             # Run contingency analysis
-            response = pandapower_electrisim.contingency_analysis(net, contingency_params)
-            return response
+            response_data = pandapower_electrisim.contingency_analysis(net, contingency_params)
+            
+            # Check if client accepts gzip compression
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:  # Only compress if > 1KB
+                # Compress response
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                print(f"Contingency analysis response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
+                return response
+            else:
+                return response_data
             
         if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
             # Extract user email for logging

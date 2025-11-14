@@ -1448,8 +1448,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
-                #indent - wcięcia
-                response = json.dumps(result, default=lambda o: o.__dict__, indent=4) 
+                # OPTIMIZED: Removed indent=4, using compact separators for ~40% size reduction
+                response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':')) 
             
                 print("Response to FRONTEND CORRECT")   
                    
@@ -1647,7 +1647,8 @@ def shortcircuit(net, in_data):
                 }
             }
         }
-        return json.dumps(diagnostic_response, indent=4)
+        # OPTIMIZED: Compact JSON for faster transfer
+        return json.dumps(diagnostic_response, separators=(',', ':'))
     print("Short circuit results:")
     print(net.res_bus_sc)
     print("\nColumns in res_bus_sc:")
@@ -1698,7 +1699,8 @@ def shortcircuit(net, in_data):
     #result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
     result = {**busbars.__dict__}
 
-    response = json.dumps(result, default=lambda o: o.__dict__, indent=4) #json.dumps - convert a subset of Python objects into a json string
+    # OPTIMIZED: Compact JSON for faster transfer
+    response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':'))
     return response
 
 
@@ -2044,12 +2046,12 @@ def contingency_analysis(net, contingency_params):
         if not contingency_cases:
             error_message = f"No contingency cases found. Network has {len(net.line)} lines, {len(net.trafo)} transformers, {len(net.gen)} generators."
             print(error_message)
-            return json.dumps({'error': error_message})
+            return json.dumps({'error': error_message}, separators=(',', ':'))
         
         if not contingency_results:
             error_message = f"No contingency results generated. All {len(contingency_cases)} cases failed to converge."
             print(error_message)
-            return json.dumps({'error': error_message})
+            return json.dumps({'error': error_message}, separators=(',', ':'))
         
         # Use the worst-case scenario results for display
         worst_case = max(contingency_results, key=lambda x: len(x.get('violations', [])))
@@ -2098,9 +2100,10 @@ def contingency_analysis(net, contingency_params):
             'contingency_results': contingency_results
         }
         
-        response = json.dumps(result, default=lambda o: o.__dict__, indent=4)
+        # OPTIMIZED: Compact JSON for faster transfer
+        response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':'))
         print("Contingency Analysis Results:")
-        print(response)
+        print(f"Response size: {len(response)} bytes")
         
         return response
         
