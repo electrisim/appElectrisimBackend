@@ -168,7 +168,39 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
         if "Bus" in in_data[x]['typ']:
             # Frontend now sends bus names in the correct format (mxCell_126)
             bus_name = in_data[x]['name']  # This is already mxCell_126
-            bus_voltage = in_data[x].get('vn_kv', None)
+            bus_id = in_data[x].get('id', bus_name)  # Get ID for error messages
+            bus_voltage_raw = in_data[x].get('vn_kv', None)
+            
+            # Validate bus voltage
+            if bus_voltage_raw is None:
+                error_msg = (
+                    f"Bus '{bus_name}' (ID: {bus_id}) is missing the 'vn_kv' (nominal voltage) attribute.\n\n"
+                    f"Please set the nominal voltage in kV for this bus element.\n"
+                    f"Common values: 110, 30, 20, 10, etc."
+                )
+                raise ValueError(error_msg)
+            
+            # Convert to float and validate it's a positive number
+            try:
+                bus_voltage = float(bus_voltage_raw)
+            except (ValueError, TypeError):
+                error_msg = (
+                    f"Bus '{bus_name}' (ID: {bus_id}) has an invalid 'vn_kv' value: '{bus_voltage_raw}'.\n\n"
+                    f"The voltage must be a positive number in kV.\n"
+                    f"Common values: 110, 30, 20, 10, etc."
+                )
+                raise ValueError(error_msg)
+            
+            # Check if voltage is zero or negative
+            if bus_voltage <= 0:
+                error_msg = (
+                    f"Bus '{bus_name}' (ID: {bus_id}) has an invalid voltage: {bus_voltage} kV.\n\n"
+                    f"The nominal voltage must be a positive number greater than 0.\n"
+                    f"Common values: 110, 30, 20, 10, etc.\n\n"
+                    f"Please correct the 'vn_kv' attribute for this bus element."
+                )
+                raise ValueError(error_msg)
+            
             bus_elements[bus_name] = bus_name  # mxCell_126 -> mxCell_126
             BusbarsDictVoltage[bus_name] = bus_voltage
     
@@ -290,7 +322,12 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
                 ExternalGridsDict[element_name] = element_name
                 ExternalGridsDictId[element_name] = element_id
                 
+        except ValueError as ve:
+            # Re-raise validation errors so they propagate to frontend
+            print(f"Error processing element {x} ({element_type}): {ve}")
+            raise
         except Exception as e:
+            # For other errors, log and continue processing other elements
             print(f"Error processing element {x} ({element_type}): {e}")
             continue
     
@@ -332,7 +369,30 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
         length_km = element_data.get('length_km')
         r0_ohm_per_km = element_data.get('r0_ohm_per_km')
         x0_ohm_per_km = element_data.get('x0_ohm_per_km')
-        c0_nf_per_km = element_data.get('c0_nf_per_km') 
+        c0_nf_per_km = element_data.get('c0_nf_per_km')
+        
+        # Validate r0_ohm_per_km and x0_ohm_per_km for OpenDSS calculations
+        # These parameters must be greater than 0
+        if r0_ohm_per_km is not None:
+            try:
+                r0_value = float(r0_ohm_per_km)
+                if r0_value <= 0:
+                    raise ValueError(f"Line '{element_name}': Parameter r0_ohm_per_km must be greater than 0 (current value: {r0_value}). Please update the line parameters.")
+            except (TypeError, ValueError) as e:
+                if "must be greater than 0" in str(e):
+                    raise  # Re-raise validation error
+                raise ValueError(f"Line '{element_name}': Invalid value for r0_ohm_per_km: {r0_ohm_per_km}")
+        
+        if x0_ohm_per_km is not None:
+            try:
+                x0_value = float(x0_ohm_per_km)
+                if x0_value <= 0:
+                    raise ValueError(f"Line '{element_name}': Parameter x0_ohm_per_km must be greater than 0 (current value: {x0_value}). Please update the line parameters.")
+            except (TypeError, ValueError) as e:
+                if "must be greater than 0" in str(e):
+                    raise  # Re-raise validation error
+                raise ValueError(f"Line '{element_name}': Invalid value for x0_ohm_per_km: {x0_ohm_per_km}")
+        
         try:
             # Create line using OpenDSS command with parameters from frontend
             line_cmd = f'New Line.{element_name} phases=3 Bus1={bus_from_name} Bus2={bus_to_name} R1={r_ohm_per_km} X1={x_ohm_per_km} Length={length_km} units=km'
@@ -422,6 +482,15 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
+        
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to static generator '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
         
         if bus_voltage is not None:
             # Handle both regular and asymmetric static generators
@@ -603,12 +672,36 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             # Get voltage ratings from the connected buses
             bus_from_voltage = BusbarsDictVoltage.get(bus_from_name)
             bus_to_voltage = BusbarsDictVoltage.get(bus_to_name)
-      
+            
             # Get transformer parameters from frontend data - no defaults
             sn_mva_raw = element_data.get('sn_mva')
             vk_percent_raw = element_data.get('vk_percent')
             vkr_percent_raw = element_data.get('vkr_percent')
+            vn_hv_kv_raw = element_data.get('vn_hv_kv')
+            vn_lv_kv_raw = element_data.get('vn_lv_kv')
             vector_group = element_data.get('vector_group', 'Dyn')  # Default to Dyn if not specified
+            
+            # Validate that both bus voltages are available
+            # No defaults or fallbacks - user must provide proper voltage information
+            if bus_from_voltage is None:
+                error_msg = (
+                    f"Missing voltage information for bus '{bus_from_name}' connected to transformer '{element_name}'.\n\n"
+                    f"Please ensure:\n"
+                    f"1. The bus element has a 'vn_kv' (nominal voltage) attribute set, OR\n"
+                    f"2. The transformer has 'vn_hv_kv' parameter set\n\n"
+                    f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+                )
+                raise ValueError(error_msg)
+            
+            if bus_to_voltage is None:
+                error_msg = (
+                    f"Missing voltage information for bus '{bus_to_name}' connected to transformer '{element_name}'.\n\n"
+                    f"Please ensure:\n"
+                    f"1. The bus element has a 'vn_kv' (nominal voltage) attribute set, OR\n"
+                    f"2. The transformer has 'vn_lv_kv' parameter set\n\n"
+                    f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+                )
+                raise ValueError(error_msg)
            
             
             # Convert to float
@@ -681,7 +774,14 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         # Get voltage from the bus data
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
-    
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to shunt reactor '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
         
         # Get shunt reactor parameters with proper null handling
         q_mvar_raw = element_data.get('q_mvar')
@@ -756,6 +856,15 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to capacitor '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
+        
         if bus_voltage is not None:
             # Get capacitor parameters with proper null handling
             q_mvar_raw = element_data.get('q_mvar')
@@ -800,6 +909,15 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to storage '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
+        
         if bus_voltage is not None:
             # Get storage parameters
             p_mw_raw = element_data.get('p_mw')
@@ -840,6 +958,15 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)
+
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to PV system '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
 
         if bus_voltage is not None:
             # Get PVSystem parameters with proper null handling
@@ -925,6 +1052,15 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
         bus_voltage = BusbarsDictVoltage.get(bus_name)        
+     
+        # Validate voltage is available
+        if bus_voltage is None:
+            error_msg = (
+                f"Missing voltage information for bus '{bus_name}' connected to external grid '{element_name}'.\n\n"
+                f"Please set the 'vn_kv' (nominal voltage) attribute for the bus element.\n\n"
+                f"Available buses with voltage: {list(BusbarsDictVoltage.keys())}"
+            )
+            raise ValueError(error_msg)
      
         # Get external grid parameters
         vm_pu_raw = element_data.get('vm_pu')
@@ -1021,15 +1157,28 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     execute_dss_command(f'set Tolerance={tolerance}')
   
     
-    # Create busbars using the new helper function
-    BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, export_commands, opendss_commands)
+    # Create busbars and other elements using helper functions
+    # Wrap in try-except to catch validation errors and return them to frontend
+    try:
+        # Create busbars - this validates voltage values
+        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, export_commands, opendss_commands)
 
-
-    # Create other elements using the new helper function
-    # Pass the execute_dss_command function to properly collect commands
-    (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
-     ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-     StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
+        # Create other elements
+        (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
+    except ValueError as ve:
+        # Validation error - return error message to frontend
+        error_response = {
+            "error": str(ve)
+        }
+        return json.dumps(error_response)
+    except Exception as e:
+        # Other errors during element creation
+        error_response = {
+            "error": f"Error creating network elements: {str(e)}"
+        }
+        return json.dumps(error_response)
     
     # Note: OpenDSS creates buses automatically when elements are connected
     # We don't need to explicitly create buses - they are created implicitly
