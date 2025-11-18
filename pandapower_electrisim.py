@@ -272,12 +272,18 @@ def create_busbars(in_data, net):
             bus_name = in_data[x]['name']
             user_friendly_name = in_data[x].get('userFriendlyName', bus_name)
             
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
             Busbars[bus_name] = pp.create_bus(
                 net,
                 name=bus_name,
                 id=in_data[x]['id'],
                 vn_kv=float(in_data[x]['vn_kv']),
-                type='b'
+                type='b',
+                in_service=in_service
             )
             
             # Store the user-friendly name mapping
@@ -395,6 +401,12 @@ def create_other_elements(in_data,net,x, Busbars):
                     # Skip adding this parameter if conversion fails
                     pass
 
+            # Add in_service parameter (default to True if not specified)
+            if 'in_service' in in_data[x]:
+                line_params["in_service"] = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            else:
+                line_params["in_service"] = True
+
             # Call the function with the prepared parameters
             pp.create_line_from_parameters(net, **line_params)
             
@@ -417,6 +429,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for External Grid")
 
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
             pp.create_ext_grid(
                 net,
                 bus=bus_idx,
@@ -429,7 +446,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 rx_max=safe_float(in_data[x]['rx_max']),
                 rx_min=safe_float(in_data[x]['rx_min']),
                 r0x0_max=safe_float(in_data[x]['r0x0_max']),
-                x0x_max=safe_float(in_data[x]['x0x_max'])
+                x0x_max=safe_float(in_data[x]['x0x_max']),
+                in_service=in_service
             )
             
             # Store user-friendly name for external grid
@@ -444,8 +462,13 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Generator")
     
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
             pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=safe_float(in_data[x]['vm_pu']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
-                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']))    #, power_station_trafo=in_data[x]['power_station_trafo']
+                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']), in_service=in_service)    #, power_station_trafo=in_data[x]['power_station_trafo']
             
             # Store user-friendly name for generator
             gen_name = in_data[x]['name']
@@ -459,8 +482,13 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Static Generator")
            
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
             pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'], type=in_data[x]['type'],
-                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5)
+                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service)
             
             # Store user-friendly name for static generator
             sgen_name = in_data[x]['name']
@@ -474,7 +502,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Static Generator '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'])   
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'], in_service=in_service)   
         #Zero sequence parameters** (Added through std_type For Three phase load flow) :
             #vk0_percent** - zero sequence relative short-circuit voltage
             #vkr0_percent** - real part of zero sequence relative short-circuit voltage
@@ -564,6 +596,12 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['mag0_rx'] = 0.0  # Default zero sequence magnetizing r/x ratio
             
+            # Add in_service parameter (default to True if not specified)
+            if 'in_service' in in_data[x]:
+                transformer_params['in_service'] = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            else:
+                transformer_params['in_service'] = True
+            
             pp.create_transformer_from_parameters(net, **transformer_params)
             
             # Store user-friendly name for transformer
@@ -638,6 +676,12 @@ def create_other_elements(in_data,net,x, Busbars):
                     else:
                         transformer_params[param] = safe_float(value)  # Convert to float
             
+            # Add in_service parameter (default to True if not specified)
+            if 'in_service' in in_data[x]:
+                transformer_params['in_service'] = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            else:
+                transformer_params['in_service'] = True
+            
             pp.create_transformer3w_from_parameters(net, **transformer_params)
             
             # Store user-friendly name for three-winding transformer
@@ -652,21 +696,34 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Shunt Reactor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_shunt(net, typ = "shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service = True)
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_shunt(net, typ = "shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service=in_service)
         
         if (in_data[x]['typ'].startswith("Capacitor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Capacitor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'])        
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service=in_service)        
         
         if (in_data[x]['typ'].startswith("Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 raise ValueError(f"Bus {in_data[x]['bus']} not found for Load")
           
-            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=in_data[x]['scaling'],type=in_data[x]['type'])
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
+            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=in_data[x]['scaling'],type=in_data[x]['type'], in_service=in_service)
             
             # Store user-friendly name for load
             load_name = in_data[x]['name']
@@ -680,7 +737,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Load '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_asymmetric_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'],p_b_mw=in_data[x]['p_b_mw'],p_c_mw=in_data[x]['p_c_mw'],q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],type=in_data[x]['type'])         
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_asymmetric_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'],p_b_mw=in_data[x]['p_b_mw'],p_c_mw=in_data[x]['p_c_mw'],q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],type=in_data[x]['type'], in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Impedance")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
@@ -691,31 +752,47 @@ def create_other_elements(in_data,net,x, Busbars):
             if to_bus_idx is None:
                 print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for Impedance '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_impedance(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], rft_pu=in_data[x]['rft_pu'],xft_pu=in_data[x]['xft_pu'],sn_mva=in_data[x]['sn_mva'])         
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_impedance(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], rft_pu=in_data[x]['rft_pu'],xft_pu=in_data[x]['xft_pu'],sn_mva=in_data[x]['sn_mva'], in_service=in_service)         
          
         if (in_data[x]['typ'].startswith("Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_ward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'],qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'])         
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_ward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'],qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Extended Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Extended Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_xward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'], qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], r_ohm =in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'],vm_pu=in_data[x]['vm_pu'])         
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_xward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'], qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], r_ohm =in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'],vm_pu=in_data[x]['vm_pu'], in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Motor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Motor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], pn_mech_mw=in_data[x]['pn_mech_mw'],
                             cos_phi=in_data[x]['cos_phi'],efficiency_n_percent=in_data[x]['efficiency_n_percent'],
                             lrc_pu=in_data[x]['lrc_pu'], rx=in_data[x]['rx'], vn_kv=in_data[x]['vn_kv'],
-                            efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'])         
+                            efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'], in_service=in_service)         
    
         
         if (in_data[x]['typ'].startswith("SVC")):
@@ -723,7 +800,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SVC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_svc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_svc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'], in_service=in_service)
          
         if (in_data[x]['typ'].startswith("TCSC")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
@@ -734,14 +815,22 @@ def create_other_elements(in_data,net,x, Busbars):
             if to_bus_idx is None:
                 print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for TCSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_tcsc(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'])
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_tcsc(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'], in_service=in_service)
                    
         if (in_data[x]['typ'].startswith("SSC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'])
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'], in_service=in_service)
         
 
         if (in_data[x]['typ'].startswith("Storage")):
@@ -749,7 +838,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if bus_idx is None:
                 print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Storage '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'])         
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'], in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("DC Line")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
@@ -760,7 +853,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if to_bus_idx is None:
                 print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for DC Line '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
-            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'])
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'], in_service=in_service)
 
 
 
