@@ -327,7 +327,6 @@ def create_other_elements(in_data,net,x, Busbars):
                     
          
             except Exception as e:
-                print(f"ERROR finding bus references for line: {e}")
                 continue
                 
             # Create a base parameters dict with required parameters
@@ -387,7 +386,6 @@ def create_other_elements(in_data,net,x, Busbars):
                 else:
                     line_params["c0_nf_per_km"] = 0.0  # Default as float
             except (ValueError, TypeError) as e:
-                print(f"Error converting zero sequence parameters for line {in_data[x]['name']}: {e}")
                 # Set to defaults if conversion fails
                 line_params["r0_ohm_per_km"] = 1.0
                 line_params["x0_ohm_per_km"] = 1.0
@@ -500,7 +498,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Asymmetric Static Generator")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Static Generator '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -534,13 +531,23 @@ def create_other_elements(in_data,net,x, Busbars):
             lv_bus_idx = Busbars.get(lv_bus_name)
             
             if hv_bus_idx is None:
-                print(f"ERROR: HV Bus '{hv_bus_name}' not found for Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if lv_bus_idx is None:
-                print(f"ERROR: LV Bus '{lv_bus_name}' not found for Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             
             # Prepare parameters dict for transformer creation with proper type conversion
+            # CRITICAL: tap_step_percent must be non-zero for tap control to work
+            # If it's 0, all tap positions are identical (no voltage change)
+            tap_step_value = safe_float(in_data[x].get('tap_step_percent', None))
+            if tap_step_value is None or tap_step_value == 0.0:
+                # Only use default if tap_max != tap_min (indicating tap control is intended)
+                tap_max_val = safe_int(in_data[x].get('tap_max', 0))
+                tap_min_val = safe_int(in_data[x].get('tap_min', 0))
+                if tap_max_val != tap_min_val and tap_max_val != 0:
+                    tap_step_value = 1.5  # Standard default for distribution transformers
+                else:
+                    tap_step_value = 0.0  # No tap control
+            
             transformer_params = {
                 'hv_bus': hv_bus_idx,
                 'lv_bus': lv_bus_idx,
@@ -560,7 +567,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 'tap_neutral': safe_int(in_data[x].get('tap_neutral', 0)),
                 'tap_max': safe_int(in_data[x].get('tap_max', 0)),
                 'tap_min': safe_int(in_data[x].get('tap_min', 0)),
-                'tap_step_percent': safe_float(in_data[x].get('tap_step_percent', 0)),
+                'tap_step_percent': tap_step_value,
                 'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0))
             }
             
@@ -625,13 +632,10 @@ def create_other_elements(in_data,net,x, Busbars):
             lv_bus_idx = Busbars.get(lv_bus_name)
             
             if hv_bus_idx is None:
-                print(f"ERROR: HV Bus '{hv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if mv_bus_idx is None:
-                print(f"ERROR: MV Bus '{mv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if lv_bus_idx is None:
-                print(f"ERROR: LV Bus '{lv_bus_name}' not found for Three Winding Transformer '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             
             # Prepare optional parameters - only include if they are not None
@@ -694,7 +698,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Shunt Reactor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Shunt Reactor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -705,7 +708,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Capacitor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Capacitor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -735,7 +737,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Asymmetric Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Asymmetric Load '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -747,10 +748,8 @@ def create_other_elements(in_data,net,x, Busbars):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
             to_bus_idx = Busbars.get(in_data[x]['busTo'])
             if from_bus_idx is None:
-                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for Impedance '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if to_bus_idx is None:
-                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for Impedance '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -761,7 +760,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -772,7 +770,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Extended Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Extended Ward '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -783,7 +780,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Motor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Motor '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -798,7 +794,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("SVC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SVC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -810,10 +805,8 @@ def create_other_elements(in_data,net,x, Busbars):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
             to_bus_idx = Busbars.get(in_data[x]['busTo'])
             if from_bus_idx is None:
-                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for TCSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if to_bus_idx is None:
-                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for TCSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -824,7 +817,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("SSC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for SSC '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -836,7 +828,6 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Storage")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                print(f"ERROR: Bus '{in_data[x]['bus']}' not found for Storage '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -848,10 +839,8 @@ def create_other_elements(in_data,net,x, Busbars):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
             to_bus_idx = Busbars.get(in_data[x]['busTo'])
             if from_bus_idx is None:
-                print(f"ERROR: From Bus '{in_data[x]['busFrom']}' not found for DC Line '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             if to_bus_idx is None:
-                print(f"ERROR: To Bus '{in_data[x]['busTo']}' not found for DC Line '{in_data[x]['name']}'. Available buses: {list(Busbars.keys())}")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -871,10 +860,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 isolated_buses = pp.topology.unsupplied_buses(net)
                 if len(isolated_buses) > 0:
                     raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
-                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init) 
+                
+                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)
+                
             except Exception as e:
-                print("An exception occurred")
-                print(f"Exception details: {str(e)}")
                 
                 # Initialize diagnostic response
                 diagnostic_response = {
@@ -1296,7 +1285,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #External Grid
                 if(net.res_ext_grid.empty):
-                        print("no external grid in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_ext_grid.iterrows():    
                             externalgrid = ExternalGridOut(name=net.ext_grid._get_value(index, 'name'), id = net.ext_grid._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf = row['p_mw']/math.sqrt(math.pow(row['p_mw'],2)+math.pow(row['q_mvar'],2)), q_p=row['q_mvar']/row['p_mw'])        
@@ -1306,8 +1295,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                              
                 #Generator         
                 if(net.res_gen.empty):
-                        print("no generators in the model")                         
-                                    
+                    pass
                 else:                    
                         for index, row in net.res_gen.iterrows():    
                             generator = GeneratorOut(name=net.gen._get_value(index, 'name'), id = net.gen._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'], va_degree=row['va_degree'], vm_pu=row['vm_pu'])        
@@ -1318,8 +1306,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Static Generator                     
                 if(net.res_sgen.empty):
-                        print("no static generators in the model")                         
-                                    
+                    pass
                 else:                    
                         for index, row in net.res_sgen.iterrows():    
                             staticgenerator = StaticGeneratorOut(name=net.sgen._get_value(index, 'name'), id = net.sgen._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
@@ -1332,8 +1319,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #Asymmetric Static Generator                     
                 if(net.res_asymmetric_sgen.empty):
-                        print("no asymmetric static generators in the model")                         
-                                    
+                    pass
                 else:                    
                         for index, row in net.res_asymmetric_sgen.iterrows():    
                             asymmetricstaticgenerator = AsymmetricStaticGeneratorOut(name=net.asymmetric_sgen._get_value(index, 'name'), id = net.asymmetric_sgen._get_value(index, 'id'), p_a_mw=row['p_a_mw'], q_a_mvar=row['q_a_mvar'], p_b_mw=row['p_b_mw'], q_b_mvar=row['q_b_mvar'], p_c_mw=row['p_c_mw'], q_c_mvar=row['q_c_mvar'])        
@@ -1342,12 +1328,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                         result = {**result, **asymmetricstaticgenerators.__dict__}
                         
-                print(net)
                
                 #Transformer                     
                 if(net.res_trafo.empty):
-                        print("no transformer in the model")                         
-                                    
+                    pass
                 else:                    
                         for index, row in net.res_trafo.iterrows():    
                             transformer = TransformerOut(name=net.trafo._get_value(index, 'name'), id = net.trafo._get_value(index, 'id'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_lv_mw=row['p_lv_mw'], q_lv_mvar=row['q_lv_mvar'], pl_mw=row['pl_mw'], 
@@ -1360,8 +1344,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Transformer3W                     
                 if(net.res_trafo3w.empty):
-                        print("no three winding transformer in the model")                         
-                                    
+                    pass
                 else:                    
                         for index, row in net.res_trafo3w.iterrows():    
                             transformer3W = Transformer3WOut(name=net.trafo3w._get_value(index, 'name'), id = net.trafo3w._get_value(index, 'id'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_mv_mw=row['p_mv_mw'], q_mv_mvar=row['q_mv_mvar'], p_lv_mw=row['p_lv_mw'], 
@@ -1377,7 +1360,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #Shunt reactor
                 if(net.res_shunt.empty):
-                        print("no shunt reactor in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_shunt.iterrows():
                             #if (row['q_mvar'] >= 0):
@@ -1389,7 +1372,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Capacitor
                 if(net.res_shunt.empty):
-                        print("no capacitor in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_shunt.iterrows(): 
                             if (net.shunt._get_value(index, 'typ') == 'capacitor'):  # q is always negative for capacitor
@@ -1401,7 +1384,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                
                 #Load
                 if(net.res_load.empty):
-                        print("no load in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_load.iterrows():    
                             load = LoadOut(name=net.load._get_value(index, 'name'), id = net.load._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
@@ -1413,7 +1396,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Asymmetric Load
                 if(net.res_asymmetric_load.empty):
-                        print("no asymmetric load in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_asymmetric_load.iterrows():    
                             asymmetricload = AsymmetricLoadOut(name=net.asymmetric_load._get_value(index, 'name'), id = net.asymmetric_load._get_value(index, 'id'), p_a_mw=row['p_a_mw'], q_a_mvar=row['q_a_mvar'], p_b_mw=row['p_b_mw'], q_b_mvar=row['q_b_mvar'], p_c_mw=row['p_c_mw'], q_c_mvar=row['q_c_mvar'])        
@@ -1424,7 +1407,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Impedance
                 if(net.res_impedance.empty):
-                        print("no impedance in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_impedance.iterrows():    
                             impedance = ImpedanceOut(name=net.impedance._get_value(index, 'name'), id = net.impedance._get_value(index, 'id'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], pl_mw=row['pl_mw'], ql_mvar=row['ql_mvar'], i_from_ka=row['i_from_ka'], i_to_ka=row['i_to_ka'])        
@@ -1435,7 +1418,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #Ward
                 if(net.res_ward.empty):
-                        print("no ward in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_ward.iterrows():    
                             ward = WardOut(name=net.ward._get_value(index, 'name'), id = net.ward._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'], vm_pu=row['vm_pu'])        
@@ -1446,7 +1429,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Extended Ward
                 if(net.res_xward.empty):
-                        print("no extended ward in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_xward.iterrows():    
                             extendedward = ExtendedWardOut(name=net.xward._get_value(index, 'name'), id = net.xward._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'], vm_pu=row['vm_pu'])        
@@ -1457,7 +1440,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Motor
                 if(net.res_motor.empty):
-                        print("no motor in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_motor.iterrows():    
                             motor = MotorOut(name=net.motor._get_value(index, 'name'), id = net.motor._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
@@ -1467,7 +1450,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         
                 #Storage
                 if(net.res_storage.empty):
-                        print("no storage in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_storage.iterrows():    
                             storage = StorageOut(name=net.storage._get_value(index, 'name'), id = net.storage._get_value(index, 'id'), p_mw=row['p_mw'], q_mvar=row['q_mvar'])        
@@ -1485,10 +1468,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result = {**result, **svcs.__dict__}
                        
                 except AttributeError:  
-                     print("no SVC in the model")
+                    pass
                 except UnboundLocalError:
-                     print("no TCSC in the model")                
-                    
+                    pass
                         
                 #TCSC   
                 try:
@@ -1499,9 +1481,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result = {**result, **tcscs.__dict__} 
                      
                 except AttributeError:  
-                     print("no TCSC in the model")     
+                    pass
                 except UnboundLocalError:
-                     print("no TCSC in the model") 
+                    pass
 
                                                
                 #SSC
@@ -1517,7 +1499,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                      
                 #SSC
                 if(net.res_ssc.empty):
-                        print("no SSC in the model")                
+                    pass
                 else:                    
                     for index, row in net.res_ssc.iterrows():    
                         ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
@@ -1528,7 +1510,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                         
                 #DCLine
                 if(net.res_dcline.empty):
-                        print("no DC line in the model")                
+                    pass
                 else:                    
                         for index, row in net.res_dcline.iterrows():    
                             dcline = ImpedanceOut(name=net.dcline._get_value(index, 'name'), id = net.dcline._get_value(index, 'id'), p_from_mw=row['p_from_mw'], q_from_mvar=row['q_from_mvar'], p_to_mw=row['p_to_mw'], q_to_mvar=row['q_to_mvar'], pl_mw=row['pl_mw'], vm_from_pu=row['vm_from_pu'], va_from_degree=row['va_from_degree'], vm_to_pu=row['vm_to_pu'], va_to_degree=row['va_to_degree'] )        
@@ -1541,7 +1523,6 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 if export_python and in_data and Busbars:
                     python_code = generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init)
                     result['pandapower_python'] = python_code
-                    print(f"Pandapower Python code export enabled: {len(python_code)} characters")
                 
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
@@ -1560,11 +1541,8 @@ def shortcircuit(net, in_data):
     # print("\nBus Data:")
     # print(net.bus)
         
-    print("\nStatic Generator Data:")
-    print(net.sgen)
     net.sgen["k"] = 1.1
     #print(net.sgen["k"])
-    print(pp.__version__)
     
     
     # print("\nShunt reactor Data:")
@@ -1627,37 +1605,22 @@ def shortcircuit(net, in_data):
     inverse_y = in_data.get('inverse_y', False)
     
     # Debug print to see what parameters are being passed
-    print(f"Short circuit parameters:")
-    print(f"  fault: {fault_type} (type: {type(fault_type)}) - fault type")
-    print(f"  case: {fault_location} (type: {type(fault_location)}) - calculation case")
-    print(f"  bus: {bus} (type: {type(bus)}) - bus index")
-    print(f"  ip: {ip}")
-    print(f"  ith: {ith}")
-    print(f"  tk_s: {tk_s}")
-    print(f"  r_fault_ohm: {r_fault_ohm}")
-    print(f"  x_fault_ohm: {x_fault_ohm}")
     
     # Print Pandapower version for debugging
-    print(f"Pandapower version: {pp.__version__}")
     
     # Validate fault_type parameter - Pandapower expects specific values
     valid_fault_types = ['3ph', '2ph', '1ph']
     if fault_type not in valid_fault_types:
-        print(f"Warning: Invalid fault_type value '{fault_type}'. Valid values are: {valid_fault_types}")
         fault_type = '3ph'  # Default to 3ph if invalid
-        print(f"Using default fault_type: {fault_type}")
     
     # Validate case parameter
     valid_cases = ['max', 'min']
     if fault_location not in valid_cases:
-        print(f"Warning: Invalid case value '{fault_location}'. Valid values are: {valid_cases}")
         fault_location = 'max'  # Default to max if invalid
-        print(f"Using default case: {fault_location}")
  
 
     try:
         # Use correct parameter mapping according to Pandapower documentation
-        print(f"Attempting short circuit calculation with fault='{fault_type}', case='{fault_location}', bus={bus}")
         
         # Call short circuit calculation with correct parameters including ip and ith
         sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s, 
@@ -1666,9 +1629,6 @@ def shortcircuit(net, in_data):
         
         # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
         if fault_type == '1ph' and net.res_bus_sc['ip_ka'].isna().all() and net.res_bus_sc['ith_ka'].isna().all():
-            print("Warning: ip_ka and ith_ka calculations failed for single-phase fault.")
-            print("This is a known limitation in pandapower for single-phase faults.")
-            print("Calculating ip_ka and ith_ka from single-phase ikss_ka using standard formulas...")
             
             # Calculate ip_ka and ith_ka from ikss_ka using standard electrical engineering formulas
             # ip_ka = kappa * sqrt(2) * ikss_ka (peak current)
@@ -1694,13 +1654,8 @@ def shortcircuit(net, in_data):
                 thermal_factor = 1.0 / tk_s if tk_s > 1.0 else 1.0
                 net.res_bus_sc['ith_ka'] = net.res_bus_sc['ikss_ka'] * np.sqrt(thermal_factor)
             
-            print(f"Calculated ip_ka using kappa factor: {kappa_factor}")
-            print(f"Calculated ith_ka for fault duration: {tk_s}s")
-            print("ip_ka and ith_ka values are now based on single-phase ikss_ka results")
-        print("Short circuit calculation completed successfully")
         
     except Exception as e:
-        print(f"Short circuit calculation failed: {e}")
         
         # Capture the diagnostic output and process it
         import io
@@ -1746,12 +1701,6 @@ def shortcircuit(net, in_data):
         }
         # OPTIMIZED: Compact JSON for faster transfer
         return json.dumps(diagnostic_response, separators=(',', ':'))
-    print("Short circuit results:")
-    print(net.res_bus_sc)
-    print("\nColumns in res_bus_sc:")
-    print(net.res_bus_sc.columns.tolist())
-    print("\nFirst few rows:")
-    print(net.res_bus_sc.head())
     #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
                 
     #wyrzuciłem skss_mw bo wyskakiwał błąd przy zwarciu jednofazowym
@@ -1791,8 +1740,6 @@ def shortcircuit(net, in_data):
         busbarList.append(busbar)
         busbars = BusbarsOut(busbars = busbarList)  
             
-    print(busbars.__dict__)
-    print(type(busbars.__dict__))
     #result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
     result = {**busbars.__dict__}
 
@@ -1905,7 +1852,6 @@ def contingency_analysis(net, contingency_params):
             raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
         
         # Check if network has elements
-        print(f"Network elements: Lines={len(net.line)}, Buses={len(net.bus)}, Generators={len(net.gen)}, Transformers={len(net.trafo)}")
         
         # Run base case power flow
         pp.runpp(net, algorithm='nr', calculate_voltage_angles=True)
@@ -2142,12 +2088,10 @@ def contingency_analysis(net, contingency_params):
         # Check if we have contingency results
         if not contingency_cases:
             error_message = f"No contingency cases found. Network has {len(net.line)} lines, {len(net.trafo)} transformers, {len(net.gen)} generators."
-            print(error_message)
             return json.dumps({'error': error_message}, separators=(',', ':'))
         
         if not contingency_results:
             error_message = f"No contingency results generated. All {len(contingency_cases)} cases failed to converge."
-            print(error_message)
             return json.dumps({'error': error_message}, separators=(',', ':'))
         
         # Use the worst-case scenario results for display
@@ -2199,14 +2143,11 @@ def contingency_analysis(net, contingency_params):
         
         # OPTIMIZED: Compact JSON for faster transfer
         response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':'))
-        print("Contingency Analysis Results:")
-        print(f"Response size: {len(response)} bytes")
         
         return response
         
     except Exception as e:
         error_message = f"Contingency analysis failed: {str(e)}"
-        print(error_message)
         return json.dumps({'error': error_message}) 
 
 
@@ -2247,7 +2188,6 @@ def optimalPowerFlow(net, opf_params):
         
         # Check if any cost functions are defined
         if len(net.poly_cost) == 0 and len(net.pwl_cost) == 0:
-            print('Warning: No cost functions defined. Using default costs for optimization.')
             setup_default_cost_functions(net, 'polynomial')
         
         # Ensure min/max p_mw columns exist for OPF
@@ -2263,7 +2203,6 @@ def optimalPowerFlow(net, opf_params):
         
         # Run optimal power flow based on type
         if opf_type == 'ac':
-            print(f"Running AC Optimal Power Flow with algorithm: {algorithm}")
             pp.runopp(net, 
                      verbose=not suppress_warnings,
                      suppress_warnings=suppress_warnings,
@@ -2275,7 +2214,6 @@ def optimalPowerFlow(net, opf_params):
                      init=init,
                      numba=numba)
         else:  # dc
-            print(f"Running DC Optimal Power Flow with algorithm: {algorithm}")
             pp.rundcopp(net,
                        verbose=not suppress_warnings,
                        suppress_warnings=suppress_warnings,
@@ -2286,10 +2224,8 @@ def optimalPowerFlow(net, opf_params):
                        init=init,
                        numba=numba)
         
-        print("Optimal Power Flow completed successfully")
         
     except Exception as e:
-        print(f"Optimal Power Flow failed: {str(e)}")
         
         # Initialize diagnostic response
         diagnostic_response = {
@@ -2302,7 +2238,6 @@ def optimalPowerFlow(net, opf_params):
         # Try to get diagnostic information
         try:
             diag_result_dict = pp.diagnostic(net, report_style='detailed')
-            print(diag_result_dict)
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -2314,7 +2249,7 @@ def optimalPowerFlow(net, opf_params):
             diagnostic_response["diagnostic"] = processed_diagnostic
                     
         except Exception as diag_error:
-            print(f"Diagnostic failed: {diag_error}")
+            pass
         
         # If no specific diagnostic was found, include the original exception
         if not diagnostic_response["diagnostic"]:
@@ -2431,7 +2366,6 @@ def optimalPowerFlow(net, opf_params):
                 busbarList.append(busbar)
                 
             except Exception as e:
-                print(f"Error processing bus {index}: {e}")
                 continue
         
         # Process line results with OPF-specific data
@@ -2467,7 +2401,6 @@ def optimalPowerFlow(net, opf_params):
                 linesList.append(line)
                 
             except Exception as e:
-                print(f"Error processing line {index}: {e}")
                 continue
         
         # Process generator results with OPF-specific data
@@ -2509,7 +2442,6 @@ def optimalPowerFlow(net, opf_params):
                 generatorsList.append(generator)
                 
             except Exception as e:
-                print(f"Error processing generator {index}: {e}")
                 continue
         
         # Process external grid results
@@ -2540,7 +2472,6 @@ def optimalPowerFlow(net, opf_params):
                 externalgridsList.append(ext_grid)
                 
             except Exception as e:
-                print(f"Error processing external grid {index}: {e}")
                 continue
         
         # Process load results
@@ -2561,7 +2492,6 @@ def optimalPowerFlow(net, opf_params):
                 loadsList.append(load)
                 
             except Exception as e:
-                print(f"Error processing load {index}: {e}")
                 continue
         
         # Create response dictionary
@@ -2581,7 +2511,6 @@ def optimalPowerFlow(net, opf_params):
         else:
             response_data['opf_converged'] = False
         
-        print(f"OPF Results: {len(busbarList)} buses, {len(linesList)} lines, {len(generatorsList)} generators")
         
         return response_data
 
@@ -2606,7 +2535,6 @@ def setup_default_cost_functions(net, cost_type='polynomial'):
                                    cp2_eur_per_mw2=0.01,    # Quadratic term
                                    cp1_eur_per_mw=20,       # Linear term  
                                    cp0_eur=0)               # Constant term
-                print(f"Added default polynomial cost to generator {gen_idx}")
     
     elif cost_type == 'piecewise_linear':
         # Add piecewise linear costs for generators without costs
@@ -2623,7 +2551,6 @@ def setup_default_cost_functions(net, cost_type='polynomial'):
                 pp.create_pwl_cost(net, element=gen_idx, et='gen',
                                   points=[[gen_min_p, gen_min_p * 15],    # [P_min, Cost_min]
                                          [gen_max_p, gen_max_p * 25]])    # [P_max, Cost_max]
-                print(f"Added default PWL cost to generator {gen_idx}") 
 
 def safe_float(value):
     """Convert value to float, replacing NaN with 0.0"""
@@ -3002,14 +2929,11 @@ def controller_simulation(net, controller_params):
         controllers = []
         
         # Use proper pandapower control module
-        print("Setting up controllers using pandapower.control module...")
         
         # Voltage control using generator voltage setpoints
         if controller_params.get('voltage_control', False):
-            print("Setting up voltage control...")
             for idx, gen in net.gen.iterrows():
                 if 'vm_pu' in gen and gen['vm_pu'] != 1.0:
-                    print(f"Generator {idx} has voltage setpoint: {gen['vm_pu']}")
                     # Create a simple voltage controller
                     # Note: This is a simplified controller - in a full implementation,
                     # you would use specific controller classes like VoltageController
@@ -3017,23 +2941,19 @@ def controller_simulation(net, controller_params):
         
         # Tap control using transformer tap positions
         if controller_params.get('tap_control', False):
-            print("Setting up tap control...")
             if len(net.trafo) > 0:
                 for idx, trafo in net.trafo.iterrows():
-                    print(f"Transformer {idx} available for tap control")
                     # Create a simple tap controller
                     # Note: This is a simplified controller - in a full implementation,
                     # you would use specific controller classes like TapController
                     pass
         
         # Run controller simulation using the proper run_control function
-        print("Running controller simulation with run_control...")
         run_control(net, 
                    max_iter=30,
                    continue_on_divergence=False,
                    check_each_level=True)
         
-        print("Controller simulation completed successfully")
         
         # Prepare results
         class ControllerBusOut(object):
@@ -3167,7 +3087,6 @@ def controller_simulation(net, controller_params):
         }
         
     except Exception as e:
-        print(f"Controller simulation error: {str(e)}")
         
         # Initialize diagnostic response
         diagnostic_response = {
@@ -3180,7 +3099,6 @@ def controller_simulation(net, controller_params):
         # Try to get diagnostic information
         try:
             diag_result_dict = pp.diagnostic(net, report_style='detailed')
-            print(diag_result_dict)
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -3192,7 +3110,7 @@ def controller_simulation(net, controller_params):
             diagnostic_response["diagnostic"] = processed_diagnostic
                     
         except Exception as diag_error:
-            print(f"Diagnostic failed: {diag_error}")
+            pass
         
         # If no specific diagnostic was found, include the original exception
         if not diagnostic_response["diagnostic"]:
@@ -3213,7 +3131,6 @@ def time_series_simulation(net, timeseries_params):
             timeseries_available = True
         except ImportError:
             timeseries_available = False
-            print("pandapower.timeseries module not available, using simplified time series simulation")
         
         # Get time series parameters
         time_steps = int(timeseries_params.get('time_steps', 24))
@@ -3227,10 +3144,6 @@ def time_series_simulation(net, timeseries_params):
         # Apply load and generation profiles
         if not timeseries_available:
             # Simplified approach: run multiple power flows with different profiles
-            print(f"Running simplified time series simulation with {time_steps} time steps")
-            print(f"Load profile: {load_profile}, Generation profile: {generation_profile}")
-            print(f"Load profile values (first 5): {load_profile_values[:5]}")
-            print(f"Generation profile values (first 5): {gen_profile_values[:5]}")
             
             # Create enhanced load profiles with more variation
             import random
@@ -3376,7 +3289,7 @@ def time_series_simulation(net, timeseries_params):
                 # Run power flow
                 pp.runpp(net, 
                         algorithm=timeseries_params.get('algorithm', 'nr'),
-                        calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'auto'),
+                        calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'True'),
                         init=timeseries_params.get('init', 'dc'))
                 
                 all_results.append({
@@ -3388,9 +3301,7 @@ def time_series_simulation(net, timeseries_params):
                 })
         else:
             # Use full timeseries module if available
-            print("Using full timeseries module")
             # For now, always use simplified approach since full module is not working
-            print("Falling back to simplified approach")
             # Run a single power flow as fallback
             pp.runpp(net, 
                     algorithm=timeseries_params.get('algorithm', 'nr'),
@@ -3550,7 +3461,6 @@ def time_series_simulation(net, timeseries_params):
         }
         
     except Exception as e:
-        print(f"Time series simulation error: {str(e)}")
         
         # Initialize diagnostic response
         diagnostic_response = {
@@ -3563,7 +3473,6 @@ def time_series_simulation(net, timeseries_params):
         # Try to get diagnostic information
         try:
             diag_result_dict = pp.diagnostic(net, report_style='detailed')
-            print(diag_result_dict)
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -3575,7 +3484,7 @@ def time_series_simulation(net, timeseries_params):
             diagnostic_response["diagnostic"] = processed_diagnostic
                     
         except Exception as diag_error:
-            print(f"Diagnostic failed: {diag_error}")
+            pass
         
         # If no specific diagnostic was found, include the original exception
         if not diagnostic_response["diagnostic"]:

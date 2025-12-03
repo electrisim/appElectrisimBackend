@@ -340,7 +340,7 @@ pytest --cov=. --cov-report=html
 ### Core Dependencies
 - **Flask 2.2.2** - Web framework
 - **Flask-CORS 3.0.10** - Cross-origin resource sharing
-- **pandapower 3.0.0** - Power system analysis
+- **pandapower 2.14.11** - Power system analysis
 - **py-dss-interface 2.0.4** - OpenDSS integration
 - **numpy 1.23** - Numerical computing
 - **pandas 2.1.4** - Data manipulation

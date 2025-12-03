@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import pandapower_electrisim
 import opendss_electrisim
+import os
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
@@ -18,19 +19,22 @@ warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
 
+# Get CORS origins from environment variable or use defaults
+cors_origins = os.getenv('CORS_ORIGINS', '').split(',') if os.getenv('CORS_ORIGINS') else [
+    # Development origins
+    'http://127.0.0.1:5500', 
+    'http://127.0.0.1:5501', 
+    'http://localhost:5500', 
+    'http://localhost:5501',
+    # Production origins
+    'https://app.electrisim.com',
+    'https://www.electrisim.com',
+    'https://electrisim.com'
+]
+
 # CORS configuration for both development and production
 CORS(app, 
-     origins=[
-         # Development origins
-         'http://127.0.0.1:5500', 
-         'http://127.0.0.1:5501', 
-         'http://localhost:5500', 
-         'http://localhost:5501',
-         # Production origins
-         'https://app.electrisim.com',
-         'https://www.electrisim.com',
-         'https://electrisim.com'
-     ], 
+     origins=cors_origins, 
      methods=['GET', 'POST', 'OPTIONS'],
      allow_headers=['Content-Type', 'Authorization', 'Access-Control-Allow-Credentials'],
      supports_credentials=True)
@@ -60,7 +64,6 @@ def simulation():
         if "OptimalPowerFlowPandaPower" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== OPTIMAL POWER FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
             
             # Extract OPF parameters
             opf_params = {
@@ -98,16 +101,6 @@ def simulation():
             calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
             init = in_data[x]['initialization']
             export_python = in_data[x].get('exportPython', False)  # Export Python code flag
-            
-            # Debug logging for exportPython
-            print(f"🔍 DEBUG - Simulation Parameters received:")
-            print(f"  - All keys in simulation params: {in_data[x].keys()}")
-            print(f"  - exportPython value: {in_data[x].get('exportPython', 'KEY NOT FOUND')}")
-            print(f"  - exportPython type: {type(export_python)}")
-            print(f"  - exportPython == True: {export_python == True}")
-            print(f"  - exportPython is True: {export_python is True}")
-            
-            print(f"Pandapower Parameters: frequency={frequency}, algorithm={algorithm}, calculate_voltage_angles={calculate_voltage_angles}, init={init}, export_python={export_python}")
 
             net = pp.create_empty_network(f_hz=frequency)
        
@@ -125,7 +118,6 @@ def simulation():
                 response.headers['Content-Encoding'] = 'gzip'
                 response.headers['Content-Type'] = 'application/json'
                 response.headers['Content-Length'] = len(compressed)
-                print(f"Pandapower load flow response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
                 return response
             else:
                 return response_data
@@ -135,8 +127,6 @@ def simulation():
         if "ShortCircuitPandaPower" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== SHORT CIRCUIT SIMULATION REQUESTED BY USER: {user_email} ===")
-                    
 
             net = pp.create_empty_network()
             Busbars = pandapower_electrisim.create_busbars(in_data, net)
@@ -152,7 +142,6 @@ def simulation():
                 response.headers['Content-Encoding'] = 'gzip'
                 response.headers['Content-Type'] = 'application/json'
                 response.headers['Content-Length'] = len(compressed)
-                print(f"Short circuit response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
                 return response
             else:
                 return response_data
@@ -160,7 +149,6 @@ def simulation():
         if "PowerFlowOpenDss" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== OPEN DSS LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
             
             # Extract OpenDSS parameters based on OpenDSS documentation
             # Reference: https://opendss.epri.com/PowerFlow.html
@@ -172,8 +160,6 @@ def simulation():
             tolerance = float(in_data[x].get('tolerance', 0.0001))  # Convergence tolerance
             controlmode = in_data[x].get('controlmode', 'Static')  # Control mode (Static, Event, Time)
             export_commands = in_data[x].get('exportCommands', False)  # Export OpenDSS commands flag
-            
-            print(f"OpenDSS Parameters: frequency={frequency}, mode={mode}, algorithm={algorithm}, loadmodel={loadmodel}, max_iterations={max_iterations}, tolerance={tolerance}, controlmode={controlmode}, export_commands={export_commands}")
             
             response_data = opendss_electrisim.powerflow(
                 in_data, 
@@ -196,7 +182,6 @@ def simulation():
                 response.headers['Content-Encoding'] = 'gzip'
                 response.headers['Content-Type'] = 'application/json'
                 response.headers['Content-Length'] = len(compressed)
-                print(f"OpenDSS response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
                 return response
             else:
                 return response_data
@@ -204,7 +189,6 @@ def simulation():
         if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== CONTINGENCY ANALYSIS SIMULATION REQUESTED BY USER: {user_email} ===")
             
             # Extract contingency analysis parameters
             contingency_params = {
@@ -237,7 +221,6 @@ def simulation():
                 response.headers['Content-Encoding'] = 'gzip'
                 response.headers['Content-Type'] = 'application/json'
                 response.headers['Content-Length'] = len(compressed)
-                print(f"Contingency analysis response compressed: {len(response_data)} -> {len(compressed)} bytes ({100*(1-len(compressed)/len(response_data)):.1f}% reduction)")
                 return response
             else:
                 return response_data
@@ -245,7 +228,6 @@ def simulation():
         if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== CONTROLLER SIMULATION REQUESTED BY USER: {user_email} ===")
             
             # Extract controller simulation parameters
             controller_params = {
@@ -271,7 +253,6 @@ def simulation():
         if "TimeSeriesSimulationPandaPower Parameters" in in_data[x]['typ']:
             # Extract user email for logging
             user_email = in_data[x].get('user_email', 'unknown@user.com')
-            print(f"=== TIME SERIES SIMULATION REQUESTED BY USER: {user_email} ===")
             
             # Extract time series simulation parameters
             timeseries_params = {
@@ -303,9 +284,15 @@ def simulation():
 
 #DLA PRODUKCJI USUWAJ PONIŻSZE WERSJE        
 if __name__ == '__main__':
-    #app.debug = False
-    #app.run(host = '127.0.0.1', port=5005)
-    #app.debug = True
-    #app.run(host = '127.0.0.1', port=5000)
-    # Disable reloader to prevent MemoryError with numba/pandapower
-    app.run(host = '0.0.0.0', port=5000, debug=True) #, use_reloader=False
+    # Get port from environment variable (Railway sets this automatically)
+    port = int(os.getenv('PORT', 5000))
+    
+    # Check if running in production
+    is_production = os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('FLASK_ENV') == 'production'
+    
+    if is_production:
+        # Production mode
+        app.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        # Development mode - disable reloader to prevent MemoryError with numba/pandapower
+        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)

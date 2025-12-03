@@ -288,10 +288,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
                     valid_connections.append(f"{field_name}={bus_ref}")
                     has_valid_bus_connection = True               
                 else:
-                    print(f"      ⚠️  Bus {bus_ref} (converted to {bus_ref_backend}) not found in BusbarsDictConnectionToName")
-                    print(f"         Available buses: {list(BusbarsDictConnectionToName.keys())}")
-
-   
+                    pass
 
             # Process different element types
             if "Line" in element_type:
@@ -324,11 +321,9 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
                 
         except ValueError as ve:
             # Re-raise validation errors so they propagate to frontend
-            print(f"Error processing element {x} ({element_type}): {ve}")
             raise
         except Exception as e:
             # For other errors, log and continue processing other elements
-            print(f"Error processing element {x} ({element_type}): {e}")
             continue
     
    
@@ -343,7 +338,6 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate line: {element_name}")
         return
     
     # Get bus connections
@@ -430,7 +424,6 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             if not is_in_service:
                 # Disable the line after it's been created
                 dss.text(f'Line.{element_name}.enabled=no')
-                print(f"  ✓ Line {element_name} set to DISABLED (out of service)")
             
             # print(f"Command: {line_cmd}")  # Reduced logging
             
@@ -440,16 +433,14 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating line: {e}")
+            pass
     else:
-        print(f"  ✗ Line {element_name} missing bus connections")
-
+        pass
 def create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
     """Create a load element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate load: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -462,7 +453,6 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
         if bus_voltage is None:
-            print(f"  ✗ Load {element_name} cannot be created - no voltage information for bus {bus_name}")
             return                 
         
         # Get load parameters with proper null handling
@@ -501,7 +491,6 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
             
             if not is_in_service:
                 dss.text(f'Load.{load_name}.enabled=no')
-                print(f"  ✓ Load {load_name} set to DISABLED (out of service)")
             # print(f"Command: {load_cmd}")  # Reduced logging
             
             LoadsDict[element_name] = load_name
@@ -509,18 +498,14 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating load: {e}")
+            pass
     else:
-        print(f"  ✗ Load {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
-
+        pass
 def create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
     """Create a static generator element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate static generator: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -582,9 +567,7 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                 
                 if not is_in_service:
                     dss.text(f'Generator.{gen_name}.enabled=no')
-                    print(f"  ✓ Generator {gen_name} set to DISABLED (out of service)")
                 # print(f"✓ Command: {gen_cmd}")  # Reduced logging
-                print(f"  Created: Generator P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr at {bus_voltage} kV bus")
                 
                 # Store in GeneratorsDict
                 GeneratorsDict[element_name] = gen_name
@@ -592,20 +575,16 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                 created_elements.add(element_name)
                 
             except Exception as e:
-                print(f"  ✗ Error creating static generator: {e}")
+                pass
         else:
-            print(f"  ✗ Could not find voltage information for bus {bus_name}")
+            pass
     else:
-        print(f"  ✗ Static Generator {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
-
+        pass
 def create_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
     """Create a generator element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate generator: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -655,7 +634,6 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             
             if not is_in_service:
                 dss.text(f'Generator.{element_name}.enabled=no')
-                print(f"  ✓ Generator {element_name} set to DISABLED (out of service)")
             # print(f"Command: {gen_cmd}")  # Reduced logging
 
             # Configure generator to NOT act as voltage source
@@ -671,12 +649,9 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating generator: {e}")
+            pass
     else:
-        print(f"  ✗ Generator {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
-
+        pass
 def vector_group_to_opendss_conns(vector_group):
     """Convert vector group notation to OpenDSS connection format
     
@@ -724,7 +699,6 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate transformer: {element_name}")
         return
     
     bus_from_ref = element_data.get('busFrom')
@@ -881,36 +855,27 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             
             if not is_in_service:
                 dss.text(f'Transformer.{element_name}.enabled=no')
-                print(f"  ✓ Transformer {element_name} set to DISABLED (out of service)")
             # print(f"Command: {transformer_cmd}")  # Reduced logging
-            print(f"  Tap settings: Position={tap_pos}, Step={tap_step_percent}%, Side={tap_side}, Taps=[{tap_hv} {tap_lv}]")
             
             # Log loss parameters if they are included
             if noloadloss_percent > 0 or i0_percent > 0:
-                print(f"  Loss parameters: Iron losses={pfe_kw} kW (%noloadloss={noloadloss_percent:.4f}%), Magnetizing current (i0)={i0_percent}%")
-            
+                pass
             TransformersDict[element_name] = element_name
             TransformersDictId[element_name] = element_id
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating transformer: {e}")
-            print(f"    Transformer properties after creation attempt:")
             try:
-                print(f"      Name: {dss.transformers.name}")
-                print(f"      Bus1: {dss.transformers.bus1}")
-                print(f"      Bus2: {bus_to_name}")
+                pass
             except Exception as debug_e:
-                print(f"      Could not get transformer properties: {debug_e}")
+                pass
     else:
-        print(f"  ✗ Transformer {element_name} missing bus connections")
-
+        pass
 def create_shunt_reactor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, ShuntsDict, ShuntsDictId, created_elements, execute_dss_command=None):
     """Create a shunt reactor element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate shunt reactor: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -946,8 +911,6 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         q_kvar = q_mvar * 1000
         p_kw = p_mw * 1000
         
-        print(f"    p_mw: {p_mw}, q_mvar: {q_mvar}")
-        print(f"    p_kw: {p_kw}, q_kvar: {q_kvar}")
         
         # Calculate parallel resistance Rp from active power
         # OpenDSS allows specifying Rp (parallel resistance) which consumes active power
@@ -962,10 +925,8 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
             v_volts = voltage_kv * 1000
             # Rp = V² / P (line-to-line voltage for 3-phase)
             rp_ohms = (v_volts ** 2) / p_watts
-            print(f"    Calculated Rp: {rp_ohms} ohms")
         else:
-            print(f"    Rp not calculated (p_kw={p_kw}, bus_voltage={bus_voltage})")
-
+            pass
         try:
             # Create shunt reactor using bus name directly - OpenDSS will create bus automatically
             # Use Rp (parallel resistance) for active power consumption
@@ -983,18 +944,14 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating shunt reactor: {e}")
+            pass
     else:
-        print(f"  ✗ Shunt reactor {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
-
+        pass
 def create_capacitor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, CapacitorsDict, CapacitorsDictId, created_elements, execute_dss_command=None):
     """Create a capacitor element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate capacitor: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -1041,18 +998,16 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
                 created_elements.add(element_name)
                 
             except Exception as e:
-                print(f"  ✗ Error creating capacitor: {e}")
+                pass
         else:
-            print(f"  ✗ Could not find voltage information for capacitor {element_name}")
+            pass
     else:
-        print(f"  ✗ Capacitor {element_name} has no bus connection")
-
+        pass
 def create_storage_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, StoragesDict, StoragesDictId, created_elements, execute_dss_command=None):
     """Create a storage element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate storage: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -1096,18 +1051,16 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 created_elements.add(element_name)
                 
             except Exception as e:
-                print(f"  ✗ Error creating storage: {e}")
+                pass
         else:
-            print(f"  ✗ Could not find voltage information for storage {element_name}")
+            pass
     else:
-        print(f"  ✗ Storage {element_name} has no bus connection")
- 
+        pass
 def create_pvsystem_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, PVSystemsDict, PVSystemsDictId, created_elements, execute_dss_command=None):
     """Create a PVSystem element in OpenDSS with comprehensive parameter support"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate PVSystem: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -1207,27 +1160,22 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                 
                 if not is_in_service:
                     dss.text(f'PVSystem.{element_name}.enabled=no')
-                    print(f"  ✓ PVSystem {element_name} set to DISABLED (out of service)")
 
                 PVSystemsDict[element_name] = element_name
                 PVSystemsDictId[element_name] = element_id
                 created_elements.add(element_name)
 
             except Exception as e:
-                print(f"  ✗ Error creating PVSystem: {e}")
+                pass
         else:
-            print(f"  ✗ Could not find voltage information for bus {bus_name}")
+            pass
     else:
-        print(f"  ✗ PVSystem {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
-
+        pass
 def create_external_grid_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, created_elements, execute_dss_command=None):
     """Create an external grid element in OpenDSS"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
-        print(f"  ⚠️  Skipping duplicate external grid: {element_name}")
         return
     
     bus_connection = element_data.get('bus')
@@ -1259,7 +1207,6 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
         # Use a reasonable default if zero or very small
         if s_sc_max_mva <= 0.1:
             s_sc_max_mva = 10000.0  # Default 10000 MVA short circuit capacity
-            print(f"  ⚠️  External Grid {element_name}: s_sc_max_mva was {s_sc_max_mva_raw}, using default {s_sc_max_mva} MVA")
         
         try:
             # Create external grid using OpenDSS VSource command
@@ -1274,12 +1221,9 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             created_elements.add(element_name)
             
         except Exception as e:
-            print(f"  ✗ Error creating external grid: {e}")
+            pass
     else:
-        print(f"  ✗ External Grid {element_name} has no bus connection")
-        print(f"    bus_connection: {bus_connection}")
-        print(f"    in BusbarsDictConnectionToName: {bus_connection in BusbarsDictConnectionToName}")
- 
+        pass
 def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode, export_commands=False):
     """Main powerflow function for OpenDSS
     
@@ -1376,18 +1320,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         dss.text('calcv')
         dss.text('solve')
     except Exception as e:
-        print(f"Error executing solve: {e}")
-    
+        pass
     # Check solve status
     try:
         converged = dss.solution.converged
         if converged:
-            print(f"✓ Load flow converged ({dss.solution.iterations} iterations)")
+            pass
         else:
-            print(f"✗ Load flow did not converge")
+            pass
     except Exception as e:
-        print(f"Error checking solve status: {e}")
-    
+        pass
     # Process results using the new output classes
     
     # Initialize result lists
@@ -1436,7 +1378,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             # These are NOT the user's buses where External Grid VSources connect
             if (actual_bus_name.lower() in ['sourcebus', 'source'] or 
                 bus_name_from_list.lower() in ['sourcebus', 'source']):
-                print(f"    ⚠️  Skipping OpenDSS system source bus: {actual_bus_name}")
                 continue
             
             # OpenDSS converts names to lowercase, so try to match against our expected buses (case-insensitive)
@@ -1454,7 +1395,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     break
             
             if not matched_bus_id:
-                print(f"    ⚠️  No match found - this is not a user bus, skipping '{actual_bus_name}'")
                 continue
             
             # Skip if we've already processed this bus number
@@ -1515,7 +1455,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # print(f"    ✓ Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")  # Reduced logging
                 
             except Exception as e:
-                print(f"Error calculating voltage for bus {matched_bus_name}: {e}")
                 # Add with default values - convert ID back to hash format for frontend
                 frontend_bus_id = matched_bus_id.replace('_', '#')
                 frontend_bus_name = matched_bus_name.replace('_', '#')
@@ -1528,7 +1467,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 busbarList.append(busbar)
                 
     except Exception as e:
-        print(f"Error processing bus results: {e}")
         # Fallback to default processing if OpenDSS bus access fails
         for bus_name in BusbarsDictConnectionToName.keys():
             try:
@@ -1547,13 +1485,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 busbarList.append(busbar)
                 
             except Exception as e2:
-                print(f"Error processing bus {bus_name}: {e2}")
                 continue
     
     # Process line results - iterate through ALL lines we created (not just OpenDSS's active ones)
     # This ensures we get results for disabled lines too (with zero values)
-    print(f"\n=== PROCESSING LINE RESULTS ===")
-    print(f"  LinesDict contains {len(LinesDict)} lines: {list(LinesDict.keys())[:5]}...")  # Show first 5
     
     for key, line_name in LinesDict.items():
         try:
@@ -1624,7 +1559,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             linesList.append(line)
             
         except Exception as e:
-            print(f"  Error processing line {key}: {e}")
             # Still add the line to results with zero values
             try:
                 frontend_name = key.replace('_', '#')
@@ -1644,11 +1578,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             except:
                 pass
     
-    print(f"  Total lines processed: {len(linesList)}")
     
     # Process load results - iterate through ALL loads we created
-    print(f"\n=== PROCESSING LOAD RESULTS ===")
-    print(f"  LoadsDict contains {len(LoadsDict)} loads: {list(LoadsDict.keys())[:5]}...")  # Show first 5
     
     for key, load_name in LoadsDict.items():
         try:
@@ -1679,7 +1610,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             loadsList.append(load)
                             
         except Exception as e:
-            print(f"  Error processing load {key}: {e}")
             # Still add the load to results with zero values
             try:
                 frontend_name = key.replace('_', '#')
@@ -1689,11 +1619,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             except:
                 pass
     
-    print(f"  Total loads processed: {len(loadsList)}")
     
     # Process static generators (created as PVSystem elements) - iterate through ALL generators we created
-    print(f"\n=== PROCESSING GENERATOR RESULTS ===")
-    print(f"  GeneratorsDict contains {len(GeneratorsDict)} generators: {list(GeneratorsDict.keys())[:5]}...")  # Show first 5
     
     for key, pv_name in GeneratorsDict.items():
         try:
@@ -1735,7 +1662,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                             va_degree = bus_angles[1] if not math.isnan(bus_angles[1]) else 0.0
                 except Exception as e:
-                    print(f"    Error getting voltage for PVSystem {pv_name}: {e}")
+                    pass
             else:
                 # Generator is disabled - report zero values
                 p_mw = q_mvar = 0.0
@@ -1758,7 +1685,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             # print(f"    ✓ Added PVSystem (static generator): {frontend_name}, P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr, V={vm_pu:.3f} pu")  # Reduced logging
                         
         except Exception as e:
-            print(f"  Error processing PVSystem {key}: {e}")
             # Still add the generator to results with zero values
             try:
                 frontend_name = key.replace('_', '#')
@@ -1775,10 +1701,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             except:
                 pass
     
-    print(f"  Total generators processed: {len(generatorsList)}")
     
     # Process transformer results - iterate through ALL transformers we created
-    print(f"\n=== PROCESSING TRANSFORMER RESULTS ===")
    
     
     for key, trafo_name in TransformersDict.items():
@@ -1792,8 +1716,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             if is_enabled:
                 # Get powers (in kW and kvar) for transformer
                 powers = dss.cktelement.powers
-                print("ELECTRISIM power:")
-                print(powers)
                 # Initialize power values
                 p_hv_mw = q_hv_mvar = p_lv_mw = q_lv_mvar = pl_mw = ql_mvar = 0.0
                 
@@ -1828,17 +1750,12 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         else:
                             raise ValueError("Losses array too short")
                     except Exception as e:
-                        print(f"      Could not get direct losses ({e}), calculating from power flow...")
                         # Fallback: Calculate losses using power balance
                         # With OpenDSS convention: positive = into terminal, negative = out of terminal
                         # Losses = P_terminal1 + P_terminal2 (algebraic sum)
                         pl_mw = p_hv_mw + p_lv_mw
                         ql_mvar = q_hv_mvar + q_lv_mvar
                     
-                    print(f"      Terminal 1 Sum: P={p_hv_mw:.4f} MW, Q={q_hv_mvar:.4f} MVAr")
-                    print(f"      Terminal 2 Sum: P={p_lv_mw:.4f} MW, Q={q_lv_mvar:.4f} MVAr")
-                    print(f"      FINAL Losses: P={pl_mw:.4f} MW, Q={ql_mvar:.4f} MVAr")
-                    print(f"      Loss percentage: {(abs(pl_mw)/max(abs(p_hv_mw), abs(p_lv_mw), 0.001)*100):.2f}%")
                 
                 # Get complex currents [I1_real, I1_imag, I2_real, I2_imag, I3_real, I3_imag, ...] in Amperes
                 currents = dss.cktelement.currents
@@ -1878,45 +1795,35 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                     # Match by name (most reliable)
                                     if elem_name == trafo_name or elem_name == key:
                                         element_data = elem_data
-                                        print(f"      Found transformer in in_data: key={elem_key}, name={elem_name}, id={elem_id}")
                                         break
                                     # Also try matching by ID
                                     elif elem_id == TransformersDictId.get(key, ''):
                                         element_data = elem_data
-                                        print(f"      Found transformer in in_data by ID: key={elem_key}, name={elem_name}, id={elem_id}")
                                         break
                         
                         if element_data:
                             sn_mva_raw = element_data.get('sn_mva')
                             if sn_mva_raw is not None:
                                 sn_mva = float(sn_mva_raw)
-                                print(f"      ✓ Using original transformer rating from input data: S={sn_mva:.4f} MVA")
                             else:
-                                print(f"      ✗ Found transformer data but sn_mva is missing (available keys: {list(element_data.keys())})")
+                                pass
                         else:
-                            print(f"      ✗ Could not find transformer in in_data")
-                            print(f"         Searched for: trafo_name='{trafo_name}', key='{key}', id='{TransformersDictId.get(key, '')}'")
                             # Debug: show what transformers ARE in in_data
                             transformer_keys_found = []
                             for elem_key, elem_data in in_data.items():
                                 if isinstance(elem_data, dict) and elem_data.get('typ', '') == 'Transformer':
                                     transformer_keys_found.append(f"{elem_key}: name={elem_data.get('name', 'N/A')}, id={elem_data.get('id', 'N/A')}")
                             if transformer_keys_found:
-                                print(f"         Available transformers in in_data: {transformer_keys_found[:3]}")  # Show first 3
-                    
+                                pass
                     # Fallback to OpenDSS reported value if original not available
                     if sn_mva is None:
                         sn_kva_reported = dss.transformers.kva
                         sn_mva = sn_kva_reported / 1000.0
-                        print(f"      ⚠ Using OpenDSS reported rating: kVA={sn_kva_reported:.2f} -> S={sn_mva:.4f} MVA")
-                        print(f"      WARNING: Could not find original rating in input data, using OpenDSS value")
                     
                     # Get HV voltage from first winding
                     dss.transformers.wdg = 1
                     vn_hv_kv = dss.transformers.kv
                     
-                    print(f"      HV voltage: {vn_hv_kv:.2f} kV")
-                    print(f"      Actual HV current: i_hv_ka={i_hv_ka:.4f} kA")
                     
                     # Get number of phases from transformer properties
                     try:
@@ -1925,7 +1832,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         # Fallback: assume 3-phase if not available
                         num_phases = 3
                     
-                    print(f"      Number of phases: {num_phases}, Rated S={sn_mva:.4f} MVA")
                     
                     # Calculate loading using two methods and use the most reasonable one
                     
@@ -1947,18 +1853,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     s_actual_mva = math.sqrt(p_hv_abs**2 + q_hv_abs**2)
                     loading_by_power = (s_actual_mva / sn_mva * 100.0) if sn_mva > 0 else 0.0
                     
-                    print(f"      P_HV (abs): {p_hv_abs:.4f} MW, Q_HV (abs): {q_hv_abs:.4f} MVAr")
-                    print(f"      Calculated rated current: i_rated_hv_ka={i_rated_hv_ka:.4f} kA")
-                    print(f"      Loading by current: {loading_by_current:.2f}%")
-                    print(f"      Actual apparent power (magnitude): {s_actual_mva:.4f} MVA")
-                    print(f"      Rated apparent power: {sn_mva:.4f} MVA")
-                    print(f"      Loading by power: {loading_by_power:.2f}%")
                     
                     # Use power-based loading (more reliable for transformers)
                     loading_percent = loading_by_power
-                    print(f"      FINAL Loading (using MVA method): {loading_percent:.2f}%")
                 except Exception as e:
-                    print(f"    Could not calculate loading for {trafo_name}: {e}")
                     loading_percent = 0.0
             else:
                 # Transformer is disabled - report zero values
@@ -1986,7 +1884,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             transformersList.append(transformer)
                         
         except Exception as e:
-            print(f"  Error processing transformer {key}: {e}")
             # Still add the transformer to results with zero values
             try:
                 frontend_name = key.replace('_', '#')
@@ -2038,10 +1935,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 bus_angles = dss.bus.vmag_angle_pu
                                 if len(bus_angles) >= 1:
                                     vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
-                                    print(f"    Capacitor {cap_name} bus voltage: vm_pu={vm_pu}")
                             except Exception as e:
-                                print(f"    Error getting voltage value for capacitor {cap_name}: {e}")
-
+                                pass
                             # Convert IDs back to hash format for frontend
                             frontend_name = key.replace('_', '#')
                             frontend_id = CapacitorsDictId[key].replace('_', '#')
@@ -2056,22 +1951,19 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             capacitorsList.append(capacitor)
                             break
                         except Exception as e:
-                            print(f"    Error processing capacitor {cap_name}: {e}")
                             continue
             except Exception as e:
-                print(f"  Error processing capacitor: {e}")
+                pass
             dss.capacitors.next()
     
     # Process shunt results (reactors in OpenDSS)
     # Use alternative method if dss.reactors is not available
-    print(f"  Processing reactors: Expected shunts in dict: {list(ShuntsDict.keys())}")
     
     try:
         # Process each expected shunt directly by setting it as active element
         if ShuntsDict:
             for key, value in ShuntsDict.items():
                 reactor_name = value  # e.g., 'mxCell_143'
-                print(f"    Looking for reactor: {reactor_name}")
                 
                 try:
                     # Set this specific reactor as active circuit element
@@ -2084,11 +1976,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     
                     # Get element info
                     element_name = dss.cktelement.name
-                    print(f"      Found reactor element: '{element_name}'")
                     
                     # Get powers
                     powers = dss.cktelement.powers
-                    print(f"      Reactor powers array length: {len(powers)}, values: {powers[:6] if len(powers) >= 6 else powers}")
                     
                     # Reactors can be single-phase or three-phase
                     if len(powers) >= 6:
@@ -2107,7 +1997,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     p_mw = (p_raw / 1000.0) if (not math.isnan(p_raw) and not math.isinf(p_raw)) else 0.0
                     q_mvar = (q_raw / 1000.0) if (not math.isnan(q_raw) and not math.isinf(q_raw)) else 0.0
                     
-                    print(f"      Reactor P={p_mw:.6f} MW, Q={q_mvar:.6f} MVar")
 
                     # Get voltage value from the shunt's bus
                     vm_pu = 1.0
@@ -2135,17 +2024,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         vm_pu=vm_pu
                     )
                     shuntsList.append(shunt)
-                    print(f"      ✓ Added shunt: {frontend_name}")
                     
                 except Exception as e:
-                    print(f"      Reactor {reactor_name} not found or error: {e}")
                     continue
         else:
-            print(f"  No reactors found in circuit")
-        
+            pass
     except Exception as e:
-        print(f"  Error accessing reactors: {e}")
-    
+        pass
     # Process storage results
     if hasattr(dss, 'storage') and dss.storage.count > 0:
         dss.storage.first()
@@ -2178,12 +2063,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             storagesList.append(storage)
                             break
                         except Exception as e:
-                            print(f"    Error processing storage {storage_name}: {e}")
                             continue
                     else:
-                        print(f"    Storage {storage_name} not found in StoragesDict")
+                        pass
             except Exception as e:
-                print(f"  Error processing storage: {e}")
+                pass
             dss.storage.next()
 
     # Process PVSystem results (matching notebook approach)
@@ -2244,27 +2128,22 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 pvsystemsList.append(pvsystem)
                                 break
                             except Exception as e:
-                                print(f"    ✗ Error processing PVSystem {pvsystem_name}: {e}")
                                 continue
                 except Exception as e:
-                    print(f"  Error processing PVSystem: {e}")
+                    pass
                 dss.pvsystems.next()
         
-        print(f"  Total PVSystems processed: {len(pvsystemsList)}")
     else:
-        print("  No PVSystems interface available in OpenDSS")
-
+        pass
     # Process external grid results
     if hasattr(dss, 'vsources') and dss.vsources.count > 0:
         dss.vsources.first()
         for _ in range(dss.vsources.count):
             try:
                 vsource_name = dss.vsources.name
-                print(f"    Processing VSource: {vsource_name}")
 
                 # Skip system VSources (OpenDSS auto-creates these)
                 if vsource_name in ['source', 'sourcebus']:
-                    print(f"      ⚠️  Skipping system VSource: {vsource_name}")
                     dss.vsources.next()
                     continue
 
@@ -2316,9 +2195,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         )
                         externalGridsList.append(externalGrid)
                     except Exception as e:
-                        print(f"Error processing external grid {vsource_name}: {e}")
+                        pass
             except Exception as e:
-                print(f"  Error processing external grid: {e}")
+                pass
             dss.vsources.next()
     
     # Build final result using simplified structure (no output classes)
@@ -2345,13 +2224,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     if externalGridsList:
         result['externalgrids'] = externalGridsList
     
-    print(f"OpenDSS results: {len(busbarList)} buses, {len(linesList)} lines, {len(transformersList)} transformers, {len(shuntsList)} shunts, {len(pvsystemsList)} pvsystems, {len(externalGridsList)} external grids")
 
     # Add OpenDSS commands to result if export was requested
     if export_commands and opendss_commands:
         commands_text = '\n'.join(opendss_commands)
         result['opendss_commands'] = commands_text
-        print(f"OpenDSS commands export enabled: {len(opendss_commands)} commands collected")
 
     # Custom JSON encoder to handle NaN values
     def safe_json_serializer(obj):
@@ -2375,13 +2252,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     try:
         # Optimized: Remove indent=4 to reduce payload size by ~40%
         response = json.dumps(result, default=safe_json_serializer, separators=(',', ':'))
-        print("=== FINAL RESULT ===")
-        print(f"Result keys: {list(result.keys())}")
-        print(f"Total elements processed: {len(busbarList) + len(linesList) + len(loadsList) + len(transformersList) + len(shuntsList) + len(capacitorsList) + len(generatorsList) + len(storagesList) + len(externalGridsList)}")
         
         return response
     except Exception as json_error:
-        print(f"JSON serialization error: {json_error}")
         return json.dumps({"error": "JSON serialization failed", "message": str(json_error)}, separators=(',', ':'))
         
         #U[pu],angle[degree]
