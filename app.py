@@ -26,6 +26,8 @@ cors_origins = os.getenv('CORS_ORIGINS', '').split(',') if os.getenv('CORS_ORIGI
     'http://127.0.0.1:5501', 
     'http://localhost:5500', 
     'http://localhost:5501',
+    'http://localhost:5502',
+    'https://03dht3kc-5000.euw.devtunnels.ms',
     # Production origins
     'https://app.electrisim.com',
     'https://www.electrisim.com',
