@@ -123,6 +123,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             mag0_rx = row.get('mag0_rx', 0.0)
             si0_hv_partial = row.get('si0_hv_partial', 0.0)
             
+            # Get tap_changer_type (pandapower 3.0+)
+            tap_changer_type = row.get('tap_changer_type', 'Ratio')
+            
             # Build the create_transformer_from_parameters call
             lines.append(f"# Transformer ID: {trafo_id}")
             trafo_code = (f"pp.create_transformer_from_parameters(net, hv_bus=bus_{hv_bus}, lv_bus=bus_{lv_bus}, "
@@ -133,6 +136,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                          f"tap_side='{tap_side}', tap_pos={tap_pos}, tap_neutral={tap_neutral}, "
                          f"tap_max={tap_max}, tap_min={tap_min}, "
                          f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, "
+                         f"tap_changer_type='{tap_changer_type}', "
                          f"vector_group='{vector_group}', "
                          f"vk0_percent={vk0_percent}, vkr0_percent={vkr0_percent}, "
                          f"mag0_percent={mag0_percent}, mag0_rx={mag0_rx}, "
@@ -186,6 +190,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             vkr0_mv_percent = row.get('vkr0_mv_percent', vkr_mv_percent)
             vkr0_lv_percent = row.get('vkr0_lv_percent', vkr_lv_percent)
             
+            # Get tap_changer_type (pandapower 3.0+)
+            tap_changer_type_3w = row.get('tap_changer_type', 'Ratio')
+            
             # Build the create_transformer3w_from_parameters call
             lines.append(f"# Three-Winding Transformer ID: {trafo3w_id}")
             trafo3w_code = (f"pp.create_transformer3w_from_parameters(net, "
@@ -197,7 +204,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                            f"pfe_kw={pfe_kw}, i0_percent={i0_percent}, "
                            f"shift_mv_degree={shift_mv_degree}, shift_lv_degree={shift_lv_degree}, "
                            f"tap_side='{tap_side}', tap_pos={tap_pos}, tap_min={tap_min}, tap_max={tap_max}, "
-                           f"tap_step_percent={tap_step_percent}, vector_group='{vector_group}', "
+                           f"tap_step_percent={tap_step_percent}, tap_changer_type='{tap_changer_type_3w}', "
+                           f"vector_group='{vector_group}', "
                            f"vk0_hv_percent={vk0_hv_percent}, vk0_mv_percent={vk0_mv_percent}, vk0_lv_percent={vk0_lv_percent}, "
                            f"vkr0_hv_percent={vkr0_hv_percent}, vkr0_mv_percent={vkr0_mv_percent}, vkr0_lv_percent={vkr0_lv_percent}, "
                            f"name='{name}')")
@@ -548,6 +556,11 @@ def create_other_elements(in_data,net,x, Busbars):
                 else:
                     tap_step_value = 0.0  # No tap control
             
+            # Get tap_changer_type (pandapower 3.0+): "Ratio", "Symmetrical", or "Ideal"
+            tap_changer_type = in_data[x].get('tap_changer_type', 'Ratio')
+            if tap_changer_type not in ['Ratio', 'Symmetrical', 'Ideal']:
+                tap_changer_type = 'Ratio'  # Default value
+            
             transformer_params = {
                 'hv_bus': hv_bus_idx,
                 'lv_bus': lv_bus_idx,
@@ -568,7 +581,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 'tap_max': safe_int(in_data[x].get('tap_max', 0)),
                 'tap_min': safe_int(in_data[x].get('tap_min', 0)),
                 'tap_step_percent': tap_step_value,
-                'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0))
+                'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0)),
+                'tap_changer_type': tap_changer_type  # pandapower 3.0+
             }
             
             # Add optional parameters with proper defaults
@@ -638,6 +652,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if lv_bus_idx is None:
                 continue
             
+            # Get tap_changer_type (pandapower 3.0+): "Ratio", "Symmetrical", or "Ideal"
+            tap_changer_type_3w = in_data[x].get('tap_changer_type', 'Ratio')
+            if tap_changer_type_3w not in ['Ratio', 'Symmetrical', 'Ideal']:
+                tap_changer_type_3w = 'Ratio'  # Default value
+            
             # Prepare optional parameters - only include if they are not None
             transformer_params = {
                 'hv_bus': hv_bus_idx,
@@ -665,7 +684,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 'tap_side': in_data[x]['tap_side'],
                 'tap_min': safe_int(in_data[x]['tap_min']),
                 'tap_max': safe_int(in_data[x]['tap_max']),
-                'tap_pos': safe_int(in_data[x]['tap_pos'])
+                'tap_pos': safe_int(in_data[x]['tap_pos']),
+                'tap_changer_type': tap_changer_type_3w  # pandapower 3.0+
             }
             
             # Add optional parameters only if they are not None
