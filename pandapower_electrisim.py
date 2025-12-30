@@ -805,10 +805,26 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], pn_mech_mw=in_data[x]['pn_mech_mw'],
-                            cos_phi=in_data[x]['cos_phi'],efficiency_n_percent=in_data[x]['efficiency_n_percent'],
-                            lrc_pu=in_data[x]['lrc_pu'], rx=in_data[x]['rx'], vn_kv=in_data[x]['vn_kv'],
-                            efficiency_percent=in_data[x]['efficiency_percent'], loading_percent=in_data[x]['loading_percent'], scaling=in_data[x]['scaling'], in_service=in_service)         
+            
+            # Handle Irc_pu / lrc_pu - frontend sends Irc_pu, Pandapower expects lrc_pu
+            # Try both key names, handle None values
+            lrc_pu_value = in_data[x].get('lrc_pu') or in_data[x].get('Irc_pu')
+            if lrc_pu_value is None or lrc_pu_value == 'None' or lrc_pu_value == '':
+                lrc_pu_value = None
+            else:
+                lrc_pu_value = safe_float_local(lrc_pu_value, None)
+            
+            pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
+                            pn_mech_mw=safe_float_local(in_data[x].get('pn_mech_mw'), 0.0),
+                            cos_phi=safe_float_local(in_data[x].get('cos_phi'), 0.85),
+                            efficiency_n_percent=safe_float_local(in_data[x].get('efficiency_n_percent'), 90.0),
+                            lrc_pu=lrc_pu_value,
+                            rx=safe_float_local(in_data[x].get('rx'), 0.0),
+                            vn_kv=safe_float_local(in_data[x].get('vn_kv'), 0.4),
+                            efficiency_percent=safe_float_local(in_data[x].get('efficiency_percent'), 90.0),
+                            loading_percent=safe_float_local(in_data[x].get('loading_percent'), 100.0),
+                            scaling=safe_float_local(in_data[x].get('scaling'), 1.0),
+                            in_service=in_service)         
    
         
         if (in_data[x]['typ'].startswith("SVC")):
@@ -1340,13 +1356,85 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #Asymmetric Static Generator                     
                 if(net.res_asymmetric_sgen.empty):
                     pass
-                else:                    
-                        for index, row in net.res_asymmetric_sgen.iterrows():    
-                            asymmetricstaticgenerator = AsymmetricStaticGeneratorOut(name=net.asymmetric_sgen._get_value(index, 'name'), id = net.asymmetric_sgen._get_value(index, 'id'), p_a_mw=row['p_a_mw'], q_a_mvar=row['q_a_mvar'], p_b_mw=row['p_b_mw'], q_b_mvar=row['q_b_mvar'], p_c_mw=row['p_c_mw'], q_c_mvar=row['q_c_mvar'])        
-                            asymmetricstaticgeneratorsList.append(asymmetricstaticgenerator) 
-                            asymmetricstaticgenerators = AsymmetricStaticGeneratorsOut(asymmetricstaticgenerators = asymmetricstaticgeneratorsList)
+                else:
+                        available_columns = net.res_asymmetric_sgen.columns.tolist()
                         
-                        result = {**result, **asymmetricstaticgenerators.__dict__}
+                        # Check if phase-specific columns exist
+                        has_phase_specific = all(col in available_columns for col in ['p_a_mw', 'q_a_mvar', 'p_b_mw', 'q_b_mvar', 'p_c_mw', 'q_c_mvar'])
+                        has_aggregate = all(col in available_columns for col in ['p_mw', 'q_mvar'])
+                        
+                        if has_phase_specific:
+                            # Use phase-specific results if available
+                            for index, row in net.res_asymmetric_sgen.iterrows():    
+                                asymmetricstaticgenerator = AsymmetricStaticGeneratorOut(
+                                    name=net.asymmetric_sgen._get_value(index, 'name'), 
+                                    id=net.asymmetric_sgen._get_value(index, 'id'), 
+                                    p_a_mw=row['p_a_mw'], 
+                                    q_a_mvar=row['q_a_mvar'], 
+                                    p_b_mw=row['p_b_mw'], 
+                                    q_b_mvar=row['q_b_mvar'], 
+                                    p_c_mw=row['p_c_mw'], 
+                                    q_c_mvar=row['q_c_mvar']
+                                )        
+                                asymmetricstaticgeneratorsList.append(asymmetricstaticgenerator)
+                        elif has_aggregate:
+                            # If only aggregate results available, distribute based on input phase distribution
+                            for index, row in net.res_asymmetric_sgen.iterrows():
+                                # Get input phase values to determine distribution
+                                p_a_input = float(net.asymmetric_sgen._get_value(index, 'p_a_mw'))
+                                p_b_input = float(net.asymmetric_sgen._get_value(index, 'p_b_mw'))
+                                p_c_input = float(net.asymmetric_sgen._get_value(index, 'p_c_mw'))
+                                q_a_input = float(net.asymmetric_sgen._get_value(index, 'q_a_mvar'))
+                                q_b_input = float(net.asymmetric_sgen._get_value(index, 'q_b_mvar'))
+                                q_c_input = float(net.asymmetric_sgen._get_value(index, 'q_c_mvar'))
+                                
+                                # Calculate total input power for distribution
+                                p_total_input = abs(p_a_input) + abs(p_b_input) + abs(p_c_input)
+                                q_total_input = abs(q_a_input) + abs(q_b_input) + abs(q_c_input)
+                                
+                                # Get aggregate results
+                                p_total = float(row['p_mw'])
+                                q_total = float(row['q_mvar'])
+                                
+                                # Distribute results proportionally based on input phase distribution
+                                if p_total_input > 0:
+                                    p_a_mw = p_total * (abs(p_a_input) / p_total_input)
+                                    p_b_mw = p_total * (abs(p_b_input) / p_total_input)
+                                    p_c_mw = p_total * (abs(p_c_input) / p_total_input)
+                                else:
+                                    # If no input power, distribute equally
+                                    p_a_mw = p_total / 3.0
+                                    p_b_mw = p_total / 3.0
+                                    p_c_mw = p_total / 3.0
+                                
+                                if q_total_input > 0:
+                                    q_a_mvar = q_total * (abs(q_a_input) / q_total_input)
+                                    q_b_mvar = q_total * (abs(q_b_input) / q_total_input)
+                                    q_c_mvar = q_total * (abs(q_c_input) / q_total_input)
+                                else:
+                                    # If no input reactive power, distribute equally
+                                    q_a_mvar = q_total / 3.0
+                                    q_b_mvar = q_total / 3.0
+                                    q_c_mvar = q_total / 3.0
+                                
+                                asymmetricstaticgenerator = AsymmetricStaticGeneratorOut(
+                                    name=net.asymmetric_sgen._get_value(index, 'name'), 
+                                    id=net.asymmetric_sgen._get_value(index, 'id'), 
+                                    p_a_mw=p_a_mw, 
+                                    q_a_mvar=q_a_mvar, 
+                                    p_b_mw=p_b_mw, 
+                                    q_b_mvar=q_b_mvar, 
+                                    p_c_mw=p_c_mw, 
+                                    q_c_mvar=q_c_mvar
+                                )        
+                                asymmetricstaticgeneratorsList.append(asymmetricstaticgenerator)
+                        else:
+                            print(f"Warning: res_asymmetric_sgen has unexpected column structure. Available columns: {available_columns}")
+                            pass
+                        
+                        if asymmetricstaticgeneratorsList:
+                            asymmetricstaticgenerators = AsymmetricStaticGeneratorsOut(asymmetricstaticgenerators = asymmetricstaticgeneratorsList)
+                            result = {**result, **asymmetricstaticgenerators.__dict__}
                         
                
                 #Transformer                     
@@ -1417,12 +1505,85 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #Asymmetric Load
                 if(net.res_asymmetric_load.empty):
                     pass
-                else:                    
-                        for index, row in net.res_asymmetric_load.iterrows():    
-                            asymmetricload = AsymmetricLoadOut(name=net.asymmetric_load._get_value(index, 'name'), id = net.asymmetric_load._get_value(index, 'id'), p_a_mw=row['p_a_mw'], q_a_mvar=row['q_a_mvar'], p_b_mw=row['p_b_mw'], q_b_mvar=row['q_b_mvar'], p_c_mw=row['p_c_mw'], q_c_mvar=row['q_c_mvar'])        
-                            asymmetricloadsList.append(asymmetricload) 
+                else:
+                        available_columns = net.res_asymmetric_load.columns.tolist()
+                        
+                        # Check if phase-specific columns exist
+                        has_phase_specific = all(col in available_columns for col in ['p_a_mw', 'q_a_mvar', 'p_b_mw', 'q_b_mvar', 'p_c_mw', 'q_c_mvar'])
+                        has_aggregate = all(col in available_columns for col in ['p_mw', 'q_mvar'])
+                        
+                        if has_phase_specific:
+                            # Use phase-specific results if available
+                            for index, row in net.res_asymmetric_load.iterrows():    
+                                asymmetricload = AsymmetricLoadOut(
+                                    name=net.asymmetric_load._get_value(index, 'name'), 
+                                    id=net.asymmetric_load._get_value(index, 'id'), 
+                                    p_a_mw=row['p_a_mw'], 
+                                    q_a_mvar=row['q_a_mvar'], 
+                                    p_b_mw=row['p_b_mw'], 
+                                    q_b_mvar=row['q_b_mvar'], 
+                                    p_c_mw=row['p_c_mw'], 
+                                    q_c_mvar=row['q_c_mvar']
+                                )        
+                                asymmetricloadsList.append(asymmetricload)
+                        elif has_aggregate:
+                            # If only aggregate results available, distribute based on input phase distribution
+                            for index, row in net.res_asymmetric_load.iterrows():
+                                # Get input phase values to determine distribution
+                                p_a_input = float(net.asymmetric_load._get_value(index, 'p_a_mw'))
+                                p_b_input = float(net.asymmetric_load._get_value(index, 'p_b_mw'))
+                                p_c_input = float(net.asymmetric_load._get_value(index, 'p_c_mw'))
+                                q_a_input = float(net.asymmetric_load._get_value(index, 'q_a_mvar'))
+                                q_b_input = float(net.asymmetric_load._get_value(index, 'q_b_mvar'))
+                                q_c_input = float(net.asymmetric_load._get_value(index, 'q_c_mvar'))
+                                
+                                # Calculate total input power for distribution
+                                p_total_input = abs(p_a_input) + abs(p_b_input) + abs(p_c_input)
+                                q_total_input = abs(q_a_input) + abs(q_b_input) + abs(q_c_input)
+                                
+                                # Get aggregate results
+                                p_total = float(row['p_mw'])
+                                q_total = float(row['q_mvar'])
+                                
+                                # Distribute results proportionally based on input phase distribution
+                                if p_total_input > 0:
+                                    p_a_mw = p_total * (abs(p_a_input) / p_total_input)
+                                    p_b_mw = p_total * (abs(p_b_input) / p_total_input)
+                                    p_c_mw = p_total * (abs(p_c_input) / p_total_input)
+                                else:
+                                    # If no input power, distribute equally
+                                    p_a_mw = p_total / 3.0
+                                    p_b_mw = p_total / 3.0
+                                    p_c_mw = p_total / 3.0
+                                
+                                if q_total_input > 0:
+                                    q_a_mvar = q_total * (abs(q_a_input) / q_total_input)
+                                    q_b_mvar = q_total * (abs(q_b_input) / q_total_input)
+                                    q_c_mvar = q_total * (abs(q_c_input) / q_total_input)
+                                else:
+                                    # If no input reactive power, distribute equally
+                                    q_a_mvar = q_total / 3.0
+                                    q_b_mvar = q_total / 3.0
+                                    q_c_mvar = q_total / 3.0
+                                
+                                asymmetricload = AsymmetricLoadOut(
+                                    name=net.asymmetric_load._get_value(index, 'name'), 
+                                    id=net.asymmetric_load._get_value(index, 'id'), 
+                                    p_a_mw=p_a_mw, 
+                                    q_a_mvar=q_a_mvar, 
+                                    p_b_mw=p_b_mw, 
+                                    q_b_mvar=q_b_mvar, 
+                                    p_c_mw=p_c_mw, 
+                                    q_c_mvar=q_c_mvar
+                                )        
+                                asymmetricloadsList.append(asymmetricload)
+                        else:
+                            print(f"Warning: res_asymmetric_load has unexpected column structure. Available columns: {available_columns}")
+                            pass
+                        
+                        if asymmetricloadsList:
                             asymmetricloads = AsymmetricLoadsOut(asymmetricloads = asymmetricloadsList) 
-                        result = {**result, **asymmetricloads.__dict__}    
+                            result = {**result, **asymmetricloads.__dict__}    
                         
                         
                 #Impedance
