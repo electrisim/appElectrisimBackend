@@ -275,8 +275,31 @@ def create_busbars(in_data, net):
     # Store user-friendly names mapping for later use
     net.user_friendly_names = {}
     
+    # Create a separate dictionary for DC buses
+    DcBuses = {}
+    
     for x in in_data:
-        if "Bus" in in_data[x]['typ']:
+        if "DC Bus" in in_data[x]['typ']:
+            # Handle DC Bus separately
+            dc_bus_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', dc_bus_name)
+            
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            
+            DcBuses[dc_bus_name] = pp.create_dc_bus(
+                net,
+                name=dc_bus_name,
+                id=in_data[x]['id'],
+                vn_kv=float(in_data[x].get('vn_kv', 0.0)),
+                in_service=in_service
+            )
+            
+            # Store the user-friendly name mapping
+            net.user_friendly_names[dc_bus_name] = user_friendly_name
+        elif "Bus" in in_data[x]['typ']:
             bus_name = in_data[x]['name']
             user_friendly_name = in_data[x].get('userFriendlyName', bus_name)
             
@@ -297,6 +320,8 @@ def create_busbars(in_data, net):
             # Store the user-friendly name mapping
             net.user_friendly_names[bus_name] = user_friendly_name
     
+    # Store DC buses in Busbars dict for compatibility
+    Busbars.update(DcBuses)
     return Busbars
 
 
@@ -871,6 +896,116 @@ def create_other_elements(in_data,net,x, Busbars):
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'], in_service=in_service)         
    
+        if (in_data[x]['typ'].startswith("Load DC")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_load_dc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x].get('p_mw', 0.0)), in_service=in_service)
+            
+            # Store user-friendly name for load DC
+            load_dc_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', load_dc_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[load_dc_name] = user_friendly_name
+        
+        if (in_data[x]['typ'].startswith("Source DC")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_source_dc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)), in_service=in_service)
+            
+            # Store user-friendly name for source DC
+            source_dc_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', source_dc_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[source_dc_name] = user_friendly_name
+        
+        if (in_data[x]['typ'].startswith("Switch")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                continue
+            # Get element index (line or transformer the switch is connected to)
+            element_idx = in_data[x].get('element')
+            if element_idx is None:
+                continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            # Get switch type (et parameter: 'line' or 'trafo')
+            et = in_data[x].get('et', 'line')  # Default to 'line'
+            closed = in_data[x].get('closed', True)
+            if isinstance(closed, str):
+                closed = closed.lower() == 'true'
+            switch_type = in_data[x].get('type', 'CB')
+            z_ohm = safe_float(in_data[x].get('z_ohm', 0.0))
+            in_ka = safe_float(in_data[x].get('in_ka', 0.0))
+            
+            pp.create_switch(net, bus=bus_idx, element=int(element_idx), et=et, name=in_data[x]['name'], id=in_data[x]['id'], 
+                           closed=closed, type=switch_type, z_ohm=z_ohm, in_ka=in_ka, in_service=in_service)
+            
+            # Store user-friendly name for switch
+            switch_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', switch_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[switch_name] = user_friendly_name
+        
+        if (in_data[x]['typ'].startswith("VSC")):
+            bus_idx = Busbars.get(in_data[x]['bus'])
+            if bus_idx is None:
+                continue
+            bus_dc_idx = Busbars.get(in_data[x].get('bus_dc', ''))
+            if bus_dc_idx is None:
+                continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
+                         p_mw=safe_float(in_data[x].get('p_mw', 0.0)), vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)), 
+                         sn_mva=safe_float(in_data[x].get('sn_mva', 0.0)), rx=safe_float(in_data[x].get('rx', 0.1)), 
+                         max_ik_ka=safe_float(in_data[x].get('max_ik_ka', 0.0)), in_service=in_service)
+            
+            # Store user-friendly name for VSC
+            vsc_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', vsc_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[vsc_name] = user_friendly_name
+        
+        if (in_data[x]['typ'].startswith("B2B VSC")):
+            bus1_idx = Busbars.get(in_data[x].get('bus1', ''))
+            bus2_idx = Busbars.get(in_data[x].get('bus2', ''))
+            if bus1_idx is None or bus2_idx is None:
+                continue
+            # Get in_service parameter (default to True if not specified)
+            in_service = True
+            if 'in_service' in in_data[x]:
+                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+            pp.create_b2b_vsc(net, bus1=bus1_idx, bus2=bus2_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
+                            p_mw=safe_float(in_data[x].get('p_mw', 0.0)), vm1_pu=safe_float(in_data[x].get('vm1_pu', 1.0)), 
+                            vm2_pu=safe_float(in_data[x].get('vm2_pu', 1.0)), sn_mva=safe_float(in_data[x].get('sn_mva', 0.0)), 
+                            rx=safe_float(in_data[x].get('rx', 0.1)), max_ik_ka=safe_float(in_data[x].get('max_ik_ka', 0.0)), 
+                            in_service=in_service)
+            
+            # Store user-friendly name for B2B VSC
+            b2b_vsc_name = in_data[x]['name']
+            user_friendly_name = in_data[x].get('userFriendlyName', b2b_vsc_name)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[b2b_vsc_name] = user_friendly_name
+        
         if (in_data[x]['typ'].startswith("DC Line")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
             to_bus_idx = Busbars.get(in_data[x]['busTo'])
@@ -1286,7 +1421,79 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 class DClinesOut(object):
                     def __init__(self, dclines: List[DClineOut]):
                         self.dclines = dclines              
-                dclinesList = list() 
+                dclinesList = list()
+                
+                class DcBusOut(object):
+                    def __init__(self, name: str, id: str, vm_pu: float, p_mw: float):          
+                        self.name = name
+                        self.id = id
+                        self.vm_pu = vm_pu
+                        self.p_mw = p_mw
+                       
+                class DcBusesOut(object):
+                    def __init__(self, dcbuses: List[DcBusOut]):
+                        self.dcbuses = dcbuses              
+                dcbusesList = list()
+                
+                class LoadDcOut(object):
+                    def __init__(self, name: str, id: str, p_mw: float):          
+                        self.name = name
+                        self.id = id
+                        self.p_mw = p_mw
+                       
+                class LoadsDcOut(object):
+                    def __init__(self, loadsdc: List[LoadDcOut]):
+                        self.loadsdc = loadsdc              
+                loadsdcList = list()
+                
+                class SourceDcOut(object):
+                    def __init__(self, name: str, id: str, vm_pu: float, p_mw: float):          
+                        self.name = name
+                        self.id = id
+                        self.vm_pu = vm_pu
+                        self.p_mw = p_mw
+                       
+                class SourcesDcOut(object):
+                    def __init__(self, sourcesdc: List[SourceDcOut]):
+                        self.sourcesdc = sourcesdc              
+                sourcesdcList = list()
+                
+                class SwitchOut(object):
+                    def __init__(self, name: str, id: str, closed: bool, i_ka: float):          
+                        self.name = name
+                        self.id = id
+                        self.closed = closed
+                        self.i_ka = i_ka
+                       
+                class SwitchesOut(object):
+                    def __init__(self, switches: List[SwitchOut]):
+                        self.switches = switches              
+                switchesList = list()
+                
+                class VSCOut(object):
+                    def __init__(self, name: str, id: str, p_mw: float, vm_pu: float):          
+                        self.name = name
+                        self.id = id
+                        self.p_mw = p_mw
+                        self.vm_pu = vm_pu
+                       
+                class VSCsOut(object):
+                    def __init__(self, vscs: List[VSCOut]):
+                        self.vscs = vscs              
+                vscsList = list()
+                
+                class B2bVSCOut(object):
+                    def __init__(self, name: str, id: str, p_mw: float, vm1_pu: float, vm2_pu: float):          
+                        self.name = name
+                        self.id = id
+                        self.p_mw = p_mw
+                        self.vm1_pu = vm1_pu
+                        self.vm2_pu = vm2_pu
+                       
+                class B2bVSCsOut(object):
+                    def __init__(self, b2bvscs: List[B2bVSCOut]):
+                        self.b2bvscs = b2bvscs              
+                b2bvscsList = list() 
                 
                 
                 #Bus
@@ -1689,6 +1896,54 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result = {**result, **sscs.__dict__}                    
                        
                                         
+                #DC Bus
+                if(hasattr(net, 'res_dc_bus') and not net.res_dc_bus.empty):
+                    for index, row in net.res_dc_bus.iterrows():    
+                        dcbus = DcBusOut(name=net.dc_bus._get_value(index, 'name'), id = net.dc_bus._get_value(index, 'id'), vm_pu=row['vm_pu'], p_mw=row['p_mw'])        
+                        dcbusesList.append(dcbus) 
+                        dcbuses = DcBusesOut(dcbuses = dcbusesList) 
+                    result = {**result, **dcbuses.__dict__}
+                
+                #Load DC
+                if(hasattr(net, 'res_load_dc') and not net.res_load_dc.empty):
+                    for index, row in net.res_load_dc.iterrows():    
+                        loaddc = LoadDcOut(name=net.load_dc._get_value(index, 'name'), id = net.load_dc._get_value(index, 'id'), p_mw=row['p_mw'])        
+                        loadsdcList.append(loaddc) 
+                        loadsdc = LoadsDcOut(loadsdc = loadsdcList) 
+                    result = {**result, **loadsdc.__dict__}
+                
+                #Source DC
+                if(hasattr(net, 'res_source_dc') and not net.res_source_dc.empty):
+                    for index, row in net.res_source_dc.iterrows():    
+                        sourcedc = SourceDcOut(name=net.source_dc._get_value(index, 'name'), id = net.source_dc._get_value(index, 'id'), vm_pu=row['vm_pu'], p_mw=row['p_mw'])        
+                        sourcesdcList.append(sourcedc) 
+                        sourcesdc = SourcesDcOut(sourcesdc = sourcesdcList) 
+                    result = {**result, **sourcesdc.__dict__}
+                
+                #Switch
+                if(hasattr(net, 'res_switch') and not net.res_switch.empty):
+                    for index, row in net.res_switch.iterrows():    
+                        switch = SwitchOut(name=net.switch._get_value(index, 'name'), id = net.switch._get_value(index, 'id'), closed=row.get('closed', True), i_ka=row.get('i_ka', 0.0))        
+                        switchesList.append(switch) 
+                        switches = SwitchesOut(switches = switchesList) 
+                    result = {**result, **switches.__dict__}
+                
+                #VSC
+                if(hasattr(net, 'res_vsc') and not net.res_vsc.empty):
+                    for index, row in net.res_vsc.iterrows():    
+                        vsc = VSCOut(name=net.vsc._get_value(index, 'name'), id = net.vsc._get_value(index, 'id'), p_mw=row['p_mw'], vm_pu=row['vm_pu'])        
+                        vscsList.append(vsc) 
+                        vscs = VSCsOut(vscs = vscsList) 
+                    result = {**result, **vscs.__dict__}
+                
+                #B2B VSC
+                if(hasattr(net, 'res_b2b_vsc') and not net.res_b2b_vsc.empty):
+                    for index, row in net.res_b2b_vsc.iterrows():    
+                        b2bvsc = B2bVSCOut(name=net.b2b_vsc._get_value(index, 'name'), id = net.b2b_vsc._get_value(index, 'id'), p_mw=row['p_mw'], vm1_pu=row['vm1_pu'], vm2_pu=row['vm2_pu'])        
+                        b2bvscsList.append(b2bvsc) 
+                        b2bvscs = B2bVSCsOut(b2bvscs = b2bvscsList) 
+                    result = {**result, **b2bvscs.__dict__}
+                
                 #DCLine
                 if(net.res_dcline.empty):
                     pass
