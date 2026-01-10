@@ -12,6 +12,7 @@ import pandas as pd
 import pandapower.control as control
 import pandapower.timeseries as ts
 from pandapower.timeseries import DFData
+from copy import deepcopy
 
 
 Busbars = {} 
@@ -254,6 +255,312 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             p_mw = row['p_mw']
             name = row['name'] if 'name' in row else f"Shunt_{idx}"
             lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name='{name}')")
+        lines.append("")
+    
+    # Create storage elements
+    if hasattr(net, 'storage') and not net.storage.empty:
+        lines.append("# Create storage elements")
+        for idx, row in net.storage.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"Storage_{idx}"
+            p_mw = row['p_mw']
+            q_mvar = row.get('q_mvar', 0.0)
+            sn_mva = row.get('sn_mva', 1.0)
+            scaling = row.get('scaling', 1.0)
+            storage_type = row.get('type', 'storage')
+            max_e_mwh = row.get('max_e_mwh', 1.0)
+            min_e_mwh = row.get('min_e_mwh', 0.0)
+            soc_percent = row.get('soc_percent', 50.0)
+            in_service = row.get('in_service', True)
+            
+            # Build the create_storage call with all parameters
+            storage_code = (f"pp.create_storage(net, bus=bus_{bus}, name='{name}', "
+                          f"p_mw={p_mw}, q_mvar={q_mvar}, sn_mva={sn_mva}, "
+                          f"scaling={scaling}, type='{storage_type}', "
+                          f"max_e_mwh={max_e_mwh}, min_e_mwh={min_e_mwh}, "
+                          f"soc_percent={soc_percent}, in_service={in_service})")
+            lines.append(storage_code)
+        lines.append("")
+    
+    # Create DC buses
+    if hasattr(net, 'bus_dc') and not net.bus_dc.empty:
+        lines.append("# Create DC buses")
+        for idx, row in net.bus_dc.iterrows():
+            name = row['name'] if 'name' in row else f"BusDC_{idx}"
+            vn_kv = row.get('vn_kv', 0.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"bus_dc_{idx} = pp.create_dc_bus(net, vn_kv={vn_kv}, name='{name}', in_service={in_service})")
+        lines.append("")
+    
+    # Create asymmetric static generators
+    if hasattr(net, 'asymmetric_sgen') and not net.asymmetric_sgen.empty:
+        lines.append("# Create asymmetric static generators")
+        for idx, row in net.asymmetric_sgen.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"AsymSGen_{idx}"
+            p_a_mw = row.get('p_a_mw', 0.0)
+            p_b_mw = row.get('p_b_mw', 0.0)
+            p_c_mw = row.get('p_c_mw', 0.0)
+            q_a_mvar = row.get('q_a_mvar', 0.0)
+            q_b_mvar = row.get('q_b_mvar', 0.0)
+            q_c_mvar = row.get('q_c_mvar', 0.0)
+            sn_mva = row.get('sn_mva', 1.0)
+            scaling = row.get('scaling', 1.0)
+            sgen_type = row.get('type', 'current_source')
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_asymmetric_sgen(net, bus=bus_{bus}, name='{name}', "
+                        f"p_a_mw={p_a_mw}, p_b_mw={p_b_mw}, p_c_mw={p_c_mw}, "
+                        f"q_a_mvar={q_a_mvar}, q_b_mvar={q_b_mvar}, q_c_mvar={q_c_mvar}, "
+                        f"sn_mva={sn_mva}, scaling={scaling}, type='{sgen_type}', in_service={in_service})")
+        lines.append("")
+    
+    # Create asymmetric loads
+    if hasattr(net, 'asymmetric_load') and not net.asymmetric_load.empty:
+        lines.append("# Create asymmetric loads")
+        for idx, row in net.asymmetric_load.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"AsymLoad_{idx}"
+            p_a_mw = row.get('p_a_mw', 0.0)
+            p_b_mw = row.get('p_b_mw', 0.0)
+            p_c_mw = row.get('p_c_mw', 0.0)
+            q_a_mvar = row.get('q_a_mvar', 0.0)
+            q_b_mvar = row.get('q_b_mvar', 0.0)
+            q_c_mvar = row.get('q_c_mvar', 0.0)
+            sn_mva = row.get('sn_mva', 1.0)
+            scaling = row.get('scaling', 1.0)
+            load_type = row.get('type', 'wye')
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_asymmetric_load(net, bus=bus_{bus}, name='{name}', "
+                        f"p_a_mw={p_a_mw}, p_b_mw={p_b_mw}, p_c_mw={p_c_mw}, "
+                        f"q_a_mvar={q_a_mvar}, q_b_mvar={q_b_mvar}, q_c_mvar={q_c_mvar}, "
+                        f"sn_mva={sn_mva}, scaling={scaling}, type='{load_type}', in_service={in_service})")
+        lines.append("")
+    
+    # Create impedance elements
+    if hasattr(net, 'impedance') and not net.impedance.empty:
+        lines.append("# Create impedance elements")
+        for idx, row in net.impedance.iterrows():
+            from_bus = row['from_bus']
+            to_bus = row['to_bus']
+            name = row['name'] if 'name' in row else f"Impedance_{idx}"
+            rft_pu = row.get('rft_pu', 0.0)
+            xft_pu = row.get('xft_pu', 0.0)
+            sn_mva = row.get('sn_mva', 1.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_impedance(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, "
+                        f"name='{name}', rft_pu={rft_pu}, xft_pu={xft_pu}, sn_mva={sn_mva}, in_service={in_service})")
+        lines.append("")
+    
+    # Create ward elements
+    if hasattr(net, 'ward') and not net.ward.empty:
+        lines.append("# Create ward elements")
+        for idx, row in net.ward.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"Ward_{idx}"
+            ps_mw = row.get('ps_mw', 0.0)
+            qs_mvar = row.get('qs_mvar', 0.0)
+            pz_mw = row.get('pz_mw', 0.0)
+            qz_mvar = row.get('qz_mvar', 0.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_ward(net, bus=bus_{bus}, name='{name}', "
+                        f"ps_mw={ps_mw}, qs_mvar={qs_mvar}, pz_mw={pz_mw}, qz_mvar={qz_mvar}, in_service={in_service})")
+        lines.append("")
+    
+    # Create extended ward elements
+    if hasattr(net, 'xward') and not net.xward.empty:
+        lines.append("# Create extended ward elements")
+        for idx, row in net.xward.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"XWard_{idx}"
+            ps_mw = row.get('ps_mw', 0.0)
+            qs_mvar = row.get('qs_mvar', 0.0)
+            pz_mw = row.get('pz_mw', 0.0)
+            qz_mvar = row.get('qz_mvar', 0.0)
+            r_ohm = row.get('r_ohm', 0.0)
+            x_ohm = row.get('x_ohm', 0.0)
+            vm_pu = row.get('vm_pu', 1.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_xward(net, bus=bus_{bus}, name='{name}', "
+                        f"ps_mw={ps_mw}, qs_mvar={qs_mvar}, pz_mw={pz_mw}, qz_mvar={qz_mvar}, "
+                        f"r_ohm={r_ohm}, x_ohm={x_ohm}, vm_pu={vm_pu}, in_service={in_service})")
+        lines.append("")
+    
+    # Create motor elements
+    if hasattr(net, 'motor') and not net.motor.empty:
+        lines.append("# Create motor elements")
+        for idx, row in net.motor.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"Motor_{idx}"
+            pn_mech_mw = row.get('pn_mech_mw', 0.0)
+            cos_phi = row.get('cos_phi', 0.85)
+            efficiency_n_percent = row.get('efficiency_n_percent', 90.0)
+            lrc_pu = row.get('lrc_pu')
+            rx = row.get('rx', 0.0)
+            vn_kv = row.get('vn_kv', 0.4)
+            efficiency_percent = row.get('efficiency_percent', 90.0)
+            loading_percent = row.get('loading_percent', 100.0)
+            scaling = row.get('scaling', 1.0)
+            in_service = row.get('in_service', True)
+            lrc_param = f"lrc_pu={lrc_pu}" if lrc_pu is not None else "lrc_pu=None"
+            lines.append(f"pp.create_motor(net, bus=bus_{bus}, name='{name}', "
+                        f"pn_mech_mw={pn_mech_mw}, cos_phi={cos_phi}, efficiency_n_percent={efficiency_n_percent}, "
+                        f"{lrc_param}, rx={rx}, vn_kv={vn_kv}, efficiency_percent={efficiency_percent}, "
+                        f"loading_percent={loading_percent}, scaling={scaling}, in_service={in_service})")
+        lines.append("")
+    
+    # Create SVC elements
+    if hasattr(net, 'svc') and not net.svc.empty:
+        lines.append("# Create SVC (Static Var Compensator) elements")
+        for idx, row in net.svc.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"SVC_{idx}"
+            x_l_ohm = row.get('x_l_ohm', 0.0)
+            x_cvar_ohm = row.get('x_cvar_ohm', 0.0)
+            set_vm_pu = row.get('set_vm_pu', 1.0)
+            thyristor_firing_angle_degree = row.get('thyristor_firing_angle_degree', 90.0)
+            controllable = row.get('controllable', True)
+            min_angle_degree = row.get('min_angle_degree', 90.0)
+            max_angle_degree = row.get('max_angle_degree', 180.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_svc(net, bus=bus_{bus}, name='{name}', "
+                        f"x_l_ohm={x_l_ohm}, x_cvar_ohm={x_cvar_ohm}, set_vm_pu={set_vm_pu}, "
+                        f"thyristor_firing_angle_degree={thyristor_firing_angle_degree}, controllable={controllable}, "
+                        f"min_angle_degree={min_angle_degree}, max_angle_degree={max_angle_degree}, in_service={in_service})")
+        lines.append("")
+    
+    # Create TCSC elements
+    if hasattr(net, 'tcsc') and not net.tcsc.empty:
+        lines.append("# Create TCSC (Thyristor-Controlled Series Capacitor) elements")
+        for idx, row in net.tcsc.iterrows():
+            from_bus = row['from_bus']
+            to_bus = row['to_bus']
+            name = row['name'] if 'name' in row else f"TCSC_{idx}"
+            x_l_ohm = row.get('x_l_ohm', 0.0)
+            x_cvar_ohm = row.get('x_cvar_ohm', 0.0)
+            set_p_to_mw = row.get('set_p_to_mw', 0.0)
+            thyristor_firing_angle_degree = row.get('thyristor_firing_angle_degree', 90.0)
+            controllable = row.get('controllable', True)
+            min_angle_degree = row.get('min_angle_degree', 90.0)
+            max_angle_degree = row.get('max_angle_degree', 180.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_tcsc(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name='{name}', "
+                        f"x_l_ohm={x_l_ohm}, x_cvar_ohm={x_cvar_ohm}, set_p_to_mw={set_p_to_mw}, "
+                        f"thyristor_firing_angle_degree={thyristor_firing_angle_degree}, controllable={controllable}, "
+                        f"min_angle_degree={min_angle_degree}, max_angle_degree={max_angle_degree}, in_service={in_service})")
+        lines.append("")
+    
+    # Create SSC elements
+    if hasattr(net, 'ssc') and not net.ssc.empty:
+        lines.append("# Create SSC (Static Synchronous Compensator) elements")
+        for idx, row in net.ssc.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"SSC_{idx}"
+            r_ohm = row.get('r_ohm', 0.0)
+            x_ohm = row.get('x_ohm', 0.0)
+            set_vm_pu = row.get('set_vm_pu', 1.0)
+            vm_internal_pu = row.get('vm_internal_pu', 1.0)
+            va_internal_degree = row.get('va_internal_degree', 0.0)
+            controllable = row.get('controllable', True)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+                        f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
+                        f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
+                        f"controllable={controllable}, in_service={in_service})")
+        lines.append("")
+    
+    # Create load DC elements
+    if hasattr(net, 'load_dc') and not net.load_dc.empty:
+        lines.append("# Create DC load elements")
+        for idx, row in net.load_dc.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"LoadDC_{idx}"
+            p_mw = row.get('p_mw', 0.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_load_dc(net, bus=bus_{bus}, name='{name}', p_mw={p_mw}, in_service={in_service})")
+        lines.append("")
+    
+    # Create source DC elements
+    if hasattr(net, 'source_dc') and not net.source_dc.empty:
+        lines.append("# Create DC source elements")
+        for idx, row in net.source_dc.iterrows():
+            bus = row['bus']
+            name = row['name'] if 'name' in row else f"SourceDC_{idx}"
+            vm_pu = row.get('vm_pu', 1.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_source_dc(net, bus=bus_{bus}, name='{name}', vm_pu={vm_pu}, in_service={in_service})")
+        lines.append("")
+    
+    # Create switch elements
+    if hasattr(net, 'switch') and not net.switch.empty:
+        lines.append("# Create switch elements")
+        for idx, row in net.switch.iterrows():
+            bus = row['bus']
+            element = row['element']
+            et = row.get('et', 'line')
+            name = row['name'] if 'name' in row else f"Switch_{idx}"
+            closed = row.get('closed', True)
+            switch_type = row.get('type', 'CB')
+            z_ohm = row.get('z_ohm', 0.0)
+            in_ka = row.get('in_ka', 0.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_switch(net, bus=bus_{bus}, element={element}, et='{et}', name='{name}', "
+                        f"closed={closed}, type='{switch_type}', z_ohm={z_ohm}, in_ka={in_ka}, in_service={in_service})")
+        lines.append("")
+    
+    # Create VSC elements
+    if hasattr(net, 'vsc') and not net.vsc.empty:
+        lines.append("# Create VSC (Voltage Source Converter) elements")
+        for idx, row in net.vsc.iterrows():
+            bus = row['bus']
+            bus_dc = row.get('bus_dc')
+            name = row['name'] if 'name' in row else f"VSC_{idx}"
+            p_mw = row.get('p_mw', 0.0)
+            vm_pu = row.get('vm_pu', 1.0)
+            sn_mva = row.get('sn_mva', 0.0)
+            rx = row.get('rx', 0.1)
+            max_ik_ka = row.get('max_ik_ka', 0.0)
+            in_service = row.get('in_service', True)
+            # bus_dc refers to a DC bus index, so use bus_dc_{bus_dc} variable name
+            bus_dc_var = f"bus_dc_{bus_dc}" if bus_dc is not None else "None"
+            lines.append(f"pp.create_vsc(net, bus=bus_{bus}, bus_dc={bus_dc_var}, name='{name}', "
+                        f"p_mw={p_mw}, vm_pu={vm_pu}, sn_mva={sn_mva}, rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
+        lines.append("")
+    
+    # Create B2B VSC elements
+    if hasattr(net, 'b2b_vsc') and not net.b2b_vsc.empty:
+        lines.append("# Create B2B VSC (Back-to-Back Voltage Source Converter) elements")
+        for idx, row in net.b2b_vsc.iterrows():
+            bus1 = row['bus1']
+            bus2 = row['bus2']
+            name = row['name'] if 'name' in row else f"B2BVSC_{idx}"
+            p_mw = row.get('p_mw', 0.0)
+            vm1_pu = row.get('vm1_pu', 1.0)
+            vm2_pu = row.get('vm2_pu', 1.0)
+            sn_mva = row.get('sn_mva', 0.0)
+            rx = row.get('rx', 0.1)
+            max_ik_ka = row.get('max_ik_ka', 0.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_b2b_vsc(net, bus1=bus_{bus1}, bus2=bus_{bus2}, name='{name}', "
+                        f"p_mw={p_mw}, vm1_pu={vm1_pu}, vm2_pu={vm2_pu}, sn_mva={sn_mva}, "
+                        f"rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
+        lines.append("")
+    
+    # Create DC line elements
+    if hasattr(net, 'dcline') and not net.dcline.empty:
+        lines.append("# Create DC line elements")
+        for idx, row in net.dcline.iterrows():
+            from_bus = row['from_bus']
+            to_bus = row['to_bus']
+            name = row['name'] if 'name' in row else f"DCLine_{idx}"
+            p_mw = row.get('p_mw', 0.0)
+            loss_percent = row.get('loss_percent', 0.0)
+            loss_mw = row.get('loss_mw', 0.0)
+            vm_from_pu = row.get('vm_from_pu', 1.0)
+            vm_to_pu = row.get('vm_to_pu', 1.0)
+            in_service = row.get('in_service', True)
+            lines.append(f"pp.create_dcline(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name='{name}', "
+                        f"p_mw={p_mw}, loss_percent={loss_percent}, loss_mw={loss_mw}, "
+                        f"vm_from_pu={vm_from_pu}, vm_to_pu={vm_to_pu}, in_service={in_service})")
         lines.append("")
     
     # Run power flow
@@ -894,7 +1201,20 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'],max_e_mwh=in_data[x]['max_e_mwh'],q_mvar=in_data[x]['q_mvar'],sn_mva=in_data[x]['sn_mva'], soc_percent=in_data[x]['soc_percent'],min_e_mwh=in_data[x]['min_e_mwh'],scaling=in_data[x]['scaling'], type=in_data[x]['type'], in_service=in_service)         
+            # Convert all numeric values to float explicitly
+            p_mw = float(in_data[x].get('p_mw', 0.0))
+            q_mvar = float(in_data[x].get('q_mvar', 0.0))
+            sn_mva = float(in_data[x].get('sn_mva', 1.0))
+            max_e_mwh = float(in_data[x].get('max_e_mwh', 1.0))
+            min_e_mwh = float(in_data[x].get('min_e_mwh', 0.0))
+            soc_percent = float(in_data[x].get('soc_percent', 50.0))
+            scaling = float(in_data[x].get('scaling', 1.0))
+            storage_type = str(in_data[x].get('type', '0'))
+            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
+                            p_mw=p_mw, q_mvar=q_mvar, sn_mva=sn_mva, 
+                            max_e_mwh=max_e_mwh, min_e_mwh=min_e_mwh, 
+                            soc_percent=soc_percent, scaling=scaling, 
+                            type=storage_type, in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Load DC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -3927,3 +4247,361 @@ def time_series_simulation(net, timeseries_params):
             diagnostic_response["diagnostic"]["general_error"] = str(e)
         
         return diagnostic_response
+
+
+class BESSControlForTargetBus(control.basic_controller.Controller):
+    """
+    Controller that adjusts BESS power to achieve target P and Q at Point of Coupling (POC).
+    Uses iterative approach to converge to the target.
+    
+    EXACT implementation from BESS_sizing_tutorial.ipynb - DO NOT MODIFY SIGN CONVENTIONS!
+    """
+    def __init__(self, net, element_index, target_p_mw, target_q_mvar, poc_bus_idx,
+                 kp_p=0.5, kp_q=0.5, max_p_mw=28.0, max_q_mvar=28.0, tolerance=1e-3,
+                 in_service=True, recycle=False, order=0, level=0, **kwargs):
+        super().__init__(net, in_service=in_service, recycle=recycle, 
+                        order=order, level=level, initial_run=True)
+        
+        self.element_index = element_index
+        self.target_p_mw = target_p_mw
+        self.target_q_mvar = target_q_mvar
+        self.poc_bus_idx = poc_bus_idx
+        self.kp_p = kp_p
+        self.kp_q = kp_q
+        self.max_p_mw = max_p_mw
+        self.max_q_mvar = max_q_mvar
+        self.tolerance = tolerance
+        
+        # EXACT notebook algorithm - simple initial guess:
+        # Sign convention: 
+        # - If target P > 0 (consumption), BESS should DISCHARGE (negative P)
+        # - If target P < 0 (generation), BESS should CHARGE (positive P)
+        # Account for losses: need slightly more power than target
+        initial_p = -target_p_mw * 1.05  # Negative because BESS discharges to supply load
+        initial_q = -target_q_mvar * 1.05  # Negative to match sign convention
+        self.p_mw = np.clip(initial_p, -max_p_mw, max_p_mw)
+        self.q_mvar = np.clip(initial_q, -max_q_mvar, max_q_mvar)
+        self.applied = False
+        self.iteration = 0
+        self.converged = False
+        
+        print(f"Initial guess: P={self.p_mw:.3f} MW, Q={self.q_mvar:.3f} Mvar")
+        
+    def is_converged(self, net):
+        return self.applied
+    
+    def control_step(self, net):
+        # DEBUG: Check storage value BEFORE setting
+        if self.iteration == 0:
+            print(f"  DEBUG: Storage BEFORE setting: p_mw={net.storage.at[self.element_index, 'p_mw']}, q_mvar={net.storage.at[self.element_index, 'q_mvar']}")
+        
+        # First, set the current BESS power values
+        net.storage.at[self.element_index, 'p_mw'] = self.p_mw
+        net.storage.at[self.element_index, 'q_mvar'] = self.q_mvar
+        
+        # DEBUG: Check storage value AFTER setting
+        if self.iteration == 0:
+            print(f"  DEBUG: Storage AFTER setting: p_mw={net.storage.at[self.element_index, 'p_mw']}, q_mvar={net.storage.at[self.element_index, 'q_mvar']}")
+        
+        # Run power flow to get current state (with sufficient iterations)
+        try:
+            pp.runpp(net, algorithm='nr', calculate_voltage_angles=True, 
+                    init='auto', verbose=False)
+        except Exception as e:
+            # If power flow fails, don't update - keep current values
+            # This can happen if the network is infeasible
+            print(f"Power flow failed at iteration {self.iteration}: {str(e)}")
+            self.applied = True
+            return
+        
+        # DEBUG: Check full network power balance after power flow
+        if self.iteration == 0:
+            print(f"  DEBUG: res_storage after PF: p_mw={net.res_storage.at[self.element_index, 'p_mw']}, q_mvar={net.res_storage.at[self.element_index, 'q_mvar']}")
+            print(f"  DEBUG: res_ext_grid: p_mw={net.res_ext_grid.at[net.ext_grid.index[0], 'p_mw']}, q_mvar={net.res_ext_grid.at[net.ext_grid.index[0], 'q_mvar']}")
+            
+            # Show ALL generators, loads, and other elements
+            print(f"  DEBUG: Network elements count:")
+            print(f"    - Buses: {len(net.bus)}")
+            print(f"    - Ext grids: {len(net.ext_grid)}")
+            print(f"    - Storages: {len(net.storage)}")
+            print(f"    - Loads: {len(net.load) if hasattr(net, 'load') else 0}")
+            print(f"    - Generators: {len(net.gen) if hasattr(net, 'gen') else 0}")
+            print(f"    - Sgens: {len(net.sgen) if hasattr(net, 'sgen') else 0}")
+            print(f"    - Trafos: {len(net.trafo)}")
+            
+            # Show bus results
+            print(f"  DEBUG: Bus results:")
+            for bus_idx in net.bus.index:
+                bus_name = net.bus.at[bus_idx, 'name'] if 'name' in net.bus.columns else f"bus_{bus_idx}"
+                bus_vn = net.bus.at[bus_idx, 'vn_kv']
+                bus_vm = net.res_bus.at[bus_idx, 'vm_pu']
+                bus_p = net.res_bus.at[bus_idx, 'p_mw']
+                bus_q = net.res_bus.at[bus_idx, 'q_mvar']
+                print(f"    Bus {bus_idx} ({bus_name}, {bus_vn}kV): vm={bus_vm:.4f}pu, P={bus_p:.3f}MW, Q={bus_q:.3f}Mvar")
+            
+            # Show transformer results (losses)
+            print(f"  DEBUG: Transformer losses:")
+            for trafo_idx in net.trafo.index:
+                trafo_name = net.trafo.at[trafo_idx, 'name'] if 'name' in net.trafo.columns else f"trafo_{trafo_idx}"
+                p_loss = net.res_trafo.at[trafo_idx, 'pl_mw']
+                q_loss = net.res_trafo.at[trafo_idx, 'ql_mvar']
+                print(f"    Trafo {trafo_idx} ({trafo_name}): P_loss={p_loss:.4f}MW, Q_loss={q_loss:.4f}Mvar")
+            
+            # Show if there are any generators
+            if hasattr(net, 'gen') and len(net.gen) > 0:
+                print(f"  DEBUG: Generator results:")
+                for gen_idx in net.gen.index:
+                    print(f"    Gen {gen_idx}: P={net.res_gen.at[gen_idx, 'p_mw']:.3f}MW, Q={net.res_gen.at[gen_idx, 'q_mvar']:.3f}Mvar")
+            
+            # Show if there are any sgens (static generators)
+            if hasattr(net, 'sgen') and len(net.sgen) > 0:
+                print(f"  DEBUG: Static generator results:")
+                for sgen_idx in net.sgen.index:
+                    print(f"    Sgen {sgen_idx}: P={net.res_sgen.at[sgen_idx, 'p_mw']:.3f}MW, Q={net.res_sgen.at[sgen_idx, 'q_mvar']:.3f}Mvar")
+            
+            # Show if there are any loads
+            if hasattr(net, 'load') and len(net.load) > 0:
+                print(f"  DEBUG: Load results:")
+                for load_idx in net.load.index:
+                    print(f"    Load {load_idx}: P={net.res_load.at[load_idx, 'p_mw']:.3f}MW, Q={net.res_load.at[load_idx, 'q_mvar']:.3f}Mvar")
+        
+        # Get current P and Q at POC from external grid
+        ext_grid_idx = net.ext_grid.index[0]
+        current_p = -net.res_ext_grid.at[ext_grid_idx, 'p_mw']
+        current_q = -net.res_ext_grid.at[ext_grid_idx, 'q_mvar']
+        
+        # Calculate error
+        error_p = self.target_p_mw - current_p
+        error_q = self.target_q_mvar - current_q
+        
+        # Print diagnostic info every 10 iterations or at iteration 0
+        if self.iteration % 10 == 0:
+            print(f"Iteration {self.iteration}: BESS P={self.p_mw:.3f} MW, Q={self.q_mvar:.3f} Mvar")
+            print(f"  POC: P={current_p:.3f} MW (target {self.target_p_mw:.3f}), Q={current_q:.3f} Mvar (target {self.target_q_mvar:.3f})")
+            print(f"  Error: P={error_p:.3f} MW, Q={error_q:.3f} Mvar")
+        
+        # Check convergence - EXACT notebook tolerance
+        if abs(error_p) < self.tolerance and abs(error_q) < self.tolerance:
+            self.converged = True
+            print(f"CONVERGED at iteration {self.iteration}!")
+            print(f"  Final BESS: P={self.p_mw:.4f} MW, Q={self.q_mvar:.4f} Mvar")
+        else:
+            # EXACT notebook algorithm - simple damping, NO inversion
+            # Adjust BESS power proportionally to error (with damping to avoid oscillations)
+            # Sign convention: 
+            # - If error_p > 0 (need more consumption), decrease BESS P (more negative = more discharge)
+            # - If error_p < 0 (too much consumption), increase BESS P (less negative = less discharge)
+            damping = 0.5  # Damping factor to prevent oscillations
+            # Error correction: if we need more P at POC, BESS should discharge more (more negative)
+            delta_p = -self.kp_p * error_p * damping  # Negative because BESS P is opposite to POC P
+            delta_q = -self.kp_q * error_q * damping  # Same for Q
+            
+            self.p_mw += delta_p
+            self.q_mvar += delta_q
+            
+            # Apply limits
+            self.p_mw = np.clip(self.p_mw, -self.max_p_mw, self.max_p_mw)
+            self.q_mvar = np.clip(self.q_mvar, -self.max_q_mvar, self.max_q_mvar)
+        
+        self.iteration += 1
+        self.applied = True
+
+
+def bess_sizing(net, bess_params):
+    """
+    Calculate required BESS power using iterative controller approach.
+    
+    Uses pandapower's control framework with BESSControlForTargetBus controller
+    that iteratively adjusts BESS power until target P/Q at POC is achieved.
+    
+    Parameters:
+    -----------
+    net : pandapower network
+        The network object
+    bess_params : dict
+        Dictionary containing:
+        - storageId: ID of the storage element (from frontend)
+        - pocBusbarId: ID of the POC busbar (from frontend)
+        - targetP: Target active power at POC (MW)
+        - targetQ: Target reactive power at POC (Mvar)
+        - tolerance: Convergence tolerance (default: 0.001)
+        - maxIterations: Maximum control iterations (default: 50)
+        - kpP: Proportional gain for active power control (default: 0.5)
+        - kpQ: Proportional gain for reactive power control (default: 0.5)
+        - frequency: Network frequency (default: 50)
+        - algorithm: Power flow algorithm (default: 'nr')
+        
+    Returns:
+    --------
+    str : JSON string with results
+    """
+    try:
+        # Extract parameters
+        storage_id = bess_params.get('storageId')
+        poc_busbar_id = bess_params.get('pocBusbarId')
+        target_p = float(bess_params.get('targetP', 0.0))
+        target_q = float(bess_params.get('targetQ', 0.0))
+        tolerance = float(bess_params.get('tolerance', 0.001))
+        max_iterations = int(bess_params.get('maxIterations', 50))
+        kp_p = float(bess_params.get('kpP', 0.5))
+        kp_q = float(bess_params.get('kpQ', 0.5))
+        
+        # Find storage element by ID (match with busbar name)
+        storage_idx = None
+        for idx in net.storage.index:
+            # Try to match by name or bus
+            storage_name = net.storage.at[idx, 'name'] if 'name' in net.storage.columns else None
+            storage_bus = net.storage.at[idx, 'bus']
+            
+            # Match by storage ID (could be name or bus index)
+            if str(storage_id) == str(storage_name) or str(storage_id) == str(storage_bus):
+                storage_idx = idx
+                break
+        
+        if storage_idx is None:
+            # Fallback: use first storage element
+            if len(net.storage) > 0:
+                storage_idx = net.storage.index[0]
+            else:
+                return json.dumps({
+                    'error': 'No storage element found in network',
+                    'bess_p_mw': None,
+                    'bess_q_mvar': None,
+                    'bess_s_mva': None,
+                    'achieved_p_mw': None,
+                    'achieved_q_mvar': None,
+                    'error_p_mw': None,
+                    'error_q_mvar': None,
+                    'converged': False,
+                    'iterations': 0
+                })
+        
+        # Find POC bus by ID (match with busbar name)
+        poc_bus_idx = None
+        for idx in net.bus.index:
+            bus_name = net.bus.at[idx, 'name'] if 'name' in net.bus.columns else None
+            
+            # Match by POC busbar ID
+            if str(poc_busbar_id) == str(bus_name) or str(poc_busbar_id) == str(idx):
+                poc_bus_idx = idx
+                break
+        
+        if poc_bus_idx is None:
+            # Fallback: use first bus (usually external grid bus)
+            if len(net.bus) > 0:
+                poc_bus_idx = net.bus.index[0]
+            else:
+                return json.dumps({
+                    'error': 'No POC bus found in network',
+                    'bess_p_mw': None,
+                    'bess_q_mvar': None,
+                    'bess_s_mva': None,
+                    'achieved_p_mw': None,
+                    'achieved_q_mvar': None,
+                    'error_p_mw': None,
+                    'error_q_mvar': None,
+                    'converged': False,
+                    'iterations': 0
+                })
+        
+        # Get storage bus index
+        bess_bus_idx = net.storage.at[storage_idx, 'bus']
+        
+        # Validate network configuration
+        # Check if POC bus has an external grid
+        ext_grid_at_poc = False
+        for idx in net.ext_grid.index:
+            if net.ext_grid.at[idx, 'bus'] == poc_bus_idx:
+                ext_grid_at_poc = True
+                break
+        
+        if not ext_grid_at_poc:
+            print(f"WARNING: POC bus {poc_bus_idx} does not have an external grid!")
+            print(f"External grid is at bus {net.ext_grid.at[net.ext_grid.index[0], 'bus']}")
+        
+        # Get storage limits from network
+        max_p_mw = abs(net.storage.at[storage_idx, 'sn_mva']) if 'sn_mva' in net.storage.columns else 28.0
+        max_q_mvar = abs(net.storage.at[storage_idx, 'sn_mva']) if 'sn_mva' in net.storage.columns else 28.0
+        
+        print(f"=== BESS SIZING STARTED ===")
+        print(f"Storage: idx={storage_idx}, bus={bess_bus_idx}, max_P={max_p_mw:.1f} MW, max_Q={max_q_mvar:.1f} Mvar")
+        print(f"POC: bus_idx={poc_bus_idx}, has_ext_grid={ext_grid_at_poc}")
+        print(f"Target: P={target_p:.3f} MW, Q={target_q:.3f} Mvar")
+        print(f"Control gains: kp_P={kp_p}, kp_Q={kp_q}, max_iter={max_iterations}, tolerance={tolerance}")
+        
+        # Create a copy of the network
+        net_ctrl = deepcopy(net)
+        
+        # Create controller (using EXACT notebook algorithm)
+        bess_ctrl = BESSControlForTargetBus(
+            net_ctrl, storage_idx, target_p, target_q, poc_bus_idx,
+            kp_p=kp_p, kp_q=kp_q, max_p_mw=max_p_mw, max_q_mvar=max_q_mvar,
+            tolerance=tolerance
+        )
+        
+        # Run iterative control loop
+        for iteration in range(max_iterations):
+            bess_ctrl.applied = False
+            # Call control_step which will run power flow and adjust BESS power
+            bess_ctrl.control_step(net_ctrl)
+            if bess_ctrl.converged:
+                break
+        
+        # Get final results
+        ext_grid_idx = net_ctrl.ext_grid.index[0]
+        achieved_p = -net_ctrl.res_ext_grid.at[ext_grid_idx, 'p_mw']
+        achieved_q = -net_ctrl.res_ext_grid.at[ext_grid_idx, 'q_mvar']
+        
+        # Calculate apparent power
+        bess_s_mva = np.sqrt(bess_ctrl.p_mw**2 + bess_ctrl.q_mvar**2)
+        
+        error_p_final = achieved_p - target_p
+        error_q_final = achieved_q - target_q
+        
+        print(f"\n=== BESS SIZING RESULTS ===")
+        print(f"Converged: {'YES' if bess_ctrl.converged else 'NO'}")
+        print(f"Iterations: {bess_ctrl.iteration}")
+        print(f"Final BESS: P={bess_ctrl.p_mw:.3f} MW, Q={bess_ctrl.q_mvar:.3f} Mvar, S={bess_s_mva:.3f} MVA")
+        print(f"Achieved POC: P={achieved_p:.3f} MW, Q={achieved_q:.3f} Mvar")
+        print(f"Final errors: P={error_p_final:.6f} MW, Q={error_q_final:.6f} Mvar")
+        
+        if not bess_ctrl.converged:
+            print("\nPossible reasons for non-convergence:")
+            print("1. Network might be too complex or have numerical issues")
+            print("2. Target might be outside BESS capability")
+            print("3. POC bus might not be properly connected to external grid")
+            print("4. Try increasing maxIterations or adjusting gains (kpP, kpQ)")
+        
+        # Prepare response
+        result = {
+            'bess_p_mw': float(bess_ctrl.p_mw),
+            'bess_q_mvar': float(bess_ctrl.q_mvar),
+            'bess_s_mva': float(bess_s_mva),
+            'achieved_p_mw': float(achieved_p),
+            'achieved_q_mvar': float(achieved_q),
+            'error_p_mw': float(error_p_final),
+            'error_q_mvar': float(error_q_final),
+            'converged': bool(bess_ctrl.converged),
+            'iterations': int(bess_ctrl.iteration)
+        }
+        
+        return json.dumps(result)
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"BESS sizing calculation failed: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        
+        return json.dumps({
+            'error': error_msg,
+            'bess_p_mw': None,
+            'bess_q_mvar': None,
+            'bess_s_mva': None,
+            'achieved_p_mw': None,
+            'achieved_q_mvar': None,
+            'error_p_mw': None,
+            'error_q_mvar': None,
+            'converged': False,
+            'iterations': 0
+        })

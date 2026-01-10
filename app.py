@@ -2,6 +2,7 @@
 import pandapower_electrisim
 import opendss_electrisim
 import os
+import json
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
@@ -59,6 +60,82 @@ def simulation():
     print(in_data) 
    
     Busbars = {}
+    
+    # Check for BESS sizing request first (it's in a nested structure)
+    if 'bess_sizing_params' in in_data and in_data.get('bess_sizing_params', {}).get('typ') == 'BessSizingPandaPower':
+        # Extract user email for logging
+        user_email = in_data.get('bess_sizing_params', {}).get('user_email', 'unknown@user.com')
+        print(f"=== BESS SIZING REQUESTED BY USER: {user_email} ===")
+        
+        # Extract BESS sizing parameters
+        bess_params = in_data.get('bess_sizing_params', {})
+        frequency = float(bess_params.get('frequency', 50))
+        algorithm = bess_params.get('algorithm', 'nr')
+        calculation_mode = bess_params.get('calculationMode', 'single')
+        
+        # Check if multiple scenarios mode
+        if calculation_mode == 'multiple' and 'scenarios' in bess_params:
+            scenarios = bess_params.get('scenarios', [])
+            print(f"=== MULTIPLE SCENARIOS MODE: {len(scenarios)} scenarios ===")
+            
+            scenario_results = []
+            for scenario in scenarios:
+                scenario_name = scenario.get('name', 'Unknown')
+                scenario_p = float(scenario.get('p', 0.0))
+                scenario_q = float(scenario.get('q', 0.0))
+                
+                print(f"=== Processing scenario: {scenario_name} (P={scenario_p} MW, Q={scenario_q} Mvar) ===")
+                
+                # Create fresh network for each scenario (as in notebook)
+                net = pp.create_empty_network(f_hz=frequency)
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, None, Busbars)
+                
+                # Create scenario-specific params
+                scenario_params = bess_params.copy()
+                scenario_params['targetP'] = scenario_p
+                scenario_params['targetQ'] = scenario_q
+                
+                # Run BESS sizing calculation for this scenario
+                scenario_result_json = pandapower_electrisim.bess_sizing(net, scenario_params)
+                scenario_result = json.loads(scenario_result_json)
+                
+                # Add scenario name to result
+                scenario_result['scenario_name'] = scenario_name
+                scenario_result['scenario_p'] = scenario_p
+                scenario_result['scenario_q'] = scenario_q
+                scenario_results.append(scenario_result)
+            
+            # Aggregate results
+            response_data = json.dumps({
+                'calculationMode': 'multiple',
+                'scenarios': scenario_results,
+                'total_scenarios': len(scenarios)
+            })
+        else:
+            # Single target mode (existing logic)
+            print(f"=== SINGLE TARGET MODE ===")
+            
+            # Create network
+            net = pp.create_empty_network(f_hz=frequency)
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            # Process all elements (create_other_elements loops internally, so call once)
+            pandapower_electrisim.create_other_elements(in_data, net, None, Busbars)
+            
+            # Run BESS sizing calculation
+            response_data = pandapower_electrisim.bess_sizing(net, bess_params)
+        
+        # Check if client accepts gzip compression
+        accept_encoding = request.headers.get('Accept-Encoding', '')
+        if 'gzip' in accept_encoding and len(response_data) > 1024:
+            compressed = gzip.compress(response_data.encode('utf-8'))
+            response = make_response(compressed)
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Type'] = 'application/json'
+            response.headers['Content-Length'] = len(compressed)
+            return response
+        else:
+            return response_data
           
     #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
     for x in in_data:    
@@ -274,7 +351,7 @@ def simulation():
             
             # Run time series simulation
             response = pandapower_electrisim.time_series_simulation(net, timeseries_params)
-            return jsonify(response)            
+            return jsonify(response)
              
     #print(net.bus)
     #print(net.shunt)
