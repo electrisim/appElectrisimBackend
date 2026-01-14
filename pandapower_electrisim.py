@@ -661,9 +661,25 @@ def create_other_elements(in_data,net,x, Busbars):
                 to_bus_idx = Busbars.get(bus_to)
                 
                 if from_bus_idx is None:
-                    raise ValueError(f"Bus {bus_from} not found for Line from_bus")
+                    element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                    raise ValueError(
+                        f"CONNECTION ERROR: Line '{element_name}' is trying to connect from bus '{bus_from}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed Bus/Busbar elements at both ends of the line\n"
+                        f"2. The line is properly connected to these Bus elements\n"
+                        f"3. Lines must connect two Bus elements (from_bus and to_bus)"
+                    )
                 if to_bus_idx is None:
-                    raise ValueError(f"Bus {bus_to} not found for Line to_bus")
+                    element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                    raise ValueError(
+                        f"CONNECTION ERROR: Line '{element_name}' is trying to connect to bus '{bus_to}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed Bus/Busbar elements at both ends of the line\n"
+                        f"2. The line is properly connected to these Bus elements\n"
+                        f"3. Lines must connect two Bus elements (from_bus and to_bus)"
+                    )
                     
          
             except Exception as e:
@@ -765,7 +781,30 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("External Grid") or in_data[x]['typ'].startswith("ExternalGrid")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                raise ValueError(f"Bus {in_data[x]['bus']} not found for External Grid")
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                bus_name = in_data[x]['bus']
+                
+                # Check if bus is None (not connected) or references non-existent bus
+                if bus_name is None:
+                    raise ValueError(
+                        f"CONNECTION ERROR: External Grid '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. Draw a connection line from the External Grid to a Bus element\n"
+                        f"3. Verify the connection line is properly attached at both ends\n\n"
+                        f"IMPORTANT: Every electrical component must be connected to at least one Bus element."
+                    )
+                else:
+                    raise ValueError(
+                        f"CONNECTION ERROR: External Grid '{element_name}' is trying to connect to bus '{bus_name}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. The External Grid is connected to this Bus element with a connection line\n"
+                        f"3. All electrical elements (External Grids, Generators, Loads, Transformers, etc.) "
+                        f"are properly connected to Bus elements\n\n"
+                        f"IMPORTANT: Each electrical component must be connected to at least one Bus element."
+                    )
 
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -798,7 +837,28 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Generator")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                raise ValueError(f"Bus {in_data[x]['bus']} not found for Generator")
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                bus_name = in_data[x]['bus']
+                
+                # Check if bus is None (not connected) or references non-existent bus
+                if bus_name is None:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Generator '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. Draw a connection line from the Generator to a Bus element\n"
+                        f"3. Verify the connection line is properly attached at both ends\n\n"
+                        f"IMPORTANT: Every electrical component must be connected to at least one Bus element."
+                    )
+                else:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Generator '{element_name}' is trying to connect to bus '{bus_name}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. The Generator is connected to this Bus element with a connection line\n"
+                        f"3. All electrical elements must be properly connected to Bus elements"
+                    )
     
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -818,7 +878,28 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Static Generator")):      
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                raise ValueError(f"Bus {in_data[x]['bus']} not found for Static Generator")
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                bus_name = in_data[x]['bus']
+                
+                # Check if bus is None (not connected) or references non-existent bus
+                if bus_name is None:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Static Generator '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. Draw a connection line from the Static Generator to a Bus element\n"
+                        f"3. Verify the connection line is properly attached at both ends\n\n"
+                        f"IMPORTANT: Every electrical component must be connected to at least one Bus element."
+                    )
+                else:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Static Generator '{element_name}' is trying to connect to bus '{bus_name}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. The Static Generator is connected to this Bus element with a connection line\n"
+                        f"3. All electrical elements must be properly connected to Bus elements"
+                    )
            
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -1070,7 +1151,28 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
-                raise ValueError(f"Bus {in_data[x]['bus']} not found for Load")
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                bus_name = in_data[x]['bus']
+                
+                # Check if bus is None (not connected) or references non-existent bus
+                if bus_name is None:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Load '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. Draw a connection line from the Load to a Bus element\n"
+                        f"3. Verify the connection line is properly attached at both ends\n\n"
+                        f"IMPORTANT: Every electrical component must be connected to at least one Bus element."
+                    )
+                else:
+                    raise ValueError(
+                        f"CONNECTION ERROR: Load '{element_name}' is trying to connect to bus '{bus_name}', "
+                        f"but this bus does not exist in your diagram.\n\n"
+                        f"SOLUTION: Please ensure that:\n"
+                        f"1. You have placed a Bus/Busbar element in your diagram\n"
+                        f"2. The Load is connected to this Bus element with a connection line\n"
+                        f"3. All electrical elements must be properly connected to Bus elements"
+                    )
           
             # Get in_service parameter (default to True if not specified)
             in_service = True
@@ -1364,27 +1466,157 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     "diagnostic": {}
                 }               
                 
+                # Check for disconnected sections by finding unsupplied buses (buses not connected to ext_grid)
+                # This is the same as isolated buses - buses without connection to external grid
+                try:
+                    # Get all buses that are not supplied (disconnected from external grid)
+                    unsupplied_buses_set = pp.topology.unsupplied_buses(net)
+                    if len(unsupplied_buses_set) > 0:
+                        # Convert set to list and ensure all values are native Python int (not numpy int64)
+                        if isinstance(unsupplied_buses_set, set):
+                            unsupplied_buses_list = [int(x) for x in unsupplied_buses_set]
+                        elif hasattr(unsupplied_buses_set, 'tolist'):
+                            unsupplied_buses_list = [int(x) for x in unsupplied_buses_set.tolist()]
+                        else:
+                            unsupplied_buses_list = [int(x) for x in list(unsupplied_buses_set)]
+                        
+                        # Find elements connected to unsupplied buses
+                        disconnected_elements = {
+                            "buses": unsupplied_buses_list,
+                            "trafos": [],
+                            "sgens": [],
+                            "loads": [],
+                            "generators": []
+                        }
+                        
+                        # Find transformers connected to unsupplied buses
+                        if hasattr(net, 'trafo') and not net.trafo.empty:
+                            for trafo_idx in net.trafo.index:
+                                hv_bus = net.trafo.loc[trafo_idx, 'hv_bus']
+                                lv_bus = net.trafo.loc[trafo_idx, 'lv_bus']
+                                if hv_bus in unsupplied_buses_set or lv_bus in unsupplied_buses_set:
+                                    disconnected_elements["trafos"].append(int(trafo_idx))
+                        
+                        # Find static generators connected to unsupplied buses
+                        if hasattr(net, 'sgen') and not net.sgen.empty:
+                            for sgen_idx in net.sgen.index:
+                                if net.sgen.loc[sgen_idx, 'bus'] in unsupplied_buses_set:
+                                    disconnected_elements["sgens"].append(int(sgen_idx))
+                        
+                        # Find loads connected to unsupplied buses
+                        if hasattr(net, 'load') and not net.load.empty:
+                            for load_idx in net.load.index:
+                                if net.load.loc[load_idx, 'bus'] in unsupplied_buses_set:
+                                    disconnected_elements["loads"].append(int(load_idx))
+                        
+                        # Find generators connected to unsupplied buses
+                        if hasattr(net, 'gen') and not net.gen.empty:
+                            for gen_idx in net.gen.index:
+                                if net.gen.loc[gen_idx, 'bus'] in unsupplied_buses_set:
+                                    disconnected_elements["generators"].append(int(gen_idx))
+                        
+                        # Ensure all bus indices are native Python int (not numpy int64)
+                        disconnected_elements["buses"] = [int(x) for x in disconnected_elements["buses"]]
+                        disconnected_elements["trafos"] = [int(x) for x in disconnected_elements["trafos"]]
+                        disconnected_elements["sgens"] = [int(x) for x in disconnected_elements["sgens"]]
+                        disconnected_elements["loads"] = [int(x) for x in disconnected_elements["loads"]]
+                        disconnected_elements["generators"] = [int(x) for x in disconnected_elements["generators"]]
+                        
+                        total_disconnected = len(disconnected_elements["buses"]) + len(disconnected_elements["trafos"]) + len(disconnected_elements["sgens"]) + len(disconnected_elements["loads"]) + len(disconnected_elements["generators"])
+                        
+                        diagnostic_response["diagnostic"]["disconnected_elements"] = disconnected_elements
+                        diagnostic_response["diagnostic"]["total_disconnected_elements"] = int(total_disconnected)
+                except Exception as disconn_error:
+                    # If detection fails, continue with other diagnostics
+                    pass
+                
+                # Check for isolated buses (buses without connection to external grid)
+                try:
+                    isolated_buses = pp.topology.unsupplied_buses(net)
+                    if len(isolated_buses) > 0:
+                        # Convert set to list and ensure all values are native Python int (not numpy int64)
+                        if isinstance(isolated_buses, set):
+                            isolated_list = [int(x) for x in isolated_buses]
+                        elif hasattr(isolated_buses, 'tolist'):
+                            isolated_list = [int(x) for x in isolated_buses.tolist()]
+                        else:
+                            isolated_list = [int(x) for x in list(isolated_buses)]
+                        
+                        diagnostic_response["diagnostic"]["isolated_buses"] = isolated_list
+                        diagnostic_response["diagnostic"]["num_isolated_buses"] = len(isolated_list)
+                except Exception as isolated_error:
+                    pass
+                
+                # Check if external grid exists
+                if not hasattr(net, 'ext_grid') or net.ext_grid.empty:
+                    diagnostic_response["diagnostic"]["no_external_grid"] = True
+                    diagnostic_response["message"] = "No external grid found. At least one External Grid element is required for power flow simulation."
                 
                 # Access initial voltage magnitudes and angles  
-                diag_result_dict = pp.diagnostic(net, report_style='detailed')             
-                
-                #print(diag_result_dict)
-                #plt.simple_plot(net, plot_line_switches=True)
-                
-                # Check for isolated buses
-                isolated_buses = pp.topology.unsupplied_buses(net)
-                if len(isolated_buses) > 0:
-                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
-                
-                # Process diagnostic data to convert element indices to user-friendly names
-                processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-                diagnostic_response["diagnostic"] = processed_diagnostic
+                try:
+                    diag_result_dict = pp.diagnostic(net, report_style='detailed')
+                    # Process diagnostic data to convert element indices to user-friendly names
+                    processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+                    # Merge processed diagnostic (don't overwrite disconnected_sections or isolated_buses)
+                    for key, value in processed_diagnostic.items():
+                        if key not in diagnostic_response["diagnostic"]:
+                            diagnostic_response["diagnostic"][key] = value
+                except Exception as diag_error:
+                    # If diagnostic fails, continue with what we have
+                    pass
                 
                 # If no specific diagnostic was found, include the original exception
                 if not diagnostic_response["diagnostic"]:
                    diagnostic_response["diagnostic"]["general_error"] = str(e)
+                else:
+                    # Enhance the message with diagnostic summary
+                    if "no_external_grid" in diagnostic_response["diagnostic"]:
+                        diagnostic_response["message"] = "No external grid found. At least one External Grid element is required for power flow simulation."
+                    elif "disconnected_elements" in diagnostic_response["diagnostic"]:
+                        disconnected = diagnostic_response["diagnostic"]["disconnected_elements"]
+                        num_buses = len(disconnected.get("buses", []))
+                        num_trafos = len(disconnected.get("trafos", []))
+                        num_sgens = len(disconnected.get("sgens", []))
+                        num_loads = len(disconnected.get("loads", []))
+                        total_elements = diagnostic_response["diagnostic"].get("total_disconnected_elements", 0)
+                        
+                        elements_summary = []
+                        if num_buses > 0:
+                            elements_summary.append(f"{num_buses} bus(es)")
+                        if num_trafos > 0:
+                            elements_summary.append(f"{num_trafos} transformer(s)")
+                        if num_sgens > 0:
+                            elements_summary.append(f"{num_sgens} static generator(s)")
+                        if num_loads > 0:
+                            elements_summary.append(f"{num_loads} load(s)")
+                        
+                        summary_text = ", ".join(elements_summary) if elements_summary else "elements"
+                        diagnostic_response["message"] = f"Network connectivity issue: {total_elements} disconnected {summary_text} found. All network sections must be connected to an External Grid element."
+                    elif "isolated_buses" in diagnostic_response["diagnostic"]:
+                        num_isolated = diagnostic_response["diagnostic"].get("num_isolated_buses", 0)
+                        diagnostic_response["message"] = f"Network connectivity issue: {num_isolated} isolated bus(es) found. All buses must be connected to an External Grid."
                 
-                return diagnostic_response
+                # Convert diagnostic response to JSON string (same format as successful response)
+                # Use a custom encoder to handle numpy types
+                def convert_numpy_types(obj):
+                    """Recursively convert numpy types to native Python types for JSON serialization"""
+                    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+                        return int(obj)
+                    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+                        return float(obj)
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, dict):
+                        return {key: convert_numpy_types(value) for key, value in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [convert_numpy_types(item) for item in obj]
+                    elif isinstance(obj, set):
+                        return [convert_numpy_types(item) for item in obj]
+                    return obj
+                
+                # Convert any remaining numpy types
+                diagnostic_response = convert_numpy_types(diagnostic_response)
+                return json.dumps(diagnostic_response, separators=(',', ':'))
             else:                              
                 
                 class BusbarOut(object):
@@ -2998,11 +3230,18 @@ def optimalPowerFlow(net, opf_params):
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
             if len(isolated_buses) > 0:
-                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                # Convert set to list (isolated_buses is a set, not numpy array)
+                if isinstance(isolated_buses, set):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
+                elif hasattr(isolated_buses, 'tolist'):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                else:
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
             
             # Process diagnostic data to convert element indices to user-friendly names
             processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-            diagnostic_response["diagnostic"] = processed_diagnostic
+            # Merge processed diagnostic with isolated_buses (don't overwrite)
+            diagnostic_response["diagnostic"].update(processed_diagnostic)
                     
         except Exception as diag_error:
             pass
@@ -3859,11 +4098,18 @@ def controller_simulation(net, controller_params):
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
             if len(isolated_buses) > 0:
-                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                # Convert set to list (isolated_buses is a set, not numpy array)
+                if isinstance(isolated_buses, set):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
+                elif hasattr(isolated_buses, 'tolist'):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                else:
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
             
             # Process diagnostic data to convert element indices to user-friendly names
             processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-            diagnostic_response["diagnostic"] = processed_diagnostic
+            # Merge processed diagnostic with isolated_buses (don't overwrite)
+            diagnostic_response["diagnostic"].update(processed_diagnostic)
                     
         except Exception as diag_error:
             pass
@@ -4233,11 +4479,18 @@ def time_series_simulation(net, timeseries_params):
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
             if len(isolated_buses) > 0:
-                diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                # Convert set to list (isolated_buses is a set, not numpy array)
+                if isinstance(isolated_buses, set):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
+                elif hasattr(isolated_buses, 'tolist'):
+                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
+                else:
+                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
             
             # Process diagnostic data to convert element indices to user-friendly names
             processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-            diagnostic_response["diagnostic"] = processed_diagnostic
+            # Merge processed diagnostic with isolated_buses (don't overwrite)
+            diagnostic_response["diagnostic"].update(processed_diagnostic)
                     
         except Exception as diag_error:
             pass
