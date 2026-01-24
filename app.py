@@ -181,13 +181,14 @@ def simulation():
                 calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
                 init = in_data[x]['initialization']
                 export_python = in_data[x].get('exportPython', False)  # Export Python code flag
+                run_control = in_data[x].get('run_control', False)  # Include controllers (DiscreteTapControl, etc.)
 
                 net = pp.create_empty_network(f_hz=frequency)
            
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
 
-                response_data = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars)  
+                response_data = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars, run_control=run_control)  
 
                 # Check if client accepts gzip compression
                 accept_encoding = request.headers.get('Accept-Encoding', '')
@@ -201,7 +202,6 @@ def simulation():
                     return response
                 else:
                     return response_data
-
             
             
             if "ShortCircuitPandaPower" in in_data[x]['typ']:

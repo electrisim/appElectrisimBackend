@@ -596,11 +596,10 @@ def create_busbars(in_data, net):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            DcBuses[dc_bus_name] = pp.create_dc_bus(
+            DcBuses[dc_bus_name] = pp.create_bus_dc(
                 net,
-                name=dc_bus_name,
-                id=in_data[x]['id'],
                 vn_kv=float(in_data[x].get('vn_kv', 0.0)),
+                name=dc_bus_name,
                 in_service=in_service
             )
             
@@ -1044,6 +1043,19 @@ def create_other_elements(in_data,net,x, Busbars):
             if not hasattr(net, 'user_friendly_names'):
                 net.user_friendly_names = {}
             net.user_friendly_names[trafo_name] = user_friendly_name
+            
+            # Discrete Tap Control: collect (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) for controllers
+            discrete_tap = in_data[x].get('discrete_tap_control')
+            if discrete_tap in (True, 'true', 'True', '1'):
+                vm_lo = safe_float_local(in_data[x].get('vm_lower_pu'), 0.99)
+                vm_hi = safe_float_local(in_data[x].get('vm_upper_pu'), 1.01)
+                vm_lo = 0.99 if vm_lo is None else float(vm_lo)
+                vm_hi = 1.01 if vm_hi is None else float(vm_hi)
+                control_side = in_data[x].get('control_side', 'lv')  # Default to 'lv' if not specified
+                trafo_idx = int(net.trafo.index[-1])
+                if not hasattr(net, 'trafo_discrete_tap_controllers'):
+                    net.trafo_discrete_tap_controllers = []
+                net.trafo_discrete_tap_controllers.append((trafo_idx, control_side, vm_lo, vm_hi))
        
         if (in_data[x]['typ'].startswith("Three Winding Transformer")):  
             # Parse vector group to separate base group from phase shift
@@ -1386,18 +1398,36 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("VSC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"Warning: VSC '{element_name}' skipped - AC bus not found")
                 continue
             bus_dc_idx = Busbars.get(in_data[x].get('bus_dc', ''))
             if bus_dc_idx is None:
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"Warning: VSC '{element_name}' skipped - DC bus not connected. VSC requires connection to both AC bus and DC bus.")
                 continue
             # Get in_service parameter (default to True if not specified)
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
-                         p_mw=safe_float(in_data[x].get('p_mw', 0.0)), vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)), 
-                         sn_mva=safe_float(in_data[x].get('sn_mva', 0.0)), rx=safe_float(in_data[x].get('rx', 0.1)), 
-                         max_ik_ka=safe_float(in_data[x].get('max_ik_ka', 0.0)), in_service=in_service)
+            
+            # VSC parameters according to pandapower API
+            # Required: r_ohm, x_ohm, r_dc_ohm (coupling transformer and DC resistance)
+            r_ohm = safe_float(in_data[x].get('r_ohm', 0.01))  # Coupling transformer resistance
+            x_ohm = safe_float(in_data[x].get('x_ohm', 0.1))   # Coupling transformer reactance
+            r_dc_ohm = safe_float(in_data[x].get('r_dc_ohm', 0.01))  # Internal DC resistance
+            
+            # Control parameters
+            control_mode_ac = in_data[x].get('control_mode_ac', 'vm_pu')  # 'vm_pu' or 'q_mvar'
+            control_value_ac = safe_float(in_data[x].get('control_value_ac', in_data[x].get('vm_pu', 1.0)))
+            control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')  # 'vm_pu' or 'p_mw'
+            control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
+            
+            pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx, 
+                         r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
+                         control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
+                         control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
+                         name=in_data[x]['name'], in_service=in_service)
             
             # Store user-friendly name for VSC
             vsc_name = in_data[x]['name']
@@ -1407,19 +1437,43 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[vsc_name] = user_friendly_name
         
         if (in_data[x]['typ'].startswith("B2B VSC")):
-            bus1_idx = Busbars.get(in_data[x].get('bus1', ''))
-            bus2_idx = Busbars.get(in_data[x].get('bus2', ''))
-            if bus1_idx is None or bus2_idx is None:
+            # B2B VSC requires: bus (AC), bus_dc_plus, bus_dc_minus
+            # For backwards compatibility, try to get bus, bus_dc_plus, bus_dc_minus
+            # If not available, fall back to bus1/bus2 interpretation
+            bus_idx = Busbars.get(in_data[x].get('bus', in_data[x].get('bus1', '')))
+            bus_dc_plus_idx = Busbars.get(in_data[x].get('bus_dc_plus', ''))
+            bus_dc_minus_idx = Busbars.get(in_data[x].get('bus_dc_minus', ''))
+            
+            if bus_idx is None:
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"Warning: B2B VSC '{element_name}' skipped - AC bus not found")
                 continue
+            if bus_dc_plus_idx is None or bus_dc_minus_idx is None:
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"Warning: B2B VSC '{element_name}' skipped - DC buses (bus_dc_plus/bus_dc_minus) not connected. B2B VSC requires connection to AC bus and DC bus pair.")
+                continue
+                
             # Get in_service parameter (default to True if not specified)
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_b2b_vsc(net, bus1=bus1_idx, bus2=bus2_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
-                            p_mw=safe_float(in_data[x].get('p_mw', 0.0)), vm1_pu=safe_float(in_data[x].get('vm1_pu', 1.0)), 
-                            vm2_pu=safe_float(in_data[x].get('vm2_pu', 1.0)), sn_mva=safe_float(in_data[x].get('sn_mva', 0.0)), 
-                            rx=safe_float(in_data[x].get('rx', 0.1)), max_ik_ka=safe_float(in_data[x].get('max_ik_ka', 0.0)), 
-                            in_service=in_service)
+            
+            # B2B VSC parameters according to pandapower API
+            r_ohm = safe_float(in_data[x].get('r_ohm', 0.01))
+            x_ohm = safe_float(in_data[x].get('x_ohm', 0.1))
+            r_dc_ohm = safe_float(in_data[x].get('r_dc_ohm', 0.01))
+            
+            # Control parameters
+            control_mode_ac = in_data[x].get('control_mode_ac', 'vm_pu')
+            control_value_ac = safe_float(in_data[x].get('control_value_ac', in_data[x].get('vm1_pu', 1.0)))
+            control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')
+            control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
+            
+            pp.create_b2b_vsc(net, bus=bus_idx, bus_dc_plus=bus_dc_plus_idx, bus_dc_minus=bus_dc_minus_idx,
+                            r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
+                            control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
+                            control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
+                            name=in_data[x]['name'], in_service=in_service)
             
             # Store user-friendly name for B2B VSC
             b2b_vsc_name = in_data[x]['name']
@@ -1429,32 +1483,235 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[b2b_vsc_name] = user_friendly_name
         
         if (in_data[x]['typ'].startswith("DC Line")):
-            from_bus_idx = Busbars.get(in_data[x]['busFrom'])
-            to_bus_idx = Busbars.get(in_data[x]['busTo'])
+            element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+            bus_from = in_data[x].get('busFrom')
+            bus_to = in_data[x].get('busTo')
+            
+            if bus_from is None:
+                raise ValueError(
+                    f"CONNECTION ERROR: DC Line '{element_name}' is missing 'busFrom' connection.\n\n"
+                    f"SOLUTION: DC Lines must be connected between two buses. Please ensure the DC Line "
+                    f"is properly drawn from one bus to another in your diagram."
+                )
+            if bus_to is None:
+                raise ValueError(
+                    f"CONNECTION ERROR: DC Line '{element_name}' is missing 'busTo' connection.\n\n"
+                    f"SOLUTION: DC Lines must be connected between two buses. Please ensure the DC Line "
+                    f"is properly drawn from one bus to another in your diagram."
+                )
+            
+            from_bus_idx = Busbars.get(bus_from)
+            to_bus_idx = Busbars.get(bus_to)
+            
             if from_bus_idx is None:
-                continue
+                raise ValueError(
+                    f"CONNECTION ERROR: DC Line '{element_name}' is trying to connect from bus '{bus_from}', "
+                    f"but this bus does not exist in your diagram.\n\n"
+                    f"SOLUTION: Please ensure the DC Line is connected to valid Bus elements."
+                )
             if to_bus_idx is None:
-                continue
+                raise ValueError(
+                    f"CONNECTION ERROR: DC Line '{element_name}' is trying to connect to bus '{bus_to}', "
+                    f"but this bus does not exist in your diagram.\n\n"
+                    f"SOLUTION: Please ensure the DC Line is connected to valid Bus elements."
+                )
+            
             # Get in_service parameter (default to True if not specified)
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=in_data[x]['p_mw'], loss_percent=in_data[x]['loss_percent'], loss_mw=in_data[x]['loss_mw'], vm_from_pu=in_data[x]['vm_from_pu'], vm_to_pu=in_data[x]['vm_to_pu'], in_service=in_service)
-
-
-
-def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None):
-               
-         
-            #pandapower - rozpływ mocy
-            try:
             
+            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, 
+                           name=in_data[x]['name'], 
+                           p_mw=safe_float(in_data[x].get('p_mw', 0.0)), 
+                           loss_percent=safe_float(in_data[x].get('loss_percent', 0.0)), 
+                           loss_mw=safe_float(in_data[x].get('loss_mw', 0.0)), 
+                           vm_from_pu=safe_float(in_data[x].get('vm_from_pu', 1.0)), 
+                           vm_to_pu=safe_float(in_data[x].get('vm_to_pu', 1.0)), 
+                           in_service=in_service)
+            
+            # Store user-friendly name for DC Line
+            dcline_name = in_data[x]['name']
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[dcline_name] = element_name
+
+
+def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None, run_control=False):
+            #pandapower - rozpływ mocy
+            # Initialize tap_control_results before try block so it's accessible in else block
+            tap_control_results = []
+            
+            try:
                 # Check for isolated buses before running power flow
                 isolated_buses = pp.topology.unsupplied_buses(net)
                 if len(isolated_buses) > 0:
                     raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
                 
-                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)
+                # Add DiscreteTapControl for two-winding transformers when "Include controllers" is enabled
+                if run_control and getattr(net, 'trafo_discrete_tap_controllers', None):
+                    print(f"🎛️ Creating DiscreteTapControl for {len(net.trafo_discrete_tap_controllers)} transformers")
+                    for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in net.trafo_discrete_tap_controllers:
+                        try:
+                            # Use the control_side from frontend (which bus voltage to monitor/control)
+                            trafo_name = net.trafo.at[trafo_idx, 'name']
+                            tap_side = net.trafo.at[trafo_idx, 'tap_side'] if 'tap_side' in net.trafo.columns else 'hv'
+                            
+                            # Get tap range info for debugging
+                            tap_min = net.trafo.at[trafo_idx, 'tap_min']
+                            tap_max = net.trafo.at[trafo_idx, 'tap_max']
+                            tap_step_percent = net.trafo.at[trafo_idx, 'tap_step_percent']
+                            tap_pos = net.trafo.at[trafo_idx, 'tap_pos']
+                            
+                            print(f"  Transformer {trafo_idx} ({trafo_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
+                            print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
+                            
+                            # Check if tap changer is properly configured
+                            if tap_min >= tap_max:
+                                print(f"    ⚠️ WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
+                            if tap_step_percent == 0:
+                                print(f"    ⚠️ WARNING: tap_step_percent is 0 - controller will not work!")
+                            
+                            # Warning if tap is already at limit
+                            if tap_pos == tap_max:
+                                print(f"    ⚠️ WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
+                                print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
+                            elif tap_pos == tap_min:
+                                print(f"    ⚠️ WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
+                                print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
+                            
+                            # Create controller with side parameter
+                            # 'side' tells which bus voltage to monitor/control (from user's control_side setting)
+                            # Try different parameter names (pandapower versions may differ)
+                            try:
+                                ctrl = control.DiscreteTapControl(
+                                    net=net,
+                                    tid=trafo_idx,
+                                    side=control_side,
+                                    vm_lower_pu=vm_lower_pu,
+                                    vm_upper_pu=vm_upper_pu
+                                )
+                                print(f"    ✅ Controller created with 'tid' parameter (index={ctrl.index})")
+                            except TypeError as te:
+                                # Try alternative parameter name
+                                print(f"    ⚠️ 'tid' failed, trying 'element_index': {te}")
+                                ctrl = control.DiscreteTapControl(
+                                    net=net,
+                                    element_index=trafo_idx,
+                                    side=control_side,
+                                    vm_lower_pu=vm_lower_pu,
+                                    vm_upper_pu=vm_upper_pu
+                                )
+                                print(f"    ✅ Controller created with 'element_index' parameter (index={ctrl.index})")
+                        except Exception as ctrl_err:
+                            print(f"    ❌ Failed to create controller: {ctrl_err}")
+                            import traceback
+                            traceback.print_exc()
+                
+                # Log controller status before power flow
+                if run_control and hasattr(net, 'controller') and not net.controller.empty:
+                    print(f"🎛️ Running power flow WITH controllers (run_control=True)")
+                    print(f"   Controllers in net: {len(net.controller)}")
+                    print(net.controller[['object', 'in_service']])
+                    
+                    # Store initial tap positions for comparison
+                    initial_tap_positions = {}
+                    for idx in net.trafo.index:
+                        initial_tap_positions[idx] = net.trafo.at[idx, 'tap_pos']
+                    print(f"   Initial tap positions: {initial_tap_positions}")
+                else:
+                    print(f"⚡ Running power flow WITHOUT controllers (run_control={run_control})")
+                    initial_tap_positions = {}
+                
+                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init, run_control=run_control)
+                
+                # Check if tap positions changed
+                if run_control and initial_tap_positions:
+                    changed = False
+                    for idx, initial_pos in initial_tap_positions.items():
+                        final_pos = net.trafo.at[idx, 'tap_pos']
+                        if initial_pos != final_pos:
+                            print(f"   📊 Tap changed: Trafo {idx}: {initial_pos} → {final_pos}")
+                            changed = True
+                    if not changed:
+                        print(f"   ⚠️ WARNING: No tap positions changed during controlled power flow!")
+                
+                # Log transformer tap positions after power flow (only for controlled transformers)
+                # Also build tap_control_results for frontend display
+                
+                if run_control and not net.trafo.empty and getattr(net, 'trafo_discrete_tap_controllers', None):
+                    # Get list of transformer indices that have controllers
+                    controlled_trafo_indices = set(ctrl_data[0] for ctrl_data in net.trafo_discrete_tap_controllers)
+                    
+                    print(f"🔧 Controlled transformer tap positions after power flow:")
+                    for idx in net.trafo.index:
+                        if idx not in controlled_trafo_indices:
+                            continue  # Skip transformers without controllers
+                        
+                        name = net.trafo.at[idx, 'name']
+                        tap_pos = net.trafo.at[idx, 'tap_pos']
+                        tap_min = net.trafo.at[idx, 'tap_min']
+                        tap_max = net.trafo.at[idx, 'tap_max']
+                        tap_step = net.trafo.at[idx, 'tap_step_percent']
+                        hv_bus_idx = net.trafo.at[idx, 'hv_bus']
+                        lv_bus_idx = net.trafo.at[idx, 'lv_bus']
+                        hv_vm_pu = net.res_bus.at[hv_bus_idx, 'vm_pu']
+                        lv_vm_pu = net.res_bus.at[lv_bus_idx, 'vm_pu']
+                        
+                        # Get user-friendly name if available
+                        user_friendly_name = net.user_friendly_names.get(name, name) if hasattr(net, 'user_friendly_names') else name
+                        
+                        # Get control limits for this transformer
+                        ctrl_data = next((c for c in net.trafo_discrete_tap_controllers if c[0] == idx), None)
+                        if ctrl_data:
+                            ctrl_side, vm_lower, vm_upper = ctrl_data[1], ctrl_data[2], ctrl_data[3]
+                            controlled_vm = lv_vm_pu if ctrl_side == 'lv' else hv_vm_pu
+                            
+                            # Check if voltage is within limits
+                            in_limits = vm_lower <= controlled_vm <= vm_upper
+                            status = "✅ IN LIMITS" if in_limits else "❌ OUT OF LIMITS"
+                            
+                            # Check if tap is at limit
+                            at_limit = ""
+                            at_limit_type = None
+                            if tap_pos == tap_max:
+                                at_limit = " (AT MAX LIMIT - cannot increase further)"
+                                at_limit_type = "max"
+                            elif tap_pos == tap_min:
+                                at_limit = " (AT MIN LIMIT - cannot decrease further)"
+                                at_limit_type = "min"
+                            
+                            print(f"   Trafo {idx} ({name}):")
+                            print(f"      Tap: {tap_pos} [{tap_min}, {tap_max}] step={tap_step}%{at_limit}")
+                            print(f"      Control side ({ctrl_side}): {controlled_vm:.4f} pu  Target: [{vm_lower}, {vm_upper}] pu  {status}")
+                            print(f"      HV bus: {hv_vm_pu:.4f} pu, LV bus: {lv_vm_pu:.4f} pu")
+                            
+                            # Calculate how much more tap range would be needed
+                            taps_needed = None
+                            if not in_limits and (tap_pos == tap_max or tap_pos == tap_min):
+                                voltage_gap = abs(controlled_vm - vm_upper) if controlled_vm > vm_upper else abs(vm_lower - controlled_vm)
+                                taps_needed = int(voltage_gap / (tap_step / 100) / controlled_vm) + 1
+                                print(f"      💡 Need ~{taps_needed} more tap positions OR increase tap_step_percent to reach target")
+                            
+                            # Build result object for frontend
+                            # Convert numpy types to native Python types for JSON serialization
+                            tap_control_results.append({
+                                'name': str(user_friendly_name),
+                                'id': str(name),
+                                'tap_pos': float(tap_pos),
+                                'tap_min': float(tap_min),
+                                'tap_max': float(tap_max),
+                                'tap_step_percent': float(tap_step),
+                                'control_side': str(ctrl_side),
+                                'controlled_vm_pu': round(float(controlled_vm), 4),
+                                'vm_lower_pu': float(vm_lower),
+                                'vm_upper_pu': float(vm_upper),
+                                'hv_vm_pu': round(float(hv_vm_pu), 4),
+                                'lv_vm_pu': round(float(lv_vm_pu), 4),
+                                'in_limits': bool(in_limits),  # Convert numpy.bool_ to Python bool
+                                'at_limit': at_limit_type,
+                                'taps_needed': int(taps_needed) if taps_needed is not None else None
+                            })
                 
             except Exception as e:
                 
@@ -2511,6 +2768,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 if export_python and in_data and Busbars:
                     python_code = generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init)
                     result['pandapower_python'] = python_code
+                
+                # Add tap control results to the response for frontend display
+                if tap_control_results:
+                    result['tap_control_results'] = tap_control_results
                 
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
