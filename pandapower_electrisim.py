@@ -585,9 +585,22 @@ def create_busbars(in_data, net):
     # Create a separate dictionary for DC buses
     DcBuses = {}
     
+    # Check if DC bus functionality is available in this pandapower version
+    has_dc_bus_support = hasattr(pp, 'create_bus_dc')
+    if not has_dc_bus_support:
+        print(f"⚠️ Note: pandapower version {pp.__version__} does not support DC buses (create_bus_dc).")
+        print("   DC Bus, VSC, and B2B VSC elements will be skipped.")
+        print("   You can still use 'DC Line' which connects two AC buses directly.")
+        print("   Upgrade to pandapower 3.1+ for full DC grid support.")
+    
     for x in in_data:
         if "DC Bus" in in_data[x]['typ']:
-            # Handle DC Bus separately
+            # Handle DC Bus separately - requires pandapower 3.1+
+            if not has_dc_bus_support:
+                user_friendly_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"   Skipping DC Bus '{user_friendly_name}' - DC bus not supported in pandapower {pp.__version__}")
+                continue
+                
             dc_bus_name = in_data[x]['name']
             user_friendly_name = in_data[x].get('userFriendlyName', dc_bus_name)
             
@@ -628,6 +641,10 @@ def create_busbars(in_data, net):
     
     # Store DC buses in Busbars dict for compatibility
     Busbars.update(DcBuses)
+    
+    # Store DC bus names in net object for later use (to distinguish DC vs AC buses)
+    net.dc_bus_names = set(DcBuses.keys())
+    
     return Busbars
 
 
@@ -1396,7 +1413,13 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[switch_name] = user_friendly_name
         
         if (in_data[x]['typ'].startswith("VSC")):
-            bus_idx = Busbars.get(in_data[x]['bus'])
+            # VSC requires pandapower 3.1+ with DC grid support
+            if not hasattr(pp, 'create_vsc'):
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                print(f"Warning: VSC '{element_name}' skipped - VSC not supported in pandapower {pp.__version__}. Upgrade to pandapower 3.1+")
+                continue
+                
+            bus_idx = Busbars.get(in_data[x].get('bus', ''))
             if bus_idx is None:
                 element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
                 print(f"Warning: VSC '{element_name}' skipped - AC bus not found")
@@ -1423,11 +1446,16 @@ def create_other_elements(in_data,net,x, Busbars):
             control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')  # 'vm_pu' or 'p_mw'
             control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
             
-            pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx, 
+            vsc_idx = pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx, 
                          r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
                          control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
                          control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
                          name=in_data[x]['name'], in_service=in_service)
+            
+            # Store custom 'id' field in the VSC dataframe
+            if 'id' not in net.vsc.columns:
+                net.vsc['id'] = ''
+            net.vsc.at[vsc_idx, 'id'] = in_data[x].get('id', '')
             
             # Store user-friendly name for VSC
             vsc_name = in_data[x]['name']
@@ -1437,45 +1465,83 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[vsc_name] = user_friendly_name
         
         if (in_data[x]['typ'].startswith("B2B VSC")):
-            # B2B VSC requires: bus (AC), bus_dc_plus, bus_dc_minus
-            # For backwards compatibility, try to get bus, bus_dc_plus, bus_dc_minus
-            # If not available, fall back to bus1/bus2 interpretation
-            bus_idx = Busbars.get(in_data[x].get('bus', in_data[x].get('bus1', '')))
-            bus_dc_plus_idx = Busbars.get(in_data[x].get('bus_dc_plus', ''))
-            bus_dc_minus_idx = Busbars.get(in_data[x].get('bus_dc_minus', ''))
+            element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
             
-            if bus_idx is None:
-                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
-                print(f"Warning: B2B VSC '{element_name}' skipped - AC bus not found")
-                continue
-            if bus_dc_plus_idx is None or bus_dc_minus_idx is None:
-                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
-                print(f"Warning: B2B VSC '{element_name}' skipped - DC buses (bus_dc_plus/bus_dc_minus) not connected. B2B VSC requires connection to AC bus and DC bus pair.")
-                continue
+            # B2B VSC can work in two modes:
+            # 1. Simple mode: AC bus to DC bus (uses create_vsc internally)
+            # 2. Full mode: AC bus to DC bus pair (bus_dc_plus/bus_dc_minus)
+            
+            bus_idx = Busbars.get(in_data[x].get('bus', ''))
+            bus_dc_idx = Busbars.get(in_data[x].get('bus_dc', ''))
+            
+            # Check for simple VSC mode (AC bus to single DC bus)
+            if bus_idx is not None and bus_dc_idx is not None:
+                # Use create_vsc for simple AC-to-DC connection
+                if not hasattr(pp, 'create_vsc'):
+                    print(f"Warning: B2B VSC '{element_name}' skipped - VSC not supported in pandapower {pp.__version__}. Upgrade to pandapower 3.1+")
+                    continue
                 
-            # Get in_service parameter (default to True if not specified)
-            in_service = True
-            if 'in_service' in in_data[x]:
-                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+                # Get in_service parameter
+                in_service = True
+                if 'in_service' in in_data[x]:
+                    in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+                
+                # VSC parameters
+                r_ohm = safe_float(in_data[x].get('r_ohm', 0.01))
+                x_ohm = safe_float(in_data[x].get('x_ohm', 0.1))
+                r_dc_ohm = safe_float(in_data[x].get('r_dc_ohm', 0.01))
+                
+                # Control parameters
+                control_mode_ac = in_data[x].get('control_mode_ac', 'vm_pu')
+                control_value_ac = safe_float(in_data[x].get('control_value_ac', in_data[x].get('vm_pu', 1.0)))
+                control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')
+                control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
+                
+                print(f"Creating VSC for B2B VSC '{element_name}': AC bus={bus_idx}, DC bus={bus_dc_idx}")
+                pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx,
+                             r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
+                             control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
+                             control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
+                             name=in_data[x]['name'], in_service=in_service)
+            else:
+                # Try full B2B VSC mode with bus_dc_plus/bus_dc_minus
+                if not hasattr(pp, 'create_b2b_vsc'):
+                    print(f"Warning: B2B VSC '{element_name}' skipped - B2B VSC not supported in pandapower {pp.__version__}. Upgrade to pandapower 3.1+")
+                    continue
+                    
+                bus_dc_plus_idx = Busbars.get(in_data[x].get('bus_dc_plus', ''))
+                bus_dc_minus_idx = Busbars.get(in_data[x].get('bus_dc_minus', ''))
+                
+                if bus_idx is None:
+                    print(f"Warning: B2B VSC '{element_name}' skipped - AC bus not connected. Connect B2B VSC to both an AC bus and a DC bus.")
+                    continue
+                if bus_dc_plus_idx is None or bus_dc_minus_idx is None:
+                    print(f"Warning: B2B VSC '{element_name}' skipped - DC buses not connected. For simple HVDC, connect B2B VSC to both an AC bus and a DC bus.")
+                    continue
+                    
+                # Get in_service parameter
+                in_service = True
+                if 'in_service' in in_data[x]:
+                    in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
+                
+                # B2B VSC parameters
+                r_ohm = safe_float(in_data[x].get('r_ohm', 0.01))
+                x_ohm = safe_float(in_data[x].get('x_ohm', 0.1))
+                r_dc_ohm = safe_float(in_data[x].get('r_dc_ohm', 0.01))
+                
+                # Control parameters
+                control_mode_ac = in_data[x].get('control_mode_ac', 'vm_pu')
+                control_value_ac = safe_float(in_data[x].get('control_value_ac', in_data[x].get('vm1_pu', 1.0)))
+                control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')
+                control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
+                
+                pp.create_b2b_vsc(net, bus=bus_idx, bus_dc_plus=bus_dc_plus_idx, bus_dc_minus=bus_dc_minus_idx,
+                                r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
+                                control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
+                                control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
+                                name=in_data[x]['name'], in_service=in_service)
             
-            # B2B VSC parameters according to pandapower API
-            r_ohm = safe_float(in_data[x].get('r_ohm', 0.01))
-            x_ohm = safe_float(in_data[x].get('x_ohm', 0.1))
-            r_dc_ohm = safe_float(in_data[x].get('r_dc_ohm', 0.01))
-            
-            # Control parameters
-            control_mode_ac = in_data[x].get('control_mode_ac', 'vm_pu')
-            control_value_ac = safe_float(in_data[x].get('control_value_ac', in_data[x].get('vm1_pu', 1.0)))
-            control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')
-            control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
-            
-            pp.create_b2b_vsc(net, bus=bus_idx, bus_dc_plus=bus_dc_plus_idx, bus_dc_minus=bus_dc_minus_idx,
-                            r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
-                            control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
-                            control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
-                            name=in_data[x]['name'], in_service=in_service)
-            
-            # Store user-friendly name for B2B VSC
+            # Store user-friendly name
             b2b_vsc_name = in_data[x]['name']
             user_friendly_name = in_data[x].get('userFriendlyName', b2b_vsc_name)
             if not hasattr(net, 'user_friendly_names'):
@@ -1488,47 +1554,96 @@ def create_other_elements(in_data,net,x, Busbars):
             bus_to = in_data[x].get('busTo')
             
             if bus_from is None:
-                raise ValueError(
-                    f"CONNECTION ERROR: DC Line '{element_name}' is missing 'busFrom' connection.\n\n"
-                    f"SOLUTION: DC Lines must be connected between two buses. Please ensure the DC Line "
-                    f"is properly drawn from one bus to another in your diagram."
-                )
+                print(f"Warning: DC Line '{element_name}' skipped - missing 'busFrom' connection. "
+                      f"DC Lines must be connected between two buses (draw it as a line connecting buses).")
+                continue
             if bus_to is None:
-                raise ValueError(
-                    f"CONNECTION ERROR: DC Line '{element_name}' is missing 'busTo' connection.\n\n"
-                    f"SOLUTION: DC Lines must be connected between two buses. Please ensure the DC Line "
-                    f"is properly drawn from one bus to another in your diagram."
-                )
+                print(f"Warning: DC Line '{element_name}' skipped - missing 'busTo' connection. "
+                      f"DC Lines must be connected between two buses (draw it as a line connecting buses).")
+                continue
             
             from_bus_idx = Busbars.get(bus_from)
             to_bus_idx = Busbars.get(bus_to)
             
             if from_bus_idx is None:
-                raise ValueError(
-                    f"CONNECTION ERROR: DC Line '{element_name}' is trying to connect from bus '{bus_from}', "
-                    f"but this bus does not exist in your diagram.\n\n"
-                    f"SOLUTION: Please ensure the DC Line is connected to valid Bus elements."
-                )
+                print(f"Warning: DC Line '{element_name}' skipped - from_bus '{bus_from}' not found.")
+                continue
             if to_bus_idx is None:
-                raise ValueError(
-                    f"CONNECTION ERROR: DC Line '{element_name}' is trying to connect to bus '{bus_to}', "
-                    f"but this bus does not exist in your diagram.\n\n"
-                    f"SOLUTION: Please ensure the DC Line is connected to valid Bus elements."
-                )
+                print(f"Warning: DC Line '{element_name}' skipped - to_bus '{bus_to}' not found.")
+                continue
             
             # Get in_service parameter (default to True if not specified)
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, 
-                           name=in_data[x]['name'], 
-                           p_mw=safe_float(in_data[x].get('p_mw', 0.0)), 
-                           loss_percent=safe_float(in_data[x].get('loss_percent', 0.0)), 
-                           loss_mw=safe_float(in_data[x].get('loss_mw', 0.0)), 
-                           vm_from_pu=safe_float(in_data[x].get('vm_from_pu', 1.0)), 
-                           vm_to_pu=safe_float(in_data[x].get('vm_to_pu', 1.0)), 
-                           in_service=in_service)
+            # Check if both buses are DC buses - use create_line_dc for DC-to-DC connections
+            dc_bus_names = getattr(net, 'dc_bus_names', set())
+            is_dc_to_dc = bus_from in dc_bus_names and bus_to in dc_bus_names
+            
+            if is_dc_to_dc:
+                # DC Line connecting two DC buses - use create_line_dc
+                if hasattr(pp, 'create_line_dc'):
+                    print(f"Creating DC line (line_dc) '{element_name}': DC bus {bus_from} -> DC bus {bus_to}")
+                    
+                    # Get line parameters
+                    length_km = safe_float(in_data[x].get('length_km', 100.0))  # Default 100km for HVDC
+                    r_ohm_per_km = safe_float(in_data[x].get('r_ohm_per_km', 0.01))  # Default DC cable resistance
+                    
+                    # Try to create a standard type for DC line if it doesn't exist
+                    std_type_name = "HVDC_Cable_320kV"
+                    try:
+                        # Check if std_type already exists
+                        if not hasattr(net, 'std_types') or 'line_dc' not in net.std_types or std_type_name not in net.std_types['line_dc']:
+                            # Create a standard type for DC lines
+                            if hasattr(pp, 'create_std_type'):
+                                pp.create_std_type(net, {
+                                    "r_ohm_per_km": r_ohm_per_km,
+                                    "c_nf_per_km": 0.0,  # DC cables don't have capacitance issues like AC
+                                    "max_i_ka": 2.0,  # Max current rating
+                                }, name=std_type_name, element="line_dc")
+                                print(f"Created DC line standard type: {std_type_name}")
+                    except Exception as e:
+                        print(f"Note: Could not create std_type: {e}")
+                    
+                    try:
+                        # create_line_dc requires from_bus_dc and to_bus_dc (DC bus indices)
+                        line_dc_idx = pp.create_line_dc(net, from_bus_dc=from_bus_idx, to_bus_dc=to_bus_idx,
+                                         length_km=length_km, std_type=std_type_name,
+                                         name=in_data[x]['name'], in_service=in_service)
+                        # Store custom 'id' field in the line_dc dataframe
+                        if 'id' not in net.line_dc.columns:
+                            net.line_dc['id'] = ''
+                        net.line_dc.at[line_dc_idx, 'id'] = in_data[x].get('id', '')
+                    except TypeError as e:
+                        # If std_type approach fails, try without it using different parameters
+                        print(f"Standard type approach failed: {e}. Trying direct parameters...")
+                        try:
+                            # Some pandapower versions allow direct parameters
+                            line_dc_idx = pp.create_line_dc(net, from_bus_dc=from_bus_idx, to_bus_dc=to_bus_idx,
+                                             length_km=length_km, r_ohm_per_km=r_ohm_per_km,
+                                             name=in_data[x]['name'], in_service=in_service)
+                            # Store custom 'id' field in the line_dc dataframe
+                            if 'id' not in net.line_dc.columns:
+                                net.line_dc['id'] = ''
+                            net.line_dc.at[line_dc_idx, 'id'] = in_data[x].get('id', '')
+                        except Exception as e2:
+                            print(f"Warning: Could not create DC line: {e2}. DC grid simulation may not work correctly.")
+                            continue
+                else:
+                    print(f"Warning: DC Line '{element_name}' connects DC buses but create_line_dc not available in pandapower {pp.__version__}. Skipped.")
+                    continue
+            else:
+                # DC Line connecting two AC buses - use create_dcline (simplified HVDC model)
+                print(f"Creating DC line (dcline) '{element_name}': AC bus {bus_from} -> AC bus {bus_to}")
+                pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, 
+                               name=in_data[x]['name'], 
+                               p_mw=safe_float(in_data[x].get('p_mw', 0.0)), 
+                               loss_percent=safe_float(in_data[x].get('loss_percent', 0.0)), 
+                               loss_mw=safe_float(in_data[x].get('loss_mw', 0.0)), 
+                               vm_from_pu=safe_float(in_data[x].get('vm_from_pu', 1.0)), 
+                               vm_to_pu=safe_float(in_data[x].get('vm_to_pu', 1.0)), 
+                               in_service=in_service)
             
             # Store user-friendly name for DC Line
             dcline_name = in_data[x]['name']
@@ -1811,16 +1926,53 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 # Access initial voltage magnitudes and angles  
                 try:
-                    diag_result_dict = pp.diagnostic(net, report_style='detailed')
+                    # Capture the diagnostic output from stdout
+                    import io
+                    import sys
+                    
+                    captured_output = io.StringIO()
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    sys.stdout = captured_output
+                    sys.stderr = captured_output  # Also capture stderr
+                    
+                    diag_result_dict = {}
+                    try:
+                        # Call diagnostic without report_style to get full text output
+                        # The default call prints the detailed diagnostic tool output
+                        diag_result_dict = pp.diagnostic(net)
+                    except Exception as diag_ex:
+                        captured_output.write(f"\nDiagnostic error: {str(diag_ex)}\n")
+                    
+                    # Restore stdout/stderr
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                    diagnostic_text_output = captured_output.getvalue()
+                    
+                    # Debug: print captured output to server console
+                    print(f"[DEBUG] Captured diagnostic output length: {len(diagnostic_text_output)}")
+                    if diagnostic_text_output:
+                        print(f"[DEBUG] Diagnostic output preview: {diagnostic_text_output[:500]}...")
+                    
+                    # Include the text output in the diagnostic response
+                    if diagnostic_text_output and len(diagnostic_text_output.strip()) > 0:
+                        diagnostic_response["diagnostic"]["diagnostic_output"] = diagnostic_text_output
+                    else:
+                        # If no output captured, add a note
+                        diagnostic_response["diagnostic"]["diagnostic_note"] = "No detailed diagnostic output available"
+                    
                     # Process diagnostic data to convert element indices to user-friendly names
-                    processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-                    # Merge processed diagnostic (don't overwrite disconnected_sections or isolated_buses)
-                    for key, value in processed_diagnostic.items():
-                        if key not in diagnostic_response["diagnostic"]:
-                            diagnostic_response["diagnostic"][key] = value
+                    if diag_result_dict and isinstance(diag_result_dict, dict):
+                        processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
+                        # Merge processed diagnostic (don't overwrite disconnected_sections or isolated_buses)
+                        for key, value in processed_diagnostic.items():
+                            if key not in diagnostic_response["diagnostic"]:
+                                diagnostic_response["diagnostic"][key] = value
                 except Exception as diag_error:
                     # If diagnostic fails, continue with what we have
-                    pass
+                    diagnostic_response["diagnostic"]["diagnostic_error"] = str(diag_error)
+                    import traceback
+                    diagnostic_response["diagnostic"]["diagnostic_traceback"] = traceback.format_exc()
                 
                 # If no specific diagnostic was found, include the original exception
                 if not diagnostic_response["diagnostic"]:
@@ -2739,8 +2891,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 #VSC
                 if(hasattr(net, 'res_vsc') and not net.res_vsc.empty):
-                    for index, row in net.res_vsc.iterrows():    
-                        vsc = VSCOut(name=net.vsc._get_value(index, 'name'), id = net.vsc._get_value(index, 'id'), p_mw=row['p_mw'], vm_pu=row['vm_pu'])        
+                    for index, row in net.res_vsc.iterrows():
+                        vsc_name = net.vsc.at[index, 'name'] if 'name' in net.vsc.columns else f'VSC_{index}'
+                        vsc_id = net.vsc.at[index, 'id'] if 'id' in net.vsc.columns else str(index)
+                        vsc = VSCOut(name=vsc_name, id=vsc_id, p_mw=row['p_mw'], vm_pu=row.get('vm_pu', 0.0))        
                         vscsList.append(vsc) 
                         vscs = VSCsOut(vscs = vscsList) 
                     result = {**result, **vscs.__dict__}
@@ -2753,7 +2907,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         b2bvscs = B2bVSCsOut(b2bvscs = b2bvscsList) 
                     result = {**result, **b2bvscs.__dict__}
                 
-                #DCLine
+                #DCLine (old HVDC link element - pp.create_dcline)
                 if(net.res_dcline.empty):
                     pass
                 else:                    
@@ -2763,6 +2917,51 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             dclines = ImpedancesOut(dclines = dclinesList) 
                         result = {**result, **dclines.__dict__}         
                 
+                # DC Grid Line (line_dc element - pp.create_line_dc)
+                # This is part of DC grid modeling (bus_dc + line_dc + vsc)
+                if hasattr(net, 'res_line_dc') and not net.res_line_dc.empty:
+                    print(f"Processing res_line_dc results: {len(net.res_line_dc)} items")
+                    
+                    class LineDcOut(object):
+                        def __init__(self, name: str, id: str, p_from_mw: float, p_to_mw: float, pl_mw: float, 
+                                     vm_from_pu: float, vm_to_pu: float, i_from_ka: float, i_to_ka: float, loading_percent: float):
+                            self.name = name
+                            self.id = id
+                            self.p_from_mw = p_from_mw
+                            self.p_to_mw = p_to_mw
+                            self.pl_mw = pl_mw
+                            self.vm_from_pu = vm_from_pu
+                            self.vm_to_pu = vm_to_pu
+                            self.i_from_ka = i_from_ka
+                            self.i_to_ka = i_to_ka
+                            self.loading_percent = loading_percent
+                    
+                    class LineDcsOut(object):
+                        def __init__(self, linedcs: List[LineDcOut]):
+                            self.linedcs = linedcs
+                    
+                    linedcsList = []
+                    for index, row in net.res_line_dc.iterrows():
+                        line_dc_name = net.line_dc.at[index, 'name'] if 'name' in net.line_dc.columns else f'LineDC_{index}'
+                        line_dc_id = net.line_dc.at[index, 'id'] if 'id' in net.line_dc.columns else str(index)
+                        
+                        linedc = LineDcOut(
+                            name=line_dc_name,
+                            id=line_dc_id,
+                            p_from_mw=row.get('p_from_mw', 0.0),
+                            p_to_mw=row.get('p_to_mw', 0.0),
+                            pl_mw=row.get('pl_mw', 0.0),
+                            vm_from_pu=row.get('vm_from_pu', 0.0),
+                            vm_to_pu=row.get('vm_to_pu', 0.0),
+                            i_from_ka=row.get('i_from_ka', 0.0),
+                            i_to_ka=row.get('i_to_ka', 0.0),
+                            loading_percent=row.get('loading_percent', 0.0)
+                        )
+                        linedcsList.append(linedc)
+                    
+                    linedcs = LineDcsOut(linedcs=linedcsList)
+                    result = {**result, **linedcs.__dict__}
+                    print(f"Added {len(linedcsList)} line_dc results to response")
                            
                 # Generate Python code if export is requested
                 if export_python and in_data and Busbars:
