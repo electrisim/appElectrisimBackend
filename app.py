@@ -23,9 +23,9 @@ app = Flask(__name__)
 # Get CORS origins from environment variable or use defaults
 cors_origins = os.getenv('CORS_ORIGINS', '').split(',') if os.getenv('CORS_ORIGINS') else [
     # Development origins
-    'http://127.0.0.1:5500', 
-    'http://127.0.0.1:5501', 
-    'http://localhost:5500', 
+    'http://127.0.0.1:5500',
+    'http://127.0.0.1:5501',
+    'http://localhost:5500',
     'http://localhost:5501',
     'http://localhost:5502',
     'https://03dht3kc-5000.euw.devtunnels.ms',
@@ -370,7 +370,10 @@ def simulation():
     
     except Exception as e:
         # Handle other unexpected errors
-        error_message = f"Server error: {str(e)}"
+        error_message = (
+            f"Server error: {str(e)} "
+            f"- if this problem persists, please contact electrisim@electrisim.com for support."
+        )
         print(f"Unexpected Error: {error_message}")
         import traceback
         traceback.print_exc()

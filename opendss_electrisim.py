@@ -1,4 +1,4 @@
-import py_dss_interface
+import opendssdirect as dss
 from typing import List
 import math
 import json
@@ -220,7 +220,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
     if execute_dss_command is None:
         def execute_dss_command(command):
             """Execute DSS command and optionally collect it for export"""
-            dss.text(command)
+            dss.run_command(command)
             if export_commands:
                 opendss_commands.append(command)
     
@@ -423,11 +423,11 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             
             if not is_in_service:
                 # Disable the line after it's been created
-                dss.text(f'Line.{element_name}.enabled=no')
+                dss.run_command(f'Line.{element_name}.enabled=no')
             
             # print(f"Command: {line_cmd}")  # Reduced logging
             
-            actual_name = dss.lines.name
+            actual_name = dss.Lines.Name()
             LinesDict[element_name] = actual_name
             LinesDictId[element_name] = element_id
             created_elements.add(element_name)
@@ -490,7 +490,7 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
                 is_in_service = False
             
             if not is_in_service:
-                dss.text(f'Load.{load_name}.enabled=no')
+                dss.run_command(f'Load.{load_name}.enabled=no')
             # print(f"Command: {load_cmd}")  # Reduced logging
             
             LoadsDict[element_name] = load_name
@@ -566,7 +566,7 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                     is_in_service = False
                 
                 if not is_in_service:
-                    dss.text(f'Generator.{gen_name}.enabled=no')
+                    dss.run_command(f'Generator.{gen_name}.enabled=no')
                 # print(f"✓ Command: {gen_cmd}")  # Reduced logging
                 
                 # Store in GeneratorsDict
@@ -633,14 +633,14 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 is_in_service = False
             
             if not is_in_service:
-                dss.text(f'Generator.{element_name}.enabled=no')
+                dss.run_command(f'Generator.{element_name}.enabled=no')
             # print(f"Command: {gen_cmd}")  # Reduced logging
 
             # Configure generator to NOT act as voltage source
-            dss.generators.mode = 1  # Power Factor mode
+            dss.Generators.Model(1)  # Power Factor mode
             # Disable voltage control by setting control mode to 0 (no control)
             try:
-                dss.generators.status = 'Variable'  # Set to variable (not fixed)
+                dss.Generators.Status(3)  # Set to variable (not fixed) - 3 is Variable mode
             except:
                 pass  # Ignore if property doesn't exist
 
@@ -854,7 +854,7 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
                 is_in_service = False
             
             if not is_in_service:
-                dss.text(f'Transformer.{element_name}.enabled=no')
+                dss.run_command(f'Transformer.{element_name}.enabled=no')
             # print(f"Command: {transformer_cmd}")  # Reduced logging
             
             # Log loss parameters if they are included
@@ -1159,7 +1159,7 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                     is_in_service = False
                 
                 if not is_in_service:
-                    dss.text(f'PVSystem.{element_name}.enabled=no')
+                    dss.run_command(f'PVSystem.{element_name}.enabled=no')
 
                 PVSystemsDict[element_name] = element_name
                 PVSystemsDictId[element_name] = element_id
@@ -1241,14 +1241,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         controlmode: Control mode (Static, Event, Time)
     """
     
-    dss = py_dss_interface.DSS()     
+    # OpenDSSDirect.py is already imported as dss at the module level
 
     # Initialize list to collect OpenDSS commands if export is requested
     opendss_commands = []
     
     def execute_dss_command(command):
         """Execute DSS command and optionally collect it for export"""
-        dss.text(command)
+        dss.run_command(command)
         if export_commands:
             opendss_commands.append(command)
     
@@ -1317,13 +1317,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
     # Execute solve commands
     try:
-        dss.text('calcv')
-        dss.text('solve')
+        dss.run_command('calcv')
+        dss.run_command('solve')
     except Exception as e:
         pass
     # Check solve status
     try:
-        converged = dss.solution.converged
+        converged = dss.Solution.Converged()
         if converged:
             pass
         else:
@@ -1360,16 +1360,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     processed_buses = set()
     
     try:
-        all_bus_names = dss.circuit.buses_names
+        all_bus_names = dss.Circuit.AllBusNames()
 
         
         # Process all buses from OpenDSS circuit
         for bus_name_from_list in all_bus_names:
             # Set active bus using the name from the list
-            dss.circuit.set_active_bus(bus_name_from_list)
+            dss.Circuit.SetActiveBus(bus_name_from_list)
             
             # Get the actual bus name (might be different from list name)
-            actual_bus_name = dss.bus.name
+            actual_bus_name = dss.Bus.Name()
             
             # Debug: Print bus names to identify source buses (commented out for less verbose logging)
             # print(f"  Processing bus from list: '{bus_name_from_list}', actual name: '{actual_bus_name}'")
@@ -1406,7 +1406,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             try:
                 # Calculate positive sequence voltage using symmetrical components
                 # This matches the notebook approach exactly
-                voltages = dss.bus.voltages  # in Volts: [Va_real, Va_imag, Vb_real, Vb_imag, Vc_real, Vc_imag]
+                voltages = dss.Bus.Voltages()  # in Volts: [Va_real, Va_imag, Vb_real, Vb_imag, Vc_real, Vc_imag]
                 
                 # Convert to kV and create complex numbers
                 Va = complex(voltages[0]/1000, voltages[1]/1000)
@@ -1433,14 +1433,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     base_kv = float(base_kv_user)
                 else:
                     # Fallback to OpenDSS's base voltage
-                    base_kv_ln = dss.bus.kv_base
+                    base_kv_ln = dss.Bus.kVBase()
                     base_kv = base_kv_ln * math.sqrt(3)  # Convert L-N to L-L
                 
                 # Calculate per-unit based on user-specified base voltage
                 vm_pu = V1_mag_ll_kv / base_kv if base_kv > 0 else 1.0
                 
                 # Get angle from vmag_angle_pu
-                va_degree = dss.bus.vmag_angle_pu[1] if len(dss.bus.vmag_angle_pu) > 1 else 0.0
+                va_degree = dss.Bus.puVmagAngle()[1] if len(dss.Bus.puVmagAngle()) > 1 else 0.0
                 
                 # Create busbar result - convert ID back to hash format for frontend
                 frontend_bus_id = matched_bus_id.replace('_', '#')
@@ -1493,14 +1493,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     for key, line_name in LinesDict.items():
         try:
             # Set the active element
-            dss.circuit.set_active_element(f"Line.{line_name}")
+            dss.Circuit.SetActiveElement(f"Line.{line_name}")
             
             # Check if the line is enabled
-            is_enabled = dss.cktelement.enabled
+            is_enabled = dss.CktElement.Enabled()
             
             if is_enabled:
                 # Get powers (in kW and kvar) - sum all three phases
-                powers = dss.cktelement.powers
+                powers = dss.CktElement.Powers()
                 if len(powers) >= 12:
                     # From side: phases 1, 2, 3
                     p_from_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
@@ -1512,7 +1512,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     p_from_mw = p_to_mw = q_from_mvar = q_to_mvar = 0.0
 
                 # Get currents (in A) - use magnitude from currents_mag_ang
-                currents = dss.cktelement.currents_mag_ang
+                currents = dss.CktElement.CurrentsMagAng()
                 if len(currents) >= 12:
                     # Current magnitude is at index 0, 6 for from and to sides
                     i_from_ka = currents[0] / 1000.0  # Convert A to kA
@@ -1584,13 +1584,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     for key, load_name in LoadsDict.items():
         try:
             # Set the active element
-            dss.circuit.set_active_element(f"Load.{load_name}")
+            dss.Circuit.SetActiveElement(f"Load.{load_name}")
             
             # Check if the load is enabled
-            is_enabled = dss.cktelement.enabled
+            is_enabled = dss.CktElement.Enabled()
             
             if is_enabled:
-                powers = dss.cktelement.powers
+                powers = dss.CktElement.Powers()
                 if len(powers) >= 6:
                     p_raw = powers[0] + powers[2] + powers[4]
                     q_raw = powers[1] + powers[3] + powers[5]
@@ -1625,14 +1625,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     for key, pv_name in GeneratorsDict.items():
         try:
             # Set this PVSystem as the active circuit element
-            dss.circuit.set_active_element(f"PVSystem.{pv_name}")
+            dss.Circuit.SetActiveElement(f"PVSystem.{pv_name}")
             
             # Check if the generator is enabled
-            is_enabled = dss.cktelement.enabled
+            is_enabled = dss.CktElement.Enabled()
             
             if is_enabled:
                 # Get PV powers
-                powers = dss.cktelement.powers
+                powers = dss.CktElement.Powers()
                 if len(powers) >= 6:
                     # Sum all three phases (powers come in pairs: P1,Q1,P2,Q2,P3,Q3)
                     p_raw = powers[0] + powers[2] + powers[4]
@@ -1648,16 +1648,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 vm_pu = 1.0
                 va_degree = 0.0
                 try:
-                    pv_bus_name = dss.pvsystems.bus1.split('.')[0]
+                    pv_bus_name = dss.PVsystems.Bus1().split('.')[0]
                     bus_index = None
-                    for i in range(dss.circuit.num_buses):
-                        dss.circuit.set_active_bus(i)
-                        if dss.bus.name.lower() == pv_bus_name.lower():
+                    for i in range(dss.Circuit.NumBuses()):
+                        dss.Circuit.SetActiveBus(i)
+                        if dss.Bus.Name().lower() == pv_bus_name.lower():
                             bus_index = i
                             break
                     if bus_index is not None:
-                        dss.circuit.set_active_bus(bus_index)
-                        bus_angles = dss.bus.vmag_angle_pu
+                        dss.Circuit.SetActiveBus(bus_index)
+                        bus_angles = dss.Bus.puVmagAngle()
                         if len(bus_angles) >= 2:
                             vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                             va_degree = bus_angles[1] if not math.isnan(bus_angles[1]) else 0.0
@@ -1708,14 +1708,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     for key, trafo_name in TransformersDict.items():
         try:
             # Set the active element
-            dss.circuit.set_active_element(f"Transformer.{trafo_name}")
+            dss.Circuit.SetActiveElement(f"Transformer.{trafo_name}")
             
             # Check if the transformer is enabled
-            is_enabled = dss.cktelement.enabled
+            is_enabled = dss.CktElement.Enabled()
             
             if is_enabled:
                 # Get powers (in kW and kvar) for transformer
-                powers = dss.cktelement.powers
+                powers = dss.CktElement.Powers()
                 # Initialize power values
                 p_hv_mw = q_hv_mvar = p_lv_mw = q_lv_mvar = pl_mw = ql_mvar = 0.0
                 
@@ -1737,7 +1737,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     
                     # Try to get losses directly from OpenDSS
                     try:
-                        losses_direct = dss.cktelement.losses
+                        losses_direct = dss.CktElement.Losses()
                         if len(losses_direct) >= 2:
                             # OpenDSS returns losses in Watts (W), not kW
                             pl_direct_w = losses_direct[0]
@@ -1758,7 +1758,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     
                 
                 # Get complex currents [I1_real, I1_imag, I2_real, I2_imag, I3_real, I3_imag, ...] in Amperes
-                currents = dss.cktelement.currents
+                currents = dss.CktElement.Currents()
                 
                 if len(currents) >= 12:
                     # Terminal 1 (HV): Calculate magnitude for each phase
@@ -1817,17 +1817,17 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 pass
                     # Fallback to OpenDSS reported value if original not available
                     if sn_mva is None:
-                        sn_kva_reported = dss.transformers.kva
+                        sn_kva_reported = dss.Transformers.kVA()
                         sn_mva = sn_kva_reported / 1000.0
                     
                     # Get HV voltage from first winding
-                    dss.transformers.wdg = 1
-                    vn_hv_kv = dss.transformers.kv
+                    dss.Transformers.Wdg(1)
+                    vn_hv_kv = dss.Transformers.kV()
                     
                     
                     # Get number of phases from transformer properties
                     try:
-                        num_phases = dss.transformers.phases
+                        num_phases = dss.Transformers.Phases()
                     except:
                         # Fallback: assume 3-phase if not available
                         num_phases = 3
@@ -1908,16 +1908,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
   
     
     # Process capacitor results
-    if dss.capacitors.count > 0:
-        dss.capacitors.first()
-        for _ in range(dss.capacitors.count):
+    if dss.Capacitors.Count() > 0:
+        dss.Capacitors.First()
+        for _ in range(dss.Capacitors.Count()):
             try:
-                cap_name = dss.capacitors.name
+                cap_name = dss.Capacitors.Name()
                 for key, value in CapacitorsDict.items():
                     # OpenDSS lowercases names, so compare case-insensitively
                     if value.lower() == cap_name.lower() or key.lower() == cap_name.lower():
                         try:
-                            powers = dss.cktelement.powers
+                            powers = dss.CktElement.Powers()
                             if len(powers) >= 6:
                                 p_raw = powers[0] + powers[2] + powers[4]
                                 q_raw = powers[1] + powers[3] + powers[5]
@@ -1932,7 +1932,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 # Set the active bus to the capacitor's bus to get voltage value
                                 # Note: We need to find the bus index for this capacitor
                                 # For now, using default value until we can map capacitor to bus
-                                bus_angles = dss.bus.vmag_angle_pu
+                                bus_angles = dss.Bus.puVmagAngle()
                                 if len(bus_angles) >= 1:
                                     vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                             except Exception as e:
@@ -1954,7 +1954,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             continue
             except Exception as e:
                 pass
-            dss.capacitors.next()
+            dss.Capacitors.Next()
     
     # Process shunt results (reactors in OpenDSS)
     # Use alternative method if dss.reactors is not available
@@ -1969,16 +1969,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     # Set this specific reactor as active circuit element
                     # Try with original case first, then lowercase if that fails
                     try:
-                        dss.circuit.set_active_element(f"Reactor.{reactor_name}")
+                        dss.Circuit.SetActiveElement(f"Reactor.{reactor_name}")
                     except:
                         # OpenDSS lowercases names, try lowercase
-                        dss.circuit.set_active_element(f"Reactor.{reactor_name.lower()}")
+                        dss.Circuit.SetActiveElement(f"Reactor.{reactor_name.lower()}")
                     
                     # Get element info
-                    element_name = dss.cktelement.name
+                    element_name = dss.CktElement.Name()
                     
                     # Get powers
-                    powers = dss.cktelement.powers
+                    powers = dss.CktElement.Powers()
                     
                     # Reactors can be single-phase or three-phase
                     if len(powers) >= 6:
@@ -2002,11 +2002,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     vm_pu = 1.0
                     try:
                         # Get the bus that this reactor is connected to
-                        bus_names = dss.cktelement.bus_names
+                        bus_names = dss.CktElement.BusNames()
                         if len(bus_names) > 0:
                             bus_name = bus_names[0].split('.')[0]  # Remove phase info
-                            dss.circuit.set_active_bus(bus_name)
-                            bus_angles = dss.bus.vmag_angle_pu
+                            dss.Circuit.SetActiveBus(bus_name)
+                            bus_angles = dss.Bus.puVmagAngle()
                             if len(bus_angles) >= 1:
                                 vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                     except Exception as e:
@@ -2032,16 +2032,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     except Exception as e:
         pass
     # Process storage results
-    if hasattr(dss, 'storage') and dss.storage.count > 0:
-        dss.storage.first()
-        for _ in range(dss.storage.count):
+    if hasattr(dss, 'Storages') and dss.Storages.Count() > 0:
+        dss.Storages.First()
+        for _ in range(dss.Storages.Count()):
             try:
-                storage_name = dss.storage.name
+                storage_name = dss.Storages.Name()
                 for key, value in StoragesDict.items():
                     # OpenDSS lowercases names, so compare case-insensitively
                     if value.lower() == storage_name.lower() or key.lower() == storage_name.lower():
                         try:
-                            powers = dss.cktelement.powers
+                            powers = dss.CktElement.Powers()
                             if len(powers) >= 6:
                                 p_raw = powers[0] + powers[2] + powers[4]
                                 q_raw = powers[1] + powers[3] + powers[5]
@@ -2068,22 +2068,22 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         pass
             except Exception as e:
                 pass
-            dss.storage.next()
+            dss.Storages.Next()
 
     # Process PVSystem results (matching notebook approach)
-    if hasattr(dss, 'pvsystems'):
-        if dss.pvsystems.count > 0:
-            dss.pvsystems.first()
-            for _ in range(dss.pvsystems.count):
+    if hasattr(dss, 'PVsystems'):
+        if dss.PVsystems.Count() > 0:
+            dss.PVsystems.First()
+            for _ in range(dss.PVsystems.Count()):
                 try:
-                    pvsystem_name = dss.pvsystems.name
+                    pvsystem_name = dss.PVsystems.Name()
                     
                     for key, value in PVSystemsDict.items():
                         # OpenDSS lowercases names, so compare case-insensitively
                         if value.lower() == pvsystem_name.lower() or key.lower() == pvsystem_name.lower():
                             try:
                                 # Get powers (in kW and kvar) - sum all three phases
-                                powers = dss.cktelement.powers
+                                powers = dss.CktElement.Powers()
                                 if len(powers) >= 6:
                                     p_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
                                     q_mvar = (powers[1] + powers[3] + powers[5]) / 1000.0
@@ -2098,13 +2098,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 
                                 try:
                                     # Get irradiance and temperature from PVSystem properties
-                                    if hasattr(dss.pvsystems, 'irradiance'):
-                                        irradiance = dss.pvsystems.irradiance
-                                    if hasattr(dss.pvsystems, 'temperature'):
-                                        temperature = dss.pvsystems.temperature
+                                    if hasattr(dss.PVsystems, 'Irradiance'):
+                                        irradiance = dss.PVsystems.Irradiance()
+                                    if hasattr(dss.PVsystems, 'Pmpp'):
+                                        temperature = 25  # Default temperature if not available
 
                                     # Get voltage from current bus using bus voltage array
-                                    bus_angles = dss.bus.vmag_angle_pu
+                                    bus_angles = dss.Bus.puVmagAngle()
                                     if len(bus_angles) >= 1:
                                         vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
                                         va_degree = bus_angles[1] if len(bus_angles) > 1 else 0.0
@@ -2131,20 +2131,20 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 continue
                 except Exception as e:
                     pass
-                dss.pvsystems.next()
+                dss.PVsystems.Next()
         
     else:
         pass
     # Process external grid results
-    if hasattr(dss, 'vsources') and dss.vsources.count > 0:
-        dss.vsources.first()
-        for _ in range(dss.vsources.count):
+    if hasattr(dss, 'Vsources') and dss.Vsources.Count() > 0:
+        dss.Vsources.First()
+        for _ in range(dss.Vsources.Count()):
             try:
-                vsource_name = dss.vsources.name
+                vsource_name = dss.Vsources.Name()
 
                 # Skip system VSources (OpenDSS auto-creates these)
                 if vsource_name in ['source', 'sourcebus']:
-                    dss.vsources.next()
+                    dss.Vsources.Next()
                     continue
 
                 # Try to find matching external grid by checking various name formats (case-insensitive)
@@ -2157,7 +2157,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
                 if matched_key:
                     try:
-                        powers = dss.cktelement.powers
+                        powers = dss.CktElement.Powers()
                         if len(powers) >= 6:
                             p_raw = powers[0] + powers[2] + powers[4]
                             q_raw = powers[1] + powers[3] + powers[5]
@@ -2198,7 +2198,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         pass
             except Exception as e:
                 pass
-            dss.vsources.next()
+            dss.Vsources.Next()
     
     # Build final result using simplified structure (no output classes)
     result = {}
@@ -2258,9 +2258,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         return json.dumps({"error": "JSON serialization failed", "message": str(json_error)}, separators=(',', ':'))
         
         #U[pu],angle[degree]
-        #print(dss.bus.vmag_angle_pu)    
-        #dss.circuit.set_active_element(dss.bus.name)
-        #print(dss.cktelement.powers)
+        #print(dss.Bus.puVmagAngle())    
+        #dss.Circuit.SetActiveElement(dss.bus.name)
+        #print(dss.CktElement.Powers())
         #print(dss.circuit.total_power)
     #P[MW]
     #Q[MVar]
