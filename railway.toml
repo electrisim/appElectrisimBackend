@@ -7,5 +7,5 @@ restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
 
 [env]
-PYTHON_VERSION = "3.9.18"
+PYTHON_VERSION = "3.10"
 
