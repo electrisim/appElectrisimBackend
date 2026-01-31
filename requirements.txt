@@ -1,7 +1,7 @@
 Flask>=3.0.0
 flask-cors>=3.0.10
 gunicorn>=21.0.0
-pandapower=3.3.2
+pandapower==3.3.2
 pandas>=2.0.0
 numpy>=1.24.0
 numba>=0.58.0
