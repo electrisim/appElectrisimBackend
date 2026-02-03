@@ -236,7 +236,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
     if execute_dss_command is None:
         def execute_dss_command(command):
             """Execute DSS command and optionally collect it for export"""
-            dss.run_command(command)
+            print(f"[OpenDSS] {command}")  # Log all commands
+            dss.Text.Command(command)  # Use Text.Command (run_command is deprecated)
             if export_commands:
                 opendss_commands.append(command)
     
@@ -387,28 +388,7 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
         x0_ohm_per_km = element_data.get('x0_ohm_per_km')
         c0_nf_per_km = element_data.get('c0_nf_per_km')
         
-        # Validate r0_ohm_per_km and x0_ohm_per_km for OpenDSS calculations
-        # These parameters must be greater than 0
-        if r0_ohm_per_km is not None:
-            try:
-                r0_value = float(r0_ohm_per_km)
-                if r0_value <= 0:
-                    raise ValueError(f"Line '{element_name}': Parameter r0_ohm_per_km must be greater than 0 (current value: {r0_value}). Please update the line parameters.")
-            except (TypeError, ValueError) as e:
-                if "must be greater than 0" in str(e):
-                    raise  # Re-raise validation error
-                raise ValueError(f"Line '{element_name}': Invalid value for r0_ohm_per_km: {r0_ohm_per_km}")
-        
-        if x0_ohm_per_km is not None:
-            try:
-                x0_value = float(x0_ohm_per_km)
-                if x0_value <= 0:
-                    raise ValueError(f"Line '{element_name}': Parameter x0_ohm_per_km must be greater than 0 (current value: {x0_value}). Please update the line parameters.")
-            except (TypeError, ValueError) as e:
-                if "must be greater than 0" in str(e):
-                    raise  # Re-raise validation error
-                raise ValueError(f"Line '{element_name}': Invalid value for x0_ohm_per_km: {x0_ohm_per_km}")
-        
+        # OpenDSS allows r0, x0, c0 to be 0; no minimum check applied.
         try:
             # Create line using OpenDSS command with parameters from frontend
             line_cmd = f'New Line.{element_name} phases=3 Bus1={bus_from_name} Bus2={bus_to_name} R1={r_ohm_per_km} X1={x_ohm_per_km} Length={length_km} units=km'
@@ -440,7 +420,9 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             
             if not is_in_service:
                 # Disable the line after it's been created
-                dss.run_command(f'Line.{element_name}.enabled=no')
+                cmd = f'Line.{element_name}.enabled=no'
+                print(f"[OpenDSS] {cmd}")
+                dss.Text.Command(cmd)
             
             # print(f"Command: {line_cmd}")  # Reduced logging
             
@@ -507,7 +489,9 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
                 is_in_service = False
             
             if not is_in_service:
-                dss.run_command(f'Load.{load_name}.enabled=no')
+                cmd = f'Load.{load_name}.enabled=no'
+                print(f"[OpenDSS] {cmd}")
+                dss.Text.Command(cmd)
             # print(f"Command: {load_cmd}")  # Reduced logging
             
             LoadsDict[element_name] = load_name
@@ -564,15 +548,10 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
             gen_name = element_name.replace(' ', '_')
             
             try:
-                # Use simple Generator element with constant P and Q
-                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f}"
-
-                # Create Generator element
+                # Use Generator element for static generator. Model=7 for constant P and Q.
+                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=7"
+                print(f"[DEBUG SGEN] Creating static generator: {gen_cmd}")
                 execute_dss_command(gen_cmd)
-                # Set Model 1 = constant P, Q (matches Pandapower static generator / sgen behavior)
-                dss.run_command(f"Generator.{gen_name}.Model=1")
-                # Status=1 (Fixed) = always on at setpoint; avoids dispatch curve scaling
-                dss.run_command(f"Generator.{gen_name}.Status=1")
                 
                 # Handle in_service status AFTER creating the element
                 in_service = element_data.get('in_service', True)
@@ -587,7 +566,9 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                     is_in_service = False
                 
                 if not is_in_service:
-                    dss.run_command(f'Generator.{gen_name}.enabled=no')
+                    cmd = f'Generator.{gen_name}.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
                 # print(f"✓ Command: {gen_cmd}")  # Reduced logging
                 
                 # Store in GeneratorsDict
@@ -635,8 +616,9 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
         q_kvar = q_mvar * 1000
 
         try:
-            # Create generator command string
-            gen_cmd = f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar}"
+            # Create generator command string with Model=3 for constant kW and kvar
+            # Model=3 is "Constant kW, Constant kvar" - maintains specified P and Q regardless of voltage
+            gen_cmd = f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar} Model=3"
             
             # Add fault study parameters if provided (sub-transient reactance/resistance)
             xdss_pu = element_data.get('xdss_pu')
@@ -662,7 +644,7 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 gen_cmd += f" XRdp={xr_ratio}"  # X/R ratio for fault study
 
             # Create generator using OpenDSS command
-            print(f"[DEBUG] Creating generator: {gen_cmd}")
+            print(f"[DEBUG] Creating generator (Model=3): {gen_cmd}")
             execute_dss_command(gen_cmd)
             
             # Handle in_service status AFTER creating the element
@@ -678,16 +660,9 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 is_in_service = False
             
             if not is_in_service:
-                dss.run_command(f'Generator.{element_name}.enabled=no')
-            # print(f"Command: {gen_cmd}")  # Reduced logging
-
-            # Configure generator to NOT act as voltage source
-            dss.Generators.Model(1)  # Power Factor mode
-            # Disable voltage control by setting control mode to 0 (no control)
-            try:
-                dss.Generators.Status(3)  # Set to variable (not fixed) - 3 is Variable mode
-            except:
-                pass  # Ignore if property doesn't exist
+                cmd = f'Generator.{element_name}.enabled=no'
+                print(f"[OpenDSS] {cmd}")
+                dss.Text.Command(cmd)
 
             GeneratorsDict[element_name] = element_name
             GeneratorsDictId[element_name] = element_id
@@ -899,7 +874,9 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
                 is_in_service = False
             
             if not is_in_service:
-                dss.run_command(f'Transformer.{element_name}.enabled=no')
+                cmd = f'Transformer.{element_name}.enabled=no'
+                print(f"[OpenDSS] {cmd}")
+                dss.Text.Command(cmd)
             # print(f"Command: {transformer_cmd}")  # Reduced logging
             
             # Log loss parameters if they are included
@@ -973,18 +950,16 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         else:
             pass
         try:
-            # Create shunt reactor using bus name directly - OpenDSS will create bus automatically
-            # Use Rp (parallel resistance) for active power consumption
-            # R=0 means no series resistance (ideal inductor)
-            simple_cmd = f"New Reactor.{element_name} Bus1={bus_name} R=0 kvar={abs(q_kvar)} kV={bus_voltage}"
-            
-            # Add parallel resistance if active power is specified
-            if rp_ohms is not None:
-                simple_cmd += f" Rp={rp_ohms}"
+            # Model shunt reactor as constant-Q using a Generator with NEGATIVE kvar.
+            # OpenDSS Generator Model=3 is "Constant kW, Constant kvar" - TRUE constant P+Q behavior.
+            # Negative kvar on generator means it ABSORBS reactive power (inductive behavior).
+            # This matches pandapower shunt where positive q_mvar = inductive (absorbs Q).
+            gen_name = f"ShuntReactor_{element_name}"
+            simple_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW=0 kvar={-abs(q_kvar)} Model=3"
+            print(f"[DEBUG SHUNT] Creating constant-Q shunt as Generator (Model=3): {simple_cmd}")
             execute_dss_command(simple_cmd)
-            # print(f"Command: {simple_cmd}")  # Reduced logging
 
-            ShuntsDict[element_name] = element_name
+            ShuntsDict[element_name] = gen_name
             ShuntsDictId[element_name] = element_id
             created_elements.add(element_name)
             
@@ -1204,7 +1179,9 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                     is_in_service = False
                 
                 if not is_in_service:
-                    dss.run_command(f'PVSystem.{element_name}.enabled=no')
+                    cmd = f'PVSystem.{element_name}.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
 
                 PVSystemsDict[element_name] = element_name
                 PVSystemsDictId[element_name] = element_id
@@ -1264,8 +1241,8 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             # First external grid disables default and creates new; additional ones just create new.
             if 'default_source_disabled' not in created_elements:
                 # Disable the default source to avoid conflicts
-                dss.run_command('Vsource.source.enabled=no')
-                print(f"[DEBUG] Disabled default Vsource.source")
+                print("[OpenDSS] Vsource.source.enabled=no")
+                dss.Text.Command('Vsource.source.enabled=no')
                 created_elements.add('default_source_disabled')
             
             # Create our Vsource at the external grid bus
@@ -1297,7 +1274,8 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     opendss_commands = []
 
     def execute_dss_command(command):
-        dss.run_command(command)
+        print(f"[OpenDSS] {command}")  # Log all commands
+        dss.Text.Command(command)
         if export_open_dss_results:
             opendss_commands.append(command)
 
@@ -1323,7 +1301,8 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             vb_list = sorted(set(float(v) for v in BusbarsDictVoltage.values()), reverse=True)
             if vb_list:
                 execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
-        dss.run_command('calcv')
+        print("[OpenDSS] calcv")
+        dss.Text.Command('calcv')
     except Exception:
         pass
 
@@ -1342,7 +1321,8 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
         print(f"[DEBUG] Snapshot solve exception: {e}")
         try:
             execute_dss_command('set Mode=Snapshot')
-            dss.run_command('solve')
+            print("[OpenDSS] solve")
+            dss.Text.Command('solve')
         except Exception:
             pass
 
@@ -1351,7 +1331,8 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     # Use run_command so the engine runs the full fault-study sequence (Solve populates Isc/Zsc per bus)
     try:
         execute_dss_command('set Mode=FaultStudy')
-        dss.run_command('solve')
+        print("[OpenDSS] solve")
+        dss.Text.Command('solve')
         print(f"[DEBUG] FaultStudy solve completed. Solution.Mode: {dss.Solution.Mode()}")
         if hasattr(dss.Solution, 'Converged'):
             print(f"[DEBUG] Solution.Converged: {dss.Solution.Converged()}")
@@ -1558,7 +1539,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     
     def execute_dss_command(command):
         """Execute DSS command and optionally collect it for export"""
-        dss.run_command(command)
+        print(f"[OpenDSS] {command}")  # Log all commands
+        dss.Text.Command(command)
         if export_commands:
             opendss_commands.append(command)
     
@@ -1627,8 +1609,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
     # Execute solve commands
     try:
-        dss.run_command('calcv')
-        dss.run_command('solve')
+        print("[OpenDSS] calcv")
+        dss.Text.Command('calcv')
+        print("[OpenDSS] solve")
+        dss.Text.Command('solve')
     except Exception as e:
         pass
     # Check solve status
@@ -1804,9 +1788,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     pf = (p_kw / s) if s > 0 else None
                     q_p = (q_kvar / p_kw) if p_kw != 0 else None
                 
-                # Create busbar result - convert ID back to hash format for frontend
-                frontend_bus_id = matched_bus_id.replace('_', '#')
-                frontend_bus_name = matched_bus_name.replace('_', '#')
+                # Use name/id as stored (underscore format to match pandapower/frontend)
+                frontend_bus_id = matched_bus_id
+                frontend_bus_name = matched_bus_name
                 busbar = BusbarOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
@@ -1821,9 +1805,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # print(f"    ✓ Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")  # Reduced logging
                 
             except Exception as e:
-                # Add with default values - convert ID back to hash format for frontend
-                frontend_bus_id = matched_bus_id.replace('_', '#')
-                frontend_bus_name = matched_bus_name.replace('_', '#')
+                # Add with default values - use name/id as stored
+                frontend_bus_id = matched_bus_id
+                frontend_bus_name = matched_bus_name
                 busbar = BusbarOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
@@ -1851,9 +1835,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     s = math.sqrt(pq[0] * pq[0] + pq[1] * pq[1])
                     pf = (pq[0] / s) if s > 0 else None
                     q_p = (pq[1] / pq[0]) if pq[0] != 0 else None
-                # Convert to hash format for frontend
-                frontend_bus_name = bus_name.replace('_', '#')
-                frontend_bus_id = bus_name.replace('_', '#')
+                # Use name/id as stored (underscore format to match pandapower/frontend)
+                frontend_bus_name = bus_name
+                frontend_bus_id = bus_name
                 busbar = BusbarOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
@@ -1924,8 +1908,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 loading_percent = 0.0
 
             # Convert IDs back to hash format for frontend
-            frontend_name = key.replace('_', '#')
-            frontend_id = LinesDictId[key].replace('_', '#')
+            frontend_name = key
+            frontend_id = LinesDictId[key]
             
             line = LineOut(
                 name=frontend_name, 
@@ -1943,8 +1927,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         except Exception as e:
             # Still add the line to results with zero values
             try:
-                frontend_name = key.replace('_', '#')
-                frontend_id = LinesDictId[key].replace('_', '#')
+                frontend_name = key
+                frontend_id = LinesDictId[key]
                 line = LineOut(
                     name=frontend_name, 
                     id=frontend_id, 
@@ -1985,8 +1969,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 p_mw = q_mvar = 0.0
 
             # Convert IDs back to hash format
-            frontend_name = key.replace('_', '#')
-            frontend_id = LoadsDictId[key].replace('_', '#')
+            frontend_name = key
+            frontend_id = LoadsDictId[key]
             
             load = LoadOut(name=frontend_name, id=frontend_id, p_mw=p_mw, q_mvar=q_mvar)
             loadsList.append(load)
@@ -1994,8 +1978,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         except Exception as e:
             # Still add the load to results with zero values
             try:
-                frontend_name = key.replace('_', '#')
-                frontend_id = LoadsDictId[key].replace('_', '#')
+                frontend_name = key
+                frontend_id = LoadsDictId[key]
                 load = LoadOut(name=frontend_name, id=frontend_id, p_mw=0.0, q_mvar=0.0)
                 loadsList.append(load)
             except:
@@ -2054,8 +2038,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 va_degree = 0.0
 
             # Convert IDs back to hash format
-            frontend_name = key.replace('_', '#')
-            frontend_id = GeneratorsDictId[key].replace('_', '#')
+            frontend_name = key
+            frontend_id = GeneratorsDictId[key]
             
             generator = GeneratorOut(
                 name=frontend_name, 
@@ -2071,8 +2055,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         except Exception as e:
             # Still add the generator to results with zero values
             try:
-                frontend_name = key.replace('_', '#')
-                frontend_id = GeneratorsDictId[key].replace('_', '#')
+                frontend_name = key
+                frontend_id = GeneratorsDictId[key]
                 generator = GeneratorOut(
                     name=frontend_name, 
                     id=frontend_id, 
@@ -2249,8 +2233,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 loading_percent = 0.0
 
             # Convert IDs back to hash format for frontend
-            frontend_name = key.replace('_', '#')
-            frontend_id = TransformersDictId[key].replace('_', '#')
+            frontend_name = key
+            frontend_id = TransformersDictId[key]
             
             transformer = TransformerOut(
                 name=frontend_name, 
@@ -2270,8 +2254,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         except Exception as e:
             # Still add the transformer to results with zero values
             try:
-                frontend_name = key.replace('_', '#')
-                frontend_id = TransformersDictId[key].replace('_', '#')
+                frontend_name = key
+                frontend_id = TransformersDictId[key]
                 transformer = TransformerOut(
                     name=frontend_name, 
                     id=frontend_id, 
@@ -2322,8 +2306,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             except Exception as e:
                                 pass
                             # Convert IDs back to hash format for frontend
-                            frontend_name = key.replace('_', '#')
-                            frontend_id = CapacitorsDictId[key].replace('_', '#')
+                            frontend_name = key
+                            frontend_id = CapacitorsDictId[key]
                             
                             capacitor = CapacitorOut(
                                 name=frontend_name, 
@@ -2347,16 +2331,20 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         # Process each expected shunt directly by setting it as active element
         if ShuntsDict:
             for key, value in ShuntsDict.items():
-                reactor_name = value  # e.g., 'mxCell_143'
-                
+                # value is OpenDSS element name (ShuntReactor_xxx when constant-Q Generator)
+                dss_elem_name = value
                 try:
-                    # Set this specific reactor as active circuit element
-                    # Try with original case first, then lowercase if that fails
+                    # Shunt reactors are now modeled as Generator (constant P+Q); try Generator first
                     try:
-                        dss.Circuit.SetActiveElement(f"Reactor.{reactor_name}")
-                    except:
-                        # OpenDSS lowercases names, try lowercase
-                        dss.Circuit.SetActiveElement(f"Reactor.{reactor_name.lower()}")
+                        dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name}")
+                    except Exception:
+                        try:
+                            dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name.lower()}")
+                        except Exception:
+                            try:
+                                dss.Circuit.SetActiveElement(f"Load.{dss_elem_name}")
+                            except Exception:
+                                dss.Circuit.SetActiveElement(f"Reactor.{dss_elem_name}")
                     
                     # Get element info
                     element_name = dss.CktElement.Name()
@@ -2382,23 +2370,37 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     q_mvar = (q_raw / 1000.0) if (not math.isnan(q_raw) and not math.isinf(q_raw)) else 0.0
                     
 
-                    # Get voltage value from the shunt's bus
+                    # Get voltage value from the shunt's bus using user-specified base voltage
                     vm_pu = 1.0
                     try:
-                        # Get the bus that this reactor is connected to
+                        # Get the bus that this shunt is connected to
                         bus_names = dss.CktElement.BusNames()
                         if len(bus_names) > 0:
                             bus_name = bus_names[0].split('.')[0]  # Remove phase info
                             dss.Circuit.SetActiveBus(bus_name)
-                            bus_angles = dss.Bus.puVmagAngle()
-                            if len(bus_angles) >= 1:
-                                vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
+                            # Get actual voltage in kV (line-to-line)
+                            voltages = dss.Bus.Voltages()  # in Volts
+                            if len(voltages) >= 6:
+                                Va = complex(voltages[0]/1000, voltages[1]/1000)
+                                Vb = complex(voltages[2]/1000, voltages[3]/1000)
+                                Vc = complex(voltages[4]/1000, voltages[5]/1000)
+                                # Positive sequence L-L voltage
+                                a = complex(-0.5, math.sqrt(3)/2)
+                                a2 = complex(-0.5, -math.sqrt(3)/2)
+                                V1 = (Va + a * Vb + a2 * Vc) / 3
+                                V1_ll_kv = abs(V1) * math.sqrt(3)
+                                # Use user-specified base voltage
+                                base_kv = BusbarsDictVoltage.get(bus_name.lower()) or BusbarsDictVoltage.get(bus_name)
+                                if base_kv:
+                                    vm_pu = V1_ll_kv / float(base_kv)
                     except Exception as e:
                         pass
+                    
+                    print(f"[DEBUG SHUNT RESULT] {key}: p_mw={p_mw:.3f}, q_mvar={q_mvar:.3f}, vm_pu={vm_pu:.4f}")
 
                     # Convert IDs back to hash format for frontend
-                    frontend_name = key.replace('_', '#')
-                    frontend_id = ShuntsDictId[key].replace('_', '#')
+                    frontend_name = key
+                    frontend_id = ShuntsDictId[key]
                     
                     shunt = ShuntOut(
                         name=frontend_name, 
@@ -2435,8 +2437,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 p_mw = q_mvar = 0.0
 
                             # Convert IDs back to hash format for frontend
-                            frontend_name = key.replace('_', '#')
-                            frontend_id = StoragesDictId[key].replace('_', '#')
+                            frontend_name = key
+                            frontend_id = StoragesDictId[key]
                             
                             storage = StorageOut(
                                 name=frontend_name, 
@@ -2496,8 +2498,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                     pass
 
                                 # Convert IDs back to hash format for frontend
-                                frontend_name = key.replace('_', '#')
-                                frontend_id = PVSystemsDictId[key].replace('_', '#')
+                                frontend_name = key
+                                frontend_id = PVSystemsDictId[key]
                                 
                                 pvsystem = PVSystemOut(
                                     name=frontend_name,
@@ -2519,7 +2521,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         
     else:
         pass
-    # Process external grid results
+    # Process external grid results (deduplicate by matched_key so each grid appears once)
+    added_external_grid_keys = set()
     if hasattr(dss, 'Vsources') and dss.Vsources.Count() > 0:
         dss.Vsources.First()
         for _ in range(dss.Vsources.Count()):
@@ -2539,7 +2542,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         matched_key = key
                         break
 
-                if matched_key:
+                if matched_key and matched_key not in added_external_grid_keys:
+                    added_external_grid_keys.add(matched_key)
                     try:
                         powers = dss.CktElement.Powers()
                         if len(powers) >= 6:
@@ -2565,9 +2569,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                         if p_mw != 0:
                             q_p = q_mvar / p_mw
 
-                        # Convert IDs back to hash format for frontend
-                        frontend_name = matched_key.replace('_', '#')
-                        frontend_id = ExternalGridsDictId[matched_key].replace('_', '#')
+                        # Use name/id as stored (underscore format to match pandapower/frontend)
+                        frontend_name = matched_key
+                        frontend_id = ExternalGridsDictId[matched_key]
                         
                         externalGrid = ExternalGridOut(
                             name=frontend_name,
