@@ -1002,13 +1002,13 @@ def create_other_elements(in_data,net,x, Busbars):
                 'vk_percent': safe_float(in_data[x].get('vk_percent', 6.0)),
                 'pfe_kw': safe_float(in_data[x].get('pfe_kw', 0.0)),
                 'i0_percent': safe_float(in_data[x].get('i0_percent', 0.0)),
-                'parallel': parallel_value,
+                'parallel': float(parallel_value),
                 'shift_degree': safe_float(in_data[x].get('shift_degree', 0)) + phase_shift_from_group,
                 'tap_side': in_data[x].get('tap_side', 'hv'),
-                'tap_pos': safe_int(in_data[x].get('tap_pos', 0)),
-                'tap_neutral': safe_int(in_data[x].get('tap_neutral', 0)),
-                'tap_max': safe_int(in_data[x].get('tap_max', 0)),
-                'tap_min': safe_int(in_data[x].get('tap_min', 0)),
+                'tap_pos': float(safe_int(in_data[x].get('tap_pos', 0))),
+                'tap_neutral': float(safe_int(in_data[x].get('tap_neutral', 0))),
+                'tap_max': float(safe_int(in_data[x].get('tap_max', 0))),
+                'tap_min': float(safe_int(in_data[x].get('tap_min', 0))),
                 'tap_step_percent': tap_step_value,
                 'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0)),
                 'tap_changer_type': tap_changer_type  # pandapower 3.0+
@@ -1124,9 +1124,9 @@ def create_other_elements(in_data,net,x, Busbars):
                 'shift_lv_degree': safe_float(in_data[x]['shift_lv_degree']) + phase_shift_from_group,
                 'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
                 'tap_side': in_data[x]['tap_side'],
-                'tap_min': safe_int(in_data[x]['tap_min']),
-                'tap_max': safe_int(in_data[x]['tap_max']),
-                'tap_pos': safe_int(in_data[x]['tap_pos']),
+                'tap_min': float(safe_int(in_data[x]['tap_min'])),
+                'tap_max': float(safe_int(in_data[x]['tap_max'])),
+                'tap_pos': float(safe_int(in_data[x]['tap_pos'])),
                 'tap_changer_type': tap_changer_type_3w  # pandapower 3.0+
             }
             
@@ -1165,7 +1165,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_shunt(net, typ = "shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service=in_service)
+            pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service)
         
         if (in_data[x]['typ'].startswith("Capacitor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -1175,7 +1175,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_shunt_as_capacitor(net, typ = "capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=in_data[x]['vn_kv'], step=in_data[x]['step'], max_step=in_data[x]['max_step'], in_service=in_service)        
+            pp.create_shunt_as_capacitor(net, typ="capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service)        
         
         if (in_data[x]['typ'].startswith("Load")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -2458,20 +2458,23 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 
                 #Bus
-                for index, row in net.res_bus.iterrows():    
-                    
-                    pf = row['p_mw']/math.sqrt(math.pow(row['p_mw'],2)+math.pow(row['q_mvar'],2))
+                for index, row in net.res_bus.iterrows():
+                    p_mw = row['p_mw']
+                    q_mvar = row['q_mvar']
+                    denom_pf = math.sqrt(math.pow(p_mw, 2) + math.pow(q_mvar, 2))
+                    if denom_pf != 0 and not math.isnan(denom_pf):
+                        pf = p_mw / denom_pf
+                    else:
+                        pf = 0.0
                     if math.isnan(pf):
-                        pf = 0
-                        
-                    q_p = row['q_mvar']/row['p_mw']     
-                    if math.isnan(q_p):
-                        q_p = 0
-                    if math.isinf(q_p):
-                        q_p = 0
-                    
-                                                                       
-                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=row['p_mw'], q_mvar=row['q_mvar'], pf = pf, q_p=q_p)         
+                        pf = 0.0
+                    if p_mw != 0 and not math.isnan(p_mw):
+                        q_p = q_mvar / p_mw
+                    else:
+                        q_p = 0.0
+                    if math.isnan(q_p) or math.isinf(q_p):
+                        q_p = 0.0
+                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=p_mw, q_mvar=q_mvar, pf = pf, q_p=q_p)         
                     busbarList.append(busbar) 
                     busbars = BusbarsOut(busbars = busbarList)
                 

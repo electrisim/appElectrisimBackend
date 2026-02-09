@@ -266,82 +266,107 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
 
 
     
+    # First pass: create External Grid (Vsource) so the slack bus and base voltage are defined before other elements
     for x in in_data:
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
             element_name = element_data.get('name', '')
-            element_id = element_data.get('id', '')  
-            
-            # Skip bus elements and parameters
+            element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
-            
-            # Debug: Show what we're processing
-      
-            
+            if not element_type.startswith("External Grid"):
+                continue
+            if 'bus' not in element_data or element_data['bus'] not in BusbarsDictConnectionToName:
+                continue
+            create_external_grid_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, created_elements, execute_dss_command)
+            ExternalGridsDict[element_name] = element_name
+            ExternalGridsDictId[element_name] = element_id
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
 
-            # Validate bus connections
-            has_valid_bus_connection = False
-            bus_connection_fields = []
-
-            # Check all possible bus connection fields
-            if 'bus' in element_data:
-                bus_connection_fields.append(('bus', element_data['bus']))
-            if 'busFrom' in element_data:
-                bus_connection_fields.append(('busFrom', element_data['busFrom']))
-            if 'busTo' in element_data:
-                bus_connection_fields.append(('busTo', element_data['busTo']))
-
-        
-
-            # Validate each bus connection
-            valid_connections = []
-            for field_name, bus_ref in bus_connection_fields:
-                # Frontend now sends bus names in the correct format (mxCell_126)
-                bus_ref_backend = bus_ref               
-                if bus_ref_backend in BusbarsDictConnectionToName:
-                    # Valid bus connection
-                    valid_connections.append(f"{field_name}={bus_ref}")
-                    has_valid_bus_connection = True               
-                else:
-                    pass
-
-            # Process different element types
-            # Use startswith() to handle numbered suffixes (e.g., "Load0", "Generator", "External Grid0")
+    # Second pass: create Lines (establish bus connectivity at same voltage level)
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = element_data.get('name', '')
+            element_id = element_data.get('id', '')
             if "Line" in element_type:
                 create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("Load"):
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
+
+    # Third pass: create Transformers (establish voltage level transitions between buses)
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = element_data.get('name', '')
+            element_id = element_data.get('id', '')
+            if element_type.startswith("Transformer"):
+                create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
+
+    # After lines and transformers: set voltage bases and run calcv so OpenDSS assigns correct base kV to each bus
+    try:
+        if BusbarsDictVoltage:
+            vb_list = sorted(set(float(v) for v in BusbarsDictVoltage.values()), reverse=True)
+            if vb_list:
+                execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
+        execute_dss_command('calcv')
+    except Exception as e:
+        pass
+
+    # Fourth pass: create Shunt elements (Reactors, Capacitors) - constant impedance elements
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = element_data.get('name', '')
+            element_id = element_data.get('id', '')
+            if element_type.startswith("Shunt Reactor"):
+                create_shunt_reactor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, ShuntsDict, ShuntsDictId, created_elements, execute_dss_command)
+            elif element_type.startswith("Capacitor"):
+                create_capacitor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, CapacitorsDict, CapacitorsDictId, created_elements, execute_dss_command)
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
+
+    # Fifth pass: create power injection elements (Generators, Loads, Storage, PVSystems)
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = element_data.get('name', '')
+            element_id = element_data.get('id', '')
+            if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
+                continue
+            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
+                continue
+            if element_type.startswith("Load"):
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Static Generator"):
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Asymmetric Static Generator"):
-                # For OpenDSS, treat asymmetric static generator as a regular static generator
-                # We'll use the phase A values as the main values
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Generator"):
                 create_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("Transformer"):
-                create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("Shunt Reactor"):
-                create_shunt_reactor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, ShuntsDict, ShuntsDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("Capacitor"):
-                create_capacitor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, CapacitorsDict, CapacitorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Storage"):
                 create_storage_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, StoragesDict, StoragesDictId, created_elements, execute_dss_command)
             elif element_type.startswith("PVSystem"):
                 create_pvsystem_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, PVSystemsDict, PVSystemsDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("External Grid"):
-                create_external_grid_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, created_elements, execute_dss_command)
-                # Store in dictionaries for later reference
-                ExternalGridsDict[element_name] = element_name
-                ExternalGridsDictId[element_name] = element_id
-                
         except ValueError as ve:
-            # Re-raise validation errors so they propagate to frontend
             raise
         except Exception as e:
-            # For other errors, log and continue processing other elements
             continue
     
    
@@ -388,7 +413,37 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
         x0_ohm_per_km = element_data.get('x0_ohm_per_km')
         c0_nf_per_km = element_data.get('c0_nf_per_km')
         
-        # OpenDSS allows r0, x0, c0 to be 0; no minimum check applied.
+        # Validate r0_ohm_per_km, x0_ohm_per_km and c0_nf_per_km for OpenDSS - must be greater than 0
+        if r0_ohm_per_km is not None:
+            try:
+                r0_value = float(r0_ohm_per_km)
+                if r0_value <= 0:
+                    raise ValueError(f"Line '{element_name}': Parameter r0_ohm_per_km must be greater than 0 (current value: {r0_value}). Please update the line parameters.")
+            except (TypeError, ValueError) as e:
+                if "must be greater than 0" in str(e):
+                    raise
+                raise ValueError(f"Line '{element_name}': Invalid value for r0_ohm_per_km: {r0_ohm_per_km}")
+        
+        if x0_ohm_per_km is not None:
+            try:
+                x0_value = float(x0_ohm_per_km)
+                if x0_value <= 0:
+                    raise ValueError(f"Line '{element_name}': Parameter x0_ohm_per_km must be greater than 0 (current value: {x0_value}). Please update the line parameters.")
+            except (TypeError, ValueError) as e:
+                if "must be greater than 0" in str(e):
+                    raise
+                raise ValueError(f"Line '{element_name}': Invalid value for x0_ohm_per_km: {x0_ohm_per_km}")
+        
+        if c0_nf_per_km is not None:
+            try:
+                c0_value = float(c0_nf_per_km)
+                if c0_value <= 0:
+                    raise ValueError(f"Line '{element_name}': Parameter c0_nf_per_km must be greater than 0 (current value: {c0_value}). Please update the line parameters.")
+            except (TypeError, ValueError) as e:
+                if "must be greater than 0" in str(e):
+                    raise
+                raise ValueError(f"Line '{element_name}': Invalid value for c0_nf_per_km: {c0_nf_per_km}")
+        
         try:
             # Create line using OpenDSS command with parameters from frontend
             line_cmd = f'New Line.{element_name} phases=3 Bus1={bus_from_name} Bus2={bus_to_name} R1={r_ohm_per_km} X1={x_ohm_per_km} Length={length_km} units=km'
@@ -548,9 +603,9 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
             gen_name = element_name.replace(' ', '_')
             
             try:
-                # Use Generator element for static generator. Model=7 for constant P and Q.
-                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=7"
-                print(f"[DEBUG SGEN] Creating static generator: {gen_cmd}")
+                # Use Generator element for static generator. Model=1 for constant P and Q
+                # (exact match for pandapower sgen which is a constant P,Q source).
+                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=1"
                 execute_dss_command(gen_cmd)
                 
                 # Handle in_service status AFTER creating the element
@@ -644,7 +699,6 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 gen_cmd += f" XRdp={xr_ratio}"  # X/R ratio for fault study
 
             # Create generator using OpenDSS command
-            print(f"[DEBUG] Creating generator (Model=3): {gen_cmd}")
             execute_dss_command(gen_cmd)
             
             # Handle in_service status AFTER creating the element
@@ -829,11 +883,8 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
                 tap_lv = 1.0 + tap_change
             
             # Calculate no-load loss percentage from iron losses
-            # For a 2-winding transformer in OpenDSS:
-            # - Iron losses occur in the CORE (not windings), so they should be applied to ONE winding only
-            # - %noloadloss should be specified as an array: [winding1_loss winding2_loss]
-            # - If specified as single value, OpenDSS applies it to ALL windings (doubling losses!)
-            # %noloadloss = (total_iron_losses_kw / rated_kVA) * 100 for winding 1
+            # %noloadloss = (total_iron_losses_kw / rated_kVA) * 100
+            # This is a scalar property in OpenDSS applied to the transformer core
             if pfe_kw > 0 and sn_kva > 0:
                 noloadloss_percent = (pfe_kw / sn_kva) * 100
             else:
@@ -841,23 +892,29 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             
             # Split the winding resistance between HV and LV sides
             # Total %Rs should be split approximately 50/50 between windings for typical transformers
-            # This avoids double-counting losses
             rs_hv = vkr_percent / 2.0
             rs_lv = vkr_percent / 2.0
             
+            # CRITICAL: OpenDSS XHL is the REACTANCE component only (not total impedance)
+            # pandapower vk_percent = |Z_sc| = sqrt(vkr_percent^2 + vkx_percent^2)
+            # OpenDSS XHL = vkx_percent = sqrt(vk_percent^2 - vkr_percent^2)
+            if vk_percent > vkr_percent:
+                xhl_percent = math.sqrt(vk_percent**2 - vkr_percent**2)
+            else:
+                xhl_percent = vk_percent  # Fallback: if vkr >= vk (shouldn't happen)
+            
             # Create complete OpenDSS transformer command with calculated taps and losses
-            # Use array notation for %Rs to properly split resistance between windings
-            # Base command with impedance and taps
-            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_from_name} {bus_to_name}) Conns=({conns}) kVs=({bus_from_voltage} {bus_to_voltage}) kVAs=({sn_kva} {sn_kva}) XHL={vk_percent} %Rs=[{rs_hv} {rs_lv}] Taps=[{tap_hv} {tap_lv}]"
+            # XHL = reactive component, %Rs = resistive components per winding
+            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_from_name} {bus_to_name}) Conns=({conns}) kVs=({bus_from_voltage} {bus_to_voltage}) kVAs=({sn_kva} {sn_kva}) XHL={xhl_percent} %Rs=[{rs_hv} {rs_lv}] Taps=[{tap_hv} {tap_lv}]"
             
             # Add loss parameters if they are non-zero
-            # Use array notation: apply iron losses to winding 1 only (core losses happen once)
+            # %noloadloss and %imag are scalar properties in OpenDSS (not per-winding arrays)
             if noloadloss_percent > 0:
-                transformer_cmd += f" %noloadloss=[{noloadloss_percent} 0]"
+                transformer_cmd += f" %noloadloss={noloadloss_percent}"
             
-            # Apply magnetizing current to winding 1 only (magnetization happens in core)
+            # %imag is the magnetizing current as % of rated current (scalar property)
             if i0_percent > 0:
-                transformer_cmd += f" %imag=[{i0_percent} 0]"
+                transformer_cmd += f" %imag={i0_percent}"
             
             execute_dss_command(transformer_cmd)
             
@@ -934,35 +991,24 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         p_kw = p_mw * 1000
         
         
-        # Calculate parallel resistance Rp from active power
-        # OpenDSS allows specifying Rp (parallel resistance) which consumes active power
-        # For parallel resistance: P = V²/Rp (in per-phase values)
-        # For 3-phase: P_total = 3 * V_LN² / Rp = V_LL² / Rp
-        # Therefore: Rp = V_LL² / P_total (in ohms)
-        rp_ohms = None
-        if p_kw != 0 and bus_voltage is not None:
-            voltage_kv = float(bus_voltage)
-            # Convert kW to W and kV to V for calculation
-            p_watts = p_kw * 1000
-            v_volts = voltage_kv * 1000
-            # Rp = V² / P (line-to-line voltage for 3-phase)
-            rp_ohms = (v_volts ** 2) / p_watts
-        else:
-            pass
+        # OpenDSS Reactor element: constant impedance (kV + kvar), matches pandapower shunt.
+        # Optional Rp = V_LL² / P_total for no-load losses when p_mw > 0.
         try:
-            # Model shunt reactor as constant-Q using a Generator with NEGATIVE kvar.
-            # OpenDSS Generator Model=3 is "Constant kW, Constant kvar" - TRUE constant P+Q behavior.
-            # Negative kvar on generator means it ABSORBS reactive power (inductive behavior).
-            # This matches pandapower shunt where positive q_mvar = inductive (absorbs Q).
-            gen_name = f"ShuntReactor_{element_name}"
-            simple_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW=0 kvar={-abs(q_kvar)} Model=3"
-            print(f"[DEBUG SHUNT] Creating constant-Q shunt as Generator (Model=3): {simple_cmd}")
-            execute_dss_command(simple_cmd)
+            reactor_name = f"ShuntReactor_{element_name}"
+            # kvar positive = inductive (reactor absorbs Q at rated voltage)
+            cmd_parts = [f"New Reactor.{reactor_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kvar={abs(q_kvar):.0f}"]
+            if p_kw > 0 and bus_voltage is not None:
+                voltage_kv = float(bus_voltage)
+                p_watts = p_kw * 1000
+                v_volts = voltage_kv * 1000
+                rp_ohms = (v_volts ** 2) / p_watts
+                cmd_parts.append(f" Rp={rp_ohms:.2f}")
+            reactor_cmd = "".join(cmd_parts)
+            execute_dss_command(reactor_cmd)
 
-            ShuntsDict[element_name] = gen_name
+            ShuntsDict[element_name] = reactor_name
             ShuntsDictId[element_name] = element_id
             created_elements.add(element_name)
-            
         except Exception as e:
             pass
     else:
@@ -1248,7 +1294,6 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             # Create our Vsource at the external grid bus
             # Use angle=0 for reference bus, Phases=3 for 3-phase
             external_grid_cmd = f"New Vsource.{element_name} Bus1={bus_name} basekv={bus_voltage} pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}"
-            print(f"[DEBUG] Creating Vsource: {external_grid_cmd}")
             execute_dss_command(external_grid_cmd)
             
             # Note: We can't store in ExternalGridsDict here as it's not in scope
@@ -1601,16 +1646,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         }
         return json.dumps(error_response)
     
-    # Note: OpenDSS creates buses automatically when elements are connected
-    # We don't need to explicitly create buses - they are created implicitly
-    # when we set the bus1/bus2 properties of elements like lines, loads, etc.
-
-    # Validate circuit before solve
-
-    # Execute solve commands
+    # Execute solve commands (voltage bases and calcv already run during element creation)
     try:
-        print("[OpenDSS] calcv")
-        dss.Text.Command('calcv')
         print("[OpenDSS] solve")
         dss.Text.Command('solve')
     except Exception as e:
@@ -2331,20 +2368,26 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         # Process each expected shunt directly by setting it as active element
         if ShuntsDict:
             for key, value in ShuntsDict.items():
-                # value is OpenDSS element name (ShuntReactor_xxx when constant-Q Generator)
+                # value is OpenDSS element name (ShuntReactor_xxx for Reactor element)
                 dss_elem_name = value
                 try:
-                    # Shunt reactors are now modeled as Generator (constant P+Q); try Generator first
+                    # Shunt reactors are modeled as Reactor element; try Reactor first, then legacy Generator
                     try:
-                        dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name}")
+                        dss.Circuit.SetActiveElement(f"Reactor.{dss_elem_name}")
                     except Exception:
                         try:
-                            dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name.lower()}")
+                            dss.Circuit.SetActiveElement(f"Reactor.{dss_elem_name.lower()}")
                         except Exception:
                             try:
-                                dss.Circuit.SetActiveElement(f"Load.{dss_elem_name}")
+                                dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name}")
                             except Exception:
-                                dss.Circuit.SetActiveElement(f"Reactor.{dss_elem_name}")
+                                try:
+                                    dss.Circuit.SetActiveElement(f"Generator.{dss_elem_name.lower()}")
+                                except Exception:
+                                    try:
+                                        dss.Circuit.SetActiveElement(f"Load.{dss_elem_name}")
+                                    except Exception:
+                                        pass
                     
                     # Get element info
                     element_name = dss.CktElement.Name()
@@ -2395,8 +2438,6 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                     vm_pu = V1_ll_kv / float(base_kv)
                     except Exception as e:
                         pass
-                    
-                    print(f"[DEBUG SHUNT RESULT] {key}: p_mw={p_mw:.3f}, q_mvar={q_mvar:.3f}, vm_pu={vm_pu:.4f}")
 
                     # Convert IDs back to hash format for frontend
                     frontend_name = key
