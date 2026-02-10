@@ -3073,10 +3073,26 @@ def shortcircuit(net, in_data):
     try:
         # Use correct parameter mapping according to Pandapower documentation
         
-        # Call short circuit calculation with correct parameters including ip and ith
-        sc.calc_sc(net, fault=fault_type, case=fault_location, bus=bus, ip=ip, ith=ith, tk_s=tk_s, 
-                   kappa_method='C', r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, 
-                   check_connectivity=False, return_all_currents=True)
+        # Call short circuit calculation with correct parameters including ip and ith.
+        # IMPORTANT: branch_results=True is required to populate res_line_sc / res_trafo_sc / res_trafo3w_sc.
+        # NOTE: return_all_currents=False (default) gives max/min per branch (simple index).
+        #       return_all_currents=True gives results per (branch, fault_bus) combination (MultiIndex).
+        #       For UI display, we want max/min per branch, so keep return_all_currents=False.
+        sc.calc_sc(
+            net,
+            fault=fault_type,
+            case=fault_location,
+            bus=bus,
+            ip=ip,
+            ith=ith,
+            tk_s=tk_s,
+            kappa_method='C',
+            r_fault_ohm=r_fault_ohm,
+            x_fault_ohm=x_fault_ohm,
+            check_connectivity=False,
+            branch_results=True,
+            return_all_currents=False,  # Changed: False gives max/min per branch with simple index
+        )
         
         # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
         if fault_type == '1ph' and net.res_bus_sc['ip_ka'].isna().all() and net.res_bus_sc['ith_ka'].isna().all():
@@ -3084,9 +3100,7 @@ def shortcircuit(net, in_data):
             # Calculate ip_ka and ith_ka from ikss_ka using standard electrical engineering formulas
             # ip_ka = kappa * sqrt(2) * ikss_ka (peak current)
             # ith_ka = ikss_ka (for short duration faults, thermal current ≈ initial current)
-            
-            import numpy as np
-            
+
             # Kappa factor for peak current calculation (typical value for medium voltage networks)
             # This can vary from 1.0 to 2.0 depending on network characteristics
             kappa_factor = 1.8  # Conservative estimate for medium voltage networks
@@ -3156,46 +3170,204 @@ def shortcircuit(net, in_data):
                 
     #wyrzuciłem skss_mw bo wyskakiwał błąd przy zwarciu jednofazowym
     class BusbarOut(object):
-        def __init__(self, name: str, id: str, ikss_ka: float, ip_ka: float, ith_ka: float, rk_ohm: float, xk_ohm: float):          
+        def __init__(self, name: str, id: str, ikss_ka: float, ip_ka: float, ith_ka: float, rk_ohm: float, xk_ohm: float):
             self.name = name
             self.id = id
-            self.ikss_ka = ikss_ka                        
+            self.ikss_ka = ikss_ka
             self.ip_ka = ip_ka
             self.ith_ka = ith_ka
             self.rk_ohm = rk_ohm
             self.xk_ohm = xk_ohm
-                         
+
     class BusbarsOut(object):
         def __init__(self, busbars: List[BusbarOut]):
-            self.busbars = busbars                
-                
-    
-    busbarList = list()      
-                
-    for index, row in net.res_bus_sc.iterrows(): 
-        
+            self.busbars = busbars
+
+    busbarList: List[BusbarOut] = []
+
+    for index, row in net.res_bus_sc.iterrows():
+
         # Handle ip_ka column (might not exist if ip=False)
         if 'ip_ka' in row and not math.isnan(row['ip_ka']):
             ip_ka = row['ip_ka']
         else:
             ip_ka = None
-            
+
         # Handle ith_ka column (might not exist if ith=False)
         if 'ith_ka' in row and not math.isnan(row['ith_ka']):
             ith_ka = row['ith_ka']
         else:
             ith_ka = None
-                    
-        busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), ikss_ka=row['ikss_ka'], ip_ka=ip_ka, ith_ka=ith_ka, rk_ohm=row['rk_ohm'], xk_ohm=row['xk_ohm'])    
-                 
+
+        busbar = BusbarOut(
+            name=net.bus._get_value(index, 'name'),
+            id=net.bus._get_value(index, 'id'),
+            ikss_ka=row['ikss_ka'],
+            ip_ka=ip_ka,
+            ith_ka=ith_ka,
+            rk_ohm=row['rk_ohm'],
+            xk_ohm=row['xk_ohm'],
+        )
+
         busbarList.append(busbar)
-        busbars = BusbarsOut(busbars = busbarList)  
-            
-    #result = {**busbars.__dict__, **lines.__dict__} #łączenie dwóch dictionaries
+
+    busbars = BusbarsOut(busbars=busbarList)
+
+    # Start result payload with busbar data (existing behaviour)
     result = {**busbars.__dict__}
 
+    # ------------------------------------------------------------------
+    # NEW: expose short-circuit results for lines and transformers
+    # ------------------------------------------------------------------
+    print(f"Short Circuit: Processing branch results...")
+    print(f"Short Circuit: net.res_line_sc exists: {hasattr(net, 'res_line_sc')}")
+    if hasattr(net, "res_line_sc"):
+        print(f"Short Circuit: net.res_line_sc shape: {net.res_line_sc.shape}")
+        print(f"Short Circuit: net.res_line_sc columns: {list(net.res_line_sc.columns)}")
+    print(f"Short Circuit: net.res_trafo_sc exists: {hasattr(net, 'res_trafo_sc')}")
+    if hasattr(net, "res_trafo_sc"):
+        print(f"Short Circuit: net.res_trafo_sc shape: {net.res_trafo_sc.shape}")
+    print(f"Short Circuit: net.res_trafo3w_sc exists: {hasattr(net, 'res_trafo3w_sc')}")
+    if hasattr(net, "res_trafo3w_sc"):
+        print(f"Short Circuit: net.res_trafo3w_sc shape: {net.res_trafo3w_sc.shape}")
+    
+    def _clean_value(v):
+        """Convert NaN to None and numpy scalars to python scalars for JSON."""
+        if isinstance(v, (float, np.floating)):
+            if math.isnan(v):
+                return None
+            return float(v)
+        return v
+
+    # Lines short-circuit results (net.res_line_sc)
+    if hasattr(net, "res_line_sc") and not net.res_line_sc.empty:
+        print(f"Short Circuit: Processing {len(net.res_line_sc)} line SC results...")
+        print(f"Short Circuit: net.line shape: {net.line.shape}")
+        print(f"Short Circuit: net.res_line_sc index type: {type(net.res_line_sc.index)}")
+        
+        # Check if we have a MultiIndex (happens with return_all_currents=True)
+        if hasattr(net.res_line_sc.index, 'levels'):
+            print(f"Short Circuit: WARNING - res_line_sc has MultiIndex, will group by branch")
+            # Group by first level (branch index) and take max values
+            res_line_sc_grouped = net.res_line_sc.groupby(level=0).max()
+        else:
+            res_line_sc_grouped = net.res_line_sc
+        
+        lines_sc_list = []
+        for idx, row in res_line_sc_grouped.iterrows():
+            line_entry = {}
+
+            # Map back to original line name and id used by the frontend
+            if idx in net.line.index:
+                line_entry["name"] = _clean_value(net.line.at[idx, "name"]) if "name" in net.line.columns else str(idx)
+                if "id" in net.line.columns:
+                    line_entry["id"] = _clean_value(net.line.at[idx, "id"])
+                else:
+                    # Fallback: use pandapower index if custom id is missing
+                    line_entry["id"] = str(idx)
+            else:
+                print(f"Short Circuit: Warning - line index {idx} not found in net.line")
+                continue
+
+            # Copy all numeric result columns
+            for col, val in row.items():
+                line_entry[col] = _clean_value(val)
+
+            lines_sc_list.append(line_entry)
+            
+            # Log first line entry
+            if len(lines_sc_list) == 1:
+                print(f"Short Circuit: First line SC entry with name/id: {line_entry}")
+
+        result["lines_sc"] = lines_sc_list
+        print(f"Short Circuit: Successfully processed {len(lines_sc_list)} line SC results")
+
+    # Two-winding transformer short-circuit results (net.res_trafo_sc)
+    if hasattr(net, "res_trafo_sc") and not net.res_trafo_sc.empty:
+        print(f"Short Circuit: Processing {len(net.res_trafo_sc)} transformer SC results...")
+        print(f"Short Circuit: net.trafo shape: {net.trafo.shape}")
+        print(f"Short Circuit: net.res_trafo_sc index type: {type(net.res_trafo_sc.index)}")
+        
+        # Check if we have a MultiIndex (happens with return_all_currents=True)
+        if hasattr(net.res_trafo_sc.index, 'levels'):
+            print(f"Short Circuit: WARNING - res_trafo_sc has MultiIndex, will group by branch")
+            # Group by first level (branch index) and take max values
+            res_trafo_sc_grouped = net.res_trafo_sc.groupby(level=0).max()
+        else:
+            res_trafo_sc_grouped = net.res_trafo_sc
+        
+        trafos_sc_list = []
+        for idx, row in res_trafo_sc_grouped.iterrows():
+            trafo_entry = {}
+
+            if idx in net.trafo.index:
+                trafo_entry["name"] = _clean_value(net.trafo.at[idx, "name"]) if "name" in net.trafo.columns else str(idx)
+                if "id" in net.trafo.columns:
+                    trafo_entry["id"] = _clean_value(net.trafo.at[idx, "id"])
+                else:
+                    trafo_entry["id"] = str(idx)
+            else:
+                print(f"Short Circuit: Warning - trafo index {idx} not found in net.trafo")
+                continue
+
+            for col, val in row.items():
+                trafo_entry[col] = _clean_value(val)
+
+            trafos_sc_list.append(trafo_entry)
+            
+            # Log first trafo entry
+            if len(trafos_sc_list) == 1:
+                print(f"Short Circuit: First trafo SC entry: {trafo_entry}")
+
+        result["trafos_sc"] = trafos_sc_list
+        print(f"Short Circuit: Successfully processed {len(trafos_sc_list)} trafo SC results")
+
+    # Three-winding transformer short-circuit results (net.res_trafo3w_sc)
+    if hasattr(net, "res_trafo3w_sc") and not net.res_trafo3w_sc.empty:
+        print(f"Short Circuit: Processing {len(net.res_trafo3w_sc)} 3-winding transformer SC results...")
+        
+        # Check if we have a MultiIndex (happens with return_all_currents=True)
+        if hasattr(net.res_trafo3w_sc.index, 'levels'):
+            print(f"Short Circuit: WARNING - res_trafo3w_sc has MultiIndex, will group by branch")
+            res_trafo3w_sc_grouped = net.res_trafo3w_sc.groupby(level=0).max()
+        else:
+            res_trafo3w_sc_grouped = net.res_trafo3w_sc
+        
+        trafos3w_sc_list = []
+        for idx, row in res_trafo3w_sc_grouped.iterrows():
+            trafo_entry = {}
+
+            if idx in net.trafo3w.index:
+                trafo_entry["name"] = _clean_value(net.trafo3w.at[idx, "name"]) if "name" in net.trafo3w.columns else str(idx)
+                if "id" in net.trafo3w.columns:
+                    trafo_entry["id"] = _clean_value(net.trafo3w.at[idx, "id"])
+                else:
+                    trafo_entry["id"] = str(idx)
+            else:
+                print(f"Short Circuit: Warning - trafo3w index {idx} not found in net.trafo3w")
+                continue
+
+            for col, val in row.items():
+                trafo_entry[col] = _clean_value(val)
+
+            trafos3w_sc_list.append(trafo_entry)
+
+        result["trafos3w_sc"] = trafos3w_sc_list
+        print(f"Short Circuit: Successfully processed {len(trafos3w_sc_list)} 3-winding trafo SC results")
+
+    # Log what we're sending back
+    print(f"Short Circuit: Final result keys: {list(result.keys())}")
+    if "lines_sc" in result:
+        print(f"Short Circuit: Sending {len(result['lines_sc'])} line SC results")
+        if len(result['lines_sc']) > 0:
+            print(f"Short Circuit: First line SC result: {result['lines_sc'][0]}")
+    if "trafos_sc" in result:
+        print(f"Short Circuit: Sending {len(result['trafos_sc'])} trafo SC results")
+    if "trafos3w_sc" in result:
+        print(f"Short Circuit: Sending {len(result['trafos3w_sc'])} trafo3w SC results")
+
     # OPTIMIZED: Compact JSON for faster transfer
-    response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':'))
+    response = json.dumps(result, default=lambda o: o.__dict__, separators=(",", ":"))
     return response
 
 
