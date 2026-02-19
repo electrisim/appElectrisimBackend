@@ -287,6 +287,13 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         except Exception as e:
             continue
 
+    # Extract the circuit source element name (first ext grid mapped to Vsource.source)
+    circuit_source_element_name = None
+    for item in created_elements:
+        if isinstance(item, str) and item.startswith('circuit_source_element:'):
+            circuit_source_element_name = item.split(':', 1)[1]
+            break
+
     # Second pass: create Lines (establish bus connectivity at same voltage level)
     for x in in_data:
         try:
@@ -354,6 +361,9 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
                 continue
             if element_type.startswith("Load"):
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
+            elif element_type.startswith("Motor"):
+                # Motors are modeled as Loads in OpenDSS
+                create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Static Generator"):
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Asymmetric Static Generator"):
@@ -373,7 +383,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
     
     return (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-            StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId)
+            StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+            circuit_source_element_name)
 
 # Individual element creation functions
 def create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command=None):
@@ -491,7 +502,7 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
     else:
         pass
 def create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
-    """Create a load element in OpenDSS"""
+    """Create a load element in OpenDSS (handles both Load and Motor types)"""
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
@@ -509,14 +520,45 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         if bus_voltage is None:
             return                 
         
-        # Get load parameters with proper null handling
-        p_mw_raw = element_data.get('p_mw')
-        q_mvar_raw = element_data.get('q_mvar')
+        # Detect if this is a Motor or regular Load
+        element_type = element_data.get('typ', '')
+        is_motor = element_type.startswith('Motor')
         
-        
-        # Convert to float
-        p_mw = float(p_mw_raw)
-        q_mvar = float(q_mvar_raw)
+        if is_motor:
+            import math
+            # Motor: calculate P and Q to match pandapower's motor model
+            # P_electric = pn_mech_mw * loading_percent / efficiency_percent * scaling
+            pn_mw = float(element_data.get('pn_mech_mw', 0) or element_data.get('pn_mw', 0))
+            efficiency_raw = float(element_data.get('efficiency_percent', 0.9))
+            loading_raw = float(element_data.get('loading_percent', efficiency_raw))
+            scaling = float(element_data.get('scaling', 1.0))
+            
+            # Detect if values are fractions (<=1) or actual percentages (>1)
+            efficiency = efficiency_raw if efficiency_raw > 1 else efficiency_raw * 100
+            loading = loading_raw if loading_raw > 1 else loading_raw * 100
+            
+            # P_elec = P_mech * (loading% / 100) / (efficiency% / 100) * scaling
+            if efficiency > 0:
+                p_mw = pn_mw * (loading / 100.0) / (efficiency / 100.0) * scaling
+            else:
+                p_mw = pn_mw * scaling
+            
+            # Use cos_phi (same as pandapower), fall back to cos_phi_n
+            cos_phi = float(element_data.get('cos_phi', 0) or element_data.get('cos_phi_n', 0.85))
+            
+            # Q = P * tan(acos(cos_phi))
+            if cos_phi > 0 and cos_phi < 1.0:
+                q_mvar = p_mw * math.tan(math.acos(cos_phi))
+            else:
+                q_mvar = 0
+        else:
+            # Regular Load: get P and Q directly
+            p_mw_raw = element_data.get('p_mw')
+            q_mvar_raw = element_data.get('q_mvar')
+            
+            # Convert to float
+            p_mw = float(p_mw_raw)
+            q_mvar = float(q_mvar_raw)
         
         # Convert to kW and kVar
         p_kw = p_mw * 1000
@@ -527,6 +569,35 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         try:
             # Create load command string
             load_cmd = f"New Load.{load_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={abs(q_kvar)}"
+            
+            # For motors, add model parameter
+            if is_motor:
+                load_cmd += " model=1"  # Constant P+jQ model for motors
+            
+            # Append harmonic analysis properties if provided
+            spectrum = element_data.get('spectrum', 'defaultload')
+            if spectrum and spectrum.lower() != 'none':
+                load_cmd += f" spectrum={spectrum}"
+            pct_series_rl = element_data.get('pctSeriesRL', '')
+            if pct_series_rl not in ('', None):
+                try:
+                    load_cmd += f" %SeriesRL={float(pct_series_rl)}"
+                except (ValueError, TypeError):
+                    pass
+            # puXharm: Special reactance for harmonics (default 0.0 means use %SeriesRL calculation)
+            pu_xharm = element_data.get('puXharm', '')
+            if pu_xharm not in ('', None, '0', '0.0'):
+                try:
+                    load_cmd += f" puXharm={float(pu_xharm)}"
+                except (ValueError, TypeError):
+                    pass
+            # XRharm: X/R ratio for harmonics (default 6.0, used when puXharm > 0)
+            xr_harm = element_data.get('XRharm', '')
+            if xr_harm not in ('', None):
+                try:
+                    load_cmd += f" XRharm={float(xr_harm)}"
+                except (ValueError, TypeError):
+                    pass
             
             # Create load using OpenDSS command
             execute_dss_command(load_cmd)
@@ -606,6 +677,24 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                 # Use Generator element for static generator. Model=1 for constant P and Q
                 # (exact match for pandapower sgen which is a constant P,Q source).
                 gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=1"
+                
+                # Append harmonic analysis properties if provided
+                spectrum = element_data.get('spectrum', 'defaultgen')
+                if spectrum and spectrum.lower() != 'none':
+                    gen_cmd += f" spectrum={spectrum}"
+                xdpp = element_data.get('Xdpp', '')
+                if xdpp not in ('', None):
+                    try:
+                        gen_cmd += f" Xdpp={float(xdpp)}"
+                    except (ValueError, TypeError):
+                        pass
+                xrdp = element_data.get('XRdp', '')
+                if xrdp not in ('', None):
+                    try:
+                        gen_cmd += f" XRdp={float(xrdp)}"
+                    except (ValueError, TypeError):
+                        pass
+                
                 execute_dss_command(gen_cmd)
                 
                 # Handle in_service status AFTER creating the element
@@ -658,45 +747,75 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             return         
         # Get generator parameters with proper null handling
         p_mw_raw = element_data.get('p_mw')
-        q_mvar_raw = element_data.get('q_mvar')
-        vm_pu_raw = element_data.get('vm_pu')        
+        q_mvar_raw = element_data.get('q_mvar', 0)
+        vm_pu_raw = element_data.get('vm_pu', 1.0)
+        cos_phi_raw = element_data.get('cos_phi', 0.85)
 
         # Convert to float
         p_mw = float(p_mw_raw)
         q_mvar = float(q_mvar_raw)
         vm_pu = float(vm_pu_raw)
+        cos_phi = float(cos_phi_raw)
         
-                # Convert to kW and kVar
+        # Convert to kW and kVar
         p_kw = p_mw * 1000
-        q_kvar = q_mvar * 1000
+        
+        # If q_mvar is 0, calculate from cos_phi (matching pandapower generator behavior)
+        if q_mvar == 0 and p_mw > 0 and cos_phi > 0 and cos_phi < 1.0:
+            import math
+            q_kvar = p_kw * math.tan(math.acos(cos_phi))
+        else:
+            q_kvar = q_mvar * 1000
 
         try:
             # Create generator command string with Model=3 for constant kW and kvar
-            # Model=3 is "Constant kW, Constant kvar" - maintains specified P and Q regardless of voltage
-            gen_cmd = f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar} Model=3"
+            gen_cmd = f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar} Model=3 PF={cos_phi}"
             
             # Add fault study parameters if provided (sub-transient reactance/resistance)
-            xdss_pu = element_data.get('xdss_pu')
-            rdss_ohm = element_data.get('rdss_ohm')
-            sn_mva = element_data.get('sn_mva')
+            xdss_pu_raw = element_data.get('xdss_pu')
+            rdss_ohm_raw = element_data.get('rdss_ohm')
+            sn_mva_raw = element_data.get('sn_mva')
             
-            # kVA rating is CRITICAL for fault study calculations
-            if sn_mva is not None:
-                gen_cmd += f" kva={float(sn_mva) * 1000}"  # MVA to kVA
+            # Convert to float safely
+            xdss_pu = float(xdss_pu_raw) if xdss_pu_raw is not None else 0.0
+            rdss_ohm = float(rdss_ohm_raw) if rdss_ohm_raw is not None else 0.0
+            sn_mva = float(sn_mva_raw) if sn_mva_raw is not None else 0.0
             
-            # Xdp is the transient reactance used for Fault Studies and Dynamics mode
-            if xdss_pu is not None:
-                gen_cmd += f" Xdp={float(xdss_pu)}"  # Transient reactance (pu) - used in fault studies
-                gen_cmd += f" Xdpp={float(xdss_pu)}"  # Subtransient reactance (pu) - for harmonics
+            # kVA rating - only add if meaningful (non-zero)
+            if sn_mva > 0:
+                gen_cmd += f" kva={sn_mva * 1000}"
             
-            # XRdp is the X/R ratio for fault studies (default is 20)
-            # If we have rdss_ohm and xdss_pu, compute X/R ratio
-            if xdss_pu is not None and rdss_ohm is not None and rdss_ohm > 0 and sn_mva is not None:
-                # Convert pu reactance to ohms: X_ohm = Xdp_pu * (kV^2 / MVA)
-                bus_voltage = BusbarsDictVoltage.get(bus_name, 1.0)
-                x_ohm = float(xdss_pu) * (bus_voltage ** 2) / float(sn_mva)
-                xr_ratio = x_ohm / float(rdss_ohm)
-                gen_cmd += f" XRdp={xr_ratio}"  # X/R ratio for fault study
+            # Xdp/Xdpp - only add if meaningful (non-zero)
+            if xdss_pu > 0:
+                gen_cmd += f" Xdp={xdss_pu}"
+                gen_cmd += f" Xdpp={xdss_pu}"
+            
+            # XRdp: X/R ratio for fault studies
+            if xdss_pu > 0 and rdss_ohm > 0 and sn_mva > 0:
+                bus_kv = float(BusbarsDictVoltage.get(bus_name, 1.0))
+                x_ohm = xdss_pu * (bus_kv ** 2) / sn_mva
+                xr_ratio = x_ohm / rdss_ohm
+                gen_cmd += f" XRdp={xr_ratio}"
+            
+            # Harmonic analysis properties
+            spectrum = element_data.get('spectrum', 'defaultgen')
+            if spectrum and spectrum.lower() != 'none':
+                gen_cmd += f" spectrum={spectrum}"
+            # Override Xdpp from harmonic tab if provided (may differ from short-circuit Xdpp)
+            harm_xdpp = element_data.get('Xdpp')
+            if harm_xdpp not in ('', None) and xdss_pu == 0:
+                try:
+                    xdpp_val = float(harm_xdpp)
+                    if xdpp_val > 0:
+                        gen_cmd += f" Xdpp={xdpp_val}"
+                except (ValueError, TypeError):
+                    pass
+            harm_xrdp = element_data.get('XRdp')
+            if harm_xrdp not in ('', None) and not (xdss_pu > 0 and rdss_ohm > 0 and sn_mva > 0):
+                try:
+                    gen_cmd += f" XRdp={float(harm_xrdp)}"
+                except (ValueError, TypeError):
+                    pass
 
             # Create generator using OpenDSS command
             execute_dss_command(gen_cmd)
@@ -916,6 +1035,12 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             if i0_percent > 0:
                 transformer_cmd += f" %imag={i0_percent}"
             
+            # Harmonic analysis property: XRConst
+            # When Yes, X/R ratio is constant for all frequencies (series RL model)
+            xr_const = element_data.get('XRConst', 'No')
+            if xr_const and str(xr_const).lower() in ('yes', 'true'):
+                transformer_cmd += " XRConst=Yes"
+            
             execute_dss_command(transformer_cmd)
             
             # Handle in_service status AFTER creating the element
@@ -1005,6 +1130,23 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
                 cmd_parts.append(f" Rp={rp_ohms:.2f}")
             reactor_cmd = "".join(cmd_parts)
             execute_dss_command(reactor_cmd)
+            
+            # Handle in_service status AFTER creating the element
+            in_service = element_data.get('in_service', True)
+            
+            # Convert to boolean for comparison
+            is_in_service = True
+            if isinstance(in_service, bool):
+                is_in_service = in_service
+            elif isinstance(in_service, str):
+                is_in_service = in_service.lower() not in ['false', 'no', '0']
+            elif in_service in [0, None]:
+                is_in_service = False
+            
+            if not is_in_service:
+                cmd = f'Reactor.{reactor_name}.enabled=no'
+                print(f"[OpenDSS] {cmd}")
+                dss.Text.Command(cmd)
 
             ShuntsDict[element_name] = reactor_name
             ShuntsDictId[element_name] = element_id
@@ -1058,6 +1200,23 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
                 simple_cmd = f"New Capacitor.{element_name} Bus1={bus_name} kvar={abs(q_kvar)} kV={bus_voltage}"
                 execute_dss_command(simple_cmd)
                 # print(f"Command: {simple_cmd}")  # Reduced logging
+                
+                # Handle in_service status AFTER creating the element
+                in_service = element_data.get('in_service', True)
+                
+                # Convert to boolean for comparison
+                is_in_service = True
+                if isinstance(in_service, bool):
+                    is_in_service = in_service
+                elif isinstance(in_service, str):
+                    is_in_service = in_service.lower() not in ['false', 'no', '0']
+                elif in_service in [0, None]:
+                    is_in_service = False
+                
+                if not is_in_service:
+                    cmd = f'Capacitor.{element_name}.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
 
                 CapacitorsDict[element_name] = element_name
                 CapacitorsDictId[element_name] = element_id
@@ -1108,8 +1267,31 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             try:
                 # Use bus name directly - OpenDSS will create bus automatically
                 simple_cmd = f"New Storage.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar}"
+                
+                # Append harmonic analysis spectrum if provided
+                spectrum = element_data.get('spectrum', 'default')
+                if spectrum and spectrum.lower() not in ('none', ''):
+                    simple_cmd += f" spectrum={spectrum}"
+                
                 execute_dss_command(simple_cmd)
                 # print(f"Command: {simple_cmd}")  # Reduced logging
+                
+                # Handle in_service status AFTER creating the element
+                in_service = element_data.get('in_service', True)
+                
+                # Convert to boolean for comparison
+                is_in_service = True
+                if isinstance(in_service, bool):
+                    is_in_service = in_service
+                elif isinstance(in_service, str):
+                    is_in_service = in_service.lower() not in ['false', 'no', '0']
+                elif in_service in [0, None]:
+                    is_in_service = False
+                
+                if not is_in_service:
+                    cmd = f'Storage.{element_name}.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
        
                 
                 StoragesDict[element_name] = element_name
@@ -1206,6 +1388,11 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                 # - %PmppGain (not supported)
                 # - Many other advanced parameters are not in standard OpenDSS
                 
+                # Harmonic analysis property
+                spectrum = element_data.get('spectrum', 'default')
+                if spectrum and spectrum.lower() not in ('none', ''):
+                    pv_cmd += f" spectrum={spectrum}"
+                
                 # If you need additional parameters, verify them in OpenDSS documentation first:
                 # https://opendss.epri.com/PVSystem.html
 
@@ -1271,33 +1458,74 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
         vm_pu = float(vm_pu_raw)
         s_sc_max_mva = float(s_sc_max_mva_raw)
         
+        # Validate and auto-correct vm_pu (OpenDSS Vsource 'pu' parameter)
+        # vm_pu should be close to 1.0 (per unit). If user entered kV value instead of p.u., auto-correct.
+        if vm_pu == 0:
+            vm_pu = 1.0
+            print(f"WARNING: External Grid '{element_name}' had vm_pu=0, auto-corrected to 1.0 p.u.")
+        elif vm_pu > 1.5 and bus_voltage is not None and float(bus_voltage) > 0:
+            corrected_vm_pu = vm_pu / float(bus_voltage)
+            print(f"WARNING: External Grid '{element_name}' has vm_pu={vm_pu}, "
+                  f"which is unreasonably high. vm_pu should be close to 1.0 (per unit). "
+                  f"Bus voltage is {bus_voltage} kV. Auto-correcting to {corrected_vm_pu:.4f} p.u. "
+                  f"(assuming user entered kV instead of p.u.)")
+            vm_pu = corrected_vm_pu
+        
         # Ensure short circuit MVA is not zero (would cause singular matrix)
         # Use a reasonable default if zero or very small
         if s_sc_max_mva <= 0.1:
             s_sc_max_mva = 10000.0  # Default 10000 MVA short circuit capacity
         
         try:
-            # IMPORTANT: When `New Circuit` is called, OpenDSS creates a default Vsource 
-            # called "source" at bus "sourcebus". If we create additional Vsources without
-            # connecting sourcebus to our network, the circuit won't be properly energized.
-            # 
-            # Solution: Disable the default source and create our own Vsource at the 
-            # external grid bus. This ensures proper network energization for fault studies.
-            # 
-            # First external grid disables default and creates new; additional ones just create new.
-            if 'default_source_disabled' not in created_elements:
-                # Disable the default source to avoid conflicts
-                print("[OpenDSS] Vsource.source.enabled=no")
-                dss.Text.Command('Vsource.source.enabled=no')
-                created_elements.add('default_source_disabled')
+            # Build spectrum parameter if provided
+            spectrum = element_data.get('spectrum', 'defaultvsource')
+            spectrum_suffix = ''
+            if spectrum and spectrum.lower() != 'none':
+                spectrum_suffix = f" spectrum={spectrum}"
             
-            # Create our Vsource at the external grid bus
-            # Use angle=0 for reference bus, Phases=3 for 3-phase
-            external_grid_cmd = f"New Vsource.{element_name} Bus1={bus_name} basekv={bus_voltage} pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}"
-            execute_dss_command(external_grid_cmd)
+            if 'circuit_source_configured' not in created_elements:
+                # First external grid: configure the default Circuit source directly.
+                # When 'New Circuit' is called, OpenDSS creates a default Vsource named
+                # "source" at bus "sourcebus". Instead of disabling it and creating a
+                # separate Vsource, we edit it with the first external grid's parameters.
+                # This is cleaner and follows the standard OpenDSS pattern where the
+                # Circuit source IS the main grid connection.
+                edit_cmd = (f"Edit Vsource.source Bus1={bus_name} basekv={bus_voltage} "
+                            f"pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}{spectrum_suffix}")
+                execute_dss_command(edit_cmd)
+                created_elements.add('circuit_source_configured')
+                # Track which element name maps to the circuit source for result retrieval
+                created_elements.add(f'circuit_source_element:{element_name}')
+            else:
+                # Additional external grids: create a new Vsource element
+                external_grid_cmd = (f"New Vsource.{element_name} Bus1={bus_name} basekv={bus_voltage} "
+                                     f"pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}{spectrum_suffix}")
+                execute_dss_command(external_grid_cmd)
             
-            # Note: We can't store in ExternalGridsDict here as it's not in scope
-            # The calling function will handle this
+            # Handle in_service status AFTER creating the element
+            in_service = element_data.get('in_service', True)
+            
+            # Convert to boolean for comparison
+            is_in_service = True
+            if isinstance(in_service, bool):
+                is_in_service = in_service
+            elif isinstance(in_service, str):
+                is_in_service = in_service.lower() not in ['false', 'no', '0']
+            elif in_service in [0, None]:
+                is_in_service = False
+            
+            if not is_in_service:
+                # For the first external grid (mapped to source), we edit it
+                if 'circuit_source_element:' + element_name in created_elements:
+                    cmd = 'Vsource.source.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
+                else:
+                    # For additional external grids
+                    cmd = f'Vsource.{element_name}.enabled=no'
+                    print(f"[OpenDSS] {cmd}")
+                    dss.Text.Command(cmd)
+            
             created_elements.add(element_name)
             
         except Exception as e:
@@ -1333,7 +1561,8 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
         BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, False, opendss_commands)
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)
+         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+         _circuit_source) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)
     except ValueError as ve:
         return json.dumps({"error": str(ve)})
     except Exception as e:
@@ -1632,7 +1861,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         # Create other elements
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
+         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+         circuit_source_element_name) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
     except ValueError as ve:
         # Validation error - return error message to frontend
         error_response = {
@@ -2570,18 +2800,23 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             try:
                 vsource_name = dss.Vsources.Name()
 
-                # Skip system VSources (OpenDSS auto-creates these)
-                if vsource_name in ['source', 'sourcebus']:
-                    dss.Vsources.Next()
-                    continue
-
-                # Try to find matching external grid by checking various name formats (case-insensitive)
                 matched_key = None
-                for key, value in ExternalGridsDict.items():
-                    # OpenDSS lowercases names, so compare case-insensitively
-                    if (value.lower() == vsource_name.lower() or key.lower() == vsource_name.lower()):
-                        matched_key = key
-                        break
+                if vsource_name.lower() in ['source', 'sourcebus']:
+                    # The default circuit source was configured with the first external
+                    # grid's parameters via "Edit Vsource.source". Map it back.
+                    if circuit_source_element_name:
+                        matched_key = circuit_source_element_name
+                    else:
+                        # No external grid mapped to circuit source; skip
+                        dss.Vsources.Next()
+                        continue
+                else:
+                    # Try to find matching external grid by checking various name formats (case-insensitive)
+                    for key, value in ExternalGridsDict.items():
+                        # OpenDSS lowercases names, so compare case-insensitively
+                        if (value.lower() == vsource_name.lower() or key.lower() == vsource_name.lower()):
+                            matched_key = key
+                            break
 
                 if matched_key and matched_key not in added_external_grid_keys:
                     added_external_grid_keys.add(matched_key)
@@ -2695,3 +2930,320 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     #Q[MVar]
     #PF
         
+        
+def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterations,
+                      tolerance, controlmode, harmonics, neglect_load_y=False,
+                      export_commands=False):
+    """
+    Perform OpenDSS harmonic analysis with full per-bus / per-line results.
+
+    Workflow (per OpenDSS docs):
+    1. Build the circuit, run a snapshot power flow to initialise.
+    2. Read fundamental (h=1) bus voltages as baseline for per-unit.
+    3. For each requested harmonic order, set frequency, solve in Direct
+       mode, and read bus voltages + line currents.
+    4. Compute VTHD per bus and ITHD per line.
+    5. Return everything in the same JSON envelope that the frontend
+       already knows (busbars, lines, etc.) plus a new
+       ``harmonic_analysis`` block with per-element detail.
+    """    # ---- Parse harmonic orders ------------------------------------------------
+    harmonic_orders = []
+    if isinstance(harmonics, str):
+        for token in harmonics.replace(';', ',').split(','):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                h = int(token)
+                if h > 0:
+                    harmonic_orders.append(h)
+            except ValueError:
+                continue
+    elif isinstance(harmonics, (list, tuple)):
+        for h in harmonics:
+            try:
+                h_int = int(h)
+                if h_int > 0:
+                    harmonic_orders.append(h_int)
+            except (TypeError, ValueError):
+                continue
+    if not harmonic_orders:
+        harmonic_orders = [3, 5, 7, 11, 13]
+
+    # ---- Step 1: run fundamental power flow (reuse existing function) ---------
+    base_result_json = powerflow(
+        in_data, frequency, mode, algorithm, loadmodel,
+        max_iterations, tolerance, controlmode, export_commands
+    )
+    try:
+        base_result = json.loads(base_result_json)
+    except Exception:
+        return base_result_json
+    if "error" in base_result:
+        return base_result_json
+
+    # ---- Step 2: rebuild circuit for harmonic analysis -------------------------
+    opendss_commands = []
+
+    def execute_dss_command(command):
+        print(f"[OpenDSS][HARMONICS] {command}")
+        dss.Text.Command(command)
+        if export_commands:
+            opendss_commands.append(command)
+
+    execute_dss_command('clear')
+    execute_dss_command('New Circuit.OpenDSS_Circuit_Harmonics')
+    execute_dss_command(f'set DefaultBaseFrequency={frequency}')
+    execute_dss_command(f'set Mode={mode}')
+    execute_dss_command(f'set Algorithm={algorithm}')
+    execute_dss_command(f'set LoadModel={loadmodel}')
+    execute_dss_command(f'set ControlMode={controlmode}')
+    execute_dss_command(f'set MaxIterations={max_iterations}')
+    execute_dss_command(f'set Tolerance={tolerance}')
+
+    try:
+        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
+            in_data, dss, export_commands, opendss_commands)
+        (LinesDict, LinesDictId, LoadsDict, LoadsDictId,
+         TransformersDict, TransformersDictId,
+         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId,
+         GeneratorsDict, GeneratorsDictId,
+         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId,
+         ExternalGridsDict, ExternalGridsDictId,
+         _circuit_source) = create_other_elements(
+            in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
+            export_commands, opendss_commands, execute_dss_command)
+    except ValueError as ve:
+        return json.dumps({"error": str(ve)}, separators=(',', ':'))
+    except Exception as e:
+        return json.dumps({"error": f"Error creating network elements for harmonics: {str(e)}"}, separators=(',', ':'))
+
+    # ---- Step 3: Add monitors for per-harmonic data capture -------------------
+    # Monitors on lines capture both voltages and currents at each harmonic step
+    user_bus_names = list(BusbarsDictConnectionToName.keys())
+    
+    for line_key, dss_line_name in LinesDict.items():
+        execute_dss_command(f'New Monitor.mon_{dss_line_name} element=Line.{dss_line_name} terminal=1 mode=0')
+
+    # ---- Step 4: Solve fundamental power flow first ---------------------------
+    execute_dss_command('solve')
+
+    # Read fundamental (h=1) bus voltages and line currents as baseline
+    def _read_bus_voltages_ll_kv():
+        """Return dict  bus_key(lower) -> V_ll_kV  for user buses."""
+        result_map = {}
+        for bus_key in user_bus_names:
+            try:
+                dss.Circuit.SetActiveBus(bus_key)
+                voltages = dss.Bus.Voltages()
+                if len(voltages) >= 6:
+                    Va = complex(voltages[0], voltages[1]) / 1000.0
+                    Vb = complex(voltages[2], voltages[3]) / 1000.0
+                    Vc = complex(voltages[4], voltages[5]) / 1000.0
+                    a_op = complex(-0.5, math.sqrt(3) / 2)
+                    a2 = complex(-0.5, -math.sqrt(3) / 2)
+                    V1 = (Va + a_op * Vb + a2 * Vc) / 3.0
+                    result_map[bus_key.lower()] = abs(V1) * math.sqrt(3)
+                else:
+                    Va = complex(voltages[0], voltages[1]) / 1000.0
+                    result_map[bus_key.lower()] = abs(Va) * math.sqrt(3)
+            except Exception:
+                result_map[bus_key.lower()] = 0.0
+        return result_map
+
+    def _read_line_currents_a():
+        """Return dict  line_key -> I_from_A  for user lines."""
+        result_map = {}
+        for key in LinesDict:
+            try:
+                dss.Circuit.SetActiveElement(f"Line.{LinesDict[key]}")
+                currents = dss.CktElement.CurrentsMagAng()
+                if len(currents) >= 2:
+                    result_map[key] = currents[0]
+                else:
+                    result_map[key] = 0.0
+            except Exception:
+                result_map[key] = 0.0
+        return result_map
+
+    fund_bus_v = _read_bus_voltages_ll_kv()
+    fund_line_i = _read_line_currents_a()
+
+    # ---- Step 5: Solve harmonics using OpenDSS built-in harmonic mode ---------
+    # This is the correct way per OpenDSS documentation:
+    # https://opendss.epri.com/HarmonicFlowAnalysis.html
+    # OpenDSS will automatically:
+    # - Convert loads to impedance models at each harmonic frequency
+    # - Use element spectra to determine harmonic current/voltage injections
+    # - Apply %SeriesRL for loads, Xdpp for generators
+    
+    if neglect_load_y:
+        execute_dss_command('set NeglectLoadY=Yes')
+    else:
+        execute_dss_command('set NeglectLoadY=No')
+    
+    # Set the harmonics list (include fundamental h=1 for reference)
+    all_harmonics = sorted(set([1] + harmonic_orders))
+    h_str = '[' + ','.join(str(h) for h in all_harmonics) + ']'
+    execute_dss_command(f'set harmonics={h_str}')
+    execute_dss_command('set mode=harmonics')
+    execute_dss_command('solve')
+
+    # ---- Step 6: Read per-harmonic data from monitors -------------------------
+    # After mode=harmonics solve, monitors have one record per harmonic step.
+    # For mode=0 monitors on 3-phase lines:
+    #   Channel 1 = V_a mag, Channel 3 = V_b mag, Channel 5 = V_c mag
+    #   Channel 7 = I_a mag, Channel 9 = I_b mag, Channel 11 = I_c mag
+    # (even channels are angles)
+    
+    bus_harmonic_v = {bk.lower(): {} for bk in user_bus_names}
+    line_harmonic_i = {lk: {} for lk in LinesDict}
+    
+    # Build a mapping from line terminal buses to bus keys for voltage data
+    line_bus_map = {}
+    for line_key in LinesDict:
+        for x_key in in_data:
+            ed = in_data[x_key]
+            if ed.get('name', '') == line_key:
+                bf = ed.get('busFrom', '')
+                if bf in BusbarsDictConnectionToName:
+                    line_bus_map[line_key] = bf.lower()
+                break
+    
+    for line_key, dss_line_name in LinesDict.items():
+        try:
+            dss.Monitors.Name = f'mon_{dss_line_name}'
+            
+            # Get number of channels and samples
+            num_channels = dss.Monitors.NumChannels
+            sample_count = dss.Monitors.SampleCount
+            
+            if sample_count == 0 or num_channels == 0:
+                print(f"[OpenDSS][HARMONICS] Monitor mon_{dss_line_name}: no data (channels={num_channels}, samples={sample_count})")
+                continue
+            
+            print(f"[OpenDSS][HARMONICS] Monitor mon_{dss_line_name}: channels={num_channels}, samples={sample_count}, harmonics={all_harmonics}")
+            
+            # Read voltage magnitude channel 1 (V_a) and current magnitude channel 7 (I_a)
+            # For mode=0 monitor: V1, V1ang, V2, V2ang, V3, V3ang, I1, I1ang, I2, I2ang, I3, I3ang
+            try:
+                v_data = list(dss.Monitors.Channel(1))  # V_a magnitude per harmonic step
+            except Exception:
+                v_data = []
+            
+            i_channel = min(7, num_channels)  # I_a is channel 7 for 3-phase
+            try:
+                i_data = list(dss.Monitors.Channel(i_channel))  # I_a magnitude per harmonic step
+            except Exception:
+                i_data = []
+            
+            # Map samples to harmonic orders
+            for idx, h in enumerate(all_harmonics):
+                if h == 1:
+                    continue  # Skip fundamental (we have it from power flow)
+                if h not in harmonic_orders:
+                    continue
+                
+                # Get current for this harmonic
+                if idx < len(i_data):
+                    line_harmonic_i[line_key][h] = abs(i_data[idx])
+                else:
+                    line_harmonic_i[line_key][h] = 0.0
+                
+                # Get voltage and map to bus
+                bus_key = line_bus_map.get(line_key, '')
+                if bus_key and idx < len(v_data):
+                    # Convert phase voltage (V) to LL (kV): V_a * sqrt(3) / 1000
+                    v_ll_kv = abs(v_data[idx]) * math.sqrt(3) / 1000.0
+                    # Only update if this is larger (multiple lines may connect to same bus)
+                    existing = bus_harmonic_v.get(bus_key, {}).get(h, 0.0)
+                    if v_ll_kv > existing:
+                        if bus_key in bus_harmonic_v:
+                            bus_harmonic_v[bus_key][h] = v_ll_kv
+                        
+        except Exception as e:
+            print(f"[OpenDSS][HARMONICS] Error reading monitor for {dss_line_name}: {e}")
+            continue
+    
+    # Fallback: also try reading bus voltages directly at each harmonic frequency
+    # (some buses may not be connected to monitored lines)
+    for h in harmonic_orders:
+        f_h = frequency * h
+        execute_dss_command(f'set frequency={f_h}')
+        execute_dss_command('set mode=direct')
+        execute_dss_command('solve')
+        
+        v_map = _read_bus_voltages_ll_kv()
+        i_map = _read_line_currents_a()
+        
+        for bk in bus_harmonic_v:
+            if h not in bus_harmonic_v[bk] or bus_harmonic_v[bk][h] == 0.0:
+                bus_harmonic_v[bk][h] = v_map.get(bk, 0.0)
+        
+        for lk in line_harmonic_i:
+            if h not in line_harmonic_i[lk] or line_harmonic_i[lk][h] == 0.0:
+                line_harmonic_i[lk][h] = i_map.get(lk, 0.0)
+
+    # ---- Step 7: compute THD --------------------------------------------------
+    bus_thd = {}
+    for bk in bus_harmonic_v:
+        v1 = fund_bus_v.get(bk, 0.0)
+        if v1 > 0:
+            sum_sq = sum(bus_harmonic_v[bk].get(h, 0.0) ** 2 for h in harmonic_orders)
+            bus_thd[bk] = (math.sqrt(sum_sq) / v1) * 100.0
+        else:
+            bus_thd[bk] = 0.0
+
+    line_thd = {}
+    for lk in line_harmonic_i:
+        i1 = fund_line_i.get(lk, 0.0)
+        if i1 > 0:
+            sum_sq = sum(line_harmonic_i[lk].get(h, 0.0) ** 2 for h in harmonic_orders)
+            line_thd[lk] = (math.sqrt(sum_sq) / i1) * 100.0
+        else:
+            line_thd[lk] = 0.0
+
+    # ---- Step 8: enrich base_result with harmonic data -------------------------
+    if "busbars" in base_result:
+        for bus_entry in base_result["busbars"]:
+            bus_key = (bus_entry.get("id") or bus_entry.get("name", "")).lower()
+            bus_entry["vthd_percent"] = round(bus_thd.get(bus_key, 0.0), 3)
+            per_h = {}
+            for h in harmonic_orders:
+                per_h[str(h)] = round(bus_harmonic_v.get(bus_key, {}).get(h, 0.0), 6)
+            bus_entry["harmonic_voltages_kv"] = per_h
+
+    if "lines" in base_result:
+        for line_entry in base_result["lines"]:
+            line_key = line_entry.get("name", "")
+            line_entry["ithd_percent"] = round(line_thd.get(line_key, 0.0), 3)
+            per_h = {}
+            for h in harmonic_orders:
+                per_h[str(h)] = round(line_harmonic_i.get(line_key, {}).get(h, 0.0), 6)
+            line_entry["harmonic_currents_a"] = per_h
+
+    # Overall metadata
+    base_result["harmonic_analysis"] = {
+        "executed": True,
+        "frequency_hz": frequency,
+        "harmonic_orders": harmonic_orders,
+        "neglectLoadY": bool(neglect_load_y),
+    }
+    if export_commands:
+        existing_text = base_result.get("opendss_commands", "")
+        harmonic_text = "\n".join(["# --- HARMONIC ANALYSIS ---"] + opendss_commands) if opendss_commands else ""
+        if existing_text and harmonic_text:
+            base_result["opendss_commands"] = existing_text + "\n" + harmonic_text
+        elif harmonic_text:
+            base_result["opendss_commands"] = harmonic_text
+
+    try:
+        return json.dumps(base_result, separators=(',', ':'))
+    except Exception as json_error:
+        return json.dumps(
+            {
+                "error": "Harmonic JSON serialization failed",
+                "message": str(json_error),
+            },
+            separators=(',', ':'),
+        )

@@ -721,7 +721,7 @@ def create_other_elements(in_data,net,x, Busbars):
             
             for param in optional_params:
                 value = in_data[x].get(param)
-                if value is not None and value != 'None' and value != '':
+                if value is not None and value not in ('None', '', 'null'):
                     try:
                         if param == 'parallel':
                             line_params[param] = int(value)
@@ -827,12 +827,37 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
+            # Validate and auto-correct vm_pu for external grid
+            ext_grid_vm_pu = safe_float(in_data[x]['vm_pu'])
+            bus_vn_kv = net.bus.loc[bus_idx, 'vn_kv'] if bus_idx is not None else None
+            
+            if ext_grid_vm_pu == 0:
+                ext_grid_vm_pu = 1.0
+                print(f"WARNING: External Grid '{in_data[x].get('userFriendlyName', in_data[x]['name'])}' had vm_pu=0, auto-corrected to 1.0 p.u.")
+            elif ext_grid_vm_pu > 1.5 and bus_vn_kv is not None and bus_vn_kv > 0:
+                # User likely entered voltage in kV instead of per unit
+                corrected_vm_pu = ext_grid_vm_pu / bus_vn_kv
+                print(f"WARNING: External Grid '{in_data[x].get('userFriendlyName', in_data[x]['name'])}' has vm_pu={ext_grid_vm_pu}, "
+                      f"which is unreasonably high. vm_pu should be close to 1.0 (per unit). "
+                      f"Bus nominal voltage is {bus_vn_kv} kV. Auto-correcting vm_pu from {ext_grid_vm_pu} to {corrected_vm_pu:.4f} p.u. "
+                      f"(assuming user entered kV instead of p.u.)")
+                if not hasattr(net, 'warnings'):
+                    net.warnings = []
+                net.warnings.append(
+                    f"External Grid '{in_data[x].get('userFriendlyName', in_data[x]['name'])}': "
+                    f"vm_pu was set to {ext_grid_vm_pu}, which appears to be a voltage in kV, not per unit. "
+                    f"Auto-corrected to {corrected_vm_pu:.4f} p.u. "
+                    f"(vm_pu should be close to 1.0, e.g. 0.95-1.05 for normal operation). "
+                    f"The bus nominal voltage ({bus_vn_kv} kV) is used as the base."
+                )
+                ext_grid_vm_pu = corrected_vm_pu
+            
             pp.create_ext_grid(
                 net,
                 bus=bus_idx,
                 name=in_data[x]['name'],
                 id=in_data[x]['id'],
-                vm_pu=safe_float(in_data[x]['vm_pu']),
+                vm_pu=ext_grid_vm_pu,
                 va_degree=safe_float(in_data[x]['va_degree']),
                 s_sc_max_mva=safe_float(in_data[x]['s_sc_max_mva']),
                 s_sc_min_mva=safe_float(in_data[x]['s_sc_min_mva']),
@@ -881,7 +906,40 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=safe_float(in_data[x]['vm_pu']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'],
+            # Validate and auto-correct vm_pu for generator
+            gen_vm_pu = safe_float(in_data[x]['vm_pu'])
+            gen_bus_vn_kv = net.bus.loc[bus_idx, 'vn_kv'] if bus_idx is not None else None
+            
+            if gen_vm_pu == 0:
+                gen_vm_pu = 1.0
+                print(f"WARNING: Generator '{in_data[x].get('userFriendlyName', in_data[x]['name'])}' had vm_pu=0, auto-corrected to 1.0 p.u.")
+            elif gen_vm_pu > 1.5 and gen_bus_vn_kv is not None and gen_bus_vn_kv > 0:
+                corrected_vm_pu = gen_vm_pu / gen_bus_vn_kv
+                print(f"WARNING: Generator '{in_data[x].get('userFriendlyName', in_data[x]['name'])}' has vm_pu={gen_vm_pu}, "
+                      f"which is unreasonably high. Auto-correcting to {corrected_vm_pu:.4f} p.u.")
+                if not hasattr(net, 'warnings'):
+                    net.warnings = []
+                net.warnings.append(
+                    f"Generator '{in_data[x].get('userFriendlyName', in_data[x]['name'])}': "
+                    f"vm_pu was set to {gen_vm_pu}, which appears to be a voltage in kV, not per unit. "
+                    f"Auto-corrected to {corrected_vm_pu:.4f} p.u. "
+                    f"(vm_pu should be close to 1.0, e.g. 0.95-1.05 for normal operation)."
+                )
+                gen_vm_pu = corrected_vm_pu
+            elif gen_vm_pu > 0 and gen_vm_pu < 0.5:
+                print(f"WARNING: Generator '{in_data[x].get('userFriendlyName', in_data[x]['name'])}' has unusually low vm_pu={gen_vm_pu}. "
+                      f"vm_pu should be close to 1.0 (per unit). Please verify this value.")
+                if not hasattr(net, 'warnings'):
+                    net.warnings = []
+                net.warnings.append(
+                    f"Generator '{in_data[x].get('userFriendlyName', in_data[x]['name'])}': "
+                    f"vm_pu is set to {gen_vm_pu}, which is unusually low. "
+                    f"vm_pu is the voltage setpoint in per unit and should be close to 1.0 (e.g. 0.95-1.05). "
+                    f"A very low value will cause the generator to try to regulate bus voltage to near zero, "
+                    f"leading to unrealistic results."
+                )
+            
+            pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=gen_vm_pu, sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0),
                           vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']), in_service=in_service)    #, power_station_trafo=in_data[x]['power_station_trafo']
             
             # Store user-friendly name for generator
@@ -922,7 +980,7 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=in_data[x]['scaling'], type=in_data[x]['type'],
+            pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'],
                            k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service)
             
             # Store user-friendly name for static generator
@@ -940,7 +998,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'], p_b_mw=in_data[x]['p_b_mw'], p_c_mw=in_data[x]['p_c_mw'], q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'], type=in_data[x]['type'], in_service=in_service)   
+            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=safe_float(in_data[x]['p_a_mw']), p_b_mw=safe_float(in_data[x]['p_b_mw']), p_c_mw=safe_float(in_data[x]['p_c_mw']), q_a_mvar=safe_float(in_data[x]['q_a_mvar']), q_b_mvar=safe_float(in_data[x]['q_b_mvar']), q_c_mvar=safe_float(in_data[x]['q_c_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'], in_service=in_service)   
         #Zero sequence parameters** (Added through std_type For Three phase load flow) :
             #vk0_percent** - zero sequence relative short-circuit voltage
             #vkr0_percent** - real part of zero sequence relative short-circuit voltage
@@ -1136,7 +1194,7 @@ def create_other_elements(in_data,net,x, Busbars):
             
             for param in optional_params:
                 value = in_data[x].get(param)
-                if value is not None and value != 'None' and value != '':
+                if value is not None and value not in ('None', '', 'null'):
                     if param == 'vector_group':
                         transformer_params[param] = vector_group  # Use parsed base group
                     else:
@@ -1208,7 +1266,7 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=in_data[x]['scaling'],type=in_data[x]['type'], in_service=in_service)
+            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=safe_float(in_data[x].get('scaling'), 1.0),type=in_data[x]['type'], in_service=in_service)
             
             # Store user-friendly name for load
             load_name = in_data[x]['name']
@@ -2975,6 +3033,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 if tap_control_results:
                     result['tap_control_results'] = tap_control_results
                 
+                # Add any vm_pu validation warnings to the response
+                if hasattr(net, 'warnings') and net.warnings:
+                    result['warnings'] = net.warnings
+                
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 # OPTIMIZED: Removed indent=4, using compact separators for ~40% size reduction
@@ -4182,19 +4244,21 @@ def setup_default_cost_functions(net, cost_type='polynomial'):
                                   points=[[gen_min_p, gen_min_p * 15],    # [P_min, Cost_min]
                                          [gen_max_p, gen_max_p * 25]])    # [P_max, Cost_max]
 
-def safe_float(value):
-    """Convert value to float, replacing NaN with 0.0"""
+def safe_float(value, default=0.0):
+    """Convert value to float. Returns default for None, 'null', 'None', empty string, or invalid values."""
     import math
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return 0.0
+    if value is None or value == 'null' or value == 'None' or value == '':
+        return default
+    if isinstance(value, float) and math.isnan(value):
+        return default
     try:
         return float(value)
     except (ValueError, TypeError):
-        return 0.0
+        return default
 
 def safe_int(value, default=1):
-    """Convert value to int with default fallback"""
-    if value is None or value == 'None' or value == '':
+    """Convert value to int with default fallback. Handles 'null', 'None', empty string."""
+    if value is None or value == 'null' or value == 'None' or value == '':
         return default
     try:
         return int(value)
