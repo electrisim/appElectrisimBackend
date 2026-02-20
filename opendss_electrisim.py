@@ -3026,7 +3026,24 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
         execute_dss_command(f'New Monitor.mon_{dss_line_name} element=Line.{dss_line_name} terminal=1 mode=0')
 
     # ---- Step 4: Solve fundamental power flow first ---------------------------
+    # OpenDSS requires a converged fundamental power flow before switching to harmonics mode.
+    # See: https://opendss.epri.com/HarmonicFlowAnalysis.html
+    execute_dss_command('set Mode=Snapshot')
     execute_dss_command('solve')
+    
+    # Check convergence before proceeding to harmonics mode
+    converged = dss.Solution.Converged()
+    if not converged:
+        # Try Direct solution mode as fallback (often more robust for initialization)
+        execute_dss_command('set Mode=Direct')
+        execute_dss_command('solve')
+        converged = dss.Solution.Converged()
+    
+    if not converged:
+        return json.dumps({
+            "error": "Power flow did not converge. Cannot proceed with harmonic analysis. "
+                     "Check the circuit topology and parameters (e.g., loads, generators, voltage setpoints)."
+        }, separators=(',', ':'))
 
     # Read fundamental (h=1) bus voltages and line currents as baseline
     def _read_bus_voltages_ll_kv():
@@ -3112,11 +3129,13 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     
     for line_key, dss_line_name in LinesDict.items():
         try:
-            dss.Monitors.Name = f'mon_{dss_line_name}'
+            # OpenDSSDirect uses function calls, not assignments
+            mon_name = f'mon_{dss_line_name}'
+            dss.Monitors.Name(mon_name)
             
-            # Get number of channels and samples
-            num_channels = dss.Monitors.NumChannels
-            sample_count = dss.Monitors.SampleCount
+            # Get number of channels and samples (function calls for OpenDSSDirect)
+            num_channels = dss.Monitors.NumChannels()
+            sample_count = dss.Monitors.SampleCount()
             
             if sample_count == 0 or num_channels == 0:
                 print(f"[OpenDSS][HARMONICS] Monitor mon_{dss_line_name}: no data (channels={num_channels}, samples={sample_count})")
@@ -3237,8 +3256,42 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
         elif harmonic_text:
             base_result["opendss_commands"] = harmonic_text
 
+    def _to_native_json(obj):
+        """Convert numpy types to native Python for JSON serialization."""
+        try:
+            import numpy as np
+            if isinstance(obj, (np.floating, np.float32, np.float64, np.float16)):
+                return float(obj)
+            if isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    def _sanitize_nan(obj):
+        """Replace NaN/Inf with null so JSON is parseable by strict parsers (e.g. JSON.parse)."""
+        if isinstance(obj, dict):
+            return {k: _sanitize_nan(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize_nan(v) for v in obj]
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return obj
+        try:
+            import numpy as np
+            if isinstance(obj, (np.floating, np.float32, np.float64, np.float16)):
+                v = float(obj)
+                return None if (math.isnan(v) or math.isinf(v)) else v
+        except ImportError:
+            pass
+        return obj
+
     try:
-        return json.dumps(base_result, separators=(',', ':'))
+        sanitized = _sanitize_nan(base_result)
+        return json.dumps(sanitized, default=_to_native_json, allow_nan=False, separators=(',', ':'))
     except Exception as json_error:
         return json.dumps(
             {
