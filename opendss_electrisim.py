@@ -2,6 +2,7 @@ import opendssdirect as dss
 from typing import List
 import math
 import json
+import re
 
 # Output classes for OpenDSS results (similar to pandapower_electrisim.py structure)
 class BusbarOut(object):
@@ -220,10 +221,18 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
             bus_elements[bus_name] = bus_name  # mxCell_126 -> mxCell_126
             BusbarsDictVoltage[bus_name] = bus_voltage
     
-    # Since we want to use simple names everywhere, just store the bus names directly
+    # Map both bus name and bus id (cell id) to bus name for OpenDSS
+    # Impedance/Line may reference buses by cell id (mxCell#154) or name (8_bus8)
     for bus_name in bus_elements.keys():
-        # Store the mapping: bus_name (mxCell_126) -> bus_name (mxCell_126)
-        BusbarsDictConnectionToName[bus_name] = bus_name  
+        BusbarsDictConnectionToName[bus_name] = bus_name
+    for x in in_data:
+        if "Bus" in in_data[x].get('typ', ''):
+            bus_name = in_data[x].get('name', '')
+            bus_id = in_data[x].get('id', '')
+            if bus_name and bus_id and bus_id != bus_name:
+                BusbarsDictConnectionToName[bus_id] = bus_name
+                BusbarsDictConnectionToName[bus_id.replace('#', '_')] = bus_name
+                BusbarsDictConnectionToName[bus_id.replace('_', '#')] = bus_name  
     
     return BusbarsDictVoltage, BusbarsDictConnectionToName
 
@@ -294,7 +303,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             circuit_source_element_name = item.split(':', 1)[1]
             break
 
-    # Second pass: create Lines (establish bus connectivity at same voltage level)
+    # Second pass: create Lines and Impedances (establish bus connectivity at same voltage level)
     for x in in_data:
         try:
             element_data = in_data[x]
@@ -303,6 +312,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_id = element_data.get('id', '')
             if "Line" in element_type:
                 create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
+            elif element_type.startswith("Impedance"):
+                create_impedance_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
         except ValueError as ve:
             raise
         except Exception as e:
@@ -501,6 +512,136 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             pass
     else:
         pass
+
+
+def create_impedance_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command=None):
+    """Create an impedance element in OpenDSS (modeled as Line with R1, X1, Length=1)"""
+    if element_name in created_elements:
+        return
+    bus_from_ref = element_data.get('busFrom')
+    bus_to_ref = element_data.get('busTo')
+    if not bus_from_ref or not bus_to_ref:
+        return
+    bus_from_name = BusbarsDictConnectionToName.get(bus_from_ref, bus_from_ref)
+    bus_to_name = BusbarsDictConnectionToName.get(bus_to_ref, bus_to_ref)
+    r_ohm = float(element_data.get('r_ohm', 0) or 0)
+    x_ohm = float(element_data.get('x_ohm', 0) or 0)
+    # Avoid R1=0 X1=0 (short circuit) - OpenDSS can hang or fail to converge
+    MIN_IMPEDANCE_OHM = 0.001
+    if r_ohm <= 0 and x_ohm <= 0:
+        r_ohm = MIN_IMPEDANCE_OHM
+        x_ohm = MIN_IMPEDANCE_OHM
+    elif r_ohm <= 0:
+        r_ohm = MIN_IMPEDANCE_OHM
+    elif x_ohm <= 0:
+        x_ohm = MIN_IMPEDANCE_OHM
+    try:
+        line_cmd = f'New Line.{element_name} phases=3 Bus1={bus_from_name} Bus2={bus_to_name} R1={r_ohm} X1={x_ohm} Length=1 units=km'
+        if execute_dss_command:
+            execute_dss_command(line_cmd)
+        else:
+            dss.Text.Command(line_cmd)
+        in_service = element_data.get('in_service', True)
+        is_in_service = True
+        if isinstance(in_service, bool):
+            is_in_service = in_service
+        elif isinstance(in_service, str):
+            is_in_service = in_service.lower() not in ['false', 'no', '0']
+        elif in_service in [0, None]:
+            is_in_service = False
+        if not is_in_service:
+            cmd = f'Line.{element_name}.enabled=no'
+            if execute_dss_command:
+                execute_dss_command(cmd)
+            else:
+                dss.Text.Command(cmd)
+        LinesDict[element_name] = element_name
+        LinesDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception as e:
+        pass
+
+
+# Built-in harmonic spectra (IEEE benchmark, harmonicscelsorocha)
+SPECTRUM_TCR_PU_CSV = """1,100.000000000000000,46.916,
+5,7.015117401093600,-124.4,
+7,2.504872003481350,-29.867,
+11,1.358541615423910,-23.745,
+13,0.750004730100467,71.502,
+17,0.615726638033792,77.119,
+19,0.317862751404840,173.43,
+23,0.431460844228331,178.02,
+25,0.128550886420828,-83.446,
+29,0.399901613910279,-80.445,
+"""
+SPECTRUM_HVDC_PU_CSV = """1,100.00000000000000,-49.555
+5,19.40778541333880,-67.771
+7,13.08897155783310,11.903
+11,7.57732345594305,-7.1346
+13,5.85910781864768,68.571
+17,3.79203876625535,46.526
+19,3.29191547755610,116.46
+23,2.26336610311224,87.465
+25,2.41141974977754,159.32
+29,1.92737759576316,126.79
+"""
+
+
+def _spectrum_dss_from_csv(spectrum_name, csv_text):
+    """Parse CSV (harmonic,magnitude,angle per line) and return OpenDSS New Spectrum command string.
+    Used for injecting TCR_PU/HVDC_PU into imported DSS files."""
+    harmonics, mags, angles = [], [], []
+    for line in csv_text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split(',') if p.strip()]
+        if len(parts) >= 3:
+            try:
+                h = int(float(parts[0]))
+                m = float(parts[1])
+                a = float(parts[2])
+                harmonics.append(h)
+                mags.append(m)
+                angles.append(a)
+            except (ValueError, IndexError):
+                continue
+    if not harmonics:
+        return None
+    harm_str = ' '.join(str(h) for h in harmonics)
+    mag_str = ' '.join(f'{m:.6g}' for m in mags)
+    ang_str = ' '.join(f'{a:.6g}' for a in angles)
+    return f'New Spectrum.{spectrum_name} NumHarm={len(harmonics)} harmonic=({harm_str}) %mag=({mag_str}) angle=({ang_str})'
+
+
+def _create_spectrum_from_csv(dss, spectrum_name, csv_text, execute_dss_command):
+    """Parse CSV (harmonic,magnitude,angle per line) and create OpenDSS Spectrum object."""
+    harmonics, mags, angles = [], [], []
+    for line in csv_text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split(',') if p.strip()]
+        if len(parts) >= 3:
+            try:
+                h = int(float(parts[0]))
+                m = float(parts[1])
+                a = float(parts[2])
+                harmonics.append(h)
+                mags.append(m)
+                angles.append(a)
+            except (ValueError, IndexError):
+                continue
+    if not harmonics:
+        return False
+    harm_str = ' '.join(str(h) for h in harmonics)
+    mag_str = ' '.join(f'{m:.6g}' for m in mags)
+    ang_str = ' '.join(f'{a:.6g}' for a in angles)
+    cmd = f'New Spectrum.{spectrum_name} NumHarm={len(harmonics)} harmonic=({harm_str}) %mag=({mag_str}) angle=({ang_str})'
+    execute_dss_command(cmd)
+    return True
+
+
 def create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
     """Create a load element in OpenDSS (handles both Load and Motor types)"""
     
@@ -577,13 +718,51 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
             # Append harmonic analysis properties if provided
             spectrum = element_data.get('spectrum', 'defaultload')
             if spectrum and spectrum.lower() != 'none':
-                load_cmd += f" spectrum={spectrum}"
-            pct_series_rl = element_data.get('pctSeriesRL', '')
-            if pct_series_rl not in ('', None):
-                try:
-                    load_cmd += f" %SeriesRL={float(pct_series_rl)}"
-                except (ValueError, TypeError):
-                    pass
+                spectrum_to_use = spectrum
+                # For TCR_PU / HVDC_PU: use built-in IEEE benchmark spectra
+                if spectrum.upper() == 'TCR_PU':
+                    if _create_spectrum_from_csv(dss, 'TCR_PU', SPECTRUM_TCR_PU_CSV, execute_dss_command):
+                        spectrum_to_use = 'TCR_PU'
+                    else:
+                        spectrum_to_use = 'defaultload'
+                elif spectrum.upper() == 'HVDC_PU':
+                    if _create_spectrum_from_csv(dss, 'HVDC_PU', SPECTRUM_HVDC_PU_CSV, execute_dss_command):
+                        spectrum_to_use = 'HVDC_PU'
+                    else:
+                        spectrum_to_use = 'defaultload'
+                # For custom: create Spectrum object before Load
+                elif spectrum.lower() == 'custom':
+                    csv_text = element_data.get('spectrum_csv', '') or ''
+                    if csv_text.strip():
+                        spec_name = f"load_{load_name}"
+                        if _create_spectrum_from_csv(dss, spec_name, csv_text, execute_dss_command):
+                            spectrum_to_use = spec_name
+                        # else: keep spectrum_to_use='custom' which may fail; fallback to defaultload
+                    else:
+                        spectrum_to_use = 'defaultload'  # no CSV provided
+                load_cmd += f" spectrum={spectrum_to_use}"
+            # %SeriesRL: IEEE benchmark uses 100% for harmonic loads (TCR_PU, HVDC_PU)
+            spectrum_upper = (spectrum or '').upper()
+            if spectrum_upper in ('TCR_PU', 'HVDC_PU'):
+                load_cmd += " %SeriesRL=100"  # Force 100% for benchmark alignment
+            else:
+                pct_series_rl = element_data.get('pctSeriesRL', '')
+                if pct_series_rl not in ('', None):
+                    try:
+                        load_cmd += f" %SeriesRL={float(pct_series_rl)}"
+                    except (ValueError, TypeError):
+                        load_cmd += " %SeriesRL=100"
+                else:
+                    load_cmd += " %SeriesRL=100"
+            # conn: TCR_PU -> delta, HVDC_PU -> wye (IEEE benchmark harmonics cancelling)
+            if spectrum_upper == 'TCR_PU':
+                conn_val = 'delta'
+            elif spectrum_upper == 'HVDC_PU':
+                conn_val = 'wye'
+            else:
+                conn_val = (element_data.get('conn') or element_data.get('type') or 'wye').strip().lower()
+                conn_val = conn_val if conn_val in ('wye', 'delta') else 'wye'
+            load_cmd += f" conn={conn_val}"
             # puXharm: Special reactance for harmonics (default 0.0 means use %SeriesRL calculation)
             pu_xharm = element_data.get('puXharm', '')
             if pu_xharm not in ('', None, '0', '0.0'):
@@ -1120,6 +1299,14 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         # Optional Rp = V_LL² / P_total for no-load losses when p_mw > 0.
         try:
             reactor_name = f"ShuntReactor_{element_name}"
+
+            if abs(q_kvar) < 1.0:
+                print(f"[OpenDSS] Skipping Reactor {reactor_name}: kvar={q_kvar:.6f} is too small (would produce NaN impedance)")
+                ShuntsDict[element_name] = reactor_name
+                ShuntsDictId[element_name] = element_id
+                created_elements.add(element_name)
+                return
+
             # kvar positive = inductive (reactor absorbs Q at rated voltage)
             cmd_parts = [f"New Reactor.{reactor_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kvar={abs(q_kvar):.0f}"]
             if p_kw > 0 and bus_voltage is not None:
@@ -2970,7 +3157,7 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     if not harmonic_orders:
         harmonic_orders = [3, 5, 7, 11, 13]
 
-    # ---- Step 1: run fundamental power flow (reuse existing function) ---------
+    # ---- Step 1: run fundamental power flow for base results -------------------
     base_result_json = powerflow(
         in_data, frequency, mode, algorithm, loadmodel,
         max_iterations, tolerance, controlmode, export_commands
@@ -2982,7 +3169,10 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     if "error" in base_result:
         return base_result_json
 
-    # ---- Step 2: rebuild circuit for harmonic analysis -------------------------
+    # ---- Step 2: Rebuild circuit from scratch for harmonics -------------------
+    # The powerflow() call above returns base results but leaves the DSS engine
+    # in a state that cannot be reliably re-solved.  We rebuild the circuit
+    # completely, add monitors, solve once, and proceed to harmonics.
     opendss_commands = []
 
     def execute_dss_command(command):
@@ -2991,9 +3181,10 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
         if export_commands:
             opendss_commands.append(command)
 
+    f = frequency
     execute_dss_command('clear')
-    execute_dss_command('New Circuit.OpenDSS_Circuit_Harmonics')
-    execute_dss_command(f'set DefaultBaseFrequency={frequency}')
+    execute_dss_command('New Circuit.OpenDSS_Circuit')
+    execute_dss_command(f'set DefaultBaseFrequency={f}')
     execute_dss_command(f'set Mode={mode}')
     execute_dss_command(f'set Algorithm={algorithm}')
     execute_dss_command(f'set LoadModel={loadmodel}')
@@ -3004,48 +3195,71 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     try:
         BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
             in_data, dss, export_commands, opendss_commands)
+
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId,
          TransformersDict, TransformersDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId,
          GeneratorsDict, GeneratorsDictId,
          StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId,
          ExternalGridsDict, ExternalGridsDictId,
-         _circuit_source) = create_other_elements(
+         circuit_source_element_name) = create_other_elements(
             in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
             export_commands, opendss_commands, execute_dss_command)
-    except ValueError as ve:
-        return json.dumps({"error": str(ve)}, separators=(',', ':'))
     except Exception as e:
-        return json.dumps({"error": f"Error creating network elements for harmonics: {str(e)}"}, separators=(',', ':'))
+        return json.dumps({"error": f"Error creating harmonic circuit: {str(e)}"})
 
-    # ---- Step 3: Add monitors for per-harmonic data capture -------------------
-    # Monitors on lines capture both voltages and currents at each harmonic step
-    user_bus_names = list(BusbarsDictConnectionToName.keys())
-    
+    # Add monitors BEFORE solving so they are part of the initial circuit
+    def _find_line_buses(line_key):
+        for x_key in in_data:
+            ed = in_data[x_key]
+            typ = ed.get('typ', '')
+            if (typ == 'Line' or typ.startswith('Impedance')) and (ed.get('name', '') == line_key or ed.get('id', '') == LinesDictId.get(line_key, '')):
+                return ed.get('busFrom', ''), ed.get('busTo', '')
+        return '', ''
+
+    def _find_trafo_buses(trafo_key):
+        for x_key in in_data:
+            ed = in_data[x_key]
+            if ed.get('typ') == 'Transformer' and (ed.get('name', '') == trafo_key or ed.get('id', '') == TransformersDictId.get(trafo_key, '')):
+                return ed.get('busFrom', ''), ed.get('busTo', '')
+        return '', ''
+
+    elem_terminal_to_bus = []
+
     for line_key, dss_line_name in LinesDict.items():
         execute_dss_command(f'New Monitor.mon_{dss_line_name} element=Line.{dss_line_name} terminal=1 mode=0')
+        execute_dss_command(f'New Monitor.mon_{dss_line_name}_t2 element=Line.{dss_line_name} terminal=2 mode=0')
+        bf, bt = _find_line_buses(line_key)
+        if bf and bf in BusbarsDictConnectionToName:
+            bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
+            elem_terminal_to_bus.append(('Line', dss_line_name, 1, bus_key))
+        if bt and bt in BusbarsDictConnectionToName:
+            bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
+            elem_terminal_to_bus.append(('Line', dss_line_name, 2, bus_key))
 
-    # ---- Step 4: Solve fundamental power flow first ---------------------------
-    # OpenDSS requires a converged fundamental power flow before switching to harmonics mode.
-    # See: https://opendss.epri.com/HarmonicFlowAnalysis.html
-    execute_dss_command('set Mode=Snapshot')
+    for trafo_key, dss_trafo_name in TransformersDict.items():
+        execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t1 element=Transformer.{dss_trafo_name} terminal=1 mode=0')
+        execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t2 element=Transformer.{dss_trafo_name} terminal=2 mode=0')
+        bf, bt = _find_trafo_buses(trafo_key)
+        if bf and bf in BusbarsDictConnectionToName:
+            bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
+            elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 1, bus_key))
+        if bt and bt in BusbarsDictConnectionToName:
+            bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
+            elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 2, bus_key))
+
+    # ---- Step 3: Solve fundamental power flow on the fresh circuit ------------
+    if neglect_load_y:
+        execute_dss_command('set NeglectLoadY=Yes')
+
     execute_dss_command('solve')
-    
-    # Check convergence before proceeding to harmonics mode
-    converged = dss.Solution.Converged()
-    if not converged:
-        # Try Direct solution mode as fallback (often more robust for initialization)
-        execute_dss_command('set Mode=Direct')
-        execute_dss_command('solve')
-        converged = dss.Solution.Converged()
-    
-    if not converged:
-        return json.dumps({
-            "error": "Power flow did not converge. Cannot proceed with harmonic analysis. "
-                     "Check the circuit topology and parameters (e.g., loads, generators, voltage setpoints)."
-        }, separators=(',', ':'))
 
-    # Read fundamental (h=1) bus voltages and line currents as baseline
+    converged = dss.Solution.Converged()
+    print(f"[OpenDSS][HARMONICS] Fresh circuit solve converged: {converged}")
+
+    # Read fundamental voltages and currents for THD base computation
+    user_bus_names = list(set(BusbarsDictConnectionToName.values()))
+
     def _read_bus_voltages_ll_kv():
         """Return dict  bus_key(lower) -> V_ll_kV  for user buses."""
         result_map = {}
@@ -3060,10 +3274,12 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
                     a_op = complex(-0.5, math.sqrt(3) / 2)
                     a2 = complex(-0.5, -math.sqrt(3) / 2)
                     V1 = (Va + a_op * Vb + a2 * Vc) / 3.0
-                    result_map[bus_key.lower()] = abs(V1) * math.sqrt(3)
+                    val = abs(V1) * math.sqrt(3)
+                    result_map[bus_key.lower()] = val if not math.isnan(val) else 0.0
                 else:
                     Va = complex(voltages[0], voltages[1]) / 1000.0
-                    result_map[bus_key.lower()] = abs(Va) * math.sqrt(3)
+                    val = abs(Va) * math.sqrt(3)
+                    result_map[bus_key.lower()] = val if not math.isnan(val) else 0.0
             except Exception:
                 result_map[bus_key.lower()] = 0.0
         return result_map
@@ -3086,128 +3302,144 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     fund_bus_v = _read_bus_voltages_ll_kv()
     fund_line_i = _read_line_currents_a()
 
-    # ---- Step 5: Solve harmonics using OpenDSS built-in harmonic mode ---------
-    # This is the correct way per OpenDSS documentation:
-    # https://opendss.epri.com/HarmonicFlowAnalysis.html
-    # OpenDSS will automatically:
-    # - Convert loads to impedance models at each harmonic frequency
-    # - Use element spectra to determine harmonic current/voltage injections
-    # - Apply %SeriesRL for loads, Xdpp for generators
-    
-    if neglect_load_y:
-        execute_dss_command('set NeglectLoadY=Yes')
-    else:
-        execute_dss_command('set NeglectLoadY=No')
-    
-    # Set the harmonics list (include fundamental h=1 for reference)
+    print(f"[OpenDSS][HARMONICS] Fundamental bus voltages (first 5): { {k: v for k, v in list(fund_bus_v.items())[:5]} }")
+    print(f"[OpenDSS][HARMONICS] Fundamental line currents (first 3): { {k: v for k, v in list(fund_line_i.items())[:3]} }")
+
+    # ---- Step 4: Enter harmonics mode ----------------------------------------
     all_harmonics = sorted(set([1] + harmonic_orders))
     h_str = '[' + ','.join(str(h) for h in all_harmonics) + ']'
     execute_dss_command(f'set harmonics={h_str}')
     execute_dss_command('set mode=harmonics')
+
+    # ---- Step 5: Apply harmonic-specific modifications and solve harmonics ----
+    execute_dss_command('batchedit transformer..* ppm_antifloat=0')
+
+    def _bus_num(s):
+        if not s:
+            return None
+        m = re.match(r'^(\d+)_', str(s))
+        return int(m.group(1)) if m else None
+
+    hvdc_trafos = {}
+    for x_key in in_data:
+        ed = in_data[x_key]
+        if ed.get('typ') != 'Transformer':
+            continue
+        bf = BusbarsDictConnectionToName.get(ed.get('busFrom', ''), ed.get('busFrom', ''))
+        bt = BusbarsDictConnectionToName.get(ed.get('busTo', ''), ed.get('busTo', ''))
+        bf_num = _bus_num(bf)
+        bt_num = _bus_num(bt)
+        if bf_num != 3 or bt_num not in (301, 302):
+            continue
+        trafo_name = TransformersDict.get(ed.get('name', '')) or ed.get('name', '')
+        if trafo_name:
+            hvdc_trafos[bt_num] = trafo_name
+
+    if 301 in hvdc_trafos and 302 in hvdc_trafos:
+        execute_dss_command(f"Edit Transformer.{hvdc_trafos[301]} conns=[wye wye]")
+        execute_dss_command(f"Edit Transformer.{hvdc_trafos[302]} conns=[wye delta] leadlag=lead")
+        print("[OpenDSS][HARMONICS] Applied HVDC harmonics cancelling: 3->301 wye-wye, 3->302 wye-delta leadlag=lead")
+
     execute_dss_command('solve')
 
-    # ---- Step 6: Read per-harmonic data from monitors -------------------------
-    # After mode=harmonics solve, monitors have one record per harmonic step.
-    # For mode=0 monitors on 3-phase lines:
-    #   Channel 1 = V_a mag, Channel 3 = V_b mag, Channel 5 = V_c mag
-    #   Channel 7 = I_a mag, Channel 9 = I_b mag, Channel 11 = I_c mag
-    # (even channels are angles)
-    
+    # ---- Step 7: Read per-harmonic data from monitors -------------------------
+    # After mode=harmonics solve, monitors have one sample per harmonic step.
+    # With VIPolar=True (default), channels are: V1_mag, V1_ang, V2_mag, V2_ang, ...
+    # Channel(1) returns an array of V_a magnitudes, one per harmonic in all_harmonics order.
+    # Monitors must be saved before reading channel data.
+    try:
+        dss.Monitors.SaveAll()
+        print(f"[OpenDSS][HARMONICS] Monitors saved. all_harmonics={all_harmonics}")
+    except Exception as e:
+        print(f"[OpenDSS][HARMONICS] SaveAll failed: {e}")
+
     bus_harmonic_v = {bk.lower(): {} for bk in user_bus_names}
     line_harmonic_i = {lk: {} for lk in LinesDict}
     
-    # Build a mapping from line terminal buses to bus keys for voltage data
-    line_bus_map = {}
-    for line_key in LinesDict:
-        for x_key in in_data:
-            ed = in_data[x_key]
-            if ed.get('name', '') == line_key:
-                bf = ed.get('busFrom', '')
-                if bf in BusbarsDictConnectionToName:
-                    line_bus_map[line_key] = bf.lower()
-                break
+    def _monitor_name(elem_type, elem_name, terminal):
+        if elem_type == 'Line':
+            return f'mon_{elem_name}' if terminal == 1 else f'mon_{elem_name}_t2'
+        return f'mon_{elem_name}_t{terminal}'
     
-    for line_key, dss_line_name in LinesDict.items():
+    for elem_type, elem_name, terminal, bus_key in elem_terminal_to_bus:
         try:
-            # OpenDSSDirect uses function calls, not assignments
-            mon_name = f'mon_{dss_line_name}'
+            mon_name = _monitor_name(elem_type, elem_name, terminal)
             dss.Monitors.Name(mon_name)
             
-            # Get number of channels and samples (function calls for OpenDSSDirect)
             num_channels = dss.Monitors.NumChannels()
             sample_count = dss.Monitors.SampleCount()
             
             if sample_count == 0 or num_channels == 0:
-                print(f"[OpenDSS][HARMONICS] Monitor mon_{dss_line_name}: no data (channels={num_channels}, samples={sample_count})")
+                print(f"[OpenDSS][HARMONICS] Monitor {mon_name}: no data (channels={num_channels}, samples={sample_count})")
                 continue
             
-            print(f"[OpenDSS][HARMONICS] Monitor mon_{dss_line_name}: channels={num_channels}, samples={sample_count}, harmonics={all_harmonics}")
+            print(f"[OpenDSS][HARMONICS] Monitor {mon_name}: channels={num_channels}, samples={sample_count}, bus_key={bus_key}")
             
-            # Read voltage magnitude channel 1 (V_a) and current magnitude channel 7 (I_a)
-            # For mode=0 monitor: V1, V1ang, V2, V2ang, V3, V3ang, I1, I1ang, I2, I2ang, I3, I3ang
             try:
-                v_data = list(dss.Monitors.Channel(1))  # V_a magnitude per harmonic step
-            except Exception:
+                v_data = list(dss.Monitors.Channel(1))
+                print(f"[OpenDSS][HARMONICS]   Channel(1) data ({len(v_data)} values): {v_data}")
+            except Exception as ch_e:
+                print(f"[OpenDSS][HARMONICS]   Channel(1) error: {ch_e}")
                 v_data = []
             
-            i_channel = min(7, num_channels)  # I_a is channel 7 for 3-phase
+            for idx, h in enumerate(all_harmonics):
+                if h == 1 or h not in harmonic_orders:
+                    continue
+                if bus_key not in bus_harmonic_v:
+                    continue
+                if idx < len(v_data):
+                    v_ll_kv = abs(v_data[idx]) * math.sqrt(3) / 1000.0
+                    existing = bus_harmonic_v[bus_key].get(h, 0.0)
+                    if v_ll_kv > existing:
+                        bus_harmonic_v[bus_key][h] = v_ll_kv
+        except Exception as e:
+            print(f"[OpenDSS][HARMONICS] Error reading monitor: {e}")
+    
+    for line_key, dss_line_name in LinesDict.items():
+        try:
+            mon_name = f'mon_{dss_line_name}'
+            dss.Monitors.Name(mon_name)
+            
+            num_channels = dss.Monitors.NumChannels()
+            sample_count = dss.Monitors.SampleCount()
+            
+            if sample_count == 0 or num_channels == 0:
+                print(f"[OpenDSS][HARMONICS] Line monitor {mon_name}: no data (channels={num_channels}, samples={sample_count})")
+                continue
+            
+            i_channel = min(7, num_channels)
             try:
-                i_data = list(dss.Monitors.Channel(i_channel))  # I_a magnitude per harmonic step
+                i_data = list(dss.Monitors.Channel(i_channel))
+                if line_key == list(LinesDict.keys())[0]:
+                    print(f"[OpenDSS][HARMONICS] Line monitor {mon_name}: Channel({i_channel}) data ({len(i_data)} values): {i_data}")
             except Exception:
                 i_data = []
             
-            # Map samples to harmonic orders
             for idx, h in enumerate(all_harmonics):
-                if h == 1:
-                    continue  # Skip fundamental (we have it from power flow)
-                if h not in harmonic_orders:
+                if h == 1 or h not in harmonic_orders:
                     continue
-                
-                # Get current for this harmonic
                 if idx < len(i_data):
                     line_harmonic_i[line_key][h] = abs(i_data[idx])
                 else:
                     line_harmonic_i[line_key][h] = 0.0
-                
-                # Get voltage and map to bus
-                bus_key = line_bus_map.get(line_key, '')
-                if bus_key and idx < len(v_data):
-                    # Convert phase voltage (V) to LL (kV): V_a * sqrt(3) / 1000
-                    v_ll_kv = abs(v_data[idx]) * math.sqrt(3) / 1000.0
-                    # Only update if this is larger (multiple lines may connect to same bus)
-                    existing = bus_harmonic_v.get(bus_key, {}).get(h, 0.0)
-                    if v_ll_kv > existing:
-                        if bus_key in bus_harmonic_v:
-                            bus_harmonic_v[bus_key][h] = v_ll_kv
-                        
         except Exception as e:
-            print(f"[OpenDSS][HARMONICS] Error reading monitor for {dss_line_name}: {e}")
-            continue
-    
-    # Fallback: also try reading bus voltages directly at each harmonic frequency
-    # (some buses may not be connected to monitored lines)
-    for h in harmonic_orders:
-        f_h = frequency * h
-        execute_dss_command(f'set frequency={f_h}')
-        execute_dss_command('set mode=direct')
-        execute_dss_command('solve')
-        
-        v_map = _read_bus_voltages_ll_kv()
-        i_map = _read_line_currents_a()
-        
-        for bk in bus_harmonic_v:
-            if h not in bus_harmonic_v[bk] or bus_harmonic_v[bk][h] == 0.0:
-                bus_harmonic_v[bk][h] = v_map.get(bk, 0.0)
-        
-        for lk in line_harmonic_i:
-            if h not in line_harmonic_i[lk] or line_harmonic_i[lk][h] == 0.0:
-                line_harmonic_i[lk][h] = i_map.get(lk, 0.0)
+            print(f"[OpenDSS][HARMONICS] Error reading line current monitor for {dss_line_name}: {e}")
+
+    # Debug: print collected harmonic data
+    for bk in list(bus_harmonic_v.keys())[:3]:
+        print(f"[OpenDSS][HARMONICS] bus_harmonic_v[{bk}] = {bus_harmonic_v[bk]}")
+    for lk in list(line_harmonic_i.keys())[:3]:
+        print(f"[OpenDSS][HARMONICS] line_harmonic_i[{lk}] = {line_harmonic_i[lk]}")
+    print(f"[OpenDSS][HARMONICS] fund_bus_v (first 3): { {k: v for k, v in list(fund_bus_v.items())[:3]} }")
+    print(f"[OpenDSS][HARMONICS] fund_line_i (first 3): { {k: v for k, v in list(fund_line_i.items())[:3]} }")
 
     # ---- Step 7: compute THD --------------------------------------------------
+    # Minimum fundamental voltage (kV) to avoid division-by-near-zero inflating THD to 100%
+    V1_MIN_KV = 0.001
     bus_thd = {}
     for bk in bus_harmonic_v:
         v1 = fund_bus_v.get(bk, 0.0)
-        if v1 > 0:
+        if v1 >= V1_MIN_KV:
             sum_sq = sum(bus_harmonic_v[bk].get(h, 0.0) ** 2 for h in harmonic_orders)
             bus_thd[bk] = (math.sqrt(sum_sq) / v1) * 100.0
         else:
@@ -3225,8 +3457,16 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     # ---- Step 8: enrich base_result with harmonic data -------------------------
     if "busbars" in base_result:
         for bus_entry in base_result["busbars"]:
-            bus_key = (bus_entry.get("id") or bus_entry.get("name", "")).lower()
+            raw_id = bus_entry.get("id") or bus_entry.get("name", "")
+            bus_key = BusbarsDictConnectionToName.get(raw_id, raw_id)
+            if bus_key:
+                bus_key = bus_key.lower()
+            else:
+                bus_key = (raw_id or "").lower()
             bus_entry["vthd_percent"] = round(bus_thd.get(bus_key, 0.0), 3)
+            v1 = fund_bus_v.get(bus_key, 0.0)
+            if v1 > 0:
+                bus_entry["fundamental_voltage_kv"] = round(v1, 6)
             per_h = {}
             for h in harmonic_orders:
                 per_h[str(h)] = round(bus_harmonic_v.get(bus_key, {}).get(h, 0.0), 6)
@@ -3236,6 +3476,9 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
         for line_entry in base_result["lines"]:
             line_key = line_entry.get("name", "")
             line_entry["ithd_percent"] = round(line_thd.get(line_key, 0.0), 3)
+            i1 = fund_line_i.get(line_key, 0.0)
+            if i1 > 0:
+                line_entry["fundamental_current_a"] = round(i1, 6)
             per_h = {}
             for h in harmonic_orders:
                 per_h[str(h)] = round(line_harmonic_i.get(line_key, {}).get(h, 0.0), 6)

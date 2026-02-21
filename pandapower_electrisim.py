@@ -565,7 +565,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     
     # Run power flow
     lines.append("# Run power flow")
-    lines.append(f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={calculate_voltage_angles}, init='{init}')")
+    # Format calculate_voltage_angles: string values like 'auto' need quotes in generated code
+    cva_str = repr(calculate_voltage_angles)
+    lines.append(f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={cva_str}, init='{init}')")
     lines.append("")
     
     # Add results printing

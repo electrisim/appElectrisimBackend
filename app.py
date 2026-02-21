@@ -608,13 +608,40 @@ def import_opendss():
         import opendssdirect as dss
         import json as _json
         import os
+        import re
+
+        # Inject TCR_PU and HVDC_PU spectrum definitions if referenced but not defined
+        dss_text_to_use = dss_text
+        needs_tcr = bool(re.search(r'spectrum\s*=\s*TCR_PU', dss_text, re.IGNORECASE))
+        needs_hvdc = bool(re.search(r'spectrum\s*=\s*HVDC_PU', dss_text, re.IGNORECASE))
+        has_tcr = bool(re.search(r'New\s+Spectrum\.TCR_PU\b', dss_text, re.IGNORECASE))
+        has_hvdc = bool(re.search(r'New\s+Spectrum\.HVDC_PU\b', dss_text, re.IGNORECASE))
+        if (needs_tcr and not has_tcr) or (needs_hvdc and not has_hvdc):
+            inj = []
+            if needs_tcr and not has_tcr:
+                cmd = opendss_electrisim._spectrum_dss_from_csv('TCR_PU', opendss_electrisim.SPECTRUM_TCR_PU_CSV)
+                if cmd:
+                    inj.append('! Injected TCR_PU spectrum (IEEE benchmark)')
+                    inj.append(cmd)
+            if needs_hvdc and not has_hvdc:
+                cmd = opendss_electrisim._spectrum_dss_from_csv('HVDC_PU', opendss_electrisim.SPECTRUM_HVDC_PU_CSV)
+                if cmd:
+                    inj.append('! Injected HVDC_PU spectrum (IEEE benchmark)')
+                    inj.append(cmd)
+            if inj:
+                # Insert after first "Clear" so spectra exist before Loads
+                inj_block = '\n'.join(inj) + '\n\n'
+                if re.match(r'^\s*Clear\s*$', dss_text, re.MULTILINE | re.IGNORECASE):
+                    dss_text_to_use = re.sub(r'^(\s*Clear\s*)$', r'\1\n\n' + inj_block, dss_text, count=1, flags=re.MULTILINE | re.IGNORECASE)
+                else:
+                    dss_text_to_use = inj_block + dss_text
 
         # Create temp file without auto-delete (Windows issue)
         fd, temp_path = tempfile.mkstemp(suffix='.dss', text=True)
         try:
             # Write the DSS content
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(dss_text)
+                f.write(dss_text_to_use)
             
             # Now load it in OpenDSS
             dss.Text.Command("Clear")
@@ -624,13 +651,15 @@ def import_opendss():
             dss.Solution.Solve()
 
             # Build a complete model JSON with all OpenDSS elements
+            import math
             bus_names = dss.Circuit.AllBusNames()
             buses = []
             for idx, bname in enumerate(bus_names):
                 dss.Circuit.SetActiveBus(bname)
                 kv_base = dss.Bus.kVBase()
-                # Name and vn_kv follow the pandapower schema used on frontend
-                buses.append([bname, float(kv_base) if kv_base is not None else 0.0, "b", True])
+                # OpenDSS kVBase is line-to-neutral; Electrisim vn_kv expects line-to-line (pandapower convention)
+                vn_kv_ll = float(kv_base) * math.sqrt(3) if kv_base is not None else 0.0
+                buses.append([bname, vn_kv_ll, "b", True])
 
             # Lines
             line_names = dss.Lines.AllNames()
@@ -674,6 +703,60 @@ def import_opendss():
                     ]
                     lines.append(line_row)
 
+            # Parse transformer connection/vector group from DSS text
+            import re
+            _trafo_vecgrp_cache = {}
+            trafo_blocks = re.split(r'(?=New\s+Transformer\.)', dss_text, flags=re.IGNORECASE)
+            for blk in trafo_blocks:
+                m = re.match(r'New\s+Transformer\.(\w+)', blk, re.IGNORECASE)
+                if not m:
+                    continue
+                tname = m.group(1)
+                info = {}
+                conns_m = re.search(r'conns\s*=\s*\[([^\]]+)\]', blk, re.IGNORECASE)
+                if conns_m:
+                    info['conns'] = [c.strip().lower() for c in conns_m.group(1).split(',')]
+                ang1_m = re.search(r'ANG1[^\d]*(-?\d+(?:\.\d+)?)', blk, re.IGNORECASE)
+                if ang1_m:
+                    info['ang1'] = float(ang1_m.group(1))
+                vecgrp_m = re.search(r'\(record\s+in\s+table\s+is\s+"([^"]+)"\)', blk, re.IGNORECASE)
+                if vecgrp_m:
+                    info['vecgrp'] = vecgrp_m.group(1).strip()
+                leadlag_m = re.search(r'leadlag\s*=\s*(\w+)', blk, re.IGNORECASE)
+                if leadlag_m:
+                    info['leadlag'] = leadlag_m.group(1).strip().lower()
+                if info:
+                    _trafo_vecgrp_cache[tname] = info
+
+            def _opendss_vecgrp_to_iec(tname):
+                """Map OpenDSS conns/leadlag/ANG1 to IEC vector group."""
+                info = _trafo_vecgrp_cache.get(tname, {})
+                if info.get('vecgrp'):
+                    return info['vecgrp']
+                conns = info.get('conns', ['wye', 'wye'])
+                ang1 = info.get('ang1', 0.0)
+                leadlag = info.get('leadlag', 'lead')
+                hv_conn = conns[0] if len(conns) > 0 else 'wye'
+                lv_conn = conns[1] if len(conns) > 1 else 'wye'
+                # Map to IEC vector groups
+                if hv_conn == 'wye' and lv_conn == 'wye':
+                    return 'YNyn0' if abs(ang1) < 1 else ('YNyn6' if ang1 > 0 else 'YNyn0')
+                if hv_conn == 'wye' and lv_conn == 'delta':
+                    if abs(ang1 + 30) < 1 or leadlag == 'lead':
+                        return 'YNd1'
+                    if abs(ang1 - 30) < 1 or leadlag == 'lag':
+                        return 'YNd11'
+                    return 'YNd1'
+                if hv_conn == 'delta' and lv_conn == 'wye':
+                    if abs(ang1 + 30) < 1 or leadlag == 'lead':
+                        return 'Dyn11'
+                    if abs(ang1 - 30) < 1 or leadlag == 'lag':
+                        return 'Dyn1'
+                    return 'Dyn11'
+                if hv_conn == 'delta' and lv_conn == 'delta':
+                    return 'Dd0' if abs(ang1) < 1 else 'Dd6'
+                return 'Dyn11'
+
             # Transformers
             trafo_names = dss.Transformers.AllNames()
             trafos = []
@@ -701,13 +784,34 @@ def import_opendss():
                             except ValueError:
                                 continue
                             
-                            # [name, std_type, hv_bus, lv_bus, sn_mva, vn_hv_kv, vn_lv_kv, vk_percent, vkr_percent, pfe_kw, i0_percent, shift_degree, ...]
+                            vector_group = _opendss_vecgrp_to_iec(tname)
+                            
+                            # [name, std_type, hv_bus, lv_bus, sn_mva, vn_hv_kv, vn_lv_kv, vk_percent, vkr_percent, pfe_kw, i0_percent, shift_degree, ..., vector_group]
                             trafo_row = [
                                 tname, "", hv_idx, lv_idx, sn_mva, hv_kv, lv_kv,
                                 6.0, 1.0, 0.0, 0.0, 0.0,  # Default impedance values
-                                None, 0, 0, 0, 0.0, 0.0, 0, False, 1, 1.0, True
+                                None, 0, 0, 0, 0.0, 0.0, 0, False, 1, 1.0, True,
+                                vector_group
                             ]
                             trafos.append(trafo_row)
+
+            # Parse spectrum definitions from DSS text for custom spectra
+            import re
+            _SPECTRUM_TEMPLATES = {'defaultload', 'defaultgen', 'defaultvsource', 'linear', 'none'}
+            _spectrum_cache = {}
+            for spec_match in re.finditer(
+                r'New\s+Spectrum\.(\w+).*?harmonic=\s*\(([^)]+)\).*?%mag=\s*\(([^)]+)\).*?angle=\s*\(([^)]+)\)',
+                dss_text, re.IGNORECASE | re.DOTALL
+            ):
+                spec_name, harm_s, mag_s, ang_s = spec_match.groups()
+                try:
+                    harms = [int(x.strip()) for x in harm_s.split()]
+                    mags = [float(x.strip()) for x in mag_s.split()]
+                    angs = [float(x.strip()) for x in ang_s.split()]
+                    csv_lines = [f'{h},{m},{a}' for h, m, a in zip(harms, mags, angs)]
+                    _spectrum_cache[spec_name.lower()] = '\n'.join(csv_lines)
+                except (ValueError, TypeError):
+                    pass
 
             # Loads
             load_names = dss.Loads.AllNames()
@@ -727,8 +831,55 @@ def import_opendss():
                         except ValueError:
                             continue
                         
-                        # [name, bus, p_mw, q_mvar, const_z_percent, const_i_percent, sn_mva, scaling, type]
-                        load_row = [lname, bus_idx, kw/1000.0, kvar/1000.0, 0.0, 0.0, None, 1.0, "wye"]
+                        # Harmonic parameters
+                        try:
+                            spec_name = (dss.Loads.Spectrum() or 'defaultload').strip() or 'defaultload'
+                        except (TypeError, AttributeError):
+                            spec_name = 'defaultload'
+                        spec_lower = spec_name.lower()
+                        pct_series_rl = 100.0
+                        try:
+                            pct_series_rl = float(dss.Loads.puSeriesRL())
+                        except (TypeError, AttributeError):
+                            pass
+                        pu_xharm = 0.0
+                        xr_harm = 6.0
+                        try:
+                            dss.Circuit.SetActiveClass('Load')
+                            dss.ActiveClass.Name(lname)
+                            pv = dss.Properties.Value('puXharm')
+                            if pv:
+                                pu_xharm = float(pv)
+                            xv = dss.Properties.Value('XRharm')
+                            if xv:
+                                xr_harm = float(xv)
+                        except (TypeError, AttributeError, ValueError):
+                            pass
+                        conn_load = 'wye'
+                        try:
+                            dss.Circuit.SetActiveClass('Load')
+                            dss.ActiveClass.Name(lname)
+                            cv = dss.Properties.Value('conn')
+                            if cv:
+                                conn_load = str(cv).strip().lower()
+                        except (TypeError, AttributeError):
+                            pass
+                        
+                        if spec_lower in _SPECTRUM_TEMPLATES:
+                            spectrum = 'Linear' if spec_lower == 'linear' else spec_lower
+                            spectrum_csv = ''
+                        elif spec_lower in ('tcr_pu', 'hvdc_pu'):
+                            spectrum = spec_name  # preserve TCR_PU or HVDC_PU
+                            spectrum_csv = ''
+                        else:
+                            spectrum = 'custom'
+                            spectrum_csv = _spectrum_cache.get(spec_lower, '')
+                        
+                        # [name, bus, p_mw, q_mvar, const_z, const_i, sn_mva, scaling, type, spectrum, spectrum_csv, pctSeriesRL, puXharm, XRharm, conn]
+                        load_row = [
+                            lname, bus_idx, kw/1000.0, kvar/1000.0, 0.0, 0.0, None, 1.0, "wye",
+                            spectrum, spectrum_csv, pct_series_rl, pu_xharm, xr_harm, conn_load
+                        ]
                         loads.append(load_row)
 
             # Generators (Vsources in OpenDSS)
@@ -765,8 +916,22 @@ def import_opendss():
             # Reactors (inductors) - these connect buses and are used in filters
             reactor_names = dss.Reactors.AllNames()
             impedances = []
+            # Read base MVA from OpenDSS circuit for per-unit conversion
+            base_mva = 100.0
+            try:
+                if hasattr(dss.Circuit, 'BaseMVA'):
+                    base_mva = float(dss.Circuit.BaseMVA())
+                else:
+                    # Fallback: parse from DSS text (e.g. baseMVA=100.0 in Circuit or Vsource)
+                    m = re.search(r'baseMVA\s*=\s*([\d.]+)', dss_text, re.IGNORECASE)
+                    if m:
+                        base_mva = float(m.group(1))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            if base_mva <= 0:
+                base_mva = 100.0
             if reactor_names:
-                print(f"Found {len(reactor_names)} reactors in OpenDSS model")
+                print(f"Found {len(reactor_names)} reactors in OpenDSS model (baseMVA={base_mva})")
                 for rname in reactor_names:
                     dss.Circuit.SetActiveElement(f"Reactor.{rname}")
                     bus_names_reactor = dss.CktElement.BusNames()
@@ -787,10 +952,15 @@ def import_opendss():
                             print(f"  WARNING: Skipping reactor {rname}, bus not found: {ve}")
                             continue
                         
-                        # Convert to impedance format for pandapower
+                        # Convert R and X from Ohms to per-unit
+                        # Z_base = V_base^2 / S_base (V_base in kV, S_base in MVA)
+                        vn_kv = float(buses[from_idx][1]) if buses[from_idx][1] else 1.0
+                        z_base = (vn_kv ** 2) / base_mva if vn_kv > 0 else 1.0
+                        r_pu = float(r_ohm) / z_base
+                        x_pu = float(x_ohm) / z_base
+                        
                         # [name, from_bus, to_bus, rft_pu, xft_pu, rtf_pu, xtf_pu, sn_mva, in_service]
-                        # For now use ohm values directly (frontend can handle it)
-                        impedance_row = [rname, from_idx, to_idx, r_ohm, x_ohm, r_ohm, x_ohm, 100.0, True]
+                        impedance_row = [rname, from_idx, to_idx, r_pu, x_pu, r_pu, x_pu, base_mva, True]
                         impedances.append(impedance_row)
                 
                 print(f"Total impedances extracted: {len(impedances)}")
