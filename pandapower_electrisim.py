@@ -908,6 +908,11 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
+            # Get slack parameter (default to False if not specified)
+            slack = False
+            if 'slack' in in_data[x]:
+                slack = bool(in_data[x]['slack']) if isinstance(in_data[x]['slack'], bool) else (str(in_data[x]['slack']).lower() == 'true')
+            
             # Validate and auto-correct vm_pu for generator
             gen_vm_pu = safe_float(in_data[x]['vm_pu'])
             gen_bus_vn_kv = net.bus.loc[bus_idx, 'vn_kv'] if bus_idx is not None else None
@@ -942,7 +947,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 )
             
             pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=gen_vm_pu, sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0),
-                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']), in_service=in_service)    #, power_station_trafo=in_data[x]['power_station_trafo']
+                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']), in_service=in_service, slack=slack)    #, power_station_trafo=in_data[x]['power_station_trafo']
             
             # Store user-friendly name for generator
             gen_name = in_data[x]['name']

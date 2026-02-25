@@ -570,8 +570,14 @@ def import_pandapower():
         
         try:
             exec(code, global_env, local_env)
+        except (UserWarning, Exception) as run_err:
+            # Power flow may fail (e.g. no reference bus) - for import we only need the net structure
+            net = local_env.get('net') or global_env.get('net')
+            if net is not None and 'reference bus' in str(run_err).lower():
+                pass  # Use net anyway; import does not require power flow results
+            else:
+                raise run_err
         finally:
-            # Restore stdout
             sys.stdout = old_stdout
         
         net = local_env.get('net') or global_env.get('net')
