@@ -1,3 +1,4 @@
+import sys
 import pandapower as pp
 import pandapower.contingency as contingency
 import pandapower.shortcircuit as sc
@@ -590,7 +591,7 @@ def create_busbars(in_data, net):
     # Check if DC bus functionality is available in this pandapower version
     has_dc_bus_support = hasattr(pp, 'create_bus_dc')
     if not has_dc_bus_support:
-        print(f"⚠️ Note: pandapower version {pp.__version__} does not support DC buses (create_bus_dc).")
+        print(f"Note: pandapower version {pp.__version__} does not support DC buses (create_bus_dc).")
         print("   DC Bus, VSC, and B2B VSC elements will be skipped.")
         print("   You can still use 'DC Line' which connects two AC buses directly.")
         print("   Upgrade to pandapower 3.1+ for full DC grid support.")
@@ -1721,6 +1722,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
             #pandapower - rozpływ mocy
             # Initialize tap_control_results before try block so it's accessible in else block
             tap_control_results = []
+
+            # Redirect stdout/stderr to a safe UTF-8 buffer during power flow
+            # to prevent UnicodeEncodeError on Windows (cp1252 can't handle emoji/Unicode
+            # characters that pandapower or our code may print)
+            import io as _io
+            _orig_stdout = sys.stdout
+            _orig_stderr = sys.stderr
+            _safe_buf = _io.StringIO()
+            sys.stdout = _safe_buf
+            sys.stderr = _safe_buf
             
             try:
                 # Check for isolated buses before running power flow
@@ -1730,7 +1741,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 # Add DiscreteTapControl for two-winding transformers when "Include controllers" is enabled
                 if run_control and getattr(net, 'trafo_discrete_tap_controllers', None):
-                    print(f"🎛️ Creating DiscreteTapControl for {len(net.trafo_discrete_tap_controllers)} transformers")
+                    print(f"Creating DiscreteTapControl for {len(net.trafo_discrete_tap_controllers)} transformers")
                     for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in net.trafo_discrete_tap_controllers:
                         try:
                             # Use the control_side from frontend (which bus voltage to monitor/control)
@@ -1748,16 +1759,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             
                             # Check if tap changer is properly configured
                             if tap_min >= tap_max:
-                                print(f"    ⚠️ WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
+                                print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
                             if tap_step_percent == 0:
-                                print(f"    ⚠️ WARNING: tap_step_percent is 0 - controller will not work!")
+                                print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
                             
                             # Warning if tap is already at limit
                             if tap_pos == tap_max:
-                                print(f"    ⚠️ WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
+                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
                                 print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
                             elif tap_pos == tap_min:
-                                print(f"    ⚠️ WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
+                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
                                 print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
                             
                             # Create controller with side parameter
@@ -1771,10 +1782,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                     vm_lower_pu=vm_lower_pu,
                                     vm_upper_pu=vm_upper_pu
                                 )
-                                print(f"    ✅ Controller created with 'tid' parameter (index={ctrl.index})")
+                                print(f"    Controller created with 'tid' parameter (index={ctrl.index})")
                             except TypeError as te:
                                 # Try alternative parameter name
-                                print(f"    ⚠️ 'tid' failed, trying 'element_index': {te}")
+                                print(f"    'tid' failed, trying 'element_index': {te}")
                                 ctrl = control.DiscreteTapControl(
                                     net=net,
                                     element_index=trafo_idx,
@@ -1782,15 +1793,15 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                     vm_lower_pu=vm_lower_pu,
                                     vm_upper_pu=vm_upper_pu
                                 )
-                                print(f"    ✅ Controller created with 'element_index' parameter (index={ctrl.index})")
+                                print(f"    Controller created with 'element_index' parameter (index={ctrl.index})")
                         except Exception as ctrl_err:
-                            print(f"    ❌ Failed to create controller: {ctrl_err}")
+                            print(f"    Failed to create controller: {ctrl_err}")
                             import traceback
                             traceback.print_exc()
                 
                 # Log controller status before power flow
                 if run_control and hasattr(net, 'controller') and not net.controller.empty:
-                    print(f"🎛️ Running power flow WITH controllers (run_control=True)")
+                    print(f"Running power flow WITH controllers (run_control=True)")
                     print(f"   Controllers in net: {len(net.controller)}")
                     print(net.controller[['object', 'in_service']])
                     
@@ -1800,7 +1811,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         initial_tap_positions[idx] = net.trafo.at[idx, 'tap_pos']
                     print(f"   Initial tap positions: {initial_tap_positions}")
                 else:
-                    print(f"⚡ Running power flow WITHOUT controllers (run_control={run_control})")
+                    print(f"Running power flow WITHOUT controllers (run_control={run_control})")
                     initial_tap_positions = {}
                 
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init, run_control=run_control)
@@ -1811,10 +1822,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     for idx, initial_pos in initial_tap_positions.items():
                         final_pos = net.trafo.at[idx, 'tap_pos']
                         if initial_pos != final_pos:
-                            print(f"   📊 Tap changed: Trafo {idx}: {initial_pos} → {final_pos}")
+                            print(f"   Tap changed: Trafo {idx}: {initial_pos} -> {final_pos}")
                             changed = True
                     if not changed:
-                        print(f"   ⚠️ WARNING: No tap positions changed during controlled power flow!")
+                        print(f"   WARNING: No tap positions changed during controlled power flow!")
                 
                 # Log transformer tap positions after power flow (only for controlled transformers)
                 # Also build tap_control_results for frontend display
@@ -1823,7 +1834,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     # Get list of transformer indices that have controllers
                     controlled_trafo_indices = set(ctrl_data[0] for ctrl_data in net.trafo_discrete_tap_controllers)
                     
-                    print(f"🔧 Controlled transformer tap positions after power flow:")
+                    print(f"Controlled transformer tap positions after power flow:")
                     for idx in net.trafo.index:
                         if idx not in controlled_trafo_indices:
                             continue  # Skip transformers without controllers
@@ -1849,7 +1860,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             
                             # Check if voltage is within limits
                             in_limits = vm_lower <= controlled_vm <= vm_upper
-                            status = "✅ IN LIMITS" if in_limits else "❌ OUT OF LIMITS"
+                            status = "IN LIMITS" if in_limits else "OUT OF LIMITS"
                             
                             # Check if tap is at limit
                             at_limit = ""
@@ -1871,7 +1882,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             if not in_limits and (tap_pos == tap_max or tap_pos == tap_min):
                                 voltage_gap = abs(controlled_vm - vm_upper) if controlled_vm > vm_upper else abs(vm_lower - controlled_vm)
                                 taps_needed = int(voltage_gap / (tap_step / 100) / controlled_vm) + 1
-                                print(f"      💡 Need ~{taps_needed} more tap positions OR increase tap_step_percent to reach target")
+                                print(f"      Need ~{taps_needed} more tap positions OR increase tap_step_percent to reach target")
                             
                             # Build result object for frontend
                             # Convert numpy types to native Python types for JSON serialization
@@ -1894,6 +1905,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             })
                 
             except Exception as e:
+                # Restore stdout/stderr before handling error
+                sys.stdout = _orig_stdout
+                sys.stderr = _orig_stderr
                 
                 # Initialize diagnostic response
                 diagnostic_response = {
@@ -1993,7 +2007,6 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 try:
                     # Capture the diagnostic output from stdout
                     import io
-                    import sys
                     
                     captured_output = io.StringIO()
                     old_stdout = sys.stdout
@@ -2091,7 +2104,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Convert any remaining numpy types
                 diagnostic_response = convert_numpy_types(diagnostic_response)
                 return json.dumps(diagnostic_response, separators=(',', ':'))
-            else:                              
+            else:
+                # Restore stdout/stderr after successful power flow
+                sys.stdout = _orig_stdout
+                sys.stderr = _orig_stderr
                 
                 class BusbarOut(object):
                     def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float, q_p: float):          

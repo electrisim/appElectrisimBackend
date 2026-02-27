@@ -171,6 +171,14 @@ class PVSystemsOut(object):
 # Frontend sends simple mxCell_ names (mxCell_126, mxCell_129, etc.)
 # Frontend now sends bus names in the correct format (mxCell_126)
 # OpenDSS may convert bus names to 
+def _sanitize_opendss_name(name):
+    """Replace spaces with underscores so the name is safe in OpenDSS commands.
+    OpenDSS uses spaces as parameter delimiters, so any space inside a bus or
+    element name breaks the command string."""
+    if name is None:
+        return name
+    return name.replace(' ', '_')
+
 def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
     """Create busbars in OpenDSS circuit - Let OpenDSS handle bus creation automatically  when elements are connected"""
     BusbarsDictVoltage = {}  
@@ -183,15 +191,15 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
     bus_elements = {}
     for x in in_data:         
         if "Bus" in in_data[x]['typ']:
-            # Frontend now sends bus names in the correct format (mxCell_126)
-            bus_name = in_data[x]['name']  # This is already mxCell_126
-            bus_id = in_data[x].get('id', bus_name)  # Get ID for error messages
+            bus_name_raw = in_data[x]['name']
+            bus_name = _sanitize_opendss_name(bus_name_raw)
+            bus_id = in_data[x].get('id', bus_name_raw)  # Get ID for error messages
             bus_voltage_raw = in_data[x].get('vn_kv', None)
             
             # Validate bus voltage
             if bus_voltage_raw is None:
                 error_msg = (
-                    f"Bus '{bus_name}' (ID: {bus_id}) is missing the 'vn_kv' (nominal voltage) attribute.\n\n"
+                    f"Bus '{bus_name_raw}' (ID: {bus_id}) is missing the 'vn_kv' (nominal voltage) attribute.\n\n"
                     f"Please set the nominal voltage in kV for this bus element.\n"
                     f"Common values: 110, 30, 20, 10, etc."
                 )
@@ -202,7 +210,7 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
                 bus_voltage = float(bus_voltage_raw)
             except (ValueError, TypeError):
                 error_msg = (
-                    f"Bus '{bus_name}' (ID: {bus_id}) has an invalid 'vn_kv' value: '{bus_voltage_raw}'.\n\n"
+                    f"Bus '{bus_name_raw}' (ID: {bus_id}) has an invalid 'vn_kv' value: '{bus_voltage_raw}'.\n\n"
                     f"The voltage must be a positive number in kV.\n"
                     f"Common values: 110, 30, 20, 10, etc."
                 )
@@ -211,24 +219,29 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
             # Check if voltage is zero or negative
             if bus_voltage <= 0:
                 error_msg = (
-                    f"Bus '{bus_name}' (ID: {bus_id}) has an invalid voltage: {bus_voltage} kV.\n\n"
+                    f"Bus '{bus_name_raw}' (ID: {bus_id}) has an invalid voltage: {bus_voltage} kV.\n\n"
                     f"The nominal voltage must be a positive number greater than 0.\n"
                     f"Common values: 110, 30, 20, 10, etc.\n\n"
                     f"Please correct the 'vn_kv' attribute for this bus element."
                 )
                 raise ValueError(error_msg)
             
-            bus_elements[bus_name] = bus_name  # mxCell_126 -> mxCell_126
+            bus_elements[bus_name] = bus_name
             BusbarsDictVoltage[bus_name] = bus_voltage
     
-    # Map both bus name and bus id (cell id) to bus name for OpenDSS
-    # Impedance/Line may reference buses by cell id (mxCell#154) or name (8_bus8)
+    # Map both bus name and bus id (cell id) to the sanitized bus name for OpenDSS.
+    # This ensures that any reference (original name with spaces, sanitized name,
+    # cell id with # or _) resolves to the same space-free OpenDSS bus name.
     for bus_name in bus_elements.keys():
         BusbarsDictConnectionToName[bus_name] = bus_name
     for x in in_data:
         if "Bus" in in_data[x].get('typ', ''):
-            bus_name = in_data[x].get('name', '')
+            bus_name_raw = in_data[x].get('name', '')
+            bus_name = _sanitize_opendss_name(bus_name_raw)
             bus_id = in_data[x].get('id', '')
+            # Map original name (with spaces) to sanitized name
+            if bus_name_raw and bus_name_raw != bus_name:
+                BusbarsDictConnectionToName[bus_name_raw] = bus_name
             if bus_name and bus_id and bus_id != bus_name:
                 BusbarsDictConnectionToName[bus_id] = bus_name
                 BusbarsDictConnectionToName[bus_id.replace('#', '_')] = bus_name
@@ -280,7 +293,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
-            element_name = element_data.get('name', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
@@ -308,7 +321,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
-            element_name = element_data.get('name', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if "Line" in element_type:
                 create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
@@ -324,7 +337,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
-            element_name = element_data.get('name', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if element_type.startswith("Transformer"):
                 create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
@@ -348,7 +361,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
-            element_name = element_data.get('name', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if element_type.startswith("Shunt Reactor"):
                 create_shunt_reactor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, ShuntsDict, ShuntsDictId, created_elements, execute_dss_command)
@@ -364,7 +377,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
-            element_name = element_data.get('name', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
@@ -419,12 +432,12 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
         if bus_from_ref_backend in BusbarsDictConnectionToName:
             bus_from_name = BusbarsDictConnectionToName[bus_from_ref_backend]
         else:
-            bus_from_name = bus_from_ref_backend
+            bus_from_name = _sanitize_opendss_name(bus_from_ref_backend)
             
         if bus_to_ref_backend in BusbarsDictConnectionToName:
             bus_to_name = BusbarsDictConnectionToName[bus_to_ref_backend]
         else:
-            bus_to_name = bus_to_ref_backend        
+            bus_to_name = _sanitize_opendss_name(bus_to_ref_backend)        
         
         # Extract line parameters from input data (like the previous version)
         r_ohm_per_km = element_data.get('r_ohm_per_km')
@@ -522,8 +535,8 @@ def create_impedance_element(dss, element_data, element_name, element_id, Busbar
     bus_to_ref = element_data.get('busTo')
     if not bus_from_ref or not bus_to_ref:
         return
-    bus_from_name = BusbarsDictConnectionToName.get(bus_from_ref, bus_from_ref)
-    bus_to_name = BusbarsDictConnectionToName.get(bus_to_ref, bus_to_ref)
+    bus_from_name = BusbarsDictConnectionToName.get(bus_from_ref) or _sanitize_opendss_name(bus_from_ref)
+    bus_to_name = BusbarsDictConnectionToName.get(bus_to_ref) or _sanitize_opendss_name(bus_to_ref)
     r_ohm = float(element_data.get('r_ohm', 0) or 0)
     x_ohm = float(element_data.get('x_ohm', 0) or 0)
     # Avoid R1=0 X1=0 (short circuit) - OpenDSS can hang or fail to converge
@@ -655,6 +668,8 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         # Get voltage from the bus data
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
@@ -820,6 +835,8 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
         # Validate voltage is available
@@ -918,6 +935,8 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         # Get voltage from the bus data
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
@@ -1085,21 +1104,13 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
         # Resolve bus names from references (could be IDs or names)
         if bus_from_ref_backend in BusbarsDictConnectionToName:
             bus_from_name = BusbarsDictConnectionToName[bus_from_ref_backend]
-            if bus_from_name.startswith('mxCell'):
-                bus_from_name = bus_from_name
-            else:
-                bus_from_name = bus_from_ref_backend
         else:
-            bus_from_name = bus_from_ref_backend
+            bus_from_name = _sanitize_opendss_name(bus_from_ref_backend)
             
         if bus_to_ref_backend in BusbarsDictConnectionToName:
             bus_to_name = BusbarsDictConnectionToName[bus_to_ref_backend]
-            if bus_to_name.startswith('mxCell'):
-                bus_to_name = bus_to_name
-            else:
-                bus_to_name = bus_to_ref_backend
         else:
-            bus_to_name = bus_to_ref_backend
+            bus_to_name = _sanitize_opendss_name(bus_to_ref_backend)
         
         
         try:
@@ -1267,6 +1278,8 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         # Get voltage from the bus data
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
@@ -1355,6 +1368,8 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
         # Validate voltage is available
@@ -1416,7 +1431,10 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
     else:
         pass
 def create_storage_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, StoragesDict, StoragesDictId, created_elements, execute_dss_command=None):
-    """Create a storage element in OpenDSS"""
+    """Create a storage element in OpenDSS with full BESS/Battery storage support.
+    Maps pandapower parameters to OpenDSS and supports OpenDSS-specific properties.
+    Reference: https://opendss.epri.com/Properties5.html
+    """
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
@@ -1428,6 +1446,8 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
         # Validate voltage is available
@@ -1444,16 +1464,53 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             p_mw_raw = element_data.get('p_mw')
             q_mvar_raw = element_data.get('q_mvar')           
             # Convert to float
-            p_mw = float(p_mw_raw)
-            q_mvar = float(q_mvar_raw)
+            p_mw = float(p_mw_raw) if p_mw_raw is not None else 0.0
+            q_mvar = float(q_mvar_raw) if q_mvar_raw is not None else 0.0
             
-            # Convert to kW and kVar
+            # Convert to kW and kVar (OpenDSS uses kW/kvar)
             p_kw = p_mw * 1000
             q_kvar = q_mvar * 1000
+
+            # Determine OpenDSS State from dispatch power:
+            #   pandapower p_mw < 0 → discharging/generating → State=DISCHARGING
+            #   pandapower p_mw > 0 → charging/consuming    → State=CHARGING
+            #   pandapower p_mw == 0 → idling                → State=IDLING
+            if p_kw < 0:
+                storage_state = 'DISCHARGING'
+                kw_rated = abs(p_kw)
+            elif p_kw > 0:
+                storage_state = 'CHARGING'
+                kw_rated = abs(p_kw)
+            else:
+                storage_state = 'IDLING'
+                kw_rated = float(element_data.get('sn_mva', 1) or 1) * 1000
+
+            # Rated apparent power (kVA) from sn_mva
+            sn_mva = float(element_data.get('sn_mva', 0) or 0)
+            kva_rated = sn_mva * 1000 if sn_mva > 0 else kw_rated
                         
             try:
-                # Use bus name directly - OpenDSS will create bus automatically
-                simple_cmd = f"New Storage.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar}"
+                # kWRated = inverter rating (max capacity)
+                # kW = requested dispatch power (positive for both charging/discharging)
+                kw_dispatch = abs(p_kw) if p_kw != 0 else 0
+                # Negate q_kvar: Pandapower uses load convention (positive=absorbing),
+                # OpenDSS Storage uses generator convention (positive=supplying)
+                kvar_opendss = -q_kvar
+                simple_cmd = (
+                    f"New Storage.{element_name} Bus1={bus_name} kV={bus_voltage} "
+                    f"kWRated={kw_rated} kW={kw_dispatch} kVA={kva_rated} kvar={kvar_opendss} "
+                    f"State={storage_state} %Discharge=100 %Charge=100"
+                )
+                
+                # Append energy parameters (pandapower max_e_mwh -> OpenDSS kWhrated)
+                max_e_mwh = element_data.get('max_e_mwh')
+                if max_e_mwh is not None:
+                    try:
+                        kWhrated = float(max_e_mwh) * 1000  # MWh to kWh
+                        if kWhrated > 0:
+                            simple_cmd += f" kWhrated={kWhrated}"
+                    except (TypeError, ValueError):
+                        pass
                 
                 # Append harmonic analysis spectrum if provided
                 spectrum = element_data.get('spectrum', 'default')
@@ -1461,7 +1518,77 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                     simple_cmd += f" spectrum={spectrum}"
                 
                 execute_dss_command(simple_cmd)
-                # print(f"Command: {simple_cmd}")  # Reduced logging
+                
+                # Apply follow-up OpenDSS properties via Text.Command
+                follow_up_cmds = []
+                
+                # soc_percent -> %stored (state of charge)
+                soc_percent = element_data.get('soc_percent')
+                if soc_percent is not None:
+                    try:
+                        pct_stored = float(soc_percent)
+                        if 0 <= pct_stored <= 100:
+                            follow_up_cmds.append(f'Storage.{element_name}.%stored={pct_stored}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                # min_e_mwh / max_e_mwh -> %reserve (percent of rated kWh held in reserve)
+                # Skip when pct_reserve >= 100% as that would block all discharge
+                min_e_mwh = element_data.get('min_e_mwh')
+                if min_e_mwh is not None and max_e_mwh is not None:
+                    try:
+                        min_e = float(min_e_mwh)
+                        max_e = float(max_e_mwh)
+                        if max_e > 0 and min_e >= 0 and min_e < max_e:
+                            pct_reserve = (min_e / max_e) * 100
+                            follow_up_cmds.append(f'Storage.{element_name}.%reserve={pct_reserve}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                # OpenDSS-specific: %Charge, %Discharge (percent of rated kW)
+                pct_charge = element_data.get('pct_charge')
+                if pct_charge is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%Charge={float(pct_charge)}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                pct_discharge = element_data.get('pct_discharge')
+                if pct_discharge is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%Discharge={float(pct_discharge)}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                # OpenDSS-specific: %EffCharge, %EffDischarge
+                pct_eff_charge = element_data.get('pct_eff_charge')
+                if pct_eff_charge is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%EffCharge={float(pct_eff_charge)}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                pct_eff_discharge = element_data.get('pct_eff_discharge')
+                if pct_eff_discharge is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%EffDischarge={float(pct_eff_discharge)}')
+                    except (TypeError, ValueError):
+                        pass
+                
+                # State was already set in the New command based on p_mw sign.
+                # Only override with explicit frontend value if p_mw == 0 (user chose IDLING).
+                if p_kw == 0:
+                    state = element_data.get('state')
+                    if state and str(state).upper() in ('IDLING', 'CHARGING', 'DISCHARGING'):
+                        follow_up_cmds.append(f'Storage.{element_name}.State={str(state).upper()}')
+                
+                # OpenDSS-specific: DispMode (DEFAULT, FOLLOW, EXTERNAL, LOADLEVEL, PRICE)
+                disp_mode = element_data.get('disp_mode')
+                if disp_mode and str(disp_mode).upper() in ('DEFAULT', 'FOLLOW', 'EXTERNAL', 'LOADLEVEL', 'PRICE'):
+                    follow_up_cmds.append(f'Storage.{element_name}.DispMode={str(disp_mode).upper()}')
+                
+                for cmd in follow_up_cmds:
+                    dss.Text.Command(cmd)
                 
                 # Handle in_service status AFTER creating the element
                 in_service = element_data.get('in_service', True)
@@ -1504,6 +1631,8 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         bus_voltage = BusbarsDictVoltage.get(bus_name)
 
         # Validate voltage is available
@@ -1626,6 +1755,8 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
         bus_connection_backend = bus_connection
         if bus_connection_backend in BusbarsDictConnectionToName:
             bus_name = BusbarsDictConnectionToName[bus_connection_backend]
+        else:
+            bus_name = _sanitize_opendss_name(bus_connection_backend)
         bus_voltage = BusbarsDictVoltage.get(bus_name)        
      
         # Validate voltage is available
@@ -1740,8 +1871,39 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             opendss_commands.append(command)
 
     f = int(frequency) if frequency else 50
+    # Pre-scan for External Grid to embed Vsource params in New Circuit
+    _ext_bus = None
+    _ext_basekv = None
+    _ext_pu = 1.0
+    _ext_mvasc3 = 10000.0
+    _ext_angle = 0
+    for _x in in_data:
+        _elem = in_data[_x]
+        if _elem.get('typ', '').startswith('External Grid'):
+            _bus_ref = _elem.get('bus', '')
+            _ext_bus = _sanitize_opendss_name(_bus_ref)
+            _ext_pu = float(_elem.get('vm_pu', 1.0) or 1.0)
+            _ext_angle = float(_elem.get('va_degree', 0) or 0)
+            _ext_mvasc3 = float(_elem.get('s_sc_max_mva', 10000.0) or 10000.0)
+            if _ext_pu == 0:
+                _ext_pu = 1.0
+            if _ext_mvasc3 <= 0.1:
+                _ext_mvasc3 = 10000.0
+            for _bx in in_data:
+                _belem = in_data[_bx]
+                if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == _ext_bus:
+                    _ext_basekv = float(_belem.get('vn_kv', 110))
+                    break
+            break
+
     execute_dss_command('clear')
-    execute_dss_command('New Circuit.OpenDSS_Circuit')
+    if _ext_bus and _ext_basekv:
+        execute_dss_command(
+            f'New Circuit.OpenDSS_Circuit bus1={_ext_bus} basekv={_ext_basekv} '
+            f'pu={_ext_pu} phases=3 angle={_ext_angle} Mvasc3={_ext_mvasc3}'
+        )
+    else:
+        execute_dss_command('New Circuit.OpenDSS_Circuit')
     execute_dss_command(f'set DefaultBaseFrequency={f}')
 
     try:
@@ -2002,15 +2164,53 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         """Execute DSS command and optionally collect it for export"""
         print(f"[OpenDSS] {command}")  # Log all commands
         dss.Text.Command(command)
+        try:
+            err = dss.Error.Description()
+            if err:
+                print(f"[OpenDSS ERROR] after '{command}': {err}")
+        except Exception:
+            pass
         if export_commands:
             opendss_commands.append(command)
     
     # Set OpenDSS circuit parameters
     f = frequency
     
-    # Create new circuit first - OpenDSS requires this before any other commands
+    # Pre-scan in_data for the first External Grid to embed its Vsource parameters
+    # directly into "New Circuit". This avoids relying on "Edit Vsource.source" which
+    # can silently fail in some opendssdirect versions, leaving zero voltage everywhere.
+    _ext_bus = None
+    _ext_basekv = None
+    _ext_pu = 1.0
+    _ext_mvasc3 = 10000.0
+    _ext_angle = 0
+    for _x in in_data:
+        _elem = in_data[_x]
+        if _elem.get('typ', '').startswith('External Grid'):
+            _bus_ref = _elem.get('bus', '')
+            _ext_bus = _sanitize_opendss_name(_bus_ref)
+            _ext_pu = float(_elem.get('vm_pu', 1.0) or 1.0)
+            _ext_angle = float(_elem.get('va_degree', 0) or 0)
+            _ext_mvasc3 = float(_elem.get('s_sc_max_mva', 10000.0) or 10000.0)
+            if _ext_pu == 0:
+                _ext_pu = 1.0
+            if _ext_mvasc3 <= 0.1:
+                _ext_mvasc3 = 10000.0
+            for _bx in in_data:
+                _belem = in_data[_bx]
+                if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == _ext_bus:
+                    _ext_basekv = float(_belem.get('vn_kv', 110))
+                    break
+            break
+    
     execute_dss_command('clear')
-    execute_dss_command('New Circuit.OpenDSS_Circuit')
+    if _ext_bus and _ext_basekv:
+        execute_dss_command(
+            f'New Circuit.OpenDSS_Circuit bus1={_ext_bus} basekv={_ext_basekv} '
+            f'pu={_ext_pu} phases=3 angle={_ext_angle} Mvasc3={_ext_mvasc3}'
+        )
+    else:
+        execute_dss_command('New Circuit.OpenDSS_Circuit')
     execute_dss_command(f'set DefaultBaseFrequency={f}')
 
     # Set solution mode (Snapshot, Daily, Dutycycle, Yearly, etc.)
@@ -2068,16 +2268,22 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         print("[OpenDSS] solve")
         dss.Text.Command('solve')
     except Exception as e:
-        pass
+        print(f"[OpenDSS] Solve EXCEPTION: {e}")
     # Check solve status
     try:
         converged = dss.Solution.Converged()
-        if converged:
-            pass
-        else:
-            pass
+        iterations = dss.Solution.Iterations()
+        print(f"[OpenDSS] Converged: {converged}, Iterations: {iterations}")
+        all_buses = dss.Circuit.AllBusNames()
+        print(f"[OpenDSS] AllBusNames: {all_buses}")
+        total_power = dss.Circuit.TotalPower()
+        print(f"[OpenDSS] TotalPower (kW, kvar): {total_power}")
+        for bname in all_buses[:6]:
+            dss.Circuit.SetActiveBus(bname)
+            v = dss.Bus.Voltages()
+            print(f"[OpenDSS] Bus '{bname}' voltages (V): {v[:6] if len(v) >= 6 else v}")
     except Exception as e:
-        pass
+        print(f"[OpenDSS] Post-solve diagnostics EXCEPTION: {e}")
     # Process results using the new output classes
     
     # Initialize result lists
@@ -2349,7 +2555,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             # Find the line in input data to get max_i_ka
             max_i_ka = None
             for data_key, data_value in in_data.items():
-                if data_value.get('name') == key and 'Line' in data_value.get('typ', ''):
+                if _sanitize_opendss_name(data_value.get('name', '')) == key and 'Line' in data_value.get('typ', ''):
                     max_i_ka_raw = data_value.get('max_i_ka')
                     if max_i_ka_raw is not None:
                         max_i_ka = float(max_i_ka_raw)
@@ -2614,8 +2820,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 
                                 # Match transformer by type and name/id
                                 if elem_type == 'Transformer':
-                                    # Match by name (most reliable)
-                                    if elem_name == trafo_name or elem_name == key:
+                                    # Match by name (most reliable) - sanitize for comparison
+                                    if _sanitize_opendss_name(elem_name) == trafo_name or _sanitize_opendss_name(elem_name) == key:
                                         element_data = elem_data
                                         break
                                     # Also try matching by ID

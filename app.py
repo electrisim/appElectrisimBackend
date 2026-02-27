@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+import sys
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import pandapower_electrisim
 import opendss_electrisim
 import os
