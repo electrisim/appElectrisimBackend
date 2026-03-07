@@ -268,18 +268,34 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             q_mvar = row.get('q_mvar', 0.0)
             sn_mva = row.get('sn_mva', 1.0)
             scaling = row.get('scaling', 1.0)
-            storage_type = row.get('type', 'storage')
+            storage_type = row.get('type', '')
             max_e_mwh = row.get('max_e_mwh', 1.0)
             min_e_mwh = row.get('min_e_mwh', 0.0)
             soc_percent = row.get('soc_percent', 50.0)
             in_service = row.get('in_service', True)
+            controllable = row.get('controllable', False)
+            max_p_mw = row.get('max_p_mw')
+            min_p_mw = row.get('min_p_mw')
+            max_q_mvar = row.get('max_q_mvar')
+            min_q_mvar = row.get('min_q_mvar')
             
             # Build the create_storage call with all parameters
             storage_code = (f"pp.create_storage(net, bus=bus_{bus}, name='{name}', "
                           f"p_mw={p_mw}, q_mvar={q_mvar}, sn_mva={sn_mva}, "
                           f"scaling={scaling}, type='{storage_type}', "
                           f"max_e_mwh={max_e_mwh}, min_e_mwh={min_e_mwh}, "
-                          f"soc_percent={soc_percent}, in_service={in_service})")
+                          f"soc_percent={soc_percent}, in_service={in_service}, "
+                          f"controllable={controllable}")
+            import pandas as pd
+            if max_p_mw is not None and not (isinstance(max_p_mw, float) and pd.isna(max_p_mw)):
+                storage_code += f", max_p_mw={max_p_mw}"
+            if min_p_mw is not None and not (isinstance(min_p_mw, float) and pd.isna(min_p_mw)):
+                storage_code += f", min_p_mw={min_p_mw}"
+            if max_q_mvar is not None and not (isinstance(max_q_mvar, float) and pd.isna(max_q_mvar)):
+                storage_code += f", max_q_mvar={max_q_mvar}"
+            if min_q_mvar is not None and not (isinstance(min_q_mvar, float) and pd.isna(min_q_mvar)):
+                storage_code += f", min_q_mvar={min_q_mvar}"
+            storage_code += ")"
             lines.append(storage_code)
         lines.append("")
     
@@ -1406,12 +1422,42 @@ def create_other_elements(in_data,net,x, Busbars):
             min_e_mwh = float(in_data[x].get('min_e_mwh', 0.0))
             soc_percent = float(in_data[x].get('soc_percent', 50.0))
             scaling = float(in_data[x].get('scaling', 1.0))
-            storage_type = str(in_data[x].get('type', '0'))
-            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
-                            p_mw=p_mw, q_mvar=q_mvar, sn_mva=sn_mva, 
-                            max_e_mwh=max_e_mwh, min_e_mwh=min_e_mwh, 
-                            soc_percent=soc_percent, scaling=scaling, 
-                            type=storage_type, in_service=in_service)         
+            storage_type = str(in_data[x].get('type', ''))
+            # OPF parameters (optional)
+            controllable_raw = in_data[x].get('controllable', False)
+            controllable = bool(controllable_raw) if isinstance(controllable_raw, bool) else (str(controllable_raw).lower() in ('true', '1'))
+            max_p_mw_raw = in_data[x].get('max_p_mw')
+            min_p_mw_raw = in_data[x].get('min_p_mw')
+            max_q_mvar_raw = in_data[x].get('max_q_mvar')
+            min_q_mvar_raw = in_data[x].get('min_q_mvar')
+            storage_kwargs = dict(
+                p_mw=p_mw, q_mvar=q_mvar, sn_mva=sn_mva,
+                max_e_mwh=max_e_mwh, min_e_mwh=min_e_mwh,
+                soc_percent=soc_percent, scaling=scaling,
+                type=storage_type, in_service=in_service,
+                controllable=controllable
+            )
+            if max_p_mw_raw is not None:
+                try:
+                    storage_kwargs['max_p_mw'] = float(max_p_mw_raw)
+                except (TypeError, ValueError):
+                    pass
+            if min_p_mw_raw is not None:
+                try:
+                    storage_kwargs['min_p_mw'] = float(min_p_mw_raw)
+                except (TypeError, ValueError):
+                    pass
+            if max_q_mvar_raw is not None:
+                try:
+                    storage_kwargs['max_q_mvar'] = float(max_q_mvar_raw)
+                except (TypeError, ValueError):
+                    pass
+            if min_q_mvar_raw is not None:
+                try:
+                    storage_kwargs['min_q_mvar'] = float(min_q_mvar_raw)
+                except (TypeError, ValueError):
+                    pass
+            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], **storage_kwargs)
    
         if (in_data[x]['typ'].startswith("Load DC")):
             bus_idx = Busbars.get(in_data[x]['bus'])

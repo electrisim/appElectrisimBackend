@@ -1496,10 +1496,21 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 # Negate q_kvar: Pandapower uses load convention (positive=absorbing),
                 # OpenDSS Storage uses generator convention (positive=supplying)
                 kvar_opendss = -q_kvar
+                # Number of phases and connection type
+                phases_raw = element_data.get('phases', 3)
+                try:
+                    phases = int(float(phases_raw)) if phases_raw is not None else 3
+                    phases = max(1, min(3, phases))
+                except (TypeError, ValueError):
+                    phases = 3
+                conn_raw = str(element_data.get('conn', 'wye')).lower()
+                conn = 'delta' if conn_raw == 'delta' else 'wye'
+
                 simple_cmd = (
-                    f"New Storage.{element_name} Bus1={bus_name} kV={bus_voltage} "
+                    f"New Storage.{element_name} phases={phases} Bus1={bus_name} kV={bus_voltage} "
+                    f"conn={conn} "
                     f"kWRated={kw_rated} kW={kw_dispatch} kVA={kva_rated} kvar={kvar_opendss} "
-                    f"State={storage_state} %Discharge=100 %Charge=100"
+                    f"State={storage_state}"
                 )
                 
                 # Append energy parameters (pandapower max_e_mwh -> OpenDSS kWhrated)
@@ -1574,7 +1585,49 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                         follow_up_cmds.append(f'Storage.{element_name}.%EffDischarge={float(pct_eff_discharge)}')
                     except (TypeError, ValueError):
                         pass
-                
+
+                # OpenDSS-specific: %IdlingkW, %IdlingkVar (self-depletion + auxiliary loads)
+                pct_idling_kw = element_data.get('pct_idling_kw')
+                if pct_idling_kw is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%IdlingkW={float(pct_idling_kw)}')
+                    except (TypeError, ValueError):
+                        pass
+
+                pct_idling_kvar = element_data.get('pct_idling_kvar')
+                if pct_idling_kvar is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.%Idlingkvar={float(pct_idling_kvar)}')
+                    except (TypeError, ValueError):
+                        pass
+
+                # OpenDSS-specific: DischargeTrigger, ChargeTrigger
+                discharge_trigger = element_data.get('discharge_trigger')
+                if discharge_trigger is not None:
+                    try:
+                        val = float(discharge_trigger)
+                        if val != 0.0:
+                            follow_up_cmds.append(f'Storage.{element_name}.DischargeTrigger={val}')
+                    except (TypeError, ValueError):
+                        pass
+
+                charge_trigger = element_data.get('charge_trigger')
+                if charge_trigger is not None:
+                    try:
+                        val = float(charge_trigger)
+                        if val != 0.0:
+                            follow_up_cmds.append(f'Storage.{element_name}.ChargeTrigger={val}')
+                    except (TypeError, ValueError):
+                        pass
+
+                # OpenDSS-specific: TimeChargeTrig (fractional hours; -1 disables)
+                time_charge_trig = element_data.get('time_charge_trig')
+                if time_charge_trig is not None:
+                    try:
+                        follow_up_cmds.append(f'Storage.{element_name}.TimeChargeTrig={float(time_charge_trig)}')
+                    except (TypeError, ValueError):
+                        pass
+
                 # State was already set in the New command based on p_mw sign.
                 # Only override with explicit frontend value if p_mw == 0 (user chose IDLING).
                 if p_kw == 0:
