@@ -402,6 +402,19 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             raise
         except Exception as e:
             continue
+
+    # Sixth pass: create Switch elements (OpenDSS: open/close Lines, disable Transformers, or Reactor for bus-bus)
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            if not element_type.startswith("Switch"):
+                continue
+            create_switch_element(dss, element_data, LinesDict, TransformersDict, BusbarsDictConnectionToName, execute_dss_command)
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
     
    
     
@@ -573,6 +586,76 @@ def create_impedance_element(dss, element_data, element_name, element_id, Busbar
         created_elements.add(element_name)
     except Exception as e:
         pass
+
+
+def _resolve_in_dict(key, d):
+    """Resolve element key in dict, trying key and #/_ variants."""
+    if not key:
+        return None
+    k = _sanitize_opendss_name(key)
+    if k in d:
+        return d[k]
+    k_alt = k.replace('_', '#') if '_' in k else k.replace('#', '_')
+    if k_alt in d:
+        return d[k_alt]
+    for dict_key in d:
+        if (dict_key or '').replace('#', '_') == (k or '').replace('#', '_'):
+            return d[dict_key]
+    return None
+
+
+def create_switch_element(dss, element_data, LinesDict, TransformersDict, BusbarsDictConnectionToName, execute_dss_command=None):
+    """Create/open switch in OpenDSS.
+    et='l': open/close Line via Bus2=__opened__...; et='t': Transformer.Enabled=no/yes;
+    et='b': bus-bus switch as Reactor (R=0.001 closed, R=1e8 open); et='t3' not supported (no 3w in OpenDSS)."""
+    def run(cmd):
+        if execute_dss_command:
+            execute_dss_command(cmd)
+        else:
+            dss.Text.Command(cmd)
+    
+    element_name = _sanitize_opendss_name(element_data.get('element', ''))
+    switch_name = _sanitize_opendss_name(element_data.get('name', 'Switch'))
+    closed = element_data.get('closed', True)
+    if isinstance(closed, str):
+        closed = closed.lower() not in ('false', 'no', '0', 'open')
+    et = str(element_data.get('et', 'l')).lower()
+    
+    if et in ('l', 'line'):
+        line_name = _resolve_in_dict(element_data.get('element', ''), LinesDict)
+        if line_name is not None:
+            try:
+                dss.Circuit.SetActiveElement(f'Line.{line_name}')
+                if dss.ActiveElement.Name() == line_name:
+                    bus2 = dss.CktElement.BusNames()[1] if len(dss.CktElement.BusNames()) > 1 else ''
+                    if closed:
+                        if bus2.startswith('__opened__'):
+                            run(f'Line.{line_name}.Bus2={bus2.replace("__opened__", "")}')
+                    else:
+                        if not bus2.startswith('__opened__'):
+                            run(f'Line.{line_name}.Bus2=__opened__{bus2}')
+            except Exception:
+                pass
+    elif et in ('t', 'trafo', 'transformer'):
+        trafo_name = _resolve_in_dict(element_data.get('element', ''), TransformersDict)
+        if trafo_name is not None:
+            try:
+                run(f'Transformer.{trafo_name}.enabled={"yes" if closed else "no"}')
+            except Exception:
+                pass
+    elif et == 'b':
+        bus1_ref = element_data.get('bus')
+        bus2_ref = element_data.get('element')
+        if bus1_ref and bus2_ref:
+            bus1 = (BusbarsDictConnectionToName.get(bus1_ref) or BusbarsDictConnectionToName.get((bus1_ref or '').replace('#', '_')) or
+                    BusbarsDictConnectionToName.get((bus1_ref or '').replace('_', '#')) or _sanitize_opendss_name(bus1_ref))
+            bus2 = (BusbarsDictConnectionToName.get(bus2_ref) or BusbarsDictConnectionToName.get((bus2_ref or '').replace('#', '_')) or
+                    BusbarsDictConnectionToName.get((bus2_ref or '').replace('_', '#')) or _sanitize_opendss_name(bus2_ref))
+            r_ohm = 0.001 if closed else 1e8
+            try:
+                run(f'New Reactor.{switch_name} phases=3 Bus1={bus1} Bus2={bus2} R={r_ohm} X=0')
+            except Exception:
+                pass
 
 
 # Built-in harmonic spectra (IEEE benchmark, harmonicscelsorocha)
@@ -1092,10 +1175,9 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
     if element_name in created_elements:
         return
     
-    bus_from_ref = element_data.get('busFrom')
-    bus_to_ref = element_data.get('busTo')    
- 
-    
+    bus_from_ref = element_data.get('busFrom') or element_data.get('hv_bus')
+    bus_to_ref = element_data.get('busTo') or element_data.get('lv_bus')
+
     if bus_from_ref and bus_to_ref:
         # Frontend now sends bus names in the correct format (mxCell_126)
         bus_from_ref_backend = bus_from_ref

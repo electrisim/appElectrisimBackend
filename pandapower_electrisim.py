@@ -18,6 +18,19 @@ from copy import deepcopy
 
 Busbars = {} 
 
+
+def _json_serialize_default(obj):
+    """Handle numpy types and custom objects for json.dumps. Works with NumPy 1.x and 2.x."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    # numpy scalars (bool_, int64, float64, etc.) have .item() -> native Python type
+    if hasattr(obj, 'item') and callable(getattr(obj, 'item')):
+        return obj.item()
+    if hasattr(obj, '__dict__'):
+        return obj.__dict__
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
     """Generate Python code to recreate the pandapower network"""
     lines = []
@@ -507,21 +520,20 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             lines.append(f"pp.create_source_dc(net, bus=bus_{bus}, name='{name}', vm_pu={vm_pu}, in_service={in_service})")
         lines.append("")
     
-    # Create switch elements
+    # Create switch elements (no in_service - Switch is always in service)
     if hasattr(net, 'switch') and not net.switch.empty:
         lines.append("# Create switch elements")
         for idx, row in net.switch.iterrows():
             bus = row['bus']
             element = row['element']
-            et = row.get('et', 'line')
+            et = row.get('et', 'l')
             name = row['name'] if 'name' in row else f"Switch_{idx}"
             closed = row.get('closed', True)
             switch_type = row.get('type', 'CB')
             z_ohm = row.get('z_ohm', 0.0)
             in_ka = row.get('in_ka', 0.0)
-            in_service = row.get('in_service', True)
             lines.append(f"pp.create_switch(net, bus=bus_{bus}, element={element}, et='{et}', name='{name}', "
-                        f"closed={closed}, type='{switch_type}', z_ohm={z_ohm}, in_ka={in_ka}, in_service={in_service})")
+                        f"closed={closed}, type='{switch_type}', z_ohm={z_ohm}, in_ka={in_ka})")
         lines.append("")
     
     # Create VSC elements
@@ -680,6 +692,26 @@ def create_other_elements(in_data,net,x, Busbars):
         except (ValueError, TypeError):
             return default
 
+    # Maps for Switch element lookup: line/trafo name -> pandapower index
+    LinesDict = {}
+    TrafoDict = {}
+    Trafo3wDict = {}
+
+    def _map_et_to_pandapower(et):
+        """Map frontend et values to pandapower single-letter codes."""
+        if et is None or et == '':
+            return 'l'
+        et_lower = str(et).lower()
+        if et_lower in ('l', 'line'):
+            return 'l'
+        if et_lower in ('t', 'trafo', 'transformer'):
+            return 't'
+        if et_lower in ('t3', 'trafo3w', 'trafo3winding'):
+            return 't3'
+        if et_lower == 'b':
+            return 'b'
+        return et_lower[0] if et_lower else 'l'
+
     for name,value in Busbars.items():
         globals()[name] = value    
        
@@ -797,7 +829,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 line_params["in_service"] = True
 
             # Call the function with the prepared parameters
-            pp.create_line_from_parameters(net, **line_params)
+            line_idx = pp.create_line_from_parameters(net, **line_params)
+            LinesDict[in_data[x]['name']] = line_idx
             
             # Store user-friendly name for line
             line_name = in_data[x]['name']
@@ -1134,7 +1167,8 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['in_service'] = True
             
-            pp.create_transformer_from_parameters(net, **transformer_params)
+            trafo_idx = pp.create_transformer_from_parameters(net, **transformer_params)
+            TrafoDict[in_data[x]['name']] = trafo_idx
             
             # Store user-friendly name for transformer
             trafo_name = in_data[x]['name']
@@ -1230,7 +1264,8 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['in_service'] = True
             
-            pp.create_transformer3w_from_parameters(net, **transformer_params)
+            trafo3w_idx = pp.create_transformer3w_from_parameters(net, **transformer_params)
+            Trafo3wDict[in_data[x]['name']] = trafo3w_idx
             
             # Store user-friendly name for three-winding transformer
             trafo3w_name = in_data[x]['name']
@@ -1496,26 +1531,51 @@ def create_other_elements(in_data,net,x, Busbars):
         if (in_data[x]['typ'].startswith("Switch")):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
+                element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
+                bus_name = in_data[x].get('bus')
+                if bus_name is None:
+                    print(f"Warning: Switch '{element_name}' has no bus connection - skipped")
+                else:
+                    print(f"Warning: Switch '{element_name}' bus '{bus_name}' not found - skipped")
                 continue
-            # Get element index (line or transformer the switch is connected to)
-            element_idx = in_data[x].get('element')
+            # Get element: line/transformer name (frontend) -> lookup pandapower index
+            element_name = in_data[x].get('element')
+            if element_name is None:
+                print(f"Warning: Switch '{in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))}' has no element connection - skipped")
+                continue
+            # Map et to pandapower codes: 'l', 't', 't3', 'b'
+            et_raw = in_data[x].get('et', 'l')
+            et = _map_et_to_pandapower(et_raw)
+            # Look up element index from name
+            if et == 'l':
+                element_idx = LinesDict.get(element_name)
+            elif et == 't':
+                element_idx = TrafoDict.get(element_name)
+            elif et == 't3':
+                element_idx = Trafo3wDict.get(element_name)
+            elif et == 'b':
+                element_idx = Busbars.get(element_name)
+            else:
+                element_idx = LinesDict.get(element_name) or TrafoDict.get(element_name)
             if element_idx is None:
+                print(f"Warning: Switch '{in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))}' element '{element_name}' (et={et}) not found - skipped")
                 continue
-            # Get in_service parameter (default to True if not specified)
-            in_service = True
-            if 'in_service' in in_data[x]:
-                in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            # Get switch type (et parameter: 'line' or 'trafo')
-            et = in_data[x].get('et', 'line')  # Default to 'line'
+            # Switch does not use in_service parameter - always in service
             closed = in_data[x].get('closed', True)
             if isinstance(closed, str):
                 closed = closed.lower() == 'true'
             switch_type = in_data[x].get('type', 'CB')
             z_ohm = safe_float(in_data[x].get('z_ohm', 0.0))
-            in_ka = safe_float(in_data[x].get('in_ka', 0.0))
+            in_ka_val = in_data[x].get('in_ka')
+            in_ka = safe_float(in_ka_val) if in_ka_val not in (None, '', 'nan') else float('nan')
+            switch_name = in_data[x].get('name', in_data[x].get('userFriendlyName', f'Switch_{x}'))
             
-            pp.create_switch(net, bus=bus_idx, element=int(element_idx), et=et, name=in_data[x]['name'], id=in_data[x]['id'], 
+            sw_idx = pp.create_switch(net, bus=bus_idx, element=int(element_idx), et=et, name=switch_name,
                            closed=closed, type=switch_type, z_ohm=z_ohm, in_ka=in_ka, in_service=in_service)
+            # Store frontend cell id for result matching
+            if 'id' not in net.switch.columns:
+                net.switch['id'] = None
+            net.switch.at[sw_idx, 'id'] = in_data[x].get('id', in_data[x].get('name', str(sw_idx)))
             
             # Store user-friendly name for switch
             switch_name = in_data[x]['name']
@@ -2547,11 +2607,19 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 sourcesdcList = list()
                 
                 class SwitchOut(object):
-                    def __init__(self, name: str, id: str, closed: bool, i_ka: float):          
+                    def __init__(self, name: str, id: str, closed: bool, i_ka: float,
+                                 p_from_mw: float = 0.0, q_from_mvar: float = 0.0,
+                                 p_to_mw: float = 0.0, q_to_mvar: float = 0.0,
+                                 loading_percent: float = 0.0):
                         self.name = name
                         self.id = id
                         self.closed = closed
                         self.i_ka = i_ka
+                        self.p_from_mw = p_from_mw
+                        self.q_from_mvar = q_from_mvar
+                        self.p_to_mw = p_to_mw
+                        self.q_to_mvar = q_to_mvar
+                        self.loading_percent = loading_percent
                        
                 class SwitchesOut(object):
                     def __init__(self, switches: List[SwitchOut]):
@@ -3011,10 +3079,19 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         sourcesdc = SourcesDcOut(sourcesdc = sourcesdcList) 
                     result = {**result, **sourcesdc.__dict__}
                 
-                #Switch
+                #Switch (net.res_switch: p_from_mw, q_from_mvar, p_to_mw, q_to_mvar, i_ka, loading_percent)
                 if(hasattr(net, 'res_switch') and not net.res_switch.empty):
                     for index, row in net.res_switch.iterrows():    
-                        switch = SwitchOut(name=net.switch._get_value(index, 'name'), id = net.switch._get_value(index, 'id'), closed=row.get('closed', True), i_ka=row.get('i_ka', 0.0))        
+                        sw_name = net.switch._get_value(index, 'name')
+                        sw_id = net.switch._get_value(index, 'id') if 'id' in net.switch.columns else str(index)
+                        sw_closed = net.switch._get_value(index, 'closed') if 'closed' in net.switch.columns else True
+                        switch = SwitchOut(
+                            name=sw_name, id=sw_id, closed=sw_closed,
+                            i_ka=row.get('i_ka', 0.0),
+                            p_from_mw=row.get('p_from_mw', 0.0), q_from_mvar=row.get('q_from_mvar', 0.0),
+                            p_to_mw=row.get('p_to_mw', 0.0), q_to_mvar=row.get('q_to_mvar', 0.0),
+                            loading_percent=row.get('loading_percent', 0.0)
+                        )
                         switchesList.append(switch) 
                         switches = SwitchesOut(switches = switchesList) 
                     result = {**result, **switches.__dict__}
@@ -3109,7 +3186,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 # OPTIMIZED: Removed indent=4, using compact separators for ~40% size reduction
-                response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':')) 
+                response = json.dumps(result, default=_json_serialize_default, separators=(',', ':')) 
             
                 print("Response to FRONTEND CORRECT")   
                    
@@ -3498,7 +3575,7 @@ def shortcircuit(net, in_data):
         print(f"Short Circuit: Sending {len(result['trafos3w_sc'])} trafo3w SC results")
 
     # OPTIMIZED: Compact JSON for faster transfer
-    response = json.dumps(result, default=lambda o: o.__dict__, separators=(",", ":"))
+    response = json.dumps(result, default=_json_serialize_default, separators=(",", ":"))
     return response
 
 
@@ -3896,7 +3973,7 @@ def contingency_analysis(net, contingency_params):
         }
         
         # OPTIMIZED: Compact JSON for faster transfer
-        response = json.dumps(result, default=lambda o: o.__dict__, separators=(',', ':'))
+        response = json.dumps(result, default=_json_serialize_default, separators=(',', ':'))
         
         return response
         
