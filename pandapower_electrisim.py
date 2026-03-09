@@ -1264,7 +1264,10 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['in_service'] = True
             
+            trafo3w_id = transformer_params.pop('id', None)
             trafo3w_idx = pp.create_transformer3w_from_parameters(net, **transformer_params)
+            if trafo3w_id is not None:
+                net.trafo3w.at[trafo3w_idx, 'id'] = trafo3w_id
             Trafo3wDict[in_data[x]['name']] = trafo3w_idx
             
             # Store user-friendly name for three-winding transformer
@@ -1670,11 +1673,14 @@ def create_other_elements(in_data,net,x, Busbars):
                 control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
                 
                 print(f"Creating VSC for B2B VSC '{element_name}': AC bus={bus_idx}, DC bus={bus_dc_idx}")
-                pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx,
+                vsc_b2b_idx = pp.create_vsc(net, bus=bus_idx, bus_dc=bus_dc_idx,
                              r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
                              control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
                              control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
                              name=in_data[x]['name'], in_service=in_service)
+                if 'id' not in net.vsc.columns:
+                    net.vsc['id'] = ''
+                net.vsc.at[vsc_b2b_idx, 'id'] = in_data[x].get('id', '')
             else:
                 # Try full B2B VSC mode with bus_dc_plus/bus_dc_minus
                 if not hasattr(pp, 'create_b2b_vsc'):
@@ -1711,7 +1717,7 @@ def create_other_elements(in_data,net,x, Busbars):
                                 r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
                                 control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
                                 control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
-                                name=in_data[x]['name'], in_service=in_service)
+                                name=in_data[x]['name'], id=in_data[x].get('id', ''), in_service=in_service)
             
             # Store user-friendly name
             b2b_vsc_name = in_data[x]['name']
@@ -3109,7 +3115,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #B2B VSC
                 if(hasattr(net, 'res_b2b_vsc') and not net.res_b2b_vsc.empty):
                     for index, row in net.res_b2b_vsc.iterrows():    
-                        b2bvsc = B2bVSCOut(name=net.b2b_vsc._get_value(index, 'name'), id = net.b2b_vsc._get_value(index, 'id'), p_mw=row['p_mw'], vm1_pu=row['vm1_pu'], vm2_pu=row['vm2_pu'])        
+                        b2b_name = net.b2b_vsc.at[index, 'name'] if 'name' in net.b2b_vsc.columns else f'B2B_VSC_{index}'
+                        b2b_id = net.b2b_vsc.at[index, 'id'] if 'id' in net.b2b_vsc.columns else str(index)
+                        b2bvsc = B2bVSCOut(name=b2b_name, id=b2b_id, p_mw=row['p_mw'], vm1_pu=row['vm1_pu'], vm2_pu=row['vm2_pu'])        
                         b2bvscsList.append(b2bvsc) 
                         b2bvscs = B2bVSCsOut(b2bvscs = b2bvscsList) 
                     result = {**result, **b2bvscs.__dict__}
