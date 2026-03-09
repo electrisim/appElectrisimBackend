@@ -2,7 +2,7 @@
 
 ## About
 
-This repository contains the backend API server for **[Electrisim](https://app.electrisim.com/)** - an open-source web-based application for comprehensive power system modeling, simulation, and analysis. The backend provides REST API endpoints for power system calculations and simulations using industry-standard libraries.
+This repository  contains the backend API server for **[Electrisim](https://app.electrisim.com/)** - an open-source web-based application for comprehensive power system modeling, simulation, and analysis. The backend provides REST API endpoints for power system calculations and simulations using industry-standard libraries.
 
 🌐 **Online Application**: [app.electrisim.com](https://app.electrisim.com/)  
 📁 **Frontend Repository**: [Frontend Code](https://github.com/electrisim/appElectrisimFrontend)

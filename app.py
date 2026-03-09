@@ -606,7 +606,7 @@ def import_opendss():
     Accepts an OpenDSS .dss text, builds a model, and returns
     a JSON structure compatible with insertComponentsForData.
     NOTE: this is a minimal implementation focused on buses and lines;
-    you can extend it to cover more element types as needed.
+    you can extend it to cover more element types as needed. 
     """
     payload = request.get_json(force=True)
     dss_text = payload.get('content', '')
