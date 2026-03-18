@@ -215,7 +215,7 @@ def simulation():
                 net = pp.create_empty_network()
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
-                response_data = pandapower_electrisim.shortcircuit(net, in_data[x])
+                response_data = pandapower_electrisim.shortcircuit(net, in_data[x], in_data)
                 
                 # Check if client accepts gzip compression
                 accept_encoding = request.headers.get('Accept-Encoding', '')
@@ -352,6 +352,38 @@ def simulation():
                     return response
                 else:
                     return response_data
+            
+            if "EconomicAnalysisPandaPower" in in_data[x]['typ']:
+                # Extract user email for logging
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== ECONOMIC ANALYSIS REQUESTED BY USER: {user_email} ===")
+                
+                # Extract economic analysis parameters
+                economic_params = {
+                    'frequency': eval(in_data[x].get('frequency', '50')),
+                    'currency': in_data[x].get('currency', 'EUR'),
+                    'algorithm': in_data[x].get('algorithm', 'nr'),
+                    'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
+                    'init': in_data[x].get('init', 'dc'),
+                    'use_generation_profile': in_data[x].get('use_generation_profile', False),
+                    'time_steps': int(in_data[x].get('time_steps', 24)),
+                    'lifetime_years': int(in_data[x].get('lifetime_years', 30)),
+                    'calculation_mode': in_data[x].get('calculation_mode', 'full'),
+                    'load_profile': in_data[x].get('load_profile', 'constant'),
+                    'generation_profile': in_data[x].get('generation_profile', 'constant'),
+                    'energy_price_per_mwh': in_data[x].get('energy_price_per_mwh'),
+                    'energy_price_currency': in_data[x].get('energy_price_currency', 'EUR')
+                }
+                
+                # Create network
+                net = pp.create_empty_network(f_hz=economic_params['frequency'])
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                
+                # Run economic analysis
+                response = pandapower_electrisim.economic_analysis(net, in_data, economic_params)
+                print(f"=== ECONOMIC ANALYSIS RESPONSE: total_capex={response.get('total_capex')}, total_power_losses_mw={response.get('total_power_losses_mw')}, error={response.get('error')} ===")
+                return jsonify(response)
                 
             if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
                 # Extract user email for logging

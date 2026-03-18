@@ -3201,7 +3201,66 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 return response  
 
 
-def shortcircuit(net, in_data):
+def analyze_shortcircuit_input_data(in_data):
+    """
+    Analyze input data for invalid short-circuit parameters that cause Ybus NaN.
+    Returns a list of specific recommendations: [{element_type, name, param, message}, ...]
+    """
+    recommendations = []
+    if not in_data or not isinstance(in_data, dict):
+        return recommendations
+
+    def _safe_float(val, default=None):
+        if val is None or val == '' or val == 'null' or val == 'None':
+            return default
+        try:
+            f = float(val)
+            return f if f == f else default  # NaN check
+        except (ValueError, TypeError):
+            return default
+
+    for key, elem in in_data.items():
+        if not isinstance(elem, dict) or 'typ' not in elem:
+            continue
+        typ = elem.get('typ', '')
+        name = elem.get('name', elem.get('id', str(key)))
+
+        # External Grid: s_sc_max_mva must be > 0.1
+        if typ and 'External Grid' in typ:
+            s_sc_max = _safe_float(elem.get('s_sc_max_mva'))
+            if s_sc_max is None or s_sc_max <= 0.1:
+                recommendations.append({
+                    'element_type': 'External Grid',
+                    'name': name,
+                    'param': 's_sc_max_mva',
+                    'message': 'Set to a positive value (e.g. 10000 or 1000000 MVA). Right-click → Edit data → Short circuit parameters.'
+                })
+            s_sc_min = _safe_float(elem.get('s_sc_min_mva'))
+            if s_sc_min is not None and s_sc_min <= 0:
+                recommendations.append({
+                    'element_type': 'External Grid',
+                    'name': name,
+                    'param': 's_sc_min_mva',
+                    'message': 'Set to a positive value. Right-click → Edit data → Short circuit parameters.'
+                })
+
+        # Static Generator with async/async_doubly_fed: sn_mva must be > 0
+        if typ and 'Static Generator' in typ:
+            gen_type = (elem.get('generator_type') or '').lower()
+            if gen_type in ('async', 'async_doubly_fed'):
+                sn_mva = _safe_float(elem.get('sn_mva'))
+                if sn_mva is None or sn_mva <= 0:
+                    recommendations.append({
+                        'element_type': 'Static Generator',
+                        'name': name,
+                        'param': 'sn_mva',
+                        'message': f'Set sn_mva (rated power) to a positive value, or change generator_type to "current_source" for PV inverters. Right-click → Edit data.'
+                    })
+
+    return recommendations
+
+
+def shortcircuit(net, in_data, in_data_full=None):
     
     # Add diagnostic prints
     # Print key parameters
@@ -3359,6 +3418,12 @@ def shortcircuit(net, in_data):
         
         # Process the diagnostic output to extract structured information
         processed_diagnostic = process_short_circuit_diagnostic(diagnostic_output, net)
+
+        # Analyze input data for invalid parameters when error suggests Ybus/NaN
+        invalid_params = []
+        err_str = str(e).lower()
+        if ('nan' in err_str and ('ybus' in err_str or 'calculation parameters' in err_str)) and in_data_full:
+            invalid_params = analyze_shortcircuit_input_data(in_data_full)
         
         # Return a diagnostic response with both raw and processed data
         diagnostic_response = {
@@ -3368,6 +3433,7 @@ def shortcircuit(net, in_data):
             "diagnostic": {
                 "raw_output": diagnostic_output,
                 "processed": processed_diagnostic,
+                "invalid_parameters": invalid_params,
                 "fault_type": fault_type,
                 "calculation_case": fault_location,
                 "bus_index": bus,
@@ -5711,3 +5777,381 @@ def bess_sizing(net, bess_params):
             'converged': False,
             'iterations': 0
         })
+
+
+def _economic_get_month_index(time_steps):
+    """Return month index (0=Jan .. 11=Dec) for each hour. Assumes hour 0 = Jan 1 00:00."""
+    days_per_month = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
+    cumulative_days = np.cumsum(np.concatenate([[0], days_per_month]))
+    t_arr = np.arange(time_steps)
+    day_of_year = t_arr // 24
+    day_of_year = np.minimum(day_of_year, 365)
+    month_idx = np.searchsorted(cumulative_days[1:], day_of_year, side='right')
+    return np.minimum(month_idx, 11)
+
+
+def _economic_get_load_profile(load_profile, time_steps):
+    """Return load scaling factors for each hour (0..time_steps-1). Yearly profiles with daily + monthly variation."""
+    base_24 = {
+        'daily': np.array([0.3, 0.25, 0.2, 0.15, 0.2, 0.4, 0.7, 0.9, 1.0, 1.1, 1.05, 1.0,
+                          0.95, 1.0, 1.05, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35]),
+        'industrial': np.array([0.1, 0.05, 0.05, 0.05, 0.1, 0.2, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0,
+                               1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05]),
+    }
+    t_arr = np.arange(time_steps)
+    hour_arr = t_arr % 24
+    month_idx = _economic_get_month_index(time_steps)
+    if load_profile == 'daily':
+        base = base_24['daily']
+        month_factor = np.array([1.15, 1.1, 1.0, 0.85, 0.8, 0.9, 1.0, 0.95, 0.9, 0.95, 1.05, 1.1])
+    elif load_profile == 'industrial':
+        base = base_24['industrial']
+        month_factor = np.array([1.02, 0.98, 1.0, 1.0, 1.0, 0.98, 0.95, 0.96, 1.0, 1.02, 1.0, 0.99])
+    else:
+        base = np.ones(24)
+        month_factor = np.ones(12)
+    daily_val = base[hour_arr]
+    monthly_val = month_factor[month_idx]
+    val = daily_val * monthly_val
+    rng = np.random.RandomState(42)
+    variation = rng.uniform(-0.1, 0.1, size=time_steps)
+    out = np.clip(val + variation, 0.1, 1.3)
+    return out
+
+
+def _economic_get_generation_profile(generation_profile, time_steps):
+    """Return generation scaling factors. Yearly profiles: daily pattern × monthly seasonal factor."""
+    t_arr = np.arange(time_steps)
+    hour_arr = t_arr % 24
+    month_idx = _economic_get_month_index(time_steps)
+    rng = np.random.RandomState(42)
+
+    if generation_profile == 'solar':
+        base_24 = np.array([0, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0,
+                            1.0, 0.95, 0.8, 0.5, 0.2, 0.05, 0, 0, 0, 0, 0, 0])
+        daily_val = base_24[hour_arr]
+        month_factor = np.array([0.25, 0.35, 0.55, 0.75, 0.9, 1.0, 0.95, 0.85, 0.65, 0.45, 0.3, 0.22])
+        monthly_val = month_factor[month_idx]
+        val = daily_val * monthly_val
+        mult = rng.uniform(0.85, 1.0, size=time_steps)
+        val = np.where(val > 0.2, val * mult, val)
+        out = np.clip(val, 0, 1.0)
+    elif generation_profile == 'onshore_wind':
+        base_24 = 0.5 + 0.4 * np.sin(2 * np.pi * (hour_arr - 6) / 24)
+        month_factor = np.array([1.15, 1.1, 1.0, 0.85, 0.7, 0.6, 0.55, 0.6, 0.75, 0.95, 1.05, 1.15])
+        val = base_24 * month_factor[month_idx]
+        variation = rng.uniform(0.7, 1.25, size=time_steps)
+        out = np.clip(val * variation, 0.05, 1.15)
+    elif generation_profile == 'offshore_wind':
+        base_24 = 0.7 + 0.2 * np.sin(2 * np.pi * (hour_arr - 4) / 24)
+        month_factor = np.array([1.0, 0.96, 0.88, 0.75, 0.63, 0.54, 0.5, 0.54, 0.67, 0.83, 0.92, 1.0])
+        val = base_24 * month_factor[month_idx]
+        variation = rng.uniform(0.9, 1.0, size=time_steps)
+        out = np.clip(val * variation, 0.25, 1.0)
+    elif generation_profile == 'wind':
+        base_24 = 0.55 + 0.4 * np.sin(2 * np.pi * (hour_arr - 5) / 24)
+        month_factor = np.array([1.12, 1.08, 1.0, 0.88, 0.72, 0.62, 0.58, 0.62, 0.78, 0.98, 1.05, 1.12])
+        val = base_24 * month_factor[month_idx]
+        variation = rng.uniform(0.7, 1.3, size=time_steps)
+        out = np.clip(val * variation, 0.08, 1.12)
+    elif generation_profile == 'constant':
+        out = np.ones(time_steps, dtype=float)
+    else:
+        variation = rng.uniform(-0.15, 0.15, size=time_steps)
+        out = np.clip(1.0 + variation, 0.8, 1.0)
+    return out
+
+
+def _economic_get_loss_mw(net):
+    """Return total active power loss (MW) from pandapower results."""
+    loss = 0.0
+    if hasattr(net, 'res_line') and not net.res_line.empty:
+        loss += float(net.res_line['pl_mw'].sum())
+    if hasattr(net, 'res_trafo') and not net.res_trafo.empty:
+        loss += float(net.res_trafo['pl_mw'].sum())
+    if hasattr(net, 'res_trafo3w') and not net.res_trafo3w.empty:
+        loss += float(net.res_trafo3w['pl_mw'].sum())
+    if hasattr(net, 'res_impedance') and not net.res_impedance.empty:
+        loss += float(net.res_impedance['pl_mw'].sum())
+    if hasattr(net, 'res_dcline') and not net.res_dcline.empty:
+        loss += float(net.res_dcline['pl_mw'].sum())
+    return loss
+
+
+def economic_analysis(net, in_data, params):
+    """
+    Calculate CAPEX (total capital expenditure), power losses, and electrical energy losses.
+    
+    Parameters:
+    -----------
+    net : pandapower network
+        The network object (after create_busbars and create_other_elements)
+    in_data : dict
+        Full request data with all elements (keys 0, 1, 2, ...)
+    params : dict
+        Economic analysis parameters: frequency, currency, algorithm, init,
+        include_energy_loss, use_generation_profile, time_steps, load_profile,
+        generation_profile, energy_price_per_mwh.
+        
+    Returns:
+    --------
+    dict : Results with total_capex, total_power_losses_mw, total_energy_losses_mwh (optional),
+           energy_loss_cost (optional), capex_breakdown, power_losses_breakdown, currency
+    """
+    try:
+        currency = params.get('currency', 'EUR').upper()
+        
+        algorithm = params.get('algorithm', 'nr')
+        calculate_voltage_angles = params.get('calculate_voltage_angles', 'auto')
+        init = params.get('init', 'dc')
+        use_generation_profile = params.get('use_generation_profile', False)
+        time_steps = max(1, min(8760, int(params.get('time_steps', 8760))))
+        calculation_mode = params.get('calculation_mode', 'full')
+        load_profile = params.get('load_profile', 'constant')
+        generation_profile = params.get('generation_profile', 'constant')
+        energy_price = params.get('energy_price_per_mwh')
+        energy_price_currency = params.get('energy_price_currency', 'EUR')
+        if energy_price is not None:
+            try:
+                energy_price = float(energy_price)
+            except (TypeError, ValueError):
+                energy_price = None
+        
+        try:
+            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)
+        except Exception as pf_err:
+            return {
+                'error': f'Power flow failed: {str(pf_err)}',
+                'total_capex': 0,
+                'total_power_losses_mw': 0,
+                'total_energy_losses_mwh': None,
+                'energy_loss_cost': None,
+                'capex_breakdown': [],
+                'power_losses_breakdown': [],
+                'currency': currency
+            }
+        
+        # Collect CAPEX from in_data - iterate over all elements
+        capex_breakdown = []
+        total_capex = 0.0
+        for x in in_data:
+            elem = in_data[x]
+            if not isinstance(elem, dict):
+                continue
+            typ = elem.get('typ', '')
+            if 'Parameters' in typ or typ == 'simulationParameters':
+                continue
+            
+            cost_per_unit = 0.0
+            if elem.get('cost_per_unit_by_currency'):
+                try:
+                    import json
+                    by_curr = elem.get('cost_per_unit_by_currency')
+                    if isinstance(by_curr, str):
+                        by_curr = json.loads(by_curr)
+                    if isinstance(by_curr, dict) and currency in by_curr:
+                        cost_per_unit = float(by_curr.get(currency, 0) or 0)
+                    elif isinstance(by_curr, (int, float)) and not isinstance(by_curr, bool):
+                        cost_per_unit = float(by_curr)
+                except (ValueError, TypeError, Exception):
+                    pass
+            
+            if cost_per_unit > 0:
+                # Multiply by quantity for elements where cost is per unit (e.g. per km for lines)
+                quantity = 1.0
+                if 'Line' in typ or 'line' in typ.lower():
+                    length_km = float(elem.get('length_km', 1) or 1)
+                    parallel = float(elem.get('parallel', 1) or 1)
+                    quantity = length_km * parallel
+                elif 'Transformer' in typ or 'trafo' in typ.lower():
+                    parallel = float(elem.get('parallel', 1) or 1)
+                    quantity = parallel
+                cost_val = cost_per_unit * quantity
+                name = elem.get('userFriendlyName', elem.get('name', elem.get('id', str(x))))
+                capex_breakdown.append({
+                    'element_type': typ,
+                    'name': name,
+                    'id': elem.get('id', str(x)),
+                    'cost': round(cost_val, 2),
+                    'currency': currency
+                })
+                total_capex += cost_val
+        
+        # Helper to resolve user-friendly name (same as CAPEX breakdown)
+        def _friendly_name(net, internal_name):
+            return getattr(net, 'user_friendly_names', {}).get(internal_name, internal_name)
+
+        # Collect power losses from pandapower results
+        power_losses_breakdown = []
+        total_power_losses_mw = 0.0
+
+        if hasattr(net, 'res_line') and not net.res_line.empty:
+            for index, row in net.res_line.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    internal = net.line.at[index, 'name'] if 'name' in net.line.columns else str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'Line', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+
+        if hasattr(net, 'res_trafo') and not net.res_trafo.empty:
+            for index, row in net.res_trafo.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    internal = net.trafo.at[index, 'name'] if 'name' in net.trafo.columns else str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'Transformer', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+
+        if hasattr(net, 'res_trafo3w') and not net.res_trafo3w.empty:
+            for index, row in net.res_trafo3w.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    internal = net.trafo3w.at[index, 'name'] if 'name' in net.trafo3w.columns else str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'Three Winding Transformer', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+
+        if hasattr(net, 'res_impedance') and not net.res_impedance.empty:
+            for index, row in net.res_impedance.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    internal = net.impedance.at[index, 'name'] if 'name' in net.impedance.columns else str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'Impedance', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+
+        if hasattr(net, 'res_dcline') and not net.res_dcline.empty:
+            for index, row in net.res_dcline.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    internal = net.dcline.at[index, 'name'] if 'name' in net.dcline.columns else str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'DC Line', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+        
+        if hasattr(net, 'res_line_dc') and not net.res_line_dc.empty:
+            for index, row in net.res_line_dc.iterrows():
+                pl_mw = float(row.get('pl_mw', 0) or 0)
+                if pl_mw > 0:
+                    try:
+                        internal = net.line_dc.at[index, 'name'] if hasattr(net, 'line_dc') and index in net.line_dc.index and 'name' in net.line_dc.columns else str(index)
+                    except Exception:
+                        internal = str(index)
+                    name = _friendly_name(net, internal)
+                    power_losses_breakdown.append({'element_type': 'DC Line', 'name': name, 'id': str(index), 'pl_mw': pl_mw})
+                    total_power_losses_mw += pl_mw
+        
+        total_energy_losses_mwh = None
+        energy_loss_cost = None
+        energy_loss_period_hours = None
+        
+        if use_generation_profile:
+            load_scale = _economic_get_load_profile(load_profile, time_steps)
+            gen_scale = _economic_get_generation_profile(generation_profile, time_steps)
+            orig_load_p = net.load['p_mw'].copy() if len(net.load) > 0 else None
+            orig_load_q = net.load['q_mvar'].copy() if len(net.load) > 0 else None
+            orig_gen_p = net.gen['p_mw'].copy() if len(net.gen) > 0 else None
+            orig_sgen_p = net.sgen['p_mw'].copy() if len(net.sgen) > 0 else None
+            orig_sgen_q = net.sgen['q_mvar'].copy() if len(net.sgen) > 0 and 'q_mvar' in net.sgen.columns else None
+
+            # Lookup table: precompute power flows for (load_scale, gen_scale) grid; interpolate per hour
+            use_1d = (load_profile == 'constant')
+            if use_1d:
+                gen_vals = np.linspace(0, 1, 21)
+                loss_vals = np.zeros(21)
+                for i, gs in enumerate(gen_vals):
+                    if orig_load_p is not None:
+                        net.load['p_mw'] = orig_load_p
+                        net.load['q_mvar'] = orig_load_q
+                    if orig_gen_p is not None:
+                        net.gen['p_mw'] = orig_gen_p * gs
+                    if orig_sgen_p is not None:
+                        net.sgen['p_mw'] = orig_sgen_p * gs
+                        if orig_sgen_q is not None:
+                            net.sgen['q_mvar'] = orig_sgen_q * gs
+                    try:
+                        init_this = init if i == 0 else "results"
+                        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this)
+                        loss_vals[i] = _economic_get_loss_mw(net) if net.converged else 0.0
+                    except Exception:
+                        loss_vals[i] = 0.0
+                losses_per_hour = np.interp(gen_scale, gen_vals, loss_vals)
+            else:
+                load_vals = np.linspace(0.1, 1.2, 11)
+                gen_vals = np.linspace(0, 1, 11)
+                loss_grid = np.zeros((11, 11))
+                for i, ls in enumerate(load_vals):
+                    for j, gs in enumerate(gen_vals):
+                        if orig_load_p is not None:
+                            net.load['p_mw'] = orig_load_p * ls
+                            net.load['q_mvar'] = orig_load_q * ls
+                        if orig_gen_p is not None:
+                            net.gen['p_mw'] = orig_gen_p * gs
+                        if orig_sgen_p is not None:
+                            net.sgen['p_mw'] = orig_sgen_p * gs
+                            if orig_sgen_q is not None:
+                                net.sgen['q_mvar'] = orig_sgen_q * gs
+                        try:
+                            init_this = init if (i == 0 and j == 0) else "results"
+                            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this)
+                            loss_grid[i, j] = _economic_get_loss_mw(net) if net.converged else 0.0
+                        except Exception:
+                            loss_grid[i, j] = 0.0
+                from scipy.interpolate import RegularGridInterpolator
+                interp = RegularGridInterpolator((load_vals, gen_vals), loss_grid, method='linear', bounds_error=False, fill_value=0.0)
+                pts = np.column_stack((load_scale, gen_scale))
+                losses_per_hour = interp(pts)
+            total_energy_mwh = float(np.sum(np.maximum(losses_per_hour, 0)))
+
+            if orig_load_p is not None:
+                net.load['p_mw'] = orig_load_p
+                net.load['q_mvar'] = orig_load_q
+            if orig_gen_p is not None:
+                net.gen['p_mw'] = orig_gen_p
+            if orig_sgen_p is not None:
+                net.sgen['p_mw'] = orig_sgen_p
+                if orig_sgen_q is not None:
+                    net.sgen['q_mvar'] = orig_sgen_q
+            total_energy_losses_mwh = round(total_energy_mwh, 4)
+            energy_loss_period_hours = time_steps
+            if energy_price is not None and energy_price > 0:
+                energy_loss_cost = round(total_energy_losses_mwh * energy_price, 2)
+        
+        result = {
+            'total_capex': round(total_capex, 2),
+            'total_power_losses_mw': round(total_power_losses_mw, 6),
+            'capex_breakdown': capex_breakdown,
+            'power_losses_breakdown': power_losses_breakdown,
+            'currency': currency
+        }
+        if total_energy_losses_mwh is not None:
+            lifetime_years = max(1, min(100, int(params.get('lifetime_years', 30))))
+            result['total_energy_losses_mwh'] = total_energy_losses_mwh
+            result['energy_loss_cost'] = energy_loss_cost
+            result['energy_loss_cost_currency'] = energy_price_currency
+            result['energy_loss_period_hours'] = energy_loss_period_hours
+            result['time_steps'] = energy_loss_period_hours
+            result['lifetime_years'] = lifetime_years
+            result['generation_profile'] = generation_profile
+            result['load_profile'] = load_profile
+            result['calculation_mode'] = calculation_mode
+            result['load_profile_values'] = load_scale.tolist()
+            result['generation_profile_values'] = gen_scale.tolist()
+        return result
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"Economic analysis failed: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return {
+            'error': error_msg,
+            'total_capex': 0,
+            'total_power_losses_mw': 0,
+            'total_energy_losses_mwh': None,
+            'energy_loss_cost': None,
+            'capex_breakdown': [],
+            'power_losses_breakdown': [],
+            'currency': params.get('currency', 'EUR')
+        }
