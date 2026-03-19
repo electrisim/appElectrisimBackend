@@ -115,7 +115,28 @@ class TransformerOut(object):
                        
 class TransformersOut(object):
     def __init__(self, transformers: List[TransformerOut]):
-        self.transformers = transformers             
+        self.transformers = transformers
+
+class Transformer3WOut(object):
+    def __init__(self, name: str, id: str, i_hv_ka: float, i_mv_ka: float, i_lv_ka: float,
+                 loading_percent: float, p_hv_mw: float = 0.0, q_hv_mvar: float = 0.0,
+                 p_mv_mw: float = 0.0, q_mv_mvar: float = 0.0, p_lv_mw: float = 0.0, q_lv_mvar: float = 0.0):
+        self.name = name
+        self.id = id
+        self.i_hv_ka = i_hv_ka
+        self.i_mv_ka = i_mv_ka
+        self.i_lv_ka = i_lv_ka
+        self.loading_percent = loading_percent
+        self.p_hv_mw = p_hv_mw
+        self.q_hv_mvar = q_hv_mvar
+        self.p_mv_mw = p_mv_mw
+        self.q_mv_mvar = q_mv_mvar
+        self.p_lv_mw = p_lv_mw
+        self.q_lv_mvar = q_lv_mvar
+
+class Transformers3WOut(object):
+    def __init__(self, transformers3w: List[Transformer3WOut]):
+        self.transformers3w = transformers3w
 
 class ShuntOut(object):
     def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, vm_pu: float):          
@@ -270,6 +291,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
     LoadsDictId = {}
     TransformersDict = {}
     TransformersDictId = {}
+    Transformers3WDict = {}
+    Transformers3WDictId = {}
     ShuntsDict = {}
     ShuntsDictId = {}
     CapacitorsDict = {}
@@ -332,15 +355,29 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         except Exception as e:
             continue
 
-    # Third pass: create Transformers (establish voltage level transitions between buses)
+    # Third pass: create 2-winding Transformers (exclude Three Winding Transformer)
     for x in in_data:
         try:
             element_data = in_data[x]
             element_type = element_data.get('typ', '')
             element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
-            if element_type.startswith("Transformer"):
+            if element_type.startswith("Transformer") and not element_type.startswith("Three Winding Transformer"):
                 create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
+        except ValueError as ve:
+            raise
+        except Exception as e:
+            continue
+
+    # Third-b pass: create 3-winding Transformers
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
+            element_id = element_data.get('id', '')
+            if element_type.startswith("Three Winding Transformer"):
+                create_transformer3w_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, Transformers3WDict, Transformers3WDictId, created_elements, execute_dss_command)
         except ValueError as ve:
             raise
         except Exception as e:
@@ -381,7 +418,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
-            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
+            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Three Winding") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
                 continue
             if element_type.startswith("Load"):
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
@@ -419,6 +456,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
    
     
     return (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+            Transformers3WDict, Transformers3WDictId,
             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
             StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
             circuit_source_element_name)
@@ -1167,6 +1205,104 @@ def vector_group_to_opendss_conns(vector_group):
         lv_conn = 'wye'
     
     return f"{hv_conn} {lv_conn}"
+
+
+def vector_group_to_opendss_conns_3w(vector_group):
+    """Convert 3-winding vector group (e.g. YNdd) to OpenDSS conns format: 'wye delta delta'
+    Vector group: first char=HV, then MV, then LV. N indicates neutral/grounded (ignored for conn type).
+    """
+    if not vector_group or not isinstance(vector_group, str):
+        return "wye wye wye"
+    vg = vector_group.upper().replace(' ', '')
+    conn_map = {'Y': 'wye', 'D': 'delta', 'Z': 'zigzag'}
+    result = []
+    i = 0
+    for _ in range(3):
+        while i < len(vg) and vg[i] == 'N':
+            i += 1
+        if i < len(vg):
+            result.append(conn_map.get(vg[i], 'wye'))
+            i += 1
+        else:
+            result.append('wye')
+    return ' '.join(result[:3])
+
+
+def create_transformer3w_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, Transformers3WDict, Transformers3WDictId, created_elements, execute_dss_command=None):
+    """Create a 3-winding transformer element in OpenDSS.
+    OpenDSS syntax: New Transformer.Name Phases=3 Windings=3 XHL=... XHT=... XLT=...
+    Buses=(bus1 bus2 bus3) kVs=(kv1 kv2 kv3) kVAs=(kva1 kva2 kva3) conns=(wye delta delta) %Rs=[r1 r2 r3]
+    Pandapower mapping: vk_hv_percent=HV-MV -> XHL, vk_lv_percent=HV-LV -> XHT, vk_mv_percent=MV-LV -> XLT
+    """
+    if element_name in created_elements:
+        return
+
+    hv_bus_ref = element_data.get('hv_bus')
+    mv_bus_ref = element_data.get('mv_bus')
+    lv_bus_ref = element_data.get('lv_bus')
+
+    if not (hv_bus_ref and mv_bus_ref and lv_bus_ref):
+        return
+
+    hv_bus_name = BusbarsDictConnectionToName.get(hv_bus_ref) or _sanitize_opendss_name(hv_bus_ref)
+    mv_bus_name = BusbarsDictConnectionToName.get(mv_bus_ref) or _sanitize_opendss_name(mv_bus_ref)
+    lv_bus_name = BusbarsDictConnectionToName.get(lv_bus_ref) or _sanitize_opendss_name(lv_bus_ref)
+
+    try:
+        vn_hv = float(element_data.get('vn_hv_kv', 400))
+        vn_mv = float(element_data.get('vn_mv_kv', 33))
+        vn_lv = float(element_data.get('vn_lv_kv', 33))
+        sn_hv = float(element_data.get('sn_hv_mva', 100)) * 1000  # kVA
+        sn_mv = float(element_data.get('sn_mv_mva', 50)) * 1000
+        sn_lv = float(element_data.get('sn_lv_mva', 50)) * 1000
+        vk_hv = float(element_data.get('vk_hv_percent', 15))
+        vk_mv = float(element_data.get('vk_mv_percent', 15))
+        vk_lv = float(element_data.get('vk_lv_percent', 15))
+        vkr_hv = float(element_data.get('vkr_hv_percent', 1))
+        vkr_mv = float(element_data.get('vkr_mv_percent', 1))
+        vkr_lv = float(element_data.get('vkr_lv_percent', 1))
+        pfe_kw = float(element_data.get('pfe_kw', 0))
+        i0_percent = float(element_data.get('i0_percent', 0))
+        vector_group = element_data.get('vector_group', 'YNdd')
+
+        # Reactance: X = sqrt(vk^2 - vkr^2). OpenDSS: XHL=HV-MV, XHT=HV-LV, XLT=MV-LV
+        xhl = math.sqrt(max(0, vk_hv**2 - vkr_hv**2))
+        xht = math.sqrt(max(0, vk_lv**2 - vkr_lv**2))
+        xlt = math.sqrt(max(0, vk_mv**2 - vkr_mv**2))
+
+        conns = vector_group_to_opendss_conns_3w(vector_group)
+
+        # No-load loss and magnetizing
+        noloadloss = (pfe_kw / sn_hv * 100) if sn_hv > 0 else 0
+
+        cmd_parts = [
+            f"New Transformer.{element_name} Phases=3 Windings=3",
+            f"XHL={xhl} XHT={xht} XLT={xlt}",
+            f"Buses=({hv_bus_name} {mv_bus_name} {lv_bus_name})",
+            f"kVs=({vn_hv} {vn_mv} {vn_lv})",
+            f"kVAs=({sn_hv} {sn_mv} {sn_lv})",
+            f"conns=({conns})",
+            f"%Rs=[{vkr_hv/2} {vkr_mv/2} {vkr_lv/2}]"
+        ]
+        if noloadloss > 0:
+            cmd_parts.append(f"%noloadloss={noloadloss}")
+        if i0_percent > 0:
+            cmd_parts.append(f"%imag={i0_percent}")
+
+        transformer_cmd = " ".join(cmd_parts)
+        execute_dss_command(transformer_cmd)
+
+        in_service = element_data.get('in_service', True)
+        is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ('false', 'no', '0')
+        if not is_in_service:
+            execute_dss_command(f'Transformer.{element_name}.enabled=no')
+
+        Transformers3WDict[element_name] = element_name
+        Transformers3WDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception as e:
+        pass
+
 
 def create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command=None):
     """Create a transformer element in OpenDSS"""
@@ -2044,6 +2180,7 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     try:
         BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, False, opendss_commands)
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+         Transformers3WDict, Transformers3WDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
          StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
          _circuit_source) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)
@@ -2382,6 +2519,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
         # Create other elements
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+         Transformers3WDict, Transformers3WDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
          StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
          circuit_source_element_name) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
@@ -2426,6 +2564,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     linesList = []
     loadsList = []
     transformersList = []
+    transformers3wList = []
     shuntsList = []
     capacitorsList = []
     generatorsList = []
@@ -3067,9 +3206,49 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 transformersList.append(transformer)
             except:
                 pass
-    
-  
-    
+
+    # Process 3-winding transformer results
+    for key, trafo_name in Transformers3WDict.items():
+        try:
+            dss.Circuit.SetActiveElement(f"Transformer.{trafo_name}")
+            is_enabled = dss.CktElement.Enabled()
+            p_hv_mw = q_hv_mvar = p_mv_mw = q_mv_mvar = p_lv_mw = q_lv_mvar = 0.0
+            i_hv_ka = i_mv_ka = i_lv_ka = 0.0
+            loading_percent = 0.0
+            if is_enabled:
+                powers = dss.CktElement.Powers()
+                currents = dss.CktElement.Currents()
+                if len(powers) >= 18:
+                    p_hv_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
+                    q_hv_mvar = (powers[1] + powers[3] + powers[5]) / 1000.0
+                    p_mv_mw = (powers[6] + powers[8] + powers[10]) / 1000.0
+                    q_mv_mvar = (powers[7] + powers[9] + powers[11]) / 1000.0
+                    p_lv_mw = (powers[12] + powers[14] + powers[16]) / 1000.0
+                    q_lv_mvar = (powers[13] + powers[15] + powers[17]) / 1000.0
+                if len(currents) >= 18:
+                    i_hv_ka = (math.sqrt(currents[0]**2 + currents[1]**2) + math.sqrt(currents[2]**2 + currents[3]**2) + math.sqrt(currents[4]**2 + currents[5]**2)) / 3 / 1000.0
+                    i_mv_ka = (math.sqrt(currents[6]**2 + currents[7]**2) + math.sqrt(currents[8]**2 + currents[9]**2) + math.sqrt(currents[10]**2 + currents[11]**2)) / 3 / 1000.0
+                    i_lv_ka = (math.sqrt(currents[12]**2 + currents[13]**2) + math.sqrt(currents[14]**2 + currents[15]**2) + math.sqrt(currents[16]**2 + currents[17]**2)) / 3 / 1000.0
+                sn_hv = 100.0  # default
+                for elem_key, elem_data in in_data.items():
+                    if isinstance(elem_data, dict) and elem_data.get('typ', '').startswith('Three Winding'):
+                        if _sanitize_opendss_name(elem_data.get('name', '')) == trafo_name:
+                            sn_hv = float(elem_data.get('sn_hv_mva', 100))
+                            break
+                s_actual = math.sqrt(abs(p_hv_mw)**2 + abs(q_hv_mvar)**2)
+                loading_percent = (s_actual / sn_hv * 100.0) if sn_hv > 0 else 0.0
+            frontend_id = Transformers3WDictId.get(key, key)
+            t3w = Transformer3WOut(name=key, id=frontend_id, i_hv_ka=i_hv_ka, i_mv_ka=i_mv_ka, i_lv_ka=i_lv_ka,
+                                   loading_percent=loading_percent, p_hv_mw=p_hv_mw, q_hv_mvar=q_hv_mvar,
+                                   p_mv_mw=p_mv_mw, q_mv_mvar=q_mv_mvar, p_lv_mw=p_lv_mw, q_lv_mvar=q_lv_mvar)
+            transformers3wList.append(t3w)
+        except Exception:
+            try:
+                transformers3wList.append(Transformer3WOut(name=key, id=Transformers3WDictId.get(key, key),
+                                                         i_hv_ka=0.0, i_mv_ka=0.0, i_lv_ka=0.0, loading_percent=0.0))
+            except:
+                pass
+
     # Process capacitor results
     if dss.Capacitors.Count() > 0:
         dss.Capacitors.First()
@@ -3403,6 +3582,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         result['loads'] = loadsList
     if transformersList:
         result['transformers'] = transformersList
+    if transformers3wList:
+        result['transformers3w'] = transformers3wList
     if shuntsList:
         result['shunts'] = shuntsList
     if capacitorsList:
@@ -3539,6 +3720,7 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
 
         (LinesDict, LinesDictId, LoadsDict, LoadsDictId,
          TransformersDict, TransformersDictId,
+         Transformers3WDict, Transformers3WDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId,
          GeneratorsDict, GeneratorsDictId,
          StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId,

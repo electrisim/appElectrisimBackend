@@ -3495,8 +3495,42 @@ def shortcircuit(net, in_data, in_data_full=None):
 
     busbars = BusbarsOut(busbars=busbarList)
 
+    def _clean_value(v):
+        """Convert NaN to None and numpy scalars to python scalars for JSON."""
+        if isinstance(v, (float, np.floating)):
+            if math.isnan(v):
+                return None
+            return float(v)
+        return v
+
     # Start result payload with busbar data (existing behaviour)
     result = {**busbars.__dict__}
+
+    # ------------------------------------------------------------------
+    # External grid short-circuit results (from bus results at ext_grid bus)
+    # ------------------------------------------------------------------
+    if hasattr(net, "ext_grid") and not net.ext_grid.empty and not net.res_bus_sc.empty:
+        ext_grid_sc_list = []
+        for idx, ext_row in net.ext_grid.iterrows():
+            bus_idx = ext_row['bus']
+            if bus_idx not in net.res_bus_sc.index:
+                continue
+            row = net.res_bus_sc.loc[bus_idx]
+            ip_ka = row['ip_ka'] if 'ip_ka' in row and not math.isnan(row['ip_ka']) else None
+            ith_ka = row['ith_ka'] if 'ith_ka' in row and not math.isnan(row['ith_ka']) else None
+            ext_entry = {
+                "name": _clean_value(ext_row['name']) if 'name' in ext_row.index else str(idx),
+                "id": _clean_value(ext_row['id']) if 'id' in ext_row.index else str(idx),
+                "ikss_ka": _clean_value(row['ikss_ka']),
+                "ip_ka": ip_ka,
+                "ith_ka": ith_ka,
+                "rk_ohm": _clean_value(row['rk_ohm']),
+                "xk_ohm": _clean_value(row['xk_ohm']),
+            }
+            ext_grid_sc_list.append(ext_entry)
+        if ext_grid_sc_list:
+            result["ext_grid_sc"] = ext_grid_sc_list
+            print(f"Short Circuit: Added {len(ext_grid_sc_list)} external grid SC results")
 
     # ------------------------------------------------------------------
     # NEW: expose short-circuit results for lines and transformers
@@ -3512,14 +3546,6 @@ def shortcircuit(net, in_data, in_data_full=None):
     print(f"Short Circuit: net.res_trafo3w_sc exists: {hasattr(net, 'res_trafo3w_sc')}")
     if hasattr(net, "res_trafo3w_sc"):
         print(f"Short Circuit: net.res_trafo3w_sc shape: {net.res_trafo3w_sc.shape}")
-    
-    def _clean_value(v):
-        """Convert NaN to None and numpy scalars to python scalars for JSON."""
-        if isinstance(v, (float, np.floating)):
-            if math.isnan(v):
-                return None
-            return float(v)
-        return v
 
     # Lines short-circuit results (net.res_line_sc)
     if hasattr(net, "res_line_sc") and not net.res_line_sc.empty:
