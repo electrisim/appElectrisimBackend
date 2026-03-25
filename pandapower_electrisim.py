@@ -6181,3 +6181,340 @@ def economic_analysis(net, in_data, params):
             'power_losses_breakdown': [],
             'currency': params.get('currency', 'EUR')
         }
+
+
+def reactive_power_capability(net, rpc_params):
+    """
+    Perform Reactive Power Capability (RPC) analysis for a wind farm.
+    Sweeps active power and determines Q_min/Q_max at the PCC bus for
+    each requested voltage level. Compares against grid code requirements.
+    """
+    import traceback
+
+    try:
+        pcc_bus_name = rpc_params.get('pcc_bus_name')
+        ext_grid_name = rpc_params.get('ext_grid_name')
+        generator_names = rpc_params.get('generator_names', [])
+        voltage_levels = rpc_params.get('voltage_levels', [1.0])
+        p_min_mw = float(rpc_params.get('p_min_mw', 0))
+        p_max_mw = float(rpc_params.get('p_max_mw', 0))
+        p_steps = int(rpc_params.get('p_steps', 20))
+        q_capability_mode = rpc_params.get('q_capability_mode', 'from_rating')
+        limit_overloads = rpc_params.get('limit_overloads', False)
+        max_loading_percent = float(rpc_params.get('max_loading_percent', 100))
+        requirements = rpc_params.get('requirements', None)
+
+        print(f"=== RPC Analysis ===")
+        print(f"  PCC bus: {pcc_bus_name}")
+        print(f"  Ext grid: {ext_grid_name}")
+        print(f"  Generators: {generator_names}")
+        print(f"  Voltage levels: {voltage_levels}")
+        print(f"  P range: {p_min_mw} - {p_max_mw} MW, {p_steps} steps")
+        print(f"  Q capability mode: {q_capability_mode}")
+        print(f"  Limit overloads: {limit_overloads}")
+
+        # Resolve PCC bus index
+        pcc_bus_idx = None
+        for idx in net.bus.index:
+            if net.bus.at[idx, 'name'] == pcc_bus_name:
+                pcc_bus_idx = idx
+                break
+        if pcc_bus_idx is None:
+            return json.dumps({'error': f'PCC bus "{pcc_bus_name}" not found in network'}, separators=(',', ':'))
+
+        # Resolve external grid index
+        ext_grid_idx = None
+        for idx in net.ext_grid.index:
+            if net.ext_grid.at[idx, 'name'] == ext_grid_name:
+                ext_grid_idx = idx
+                break
+        if ext_grid_idx is None:
+            return json.dumps({'error': f'External grid "{ext_grid_name}" not found in network'}, separators=(',', ':'))
+
+        # Resolve generator (sgen) indices
+        sgen_indices = []
+        for idx in net.sgen.index:
+            if net.sgen.at[idx, 'name'] in generator_names:
+                sgen_indices.append(idx)
+
+        # Also check gen table
+        gen_indices = []
+        if hasattr(net, 'gen') and not net.gen.empty:
+            for idx in net.gen.index:
+                if net.gen.at[idx, 'name'] in generator_names:
+                    gen_indices.append(idx)
+
+        if not sgen_indices and not gen_indices:
+            return json.dumps({'error': 'No matching generators found in the network'}, separators=(',', ':'))
+
+        print(f"  Resolved: PCC bus idx={pcc_bus_idx}, ext_grid idx={ext_grid_idx}")
+        print(f"  sgen indices: {sgen_indices}, gen indices: {gen_indices}")
+
+        # Resolve user-friendly PCC bus name for display
+        pcc_bus_friendly = pcc_bus_name
+        if hasattr(net, 'user_friendly_names') and pcc_bus_name in net.user_friendly_names:
+            pcc_bus_friendly = net.user_friendly_names[pcc_bus_name]
+
+        # Compute installed capacity and per-unit Q limits for each generator
+        gen_info = []
+        for idx in sgen_indices:
+            sn = net.sgen.at[idx, 'sn_mva'] if 'sn_mva' in net.sgen.columns and not pd.isna(net.sgen.at[idx, 'sn_mva']) else 0
+            name = net.sgen.at[idx, 'name']
+            gen_info.append({
+                'type': 'sgen',
+                'idx': idx,
+                'name': name,
+                'sn_mva': float(sn) if sn > 0 else float(net.sgen.at[idx, 'p_mw']),
+            })
+
+        total_installed_mw = sum(g['sn_mva'] for g in gen_info)
+        if total_installed_mw <= 0:
+            total_installed_mw = sum(float(net.sgen.at[g['idx'], 'p_mw']) for g in gen_info)
+        if total_installed_mw <= 0:
+            return json.dumps({'error': 'Total installed capacity is zero. Set sn_mva on generators.'}, separators=(',', ':'))
+
+        if p_max_mw <= 0:
+            p_max_mw = total_installed_mw
+
+        p_points = np.linspace(p_min_mw, p_max_mw, max(p_steps + 1, 2))
+
+        def _run_pf_robust(net_pf):
+            """Try multiple solver strategies for convergence."""
+            strategies = [
+                {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
+                {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
+                {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
+                {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
+            ]
+            for s in strategies:
+                try:
+                    pp.runpp(net_pf,
+                             algorithm=s['algorithm'],
+                             calculate_voltage_angles=True,
+                             init=s['init'],
+                             max_iteration=s['max_iteration'],
+                             enforce_q_lims=False)
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        def _compute_q_capability(sn, p_gen, mode):
+            """Compute |Q| capability for a single generator."""
+            if sn <= 0:
+                return 0
+            if mode == 'from_rating':
+                return math.sqrt(max(sn ** 2 - p_gen ** 2, 0))
+            else:
+                return sn * 0.5
+
+        curves = {}
+        warnings_list = []
+        compliance = {}
+
+        for v_pu in voltage_levels:
+            v_key = f"{float(v_pu):.4f}"
+            print(f"\n  --- Voltage level: {v_pu} pu ---")
+
+            p_result = []
+            q_max_result = []
+            q_min_result = []
+
+            for p_total in p_points:
+                p_val = float(p_total)
+
+                # --- Q_max sweep (overexcited, positive Q) ---
+                q_max_pcc = None
+                for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
+                    net_copy = deepcopy(net)
+                    net_copy.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
+                    for g in gen_info:
+                        share = g['sn_mva'] / total_installed_mw
+                        p_gen = p_val * share
+                        q_cap = _compute_q_capability(g['sn_mva'], p_gen, q_capability_mode)
+                        net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
+                        net_copy.sgen.at[g['idx'], 'q_mvar'] = q_cap * q_frac
+
+                    if _run_pf_robust(net_copy):
+                        q_max_pcc = float(-net_copy.res_bus.at[pcc_bus_idx, 'q_mvar'])
+                        if limit_overloads:
+                            overloaded = False
+                            if not net_copy.res_trafo.empty and net_copy.res_trafo.loading_percent.max() > max_loading_percent:
+                                overloaded = True
+                            if not net_copy.res_line.empty and net_copy.res_line.loading_percent.max() > max_loading_percent:
+                                overloaded = True
+                            if overloaded:
+                                q_max_pcc = _rpc_binary_search_q(
+                                    net, ext_grid_idx, float(v_pu), gen_info,
+                                    total_installed_mw, p_val, q_capability_mode,
+                                    'max', max_loading_percent, pcc_bus_idx
+                                )
+                                warnings_list.append(
+                                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited due to overload"
+                                )
+                        if q_frac < 1.0:
+                            warnings_list.append(
+                                f"V={v_pu}pu, P={p_val:.1f}MW: Q_max converged at {q_frac*100:.0f}% capability"
+                            )
+                        break
+                    else:
+                        continue
+
+                if q_max_pcc is None:
+                    print(f"    Q_max PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
+
+                # --- Q_min sweep (underexcited, negative Q) ---
+                q_min_pcc = None
+                for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
+                    net_copy2 = deepcopy(net)
+                    net_copy2.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
+                    for g in gen_info:
+                        share = g['sn_mva'] / total_installed_mw
+                        p_gen = p_val * share
+                        q_cap = _compute_q_capability(g['sn_mva'], p_gen, q_capability_mode)
+                        net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
+                        net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_cap * q_frac
+
+                    if _run_pf_robust(net_copy2):
+                        q_min_pcc = float(-net_copy2.res_bus.at[pcc_bus_idx, 'q_mvar'])
+                        if limit_overloads:
+                            overloaded = False
+                            if not net_copy2.res_trafo.empty and net_copy2.res_trafo.loading_percent.max() > max_loading_percent:
+                                overloaded = True
+                            if not net_copy2.res_line.empty and net_copy2.res_line.loading_percent.max() > max_loading_percent:
+                                overloaded = True
+                            if overloaded:
+                                q_min_pcc = _rpc_binary_search_q(
+                                    net, ext_grid_idx, float(v_pu), gen_info,
+                                    total_installed_mw, p_val, q_capability_mode,
+                                    'min', max_loading_percent, pcc_bus_idx
+                                )
+                                warnings_list.append(
+                                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited due to overload"
+                                )
+                        if q_frac < 1.0:
+                            warnings_list.append(
+                                f"V={v_pu}pu, P={p_val:.1f}MW: Q_min converged at {q_frac*100:.0f}% capability"
+                            )
+                        break
+                    else:
+                        continue
+
+                if q_min_pcc is None:
+                    print(f"    Q_min PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
+
+                p_result.append(round(p_val, 4))
+                q_max_result.append(round(q_max_pcc, 4) if q_max_pcc is not None else None)
+                q_min_result.append(round(q_min_pcc, 4) if q_min_pcc is not None else None)
+
+            curves[v_key] = {
+                'p_mw': p_result,
+                'q_max_mvar': q_max_result,
+                'q_min_mvar': q_min_result
+            }
+
+            # Check compliance against requirements for this voltage level
+            if requirements:
+                v_req = requirements.get(v_key, None)
+                if v_req:
+                    req_p = v_req.get('p_mw', [])
+                    req_q_max = v_req.get('q_req_max_mvar', [])
+                    req_q_min = v_req.get('q_req_min_mvar', [])
+                    is_compliant = True
+
+                    for i, p_r in enumerate(req_p):
+                        if i >= len(req_q_max) or i >= len(req_q_min):
+                            break
+                        cap_q_max = np.interp(float(p_r), p_result,
+                                              [v if v is not None else 0 for v in q_max_result])
+                        cap_q_min = np.interp(float(p_r), p_result,
+                                              [v if v is not None else 0 for v in q_min_result])
+                        if cap_q_max < float(req_q_max[i]) or cap_q_min > float(req_q_min[i]):
+                            is_compliant = False
+                            break
+
+                    compliance[v_key] = is_compliant
+                else:
+                    compliance[v_key] = None
+            else:
+                compliance[v_key] = None
+
+        result = {
+            'rpc_results': {
+                'voltage_levels': [round(float(v), 4) for v in voltage_levels],
+                'curves': curves,
+                'requirements': requirements if requirements else {},
+                'compliance': compliance,
+                'warnings': warnings_list,
+                'total_installed_mw': round(total_installed_mw, 4),
+                'pcc_bus_name': pcc_bus_friendly,
+                'generator_count': len(gen_info),
+            }
+        }
+
+        return json.dumps(result, default=_json_serialize_default, separators=(',', ':'))
+
+    except Exception as e:
+        traceback.print_exc()
+        return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
+
+
+def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
+                          total_installed_mw, p_val, q_capability_mode,
+                          direction, max_loading_percent, pcc_bus_idx,
+                          iterations=12):
+    """
+    Binary search to find the maximum (or minimum) Q at PCC that keeps
+    all branch loadings within max_loading_percent.
+    direction: 'max' for overexcited, 'min' for underexcited.
+    """
+    lo, hi = 0.0, 1.0
+
+    best_q_pcc = 0.0
+
+    for _ in range(iterations):
+        mid = (lo + hi) / 2.0
+        net_try = deepcopy(net)
+        net_try.ext_grid.at[ext_grid_idx, 'vm_pu'] = v_pu
+
+        for g in gen_info:
+            share = g['sn_mva'] / total_installed_mw
+            p_gen = p_val * share
+            sn = g['sn_mva']
+
+            if q_capability_mode == 'from_rating':
+                q_full = math.sqrt(max(sn ** 2 - p_gen ** 2, 0)) if sn > 0 else 0
+            else:
+                q_full = sn * 0.5 if sn > 0 else 0
+
+            q_gen = q_full * mid * (1 if direction == 'max' else -1)
+            net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
+            net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
+
+        converged = False
+        for init_strat in ['auto', 'dc', 'flat']:
+            try:
+                pp.runpp(net_try, algorithm='nr', calculate_voltage_angles=True,
+                         init=init_strat, max_iteration=50, enforce_q_lims=False)
+                converged = True
+                break
+            except Exception:
+                continue
+
+        if not converged:
+            hi = mid
+            continue
+
+        overloaded = False
+        if not net_try.res_trafo.empty and net_try.res_trafo.loading_percent.max() > max_loading_percent:
+            overloaded = True
+        if not net_try.res_line.empty and net_try.res_line.loading_percent.max() > max_loading_percent:
+            overloaded = True
+
+        if overloaded:
+            hi = mid
+        else:
+            lo = mid
+            best_q_pcc = float(-net_try.res_bus.at[pcc_bus_idx, 'q_mvar'])
+
+    return best_q_pcc

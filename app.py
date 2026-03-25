@@ -208,6 +208,42 @@ def simulation():
                     return response_data
             
             
+            if "RPCAnalysisPandaPower" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== RPC ANALYSIS REQUESTED BY USER: {user_email} ===")
+
+                frequency = float(in_data[x].get('frequency', 50))
+                net = pp.create_empty_network(f_hz=frequency)
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+
+                rpc_params = {
+                    'pcc_bus_name': in_data[x].get('pcc_bus_name'),
+                    'ext_grid_name': in_data[x].get('ext_grid_name'),
+                    'generator_names': in_data[x].get('generator_names', []),
+                    'voltage_levels': [float(v) for v in in_data[x].get('voltage_levels', [1.0])],
+                    'p_min_mw': in_data[x].get('p_min_mw', 0),
+                    'p_max_mw': in_data[x].get('p_max_mw', 0),
+                    'p_steps': in_data[x].get('p_steps', 20),
+                    'q_capability_mode': in_data[x].get('q_capability_mode', 'from_rating'),
+                    'limit_overloads': in_data[x].get('limit_overloads', False),
+                    'max_loading_percent': in_data[x].get('max_loading_percent', 100),
+                    'requirements': in_data[x].get('requirements', None),
+                }
+
+                response_data = pandapower_electrisim.reactive_power_capability(net, rpc_params)
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
             if "ShortCircuitPandaPower" in in_data[x]['typ']:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
