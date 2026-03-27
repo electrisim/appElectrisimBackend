@@ -229,6 +229,7 @@ def simulation():
                     'limit_overloads': in_data[x].get('limit_overloads', False),
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),
+                    'verbose_iwamoto': in_data[x].get('verbose_iwamoto', False),
                 }
 
                 response_data = pandapower_electrisim.reactive_power_capability(net, rpc_params)

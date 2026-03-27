@@ -6188,6 +6188,9 @@ def reactive_power_capability(net, rpc_params):
     Perform Reactive Power Capability (RPC) analysis for a wind farm.
     Sweeps active power and determines Q_min/Q_max at the PCC bus for
     each requested voltage level. Compares against grid code requirements.
+
+    rpc_params may include verbose_iwamoto (default False): when True, pandapower's
+    per-iteration Iwamoto multiplier lines are printed; otherwise they are suppressed.
     """
     import traceback
 
@@ -6203,6 +6206,7 @@ def reactive_power_capability(net, rpc_params):
         limit_overloads = rpc_params.get('limit_overloads', False)
         max_loading_percent = float(rpc_params.get('max_loading_percent', 100))
         requirements = rpc_params.get('requirements', None)
+        verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
 
         print(f"=== RPC Analysis ===")
         print(f"  PCC bus: {pcc_bus_name}")
@@ -6212,6 +6216,8 @@ def reactive_power_capability(net, rpc_params):
         print(f"  P range: {p_min_mw} - {p_max_mw} MW, {p_steps} steps")
         print(f"  Q capability mode: {q_capability_mode}")
         print(f"  Limit overloads: {limit_overloads}")
+        if verbose_iwamoto:
+            print(f"  verbose_iwamoto: True (pandapower will print each Iwamoto multiplier line)")
 
         # Resolve PCC bus index
         pcc_bus_idx = None
@@ -6278,27 +6284,6 @@ def reactive_power_capability(net, rpc_params):
 
         p_points = np.linspace(p_min_mw, p_max_mw, max(p_steps + 1, 2))
 
-        def _run_pf_robust(net_pf):
-            """Try multiple solver strategies for convergence."""
-            strategies = [
-                {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
-                {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
-                {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
-                {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
-            ]
-            for s in strategies:
-                try:
-                    pp.runpp(net_pf,
-                             algorithm=s['algorithm'],
-                             calculate_voltage_angles=True,
-                             init=s['init'],
-                             max_iteration=s['max_iteration'],
-                             enforce_q_lims=False)
-                    return True
-                except Exception:
-                    continue
-            return False
-
         def _compute_q_capability(sn, p_gen, mode):
             """Compute |Q| capability for a single generator."""
             if sn <= 0:
@@ -6335,7 +6320,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy.sgen.at[g['idx'], 'q_mvar'] = q_cap * q_frac
 
-                    if _run_pf_robust(net_copy):
+                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto):
                         q_max_pcc = float(-net_copy.res_bus.at[pcc_bus_idx, 'q_mvar'])
                         if limit_overloads:
                             overloaded = False
@@ -6347,7 +6332,8 @@ def reactive_power_capability(net, rpc_params):
                                 q_max_pcc = _rpc_binary_search_q(
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
-                                    'max', max_loading_percent, pcc_bus_idx
+                                    'max', max_loading_percent, pcc_bus_idx,
+                                    verbose_iwamoto=verbose_iwamoto
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited due to overload"
@@ -6375,7 +6361,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_cap * q_frac
 
-                    if _run_pf_robust(net_copy2):
+                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto):
                         q_min_pcc = float(-net_copy2.res_bus.at[pcc_bus_idx, 'q_mvar'])
                         if limit_overloads:
                             overloaded = False
@@ -6387,7 +6373,8 @@ def reactive_power_capability(net, rpc_params):
                                 q_min_pcc = _rpc_binary_search_q(
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
-                                    'min', max_loading_percent, pcc_bus_idx
+                                    'min', max_loading_percent, pcc_bus_idx,
+                                    verbose_iwamoto=verbose_iwamoto
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited due to overload"
@@ -6459,10 +6446,55 @@ def reactive_power_capability(net, rpc_params):
         return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
 
 
+def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
+    """
+    Run power flow for RPC with multiple solver fallbacks (nr first, then iwamoto_nr).
+    Pandapower's iwamoto_nr prints one line per iteration ("iwamoto muliplier: ...").
+    By default those prints are captured and discarded so RPC does not flood server logs;
+    pass verbose_iwamoto=True to forward them to stdout (for debugging).
+    """
+    import io
+
+    strategies = [
+        {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
+        {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
+        {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
+        {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
+    ]
+    for s in strategies:
+        algo = s['algorithm']
+        try:
+            if algo == 'iwamoto_nr' and not verbose_iwamoto:
+                buf = io.StringIO()
+                old_out, old_err = sys.stdout, sys.stderr
+                sys.stdout = sys.stderr = buf
+                try:
+                    pp.runpp(net_pf,
+                             algorithm=algo,
+                             calculate_voltage_angles=True,
+                             init=s['init'],
+                             max_iteration=s['max_iteration'],
+                             enforce_q_lims=False)
+                finally:
+                    sys.stdout = old_out
+                    sys.stderr = old_err
+            else:
+                pp.runpp(net_pf,
+                         algorithm=algo,
+                         calculate_voltage_angles=True,
+                         init=s['init'],
+                         max_iteration=s['max_iteration'],
+                         enforce_q_lims=False)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
                           total_installed_mw, p_val, q_capability_mode,
                           direction, max_loading_percent, pcc_bus_idx,
-                          iterations=12):
+                          iterations=12, verbose_iwamoto=False):
     """
     Binary search to find the maximum (or minimum) Q at PCC that keeps
     all branch loadings within max_loading_percent.
@@ -6491,15 +6523,7 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
             net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
 
-        converged = False
-        for init_strat in ['auto', 'dc', 'flat']:
-            try:
-                pp.runpp(net_try, algorithm='nr', calculate_voltage_angles=True,
-                         init=init_strat, max_iteration=50, enforce_q_lims=False)
-                converged = True
-                break
-            except Exception:
-                continue
+        converged = _rpc_run_pf_robust(net_try, verbose_iwamoto)
 
         if not converged:
             hi = mid
