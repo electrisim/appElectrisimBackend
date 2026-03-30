@@ -8,12 +8,14 @@ import opendss_electrisim
 import os
 import json
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, Response, stream_with_context
 from flask_cors import CORS, cross_origin #żeby działało trzeba wywołać polecenie pip install -U flask-cors==3.0.10 
 import pandapower as pp
 import pandas as pd
 import gzip
 import io
+import queue
+import threading
 
 import numpy as np
 
@@ -224,13 +226,67 @@ def simulation():
                     'voltage_levels': [float(v) for v in in_data[x].get('voltage_levels', [1.0])],
                     'p_min_mw': in_data[x].get('p_min_mw', 0),
                     'p_max_mw': in_data[x].get('p_max_mw', 0),
-                    'p_steps': in_data[x].get('p_steps', 20),
+                    'p_steps': in_data[x].get('p_steps', 10),
                     'q_capability_mode': in_data[x].get('q_capability_mode', 'from_rating'),
                     'limit_overloads': in_data[x].get('limit_overloads', False),
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),
                     'verbose_iwamoto': in_data[x].get('verbose_iwamoto', False),
+                    'grid_code_template_key': in_data[x].get('grid_code_template_key'),
+                    'grid_code_template_name': in_data[x].get('grid_code_template_name'),
                 }
+
+                use_rpc_stream = bool(in_data[x].get('rpc_stream', False))
+
+                if use_rpc_stream:
+
+                    def _rpc_ndjson_stream():
+                        q = queue.Queue()
+
+                        def _progress_cb(msg):
+                            q.put(('p', msg))
+
+                        def _worker():
+                            try:
+                                rp = {**rpc_params, '_progress_callback': _progress_cb}
+                                out = pandapower_electrisim.reactive_power_capability(net, rp)
+                                q.put(('d', out))
+                            except Exception as ex:
+                                q.put(('e', str(ex)))
+
+                        threading.Thread(target=_worker, daemon=True).start()
+
+                        while True:
+                            kind, payload = q.get()
+                            if kind == 'p':
+                                yield json.dumps({'type': 'progress', 'message': payload}, ensure_ascii=False) + '\n'
+                            elif kind == 'e':
+                                yield json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False) + '\n'
+                                return
+                            elif kind == 'd':
+                                raw = payload
+                                break
+
+                        if raw is None:
+                            yield json.dumps({'type': 'error', 'message': 'No RPC result'}, ensure_ascii=False) + '\n'
+                            return
+                        try:
+                            obj = json.loads(raw)
+                        except Exception:
+                            yield json.dumps({'type': 'error', 'message': 'Invalid RPC JSON'}, ensure_ascii=False) + '\n'
+                            return
+                        if isinstance(obj, dict) and obj.get('error'):
+                            yield json.dumps({'type': 'error', 'message': obj['error']}, ensure_ascii=False) + '\n'
+                            return
+                        yield json.dumps({'type': 'result', 'data': obj}, ensure_ascii=False, separators=(',', ':')) + '\n'
+
+                    resp = Response(
+                        stream_with_context(_rpc_ndjson_stream()),
+                        mimetype='application/x-ndjson'
+                    )
+                    resp.headers['Cache-Control'] = 'no-cache'
+                    resp.headers['X-Accel-Buffering'] = 'no'
+                    return resp
 
                 response_data = pandapower_electrisim.reactive_power_capability(net, rpc_params)
 

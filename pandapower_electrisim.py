@@ -6201,12 +6201,14 @@ def reactive_power_capability(net, rpc_params):
         voltage_levels = rpc_params.get('voltage_levels', [1.0])
         p_min_mw = float(rpc_params.get('p_min_mw', 0))
         p_max_mw = float(rpc_params.get('p_max_mw', 0))
-        p_steps = int(rpc_params.get('p_steps', 20))
+        p_steps = int(rpc_params.get('p_steps', 10))
         q_capability_mode = rpc_params.get('q_capability_mode', 'from_rating')
         limit_overloads = rpc_params.get('limit_overloads', False)
         max_loading_percent = float(rpc_params.get('max_loading_percent', 100))
         requirements = rpc_params.get('requirements', None)
+        grid_code_template_name = rpc_params.get('grid_code_template_name')
         verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
+        progress_cb = rpc_params.get('_progress_callback')
 
         print(f"=== RPC Analysis ===")
         print(f"  PCC bus: {pcc_bus_name}")
@@ -6299,7 +6301,10 @@ def reactive_power_capability(net, rpc_params):
 
         for v_pu in voltage_levels:
             v_key = f"{float(v_pu):.4f}"
-            print(f"\n  --- Voltage level: {v_pu} pu ---")
+            _vl_msg = f"\n  --- Voltage level: {v_pu} pu ---"
+            print(_vl_msg)
+            if progress_cb:
+                progress_cb(_vl_msg)
 
             p_result = []
             q_max_result = []
@@ -6436,6 +6441,7 @@ def reactive_power_capability(net, rpc_params):
                 'total_installed_mw': round(total_installed_mw, 4),
                 'pcc_bus_name': pcc_bus_friendly,
                 'generator_count': len(gen_info),
+                'grid_code_template_name': grid_code_template_name,
             }
         }
 
