@@ -219,6 +219,11 @@ def simulation():
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
 
+                q_mode = in_data[x].get('q_capability_mode', 'from_rating')
+                if q_mode == 'from_sgen_curve':
+                    pandapower_electrisim.apply_sgen_q_capability_curves(
+                        net, in_data, rpc_use_diagram_curves=True)
+
                 rpc_params = {
                     'pcc_bus_name': in_data[x].get('pcc_bus_name'),
                     'ext_grid_name': in_data[x].get('ext_grid_name'),
@@ -227,7 +232,7 @@ def simulation():
                     'p_min_mw': in_data[x].get('p_min_mw', 0),
                     'p_max_mw': in_data[x].get('p_max_mw', 0),
                     'p_steps': in_data[x].get('p_steps', 10),
-                    'q_capability_mode': in_data[x].get('q_capability_mode', 'from_rating'),
+                    'q_capability_mode': q_mode,
                     'limit_overloads': in_data[x].get('limit_overloads', False),
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),

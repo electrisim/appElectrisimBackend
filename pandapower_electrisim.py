@@ -679,6 +679,121 @@ def create_busbars(in_data, net):
     return Busbars
 
 
+def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
+    """
+    Build pandapower net.q_capability_curve_table and characteristic objects for static generators
+    from Electrisim diagram data (reactive_capability_curve, curve_style, q_capability_curve_json).
+    Sets net._electrisim_enforce_q_lims True when any curve is applied (required for runpp to use Q limits).
+
+    If rpc_use_diagram_curves is True (RPC with q_capability_mode=from_sgen_curve), also apply curves
+    when valid q_capability_curve_json exists even if reactive_capability_curve is false, so RPC can
+    use manufacturer P–Q data without requiring the PF checkbox.
+    """
+    if in_data is None or not hasattr(net, 'sgen') or net.sgen.empty:
+        return
+    if 'id' not in net.sgen.columns:
+        return
+
+    def _truthy(val):
+        if val is None:
+            return False
+        if isinstance(val, bool):
+            return val
+        s = str(val).strip().lower()
+        return s in ('true', '1', 'yes', 'on')
+
+    rows = []
+    updates = []  # (sgen_row_index, curve_id, curve_style_str)
+    next_curve_id = 0
+
+    for key, elem in in_data.items():
+        if not isinstance(elem, dict):
+            continue
+        typ = elem.get('typ') or ''
+        if not typ.startswith('Static Generator'):
+            continue
+        curve_requested = _truthy(elem.get('reactive_capability_curve'))
+        if not curve_requested and rpc_use_diagram_curves:
+            raw_try = elem.get('q_capability_curve_json') or elem.get('q_capability_curve_points')
+            if raw_try is not None and (not isinstance(raw_try, str) or str(raw_try).strip()):
+                curve_requested = True
+        if not curve_requested:
+            continue
+        raw_json = elem.get('q_capability_curve_json') or elem.get('q_capability_curve_points')
+        if raw_json is None or (isinstance(raw_json, str) and not raw_json.strip()):
+            continue
+        try:
+            if isinstance(raw_json, str):
+                points = json.loads(raw_json)
+            else:
+                points = raw_json
+        except (json.JSONDecodeError, TypeError):
+            print(f"Warning: Static Generator '{elem.get('name', key)}': invalid q_capability_curve_json, skipping Q curve.")
+            continue
+        if not isinstance(points, list) or len(points) < 2:
+            print(f"Warning: Static Generator '{elem.get('name', key)}': Q capability curve needs at least 2 points, skipping.")
+            continue
+        style = elem.get('curve_style') or 'straightLineYValues'
+        if style not in ('straightLineYValues', 'constantYValue'):
+            style = 'straightLineYValues'
+        cell_id = elem.get('id')
+        try:
+            mask = net.sgen['id'] == cell_id
+            if not mask.any():
+                print(f"Warning: No sgen with id={cell_id!r} for Q capability curve, skipping.")
+                continue
+            sgen_idx = net.sgen.index[mask][0]
+        except Exception as ex:
+            print(f"Warning: Could not match sgen for Q curve (id={cell_id!r}): {ex}")
+            continue
+        curve_id = next_curve_id
+        next_curve_id += 1
+        try:
+            parsed_pts = []
+            for pt in points:
+                if not isinstance(pt, dict):
+                    continue
+                parsed_pts.append({
+                    'id_q_capability_curve': curve_id,
+                    'p_mw': float(pt['p_mw']),
+                    'q_min_mvar': float(pt['q_min_mvar']),
+                    'q_max_mvar': float(pt['q_max_mvar']),
+                })
+            if len(parsed_pts) < 2:
+                print(f"Warning: Static Generator '{elem.get('name', key)}': fewer than 2 valid curve points, skipping.")
+                next_curve_id -= 1
+                continue
+            parsed_pts.sort(key=lambda r: r['p_mw'])
+            rows.extend(parsed_pts)
+            updates.append((sgen_idx, curve_id, style))
+        except (KeyError, TypeError, ValueError) as ex:
+            print(f"Warning: Static Generator '{elem.get('name', key)}': bad Q curve point data: {ex}")
+            next_curve_id -= 1
+            continue
+
+    if not rows:
+        return
+
+    try:
+        from pandapower.control.util.auxiliary import create_q_capability_characteristics_object
+    except ImportError:
+        print('Warning: pandapower.control.util.auxiliary.create_q_capability_characteristics_object not available; Q curves skipped.')
+        return
+
+    net['q_capability_curve_table'] = pd.DataFrame(rows)
+    for sgen_idx, curve_id, style in updates:
+        net.sgen.at[sgen_idx, 'id_q_capability_characteristic'] = curve_id
+        net.sgen.at[sgen_idx, 'curve_style'] = style
+    create_q_capability_characteristics_object(net)
+    net._electrisim_enforce_q_lims = True
+    print(f"Applied {len(updates)} static generator Q capability curve(s); power flow will use enforce_q_lims=True.")
+
+
+def _electrisim_enforce_q_lims_kw(net):
+    """Keyword args for pp.runpp when static generator Q capability curves are present."""
+    return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
+
+
 def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
@@ -1829,6 +1944,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 net.user_friendly_names = {}
             net.user_friendly_names[dcline_name] = element_name
 
+    apply_sgen_q_capability_curves(net, in_data)
+
 
 def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None, run_control=False):
             #pandapower - rozpływ mocy
@@ -1926,7 +2043,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     print(f"Running power flow WITHOUT controllers (run_control={run_control})")
                     initial_tap_positions = {}
                 
-                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init, run_control=run_control)
+                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
+                         run_control=run_control, **_electrisim_enforce_q_lims_kw(net))
                 
                 # Check if tap positions changed
                 if run_control and initial_tap_positions:
@@ -5237,7 +5355,8 @@ def time_series_simulation(net, timeseries_params):
                 pp.runpp(net, 
                         algorithm=timeseries_params.get('algorithm', 'nr'),
                         calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'True'),
-                        init=timeseries_params.get('init', 'dc'))
+                        init=timeseries_params.get('init', 'dc'),
+                        **_electrisim_enforce_q_lims_kw(net))
                 
                 all_results.append({
                     'time_step': t,
@@ -5253,7 +5372,8 @@ def time_series_simulation(net, timeseries_params):
             pp.runpp(net, 
                     algorithm=timeseries_params.get('algorithm', 'nr'),
                     calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'auto'),
-                    init=timeseries_params.get('init', 'dc'))
+                    init=timeseries_params.get('init', 'dc'),
+                    **_electrisim_enforce_q_lims_kw(net))
             
             all_results = [{
                 'time_step': 0,
@@ -5944,7 +6064,8 @@ def economic_analysis(net, in_data, params):
                 energy_price = None
         
         try:
-            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init)
+            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
+                     **_electrisim_enforce_q_lims_kw(net))
         except Exception as pf_err:
             return {
                 'error': f'Power flow failed: {str(pf_err)}',
@@ -6098,7 +6219,8 @@ def economic_analysis(net, in_data, params):
                             net.sgen['q_mvar'] = orig_sgen_q * gs
                     try:
                         init_this = init if i == 0 else "results"
-                        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this)
+                        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
+                                 **_electrisim_enforce_q_lims_kw(net))
                         loss_vals[i] = _economic_get_loss_mw(net) if net.converged else 0.0
                     except Exception:
                         loss_vals[i] = 0.0
@@ -6120,7 +6242,8 @@ def economic_analysis(net, in_data, params):
                                 net.sgen['q_mvar'] = orig_sgen_q * gs
                         try:
                             init_this = init if (i == 0 and j == 0) else "results"
-                            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this)
+                            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
+                                     **_electrisim_enforce_q_lims_kw(net))
                             loss_grid[i, j] = _economic_get_loss_mw(net) if net.converged else 0.0
                         except Exception:
                             loss_grid[i, j] = 0.0
@@ -6183,11 +6306,106 @@ def economic_analysis(net, in_data, params):
         }
 
 
+def _rpc_q_curve_table_subset(qtbl, cid):
+    """Rows matching id_q_capability_curve == cid (tolerant int/float/numpy types)."""
+    try:
+        cnum = int(np.floor(float(cid)))
+    except (TypeError, ValueError):
+        return qtbl.iloc[0:0]
+    col = pd.to_numeric(qtbl['id_q_capability_curve'], errors='coerce')
+    return qtbl.loc[col == cnum]
+
+
+def _rpc_interp_sgen_pq_limits(net, sgen_idx, p_mw):
+    """
+    Interpolate (q_min_mvar, q_max_mvar) at p_mw from net.q_capability_curve_table for the
+    characteristic linked to net.sgen row sgen_idx. Returns None if unavailable.
+    """
+    try:
+        if not hasattr(net, 'sgen') or net.sgen.empty:
+            return None
+        if 'id_q_capability_characteristic' not in net.sgen.columns:
+            return None
+        cid = net.sgen.at[sgen_idx, 'id_q_capability_characteristic']
+        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+            return None
+        qtbl = net.get('q_capability_curve_table', None)
+        if qtbl is None or (hasattr(qtbl, 'empty') and qtbl.empty):
+            return None
+        if 'id_q_capability_curve' not in qtbl.columns:
+            return None
+        sub = _rpc_q_curve_table_subset(qtbl, cid)
+        if len(sub) < 2:
+            return None
+        sub = sub.sort_values('p_mw')
+        p = sub['p_mw'].astype(float).values
+        qmin = sub['q_min_mvar'].astype(float).values
+        qmax = sub['q_max_mvar'].astype(float).values
+        p_m = float(p_mw)
+        q_mi = float(np.interp(p_m, p, qmin))
+        q_ma = float(np.interp(p_m, p, qmax))
+        return (q_mi, q_ma)
+    except Exception:
+        return None
+
+
+def _rpc_sgen_has_q_curve(net, sgen_idx):
+    """True if this sgen row is linked to at least two points in q_capability_curve_table."""
+    try:
+        if not hasattr(net, 'sgen') or net.sgen.empty:
+            return False
+        if 'id_q_capability_characteristic' not in net.sgen.columns:
+            return False
+        cid = net.sgen.at[sgen_idx, 'id_q_capability_characteristic']
+        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+            return False
+        qtbl = net.get('q_capability_curve_table', None)
+        if qtbl is None or (hasattr(qtbl, 'empty') and qtbl.empty):
+            return False
+        if 'id_q_capability_curve' not in qtbl.columns:
+            return False
+        sub = _rpc_q_curve_table_subset(qtbl, cid)
+        return len(sub) >= 2
+    except Exception:
+        return False
+
+
+def _rpc_sgen_q_caps(net, sgen_idx, p_gen, sn, mode):
+    """
+    (q_pos_cap, q_neg_cap) for RPC sweeps: positive Q uses q_pos_cap * fraction;
+    negative Q uses -q_neg_cap * fraction. For symmetric modes both are equal.
+    """
+    if mode == 'from_sgen_curve':
+        lim = _rpc_interp_sgen_pq_limits(net, sgen_idx, p_gen)
+        if lim is not None:
+            q_mi, q_ma = lim
+            q_pos = max(0.0, float(q_ma))
+            q_neg = max(0.0, float(-q_mi))
+            return q_pos, q_neg
+        if sn > 0:
+            fr = math.sqrt(max(sn ** 2 - p_gen ** 2, 0))
+            return fr, fr
+        return 0.0, 0.0
+    if mode == 'from_rating':
+        if sn <= 0:
+            return 0.0, 0.0
+        fr = math.sqrt(max(sn ** 2 - p_gen ** 2, 0))
+        return fr, fr
+    half = sn * 0.5 if sn > 0 else 0.0
+    return half, half
+
+
 def reactive_power_capability(net, rpc_params):
     """
     Perform Reactive Power Capability (RPC) analysis for a wind farm.
     Sweeps active power and determines Q_min/Q_max at the PCC bus for
     each requested voltage level. Compares against grid code requirements.
+
+    rpc_params['q_capability_mode']:
+      - 'from_rating': circular limit sqrt(S_n^2 - P^2) per unit
+      - 'fixed_fraction': 0.5 * S_n
+      - 'from_sgen_curve': interpolate q_min/q_max vs P from net.q_capability_curve_table
+        (after apply_sgen_q_capability_curves); units without a curve fall back to from_rating
 
     rpc_params may include verbose_iwamoto (default False): when True, pandapower's
     per-iteration Iwamoto multiplier lines are printed; otherwise they are suppressed.
@@ -6286,17 +6504,23 @@ def reactive_power_capability(net, rpc_params):
 
         p_points = np.linspace(p_min_mw, p_max_mw, max(p_steps + 1, 2))
 
-        def _compute_q_capability(sn, p_gen, mode):
-            """Compute |Q| capability for a single generator."""
-            if sn <= 0:
-                return 0
-            if mode == 'from_rating':
-                return math.sqrt(max(sn ** 2 - p_gen ** 2, 0))
-            else:
-                return sn * 0.5
-
         curves = {}
         warnings_list = []
+        try:
+            eg_bus = int(net.ext_grid.at[ext_grid_idx, 'bus'])
+            if int(pcc_bus_idx) != eg_bus:
+                warnings_list.append(
+                    'Named PCC bus differs from External Grid bus — red curves show net Q at the named PCC '
+                    '(res_bus after PF); ensure grid-code blue curves refer to the same node.'
+                )
+        except Exception:
+            pass
+        if q_capability_mode == 'from_sgen_curve':
+            if not any(_rpc_sgen_has_q_curve(net, g['idx']) for g in gen_info):
+                warnings_list.append(
+                    'Q mode "from_sgen_curve": no selected static generator has an active P–Q curve '
+                    '(enable reactive capability on the unit). Using circular √(S_n²−P²) fallback for all.'
+                )
         compliance = {}
 
         for v_pu in voltage_levels:
@@ -6321,12 +6545,13 @@ def reactive_power_capability(net, rpc_params):
                     for g in gen_info:
                         share = g['sn_mva'] / total_installed_mw
                         p_gen = p_val * share
-                        q_cap = _compute_q_capability(g['sn_mva'], p_gen, q_capability_mode)
+                        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
+                            net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
                         net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
-                        net_copy.sgen.at[g['idx'], 'q_mvar'] = q_cap * q_frac
+                        net_copy.sgen.at[g['idx'], 'q_mvar'] = q_pos_cap * q_frac
 
                     if _rpc_run_pf_robust(net_copy, verbose_iwamoto):
-                        q_max_pcc = float(-net_copy.res_bus.at[pcc_bus_idx, 'q_mvar'])
+                        q_max_pcc = _rpc_pcc_q_for_chart(net_copy, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
                             if not net_copy.res_trafo.empty and net_copy.res_trafo.loading_percent.max() > max_loading_percent:
@@ -6362,12 +6587,13 @@ def reactive_power_capability(net, rpc_params):
                     for g in gen_info:
                         share = g['sn_mva'] / total_installed_mw
                         p_gen = p_val * share
-                        q_cap = _compute_q_capability(g['sn_mva'], p_gen, q_capability_mode)
+                        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
+                            net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
                         net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
-                        net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_cap * q_frac
+                        net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_neg_cap * q_frac
 
                     if _rpc_run_pf_robust(net_copy2, verbose_iwamoto):
-                        q_min_pcc = float(-net_copy2.res_bus.at[pcc_bus_idx, 'q_mvar'])
+                        q_min_pcc = _rpc_pcc_q_for_chart(net_copy2, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
                             if not net_copy2.res_trafo.empty and net_copy2.res_trafo.loading_percent.max() > max_loading_percent:
@@ -6442,6 +6668,14 @@ def reactive_power_capability(net, rpc_params):
                 'pcc_bus_name': pcc_bus_friendly,
                 'generator_count': len(gen_info),
                 'grid_code_template_name': grid_code_template_name,
+                'q_capability_mode': q_capability_mode,
+                'pcc_q_convention': (
+                    'Red curves: net reactive power at the selected PCC bus after power flow '
+                    '(res_bus.q_mvar), including all shunts, lines, transformers, and injections at that bus. '
+                    'Sign for the chart: if PCC is the External Grid bus, use res_bus.q_mvar as plotted; '
+                    'if PCC is another bus, use −res_bus.q_mvar so +Q matches overexcited / −Q underexcited '
+                    'relative to the usual grid-connection frame. Blue curves are grid-code PCC requirements.'
+                ),
             }
         }
 
@@ -6450,6 +6684,26 @@ def reactive_power_capability(net, rpc_params):
     except Exception as e:
         traceback.print_exc()
         return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
+
+
+def _rpc_pcc_q_for_chart(net_pf, pcc_bus_idx, ext_grid_idx):
+    """
+    Net reactive power (Mvar) at the PCC for RPC red curves: always res_bus.q_mvar at pcc_bus_idx
+    after runpp, so shunts, lines, trafos, and all elements at that bus are included.
+
+    Sign vs chart axes (overexcited +Q, underexcited −Q): when PCC is the External Grid bus, return
+    q_mvar as stored in res_bus; when PCC is a different bus, return −q_mvar so the plotted sign
+    matches the connection-side convention used alongside grid-code blue bands.
+    """
+    q_raw = float(net_pf.res_bus.at[pcc_bus_idx, 'q_mvar'])
+    try:
+        if ext_grid_idx is not None and not net_pf.ext_grid.empty:
+            eg_bus = int(net_pf.ext_grid.at[ext_grid_idx, 'bus'])
+            if int(pcc_bus_idx) == eg_bus:
+                return q_raw
+    except Exception:
+        pass
+    return -q_raw
 
 
 def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
@@ -6519,12 +6773,8 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             share = g['sn_mva'] / total_installed_mw
             p_gen = p_val * share
             sn = g['sn_mva']
-
-            if q_capability_mode == 'from_rating':
-                q_full = math.sqrt(max(sn ** 2 - p_gen ** 2, 0)) if sn > 0 else 0
-            else:
-                q_full = sn * 0.5 if sn > 0 else 0
-
+            q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(net, g['idx'], p_gen, sn, q_capability_mode)
+            q_full = q_pos_cap if direction == 'max' else q_neg_cap
             q_gen = q_full * mid * (1 if direction == 'max' else -1)
             net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
             net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
@@ -6545,6 +6795,6 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             hi = mid
         else:
             lo = mid
-            best_q_pcc = float(-net_try.res_bus.at[pcc_bus_idx, 'q_mvar'])
+            best_q_pcc = _rpc_pcc_q_for_chart(net_try, pcc_bus_idx, ext_grid_idx)
 
     return best_q_pcc
