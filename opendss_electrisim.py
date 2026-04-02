@@ -720,6 +720,16 @@ SPECTRUM_HVDC_PU_CSV = """1,100.00000000000000,-49.555
 29,1.92737759576316,126.79
 """
 
+# Electrisim UI "Linear" harmonic mode: magnitude ~ 100/h (% of fundamental), angle 0.
+# OpenDSS does not provide a built-in Spectrum named "Linear"; passing spectrum=Linear yields
+# no harmonic injection and zero harmonic voltages/currents after mode=harmonics.
+SPECTRUM_LINEAR_UI_CSV = """3,33.333333,0
+5,20.0,0
+7,14.285714,0
+11,9.090909,0
+13,7.692308,0
+"""
+
 
 def _spectrum_dss_from_csv(spectrum_name, csv_text):
     """Parse CSV (harmonic,magnitude,angle per line) and return OpenDSS New Spectrum command string.
@@ -774,6 +784,31 @@ def _create_spectrum_from_csv(dss, spectrum_name, csv_text, execute_dss_command)
     cmd = f'New Spectrum.{spectrum_name} NumHarm={len(harmonics)} harmonic=({harm_str}) %mag=({mag_str}) angle=({ang_str})'
     execute_dss_command(cmd)
     return True
+
+
+def _resolve_named_spectrum_for_element(dss, element_data, default_spectrum, spectrum_object_name, execute_dss_command):
+    """
+    Resolve spectrum= for Generator, static Generator, PVSystem, Vsource: named spectrum or
+    custom CSV (creates New Spectrum.<spectrum_object_name> and references it).
+    """
+    spectrum = element_data.get('spectrum', default_spectrum)
+    if spectrum is None or str(spectrum).strip().lower() == 'none':
+        return None
+    spectrum = str(spectrum).strip()
+    sl = spectrum.lower()
+    if sl == 'custom':
+        csv_text = element_data.get('spectrum_csv', '') or ''
+        if csv_text.strip():
+            safe_name = _sanitize_opendss_name(spectrum_object_name)
+            if _create_spectrum_from_csv(dss, safe_name, csv_text, execute_dss_command):
+                return safe_name
+        return default_spectrum
+    if sl == 'linear':
+        lin_name = _sanitize_opendss_name(f"{spectrum_object_name}_linear")
+        if _create_spectrum_from_csv(dss, lin_name, SPECTRUM_LINEAR_UI_CSV, execute_dss_command):
+            return lin_name
+        return default_spectrum
+    return spectrum
 
 
 def create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
@@ -876,6 +911,12 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
                         # else: keep spectrum_to_use='custom' which may fail; fallback to defaultload
                     else:
                         spectrum_to_use = 'defaultload'  # no CSV provided
+                elif spectrum.lower() == 'linear':
+                    spec_name = _sanitize_opendss_name(f"load_linear_{load_name}")
+                    if _create_spectrum_from_csv(dss, spec_name, SPECTRUM_LINEAR_UI_CSV, execute_dss_command):
+                        spectrum_to_use = spec_name
+                    else:
+                        spectrum_to_use = 'defaultload'
                 load_cmd += f" spectrum={spectrum_to_use}"
             # %SeriesRL: IEEE benchmark uses 100% for harmonic loads (TCR_PU, HVDC_PU)
             spectrum_upper = (spectrum or '').upper()
@@ -996,9 +1037,11 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                 gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=1"
                 
                 # Append harmonic analysis properties if provided
-                spectrum = element_data.get('spectrum', 'defaultgen')
-                if spectrum and spectrum.lower() != 'none':
-                    gen_cmd += f" spectrum={spectrum}"
+                spec_name = _sanitize_opendss_name(f"harm_sgen_{gen_name}")
+                spectrum_resolved = _resolve_named_spectrum_for_element(
+                    dss, element_data, 'defaultgen', spec_name, execute_dss_command)
+                if spectrum_resolved:
+                    gen_cmd += f" spectrum={spectrum_resolved}"
                 xdpp = element_data.get('Xdpp', '')
                 if xdpp not in ('', None):
                     try:
@@ -1117,9 +1160,11 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 gen_cmd += f" XRdp={xr_ratio}"
             
             # Harmonic analysis properties
-            spectrum = element_data.get('spectrum', 'defaultgen')
-            if spectrum and spectrum.lower() != 'none':
-                gen_cmd += f" spectrum={spectrum}"
+            spec_name = _sanitize_opendss_name(f"harm_gen_{element_name}")
+            spectrum_resolved = _resolve_named_spectrum_for_element(
+                dss, element_data, 'defaultgen', spec_name, execute_dss_command)
+            if spectrum_resolved:
+                gen_cmd += f" spectrum={spectrum_resolved}"
             # Override Xdpp from harmonic tab if provided (may differ from short-circuit Xdpp)
             harm_xdpp = element_data.get('Xdpp')
             if harm_xdpp not in ('', None) and xdss_pu == 0:
@@ -1744,7 +1789,15 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 # Append harmonic analysis spectrum if provided
                 spectrum = element_data.get('spectrum', 'default')
                 if spectrum and spectrum.lower() not in ('none', ''):
-                    simple_cmd += f" spectrum={spectrum}"
+                    sl_sp = str(spectrum).strip().lower()
+                    if sl_sp == 'linear':
+                        lin_name = _sanitize_opendss_name(f"{element_name}_stor_linear")
+                        if _create_spectrum_from_csv(dss, lin_name, SPECTRUM_LINEAR_UI_CSV, execute_dss_command):
+                            simple_cmd += f" spectrum={lin_name}"
+                        else:
+                            simple_cmd += " spectrum=default"
+                    else:
+                        simple_cmd += f" spectrum={spectrum}"
                 
                 execute_dss_command(simple_cmd)
                 
@@ -1976,9 +2029,11 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                 # - Many other advanced parameters are not in standard OpenDSS
                 
                 # Harmonic analysis property
-                spectrum = element_data.get('spectrum', 'default')
-                if spectrum and spectrum.lower() not in ('none', ''):
-                    pv_cmd += f" spectrum={spectrum}"
+                spec_name = _sanitize_opendss_name(f"harm_pv_{element_name}")
+                spectrum_resolved = _resolve_named_spectrum_for_element(
+                    dss, element_data, 'default', spec_name, execute_dss_command)
+                if spectrum_resolved:
+                    pv_cmd += f" spectrum={spectrum_resolved}"
                 
                 # If you need additional parameters, verify them in OpenDSS documentation first:
                 # https://opendss.epri.com/PVSystem.html
@@ -2066,11 +2121,13 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             s_sc_max_mva = 10000.0  # Default 10000 MVA short circuit capacity
         
         try:
-            # Build spectrum parameter if provided
-            spectrum = element_data.get('spectrum', 'defaultvsource')
+            # Build spectrum parameter if provided (named spectrum or custom CSV -> New Spectrum.*)
+            spec_name = _sanitize_opendss_name(f"harm_vsrc_{element_name}")
+            spectrum_resolved = _resolve_named_spectrum_for_element(
+                dss, element_data, 'defaultvsource', spec_name, execute_dss_command)
             spectrum_suffix = ''
-            if spectrum and spectrum.lower() != 'none':
-                spectrum_suffix = f" spectrum={spectrum}"
+            if spectrum_resolved:
+                spectrum_suffix = f" spectrum={spectrum_resolved}"
             
             if 'circuit_source_configured' not in created_elements:
                 # First external grid: configure the default Circuit source directly.
