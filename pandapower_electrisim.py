@@ -6395,6 +6395,31 @@ def _rpc_sgen_q_caps(net, sgen_idx, p_gen, sn, mode):
     return half, half
 
 
+def _rpc_masked_q_interp_clip(p_target, p_list, q_list):
+    """
+    Interpolate Q at p_target using only finite (p, q) pairs (skip None q from failed PF).
+    Outside the span of valid P, clip to endpoint values (matches line chart behavior).
+    Returns None if there are no valid pairs.
+    """
+    pairs = []
+    for p, q in zip(p_list, q_list):
+        if q is None:
+            continue
+        try:
+            pairs.append((float(p), float(q)))
+        except (TypeError, ValueError):
+            continue
+    if not pairs:
+        return None
+    pairs.sort(key=lambda t: t[0])
+    px = np.array([t[0] for t in pairs], dtype=float)
+    qy = np.array([t[1] for t in pairs], dtype=float)
+    pt = float(p_target)
+    if len(px) == 1:
+        return float(qy[0])
+    return float(np.interp(pt, px, qy, left=float(qy[0]), right=float(qy[-1])))
+
+
 def reactive_power_capability(net, rpc_params):
     """
     Perform Reactive Power Capability (RPC) analysis for a wind farm.
@@ -6639,17 +6664,43 @@ def reactive_power_capability(net, rpc_params):
                     req_q_max = v_req.get('q_req_max_mvar', [])
                     req_q_min = v_req.get('q_req_min_mvar', [])
                     is_compliant = True
+                    tol_mvar = 1e-4
 
-                    for i, p_r in enumerate(req_p):
-                        if i >= len(req_q_max) or i >= len(req_q_min):
-                            break
-                        cap_q_max = np.interp(float(p_r), p_result,
-                                              [v if v is not None else 0 for v in q_max_result])
-                        cap_q_min = np.interp(float(p_r), p_result,
-                                              [v if v is not None else 0 for v in q_min_result])
-                        if cap_q_max < float(req_q_max[i]) or cap_q_min > float(req_q_min[i]):
+                    n = min(len(req_p), len(req_q_max), len(req_q_min))
+                    if n < 1:
+                        is_compliant = False
+                    else:
+                        try:
+                            order = np.argsort([float(req_p[i]) for i in range(n)])
+                            rp = np.array([float(req_p[i]) for i in order], dtype=float)
+                            rmax = np.array([float(req_q_max[i]) for i in order], dtype=float)
+                            rmin = np.array([float(req_q_min[i]) for i in order], dtype=float)
+                        except (TypeError, ValueError):
                             is_compliant = False
-                            break
+                            rp = rmax = rmin = None
+
+                        if rp is not None:
+                            p_lo = float(rp[0])
+                            p_hi = float(rp[-1])
+                            p_check = set(float(x) for x in rp.tolist())
+                            for p_val in p_result:
+                                try:
+                                    pf = float(p_val)
+                                except (TypeError, ValueError):
+                                    continue
+                                if p_lo <= pf <= p_hi:
+                                    p_check.add(pf)
+                            for p_s in sorted(p_check):
+                                req_max_v = float(np.interp(p_s, rp, rmax, left=float(rmax[0]), right=float(rmax[-1])))
+                                req_min_v = float(np.interp(p_s, rp, rmin, left=float(rmin[0]), right=float(rmin[-1])))
+                                cap_max_v = _rpc_masked_q_interp_clip(p_s, p_result, q_max_result)
+                                cap_min_v = _rpc_masked_q_interp_clip(p_s, p_result, q_min_result)
+                                if cap_max_v is None or cap_min_v is None:
+                                    is_compliant = False
+                                    break
+                                if cap_max_v < req_max_v - tol_mvar or cap_min_v > req_min_v + tol_mvar:
+                                    is_compliant = False
+                                    break
 
                     compliance[v_key] = is_compliant
                 else:
