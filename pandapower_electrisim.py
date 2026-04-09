@@ -2028,20 +2028,20 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             import traceback
                             traceback.print_exc()
                 
+                # Snapshot tap positions before runpp whenever controllers may run (for UI / diagnostics)
+                initial_tap_positions = {}
+                if run_control:
+                    for idx in net.trafo.index:
+                        initial_tap_positions[idx] = float(net.trafo.at[idx, 'tap_pos'])
+
                 # Log controller status before power flow
                 if run_control and hasattr(net, 'controller') and not net.controller.empty:
                     print(f"Running power flow WITH controllers (run_control=True)")
                     print(f"   Controllers in net: {len(net.controller)}")
                     print(net.controller[['object', 'in_service']])
-                    
-                    # Store initial tap positions for comparison
-                    initial_tap_positions = {}
-                    for idx in net.trafo.index:
-                        initial_tap_positions[idx] = net.trafo.at[idx, 'tap_pos']
                     print(f"   Initial tap positions: {initial_tap_positions}")
                 else:
                     print(f"Running power flow WITHOUT controllers (run_control={run_control})")
-                    initial_tap_positions = {}
                 
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
                          run_control=run_control, **_electrisim_enforce_q_lims_kw(net))
@@ -2116,9 +2116,18 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             
                             # Build result object for frontend
                             # Convert numpy types to native Python types for JSON serialization
+                            trafo_cell_id = None
+                            if 'id' in net.trafo.columns:
+                                try:
+                                    trafo_cell_id = str(net.trafo.at[idx, 'id'])
+                                except Exception:
+                                    trafo_cell_id = None
+                            tap_pos_initial = float(initial_tap_positions[idx]) if idx in initial_tap_positions else float(tap_pos)
                             tap_control_results.append({
                                 'name': str(user_friendly_name),
                                 'id': str(name),
+                                'cell_id': trafo_cell_id,
+                                'tap_pos_initial': tap_pos_initial,
                                 'tap_pos': float(tap_pos),
                                 'tap_min': float(tap_min),
                                 'tap_max': float(tap_max),
