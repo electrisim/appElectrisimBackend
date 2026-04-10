@@ -237,6 +237,7 @@ def simulation():
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),
                     'verbose_iwamoto': in_data[x].get('verbose_iwamoto', False),
+                    'run_control': in_data[x].get('run_control', False),
                     'grid_code_template_key': in_data[x].get('grid_code_template_key'),
                     'grid_code_template_name': in_data[x].get('grid_code_template_name'),
                 }

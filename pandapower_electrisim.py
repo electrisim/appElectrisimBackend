@@ -1973,60 +1973,25 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     print(f"Creating DiscreteTapControl for {len(net.trafo_discrete_tap_controllers)} transformers")
                     for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in net.trafo_discrete_tap_controllers:
                         try:
-                            # Use the control_side from frontend (which bus voltage to monitor/control)
                             trafo_name = net.trafo.at[trafo_idx, 'name']
                             tap_side = net.trafo.at[trafo_idx, 'tap_side'] if 'tap_side' in net.trafo.columns else 'hv'
-                            
-                            # Get tap range info for debugging
                             tap_min = net.trafo.at[trafo_idx, 'tap_min']
                             tap_max = net.trafo.at[trafo_idx, 'tap_max']
                             tap_step_percent = net.trafo.at[trafo_idx, 'tap_step_percent']
                             tap_pos = net.trafo.at[trafo_idx, 'tap_pos']
-                            
                             print(f"  Transformer {trafo_idx} ({trafo_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
                             print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
-                            
-                            # Check if tap changer is properly configured
                             if tap_min >= tap_max:
                                 print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
                             if tap_step_percent == 0:
                                 print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
-                            
-                            # Warning if tap is already at limit
                             if tap_pos == tap_max:
                                 print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
-                                print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
                             elif tap_pos == tap_min:
                                 print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
-                                print(f"       Tip: Set tap_pos closer to tap_neutral (0) to allow both increase and decrease")
-                            
-                            # Create controller with side parameter
-                            # 'side' tells which bus voltage to monitor/control (from user's control_side setting)
-                            # Try different parameter names (pandapower versions may differ)
-                            try:
-                                ctrl = control.DiscreteTapControl(
-                                    net=net,
-                                    tid=trafo_idx,
-                                    side=control_side,
-                                    vm_lower_pu=vm_lower_pu,
-                                    vm_upper_pu=vm_upper_pu
-                                )
-                                print(f"    Controller created with 'tid' parameter (index={ctrl.index})")
-                            except TypeError as te:
-                                # Try alternative parameter name
-                                print(f"    'tid' failed, trying 'element_index': {te}")
-                                ctrl = control.DiscreteTapControl(
-                                    net=net,
-                                    element_index=trafo_idx,
-                                    side=control_side,
-                                    vm_lower_pu=vm_lower_pu,
-                                    vm_upper_pu=vm_upper_pu
-                                )
-                                print(f"    Controller created with 'element_index' parameter (index={ctrl.index})")
-                        except Exception as ctrl_err:
-                            print(f"    Failed to create controller: {ctrl_err}")
-                            import traceback
-                            traceback.print_exc()
+                        except Exception:
+                            pass
+                    _electrisim_attach_discrete_tap_controllers(net)
                 
                 # Snapshot tap positions before runpp whenever controllers may run (for UI / diagnostics)
                 initial_tap_positions = {}
@@ -6461,6 +6426,11 @@ def reactive_power_capability(net, rpc_params):
         grid_code_template_name = rpc_params.get('grid_code_template_name')
         verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
         progress_cb = rpc_params.get('_progress_callback')
+        _rc = rpc_params.get('run_control', False)
+        if isinstance(_rc, str):
+            run_control = _rc.lower() in ('true', '1', 'yes', 'on')
+        else:
+            run_control = bool(_rc)
 
         print(f"=== RPC Analysis ===")
         print(f"  PCC bus: {pcc_bus_name}")
@@ -6470,6 +6440,7 @@ def reactive_power_capability(net, rpc_params):
         print(f"  P range: {p_min_mw} - {p_max_mw} MW, {p_steps} steps")
         print(f"  Q capability mode: {q_capability_mode}")
         print(f"  Limit overloads: {limit_overloads}")
+        print(f"  run_control (DiscreteTapControl): {run_control}")
         if verbose_iwamoto:
             print(f"  verbose_iwamoto: True (pandapower will print each Iwamoto multiplier line)")
 
@@ -6555,6 +6526,19 @@ def reactive_power_capability(net, rpc_params):
                     'Q mode "from_sgen_curve": no selected static generator has an active P–Q curve '
                     '(enable reactive capability on the unit). Using circular √(S_n²−P²) fallback for all.'
                 )
+        tc_list = getattr(net, 'trafo_discrete_tap_controllers', None) or []
+        tc_names = []
+        for row in tc_list:
+            try:
+                ti = row[0]
+                tc_names.append(str(net.trafo.at[ti, 'name']))
+            except Exception:
+                tc_names.append(str(row[0]) if row else '?')
+        if run_control and not tc_list:
+            warnings_list.append(
+                'Include controller is on, but no transformers have discrete tap control configured '
+                '(enable it on transformer elements in the diagram). RPC runs as unconstrained PF.'
+            )
         compliance = {}
 
         for v_pu in voltage_levels:
@@ -6584,7 +6568,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy.sgen.at[g['idx'], 'q_mvar'] = q_pos_cap * q_frac
 
-                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto):
+                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto, run_control):
                         q_max_pcc = _rpc_pcc_q_for_chart(net_copy, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
@@ -6597,7 +6581,7 @@ def reactive_power_capability(net, rpc_params):
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
                                     'max', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto
+                                    verbose_iwamoto=verbose_iwamoto, run_control=run_control
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited due to overload"
@@ -6626,7 +6610,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_neg_cap * q_frac
 
-                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto):
+                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto, run_control):
                         q_min_pcc = _rpc_pcc_q_for_chart(net_copy2, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
@@ -6639,7 +6623,7 @@ def reactive_power_capability(net, rpc_params):
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
                                     'min', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto
+                                    verbose_iwamoto=verbose_iwamoto, run_control=run_control
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited due to overload"
@@ -6729,6 +6713,12 @@ def reactive_power_capability(net, rpc_params):
                 'generator_count': len(gen_info),
                 'grid_code_template_name': grid_code_template_name,
                 'q_capability_mode': q_capability_mode,
+                'tap_changer_control': {
+                    'run_control_requested': run_control,
+                    'controllers_applied': bool(run_control and tc_list),
+                    'transformer_count': len(tc_list),
+                    'transformer_names': tc_names,
+                },
                 'pcc_q_convention': (
                     'Red curves: net reactive power at the selected PCC bus after power flow '
                     '(res_bus.q_mvar), including all shunts, lines, transformers, and injections at that bus. '
@@ -6744,6 +6734,37 @@ def reactive_power_capability(net, rpc_params):
     except Exception as e:
         traceback.print_exc()
         return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
+
+
+def _electrisim_attach_discrete_tap_controllers(net):
+    """
+    Register pandapower DiscreteTapControl for each (trafo_idx, side, vm_lo, vm_hi) in
+    net.trafo_discrete_tap_controllers (populated during create_other_elements).
+    Safe on a fresh or deep-copied net before runpp(..., run_control=True).
+    """
+    lst = getattr(net, 'trafo_discrete_tap_controllers', None)
+    if not lst:
+        return
+    for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in lst:
+        try:
+            try:
+                control.DiscreteTapControl(
+                    net=net,
+                    tid=trafo_idx,
+                    side=control_side,
+                    vm_lower_pu=vm_lower_pu,
+                    vm_upper_pu=vm_upper_pu
+                )
+            except TypeError:
+                control.DiscreteTapControl(
+                    net=net,
+                    element_index=trafo_idx,
+                    side=control_side,
+                    vm_lower_pu=vm_lower_pu,
+                    vm_upper_pu=vm_upper_pu
+                )
+        except Exception:
+            pass
 
 
 def _rpc_pcc_q_for_chart(net_pf, pcc_bus_idx, ext_grid_idx):
@@ -6766,21 +6787,32 @@ def _rpc_pcc_q_for_chart(net_pf, pcc_bus_idx, ext_grid_idx):
     return -q_raw
 
 
-def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
+def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control=False):
     """
     Run power flow for RPC with multiple solver fallbacks (nr first, then iwamoto_nr).
     Pandapower's iwamoto_nr prints one line per iteration ("iwamoto muliplier: ...").
     By default those prints are captured and discarded so RPC does not flood server logs;
     pass verbose_iwamoto=True to forward them to stdout (for debugging).
+
+    When run_control is True and the net lists trafo_discrete_tap_controllers, registers
+    DiscreteTapControl and runs pp.runpp(..., run_control=True) with a single NR strategy
+    (controller state is not reliable across solver fallbacks on the same net).
     """
     import io
 
-    strategies = [
-        {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
-        {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
-        {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
-        {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
-    ]
+    q_kw = _electrisim_enforce_q_lims_kw(net_pf)
+    tc = getattr(net_pf, 'trafo_discrete_tap_controllers', None) or []
+    rc = bool(run_control) and bool(tc)
+    if rc:
+        _electrisim_attach_discrete_tap_controllers(net_pf)
+        strategies = [{'algorithm': 'nr', 'init': 'auto', 'max_iteration': 100}]
+    else:
+        strategies = [
+            {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
+            {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
+            {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
+            {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
+        ]
     for s in strategies:
         algo = s['algorithm']
         try:
@@ -6794,7 +6826,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
                              calculate_voltage_angles=True,
                              init=s['init'],
                              max_iteration=s['max_iteration'],
-                             enforce_q_lims=False)
+                             run_control=rc,
+                             **q_kw)
                 finally:
                     sys.stdout = old_out
                     sys.stderr = old_err
@@ -6804,7 +6837,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
                          calculate_voltage_angles=True,
                          init=s['init'],
                          max_iteration=s['max_iteration'],
-                         enforce_q_lims=False)
+                         run_control=rc,
+                         **q_kw)
             return True
         except Exception:
             continue
@@ -6814,7 +6848,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False):
 def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
                           total_installed_mw, p_val, q_capability_mode,
                           direction, max_loading_percent, pcc_bus_idx,
-                          iterations=12, verbose_iwamoto=False):
+                          iterations=12, verbose_iwamoto=False, run_control=False):
     """
     Binary search to find the maximum (or minimum) Q at PCC that keeps
     all branch loadings within max_loading_percent.
@@ -6839,7 +6873,7 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
             net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
 
-        converged = _rpc_run_pf_robust(net_try, verbose_iwamoto)
+        converged = _rpc_run_pf_robust(net_try, verbose_iwamoto, run_control)
 
         if not converged:
             hi = mid
