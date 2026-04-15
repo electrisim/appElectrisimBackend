@@ -1178,7 +1178,8 @@ def create_other_elements(in_data,net,x, Busbars):
             #mag0_rx**  - zero sequence magnetizing r/x  ratio
             #si0_hv_partial** - zero sequence short circuit impedance  distribution in hv side
             #vk0_percent=in_data[x]['vk0_percent'], vkr0_percent=in_data[x]['vkr0_percent'], mag0_percent=in_data[x]['mag0_percent'], si0_hv_partial=in_data[x]['si0_hv_partial'],
-        if (in_data[x]['typ'].startswith("Transformer")): 
+        _typ = in_data[x].get('typ') or ''
+        if (_typ.startswith("Transformer") or _typ.startswith("Two Winding Transformer")) and not _typ.startswith("Three Winding Transformer"):
             # Get values with default fallbacks and proper type conversion
             parallel_value = safe_int(in_data[x].get('parallel', 1), 1)
             vector_group_raw = in_data[x].get('vector_group', None)

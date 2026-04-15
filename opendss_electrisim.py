@@ -362,7 +362,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_type = element_data.get('typ', '')
             element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
-            if element_type.startswith("Transformer") and not element_type.startswith("Three Winding Transformer"):
+            if (element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer")) and not element_type.startswith("Three Winding Transformer"):
                 create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
         except ValueError as ve:
             raise
@@ -418,7 +418,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
-            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Three Winding") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
+            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer") or element_type.startswith("Three Winding") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
                 continue
             if element_type.startswith("Load"):
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
@@ -3084,9 +3084,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     # HV side (Terminal 1): phases 1, 2, 3
                     p_hv_kw = powers[0] + powers[2] + powers[4]
                     q_hv_kvar = powers[1] + powers[3] + powers[5]
-                    # LV side (Terminal 2): phases 1, 2, 3
-                    p_lv_kw = powers[8] + powers[10] + powers[12]
-                    q_lv_kvar = powers[9] + powers[11] + powers[13]
+                    # LV side (Terminal 2): phases 1, 2, 3 — indices 6..11 (pairs P,Q per phase), same layout as lines code below
+                    p_lv_kw = powers[6] + powers[8] + powers[10]
+                    q_lv_kvar = powers[7] + powers[9] + powers[11]
                     
                     # Convert to MW/MVAr
                     p_hv_mw = p_hv_kw / 1000.0 if not math.isnan(p_hv_kw) else 0.0
@@ -3149,8 +3149,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 elem_name = elem_data.get('name', '')
                                 elem_id = elem_data.get('id', '')
                                 
-                                # Match transformer by type and name/id
-                                if elem_type == 'Transformer':
+                                # Match transformer by type and name/id (typ is usually "Transformer0", etc.)
+                                if (elem_type.startswith("Transformer") or elem_type.startswith("Two Winding Transformer")) and not elem_type.startswith("Three Winding Transformer"):
                                     # Match by name (most reliable) - sanitize for comparison
                                     if _sanitize_opendss_name(elem_name) == trafo_name or _sanitize_opendss_name(elem_name) == key:
                                         element_data = elem_data
@@ -3170,7 +3170,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             # Debug: show what transformers ARE in in_data
                             transformer_keys_found = []
                             for elem_key, elem_data in in_data.items():
-                                if isinstance(elem_data, dict) and elem_data.get('typ', '') == 'Transformer':
+                                if isinstance(elem_data, dict) and (elem_data.get('typ', '').startswith("Transformer") or elem_data.get('typ', '').startswith("Two Winding Transformer")) and not elem_data.get('typ', '').startswith("Three Winding Transformer"):
                                     transformer_keys_found.append(f"{elem_key}: name={elem_data.get('name', 'N/A')}, id={elem_data.get('id', 'N/A')}")
                             if transformer_keys_found:
                                 pass
@@ -3800,7 +3800,8 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     def _find_trafo_buses(trafo_key):
         for x_key in in_data:
             ed = in_data[x_key]
-            if ed.get('typ') == 'Transformer' and (ed.get('name', '') == trafo_key or ed.get('id', '') == TransformersDictId.get(trafo_key, '')):
+            _t = ed.get('typ', '')
+            if (_t.startswith("Transformer") or _t.startswith("Two Winding Transformer")) and not _t.startswith("Three Winding Transformer") and (ed.get('name', '') == trafo_key or ed.get('id', '') == TransformersDictId.get(trafo_key, '')):
                 return ed.get('busFrom', ''), ed.get('busTo', '')
         return '', ''
 
