@@ -16,7 +16,37 @@ from pandapower.timeseries import DFData
 from copy import deepcopy
 
 
-Busbars = {} 
+Busbars = {}
+
+
+def _pf_res_row_for_element(net_element_df, res_df, element_index):
+    """
+    Map a net element row (trafo / trafo3w) to its power-flow result row.
+    Prefer matching index; if lengths match, fall back to same position (handles rare index dtype mismatches).
+    """
+    if res_df is None or getattr(res_df, 'empty', True):
+        return None
+    try:
+        if element_index in res_df.index:
+            return res_df.loc[element_index]
+    except (TypeError, KeyError, ValueError):
+        pass
+    if len(res_df) == len(net_element_df):
+        try:
+            pos = list(net_element_df.index).index(element_index)
+            return res_df.iloc[pos]
+        except (ValueError, IndexError, TypeError):
+            pass
+    return None
+
+
+def _trafo_out_id(raw_id, name, index_fallback):
+    """Stable string id for JSON (avoid NaN/null from pandas)."""
+    if raw_id is not None and not pd.isna(raw_id):
+        return str(raw_id)
+    if name is not None and not pd.isna(name):
+        return str(name)
+    return str(index_fallback)
 
 
 def _json_serialize_default(obj):
@@ -2902,31 +2932,116 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             result = {**result, **asymmetricstaticgenerators.__dict__}
                         
                
-                #Transformer                     
-                if(net.res_trafo.empty):
-                    pass
-                else:                    
-                        for index, row in net.res_trafo.iterrows():    
-                            transformer = TransformerOut(name=net.trafo._get_value(index, 'name'), id = net.trafo._get_value(index, 'id'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_lv_mw=row['p_lv_mw'], q_lv_mvar=row['q_lv_mvar'], pl_mw=row['pl_mw'], 
-                                                         ql_mvar=row['ql_mvar'], i_hv_ka=row['i_hv_ka'], i_lv_ka=row['i_lv_ka'], vm_hv_pu=row['vm_hv_pu'], vm_lv_pu=row['vm_lv_pu'], va_hv_degree=row['va_hv_degree'], va_lv_degree=row['va_lv_degree'], loading_percent=row['loading_percent'])        
-                            transformersList.append(transformer) 
-                            transformers = TransformersOut(transformers = transformersList)
-                        
-                        result = {**result, **transformers.__dict__}   
-                        
-                        
-                #Transformer3W                     
-                if(net.res_trafo3w.empty):
-                    pass
-                else:                    
-                        for index, row in net.res_trafo3w.iterrows():    
-                            transformer3W = Transformer3WOut(name=net.trafo3w._get_value(index, 'name'), id = net.trafo3w._get_value(index, 'id'), p_hv_mw=row['p_hv_mw'], q_hv_mvar=row['q_hv_mvar'], p_mv_mw=row['p_mv_mw'], q_mv_mvar=row['q_mv_mvar'], p_lv_mw=row['p_lv_mw'], 
-                                                         q_lv_mvar=row['q_lv_mvar'], pl_mw=row['pl_mw'], ql_mvar=row['ql_mvar'], i_hv_ka=row['i_hv_ka'], i_mv_ka=row['i_mv_ka'], i_lv_ka=row['i_lv_ka'], vm_hv_pu=row['vm_hv_pu'], vm_mv_pu=row['vm_mv_pu'],
-                                                         vm_lv_pu=row['vm_lv_pu'], va_hv_degree=row['va_hv_degree'], va_mv_degree=row['va_mv_degree'], va_lv_degree=row['va_lv_degree'], loading_percent=row['loading_percent'])        
-                            transformers3WList.append(transformer3W)
-                            transformers3W = Transformers3WOut(transformers3W = transformers3WList)
-                        
-                        result = {**result, **transformers3W.__dict__}  
+                # Transformer — one JSON row per net.trafo (frontend updates every 2W trafo on the diagram).
+                # net.res_trafo can omit rows (out-of-service, unsupplied, etc.); iterating only res_trafo left those shapes without results.
+                if not net.trafo.empty:
+                    res_tf = getattr(net, 'res_trafo', None)
+                    for trafo_index in net.trafo.index:
+                        t_name = net.trafo._get_value(trafo_index, 'name')
+                        t_raw_id = net.trafo._get_value(trafo_index, 'id')
+                        t_name_s = str(t_name) if t_name is not None and not pd.isna(t_name) else str(trafo_index)
+                        t_id = _trafo_out_id(t_raw_id, t_name, trafo_index)
+                        row = _pf_res_row_for_element(net.trafo, res_tf, trafo_index)
+                        if row is not None:
+                            transformer = TransformerOut(
+                                name=t_name_s,
+                                id=t_id,
+                                p_hv_mw=row['p_hv_mw'],
+                                q_hv_mvar=row['q_hv_mvar'],
+                                p_lv_mw=row['p_lv_mw'],
+                                q_lv_mvar=row['q_lv_mvar'],
+                                pl_mw=row['pl_mw'],
+                                ql_mvar=row['ql_mvar'],
+                                i_hv_ka=row['i_hv_ka'],
+                                i_lv_ka=row['i_lv_ka'],
+                                vm_hv_pu=row['vm_hv_pu'],
+                                vm_lv_pu=row['vm_lv_pu'],
+                                va_hv_degree=row['va_hv_degree'],
+                                va_lv_degree=row['va_lv_degree'],
+                                loading_percent=row['loading_percent'],
+                            )
+                        else:
+                            transformer = TransformerOut(
+                                name=t_name_s,
+                                id=t_id,
+                                p_hv_mw=0.0,
+                                q_hv_mvar=0.0,
+                                p_lv_mw=0.0,
+                                q_lv_mvar=0.0,
+                                pl_mw=0.0,
+                                ql_mvar=0.0,
+                                i_hv_ka=0.0,
+                                i_lv_ka=0.0,
+                                vm_hv_pu=1.0,
+                                vm_lv_pu=1.0,
+                                va_hv_degree=0.0,
+                                va_lv_degree=0.0,
+                                loading_percent=0.0,
+                            )
+                        transformersList.append(transformer)
+                    if transformersList:
+                        transformers = TransformersOut(transformers=transformersList)
+                        result = {**result, **transformers.__dict__}
+
+                # Three-winding transformer — same pattern as 2W
+                if hasattr(net, 'trafo3w') and not net.trafo3w.empty:
+                    res_t3 = getattr(net, 'res_trafo3w', None)
+                    for t3_index in net.trafo3w.index:
+                        t_name = net.trafo3w._get_value(t3_index, 'name')
+                        t_raw_id = net.trafo3w._get_value(t3_index, 'id')
+                        t_name_s = str(t_name) if t_name is not None and not pd.isna(t_name) else str(t3_index)
+                        t_id = _trafo_out_id(t_raw_id, t_name, t3_index)
+                        row = _pf_res_row_for_element(net.trafo3w, res_t3, t3_index)
+                        if row is not None:
+                            transformer3W = Transformer3WOut(
+                                name=t_name_s,
+                                id=t_id,
+                                p_hv_mw=row['p_hv_mw'],
+                                q_hv_mvar=row['q_hv_mvar'],
+                                p_mv_mw=row['p_mv_mw'],
+                                q_mv_mvar=row['q_mv_mvar'],
+                                p_lv_mw=row['p_lv_mw'],
+                                q_lv_mvar=row['q_lv_mvar'],
+                                pl_mw=row['pl_mw'],
+                                ql_mvar=row['ql_mvar'],
+                                i_hv_ka=row['i_hv_ka'],
+                                i_mv_ka=row['i_mv_ka'],
+                                i_lv_ka=row['i_lv_ka'],
+                                vm_hv_pu=row['vm_hv_pu'],
+                                vm_mv_pu=row['vm_mv_pu'],
+                                vm_lv_pu=row['vm_lv_pu'],
+                                va_hv_degree=row['va_hv_degree'],
+                                va_mv_degree=row['va_mv_degree'],
+                                va_lv_degree=row['va_lv_degree'],
+                                loading_percent=row['loading_percent'],
+                            )
+                        else:
+                            transformer3W = Transformer3WOut(
+                                name=t_name_s,
+                                id=t_id,
+                                p_hv_mw=0.0,
+                                q_hv_mvar=0.0,
+                                p_mv_mw=0.0,
+                                q_mv_mvar=0.0,
+                                p_lv_mw=0.0,
+                                q_lv_mvar=0.0,
+                                pl_mw=0.0,
+                                ql_mvar=0.0,
+                                i_hv_ka=0.0,
+                                i_mv_ka=0.0,
+                                i_lv_ka=0.0,
+                                vm_hv_pu=1.0,
+                                vm_mv_pu=1.0,
+                                vm_lv_pu=1.0,
+                                va_hv_degree=0.0,
+                                va_mv_degree=0.0,
+                                va_lv_degree=0.0,
+                                loading_percent=0.0,
+                            )
+                        transformers3WList.append(transformer3W)
+                    if transformers3WList:
+                        transformers3W = Transformers3WOut(transformers3W=transformers3WList)
+                        result = {**result, **transformers3W.__dict__}
                
                
 
