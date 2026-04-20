@@ -1,5 +1,5 @@
 import opendssdirect as dss
-from typing import List
+from typing import List, Optional
 import math
 import json
 import re
@@ -1277,7 +1277,7 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
     """Create a 3-winding transformer element in OpenDSS.
     OpenDSS syntax: New Transformer.Name Phases=3 Windings=3 XHL=... XHT=... XLT=...
     Buses=(bus1 bus2 bus3) kVs=(kv1 kv2 kv3) kVAs=(kva1 kva2 kva3) conns=(wye delta delta) %Rs=[r1 r2 r3]
-    Pandapower mapping: vk_hv_percent=HV-MV -> XHL, vk_lv_percent=HV-LV -> XHT, vk_mv_percent=MV-LV -> XLT
+    Pandapower mapping: vk_hv_percent (HV-MV) -> XHL; vk_lv_percent (HV-LV) -> XHT; vk_mv_percent (MV-LV) -> XLT
     """
     if element_name in created_elements:
         return
@@ -1310,12 +1310,79 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
         i0_percent = float(element_data.get('i0_percent', 0))
         vector_group = element_data.get('vector_group', 'YNdd')
 
-        # Reactance: X = sqrt(vk^2 - vkr^2). OpenDSS: XHL=HV-MV, XHT=HV-LV, XLT=MV-LV
-        xhl = math.sqrt(max(0, vk_hv**2 - vkr_hv**2))
-        xht = math.sqrt(max(0, vk_lv**2 - vkr_lv**2))
-        xlt = math.sqrt(max(0, vk_mv**2 - vkr_mv**2))
+        # Base conversion — this is the subtle one.
+        #
+        # Pandapower trafo3w (https://pandapower.readthedocs.io/en/latest/elements/trafo3w.html)
+        # defines each per-pair short-circuit voltage on the MIN apparent power of the pair:
+        #   vk_hv_percent on min(sn_hv, sn_mv)   (HV-MV pair)
+        #   vk_mv_percent on min(sn_mv, sn_lv)   (MV-LV pair)
+        #   vk_lv_percent on min(sn_hv, sn_lv)   (HV-LV pair)
+        #
+        # OpenDSS Transformer with Windings=3 expects XHL/XHT/XLT on the WINDING-1 kVA base
+        # (https://opendss.epri.com/Three-WindingTransformers.html and OpenDSS primer). With
+        # winding 1 = HV, winding 2 = MV, winding 3 = LV we have XHL = 1-2 (HV-MV),
+        # XHT = 1-3 (HV-LV), XLT = 2-3 (MV-LV), all referenced to sn_hv.
+        #
+        # The conversion factor for each pair is sn_hv / min(sn_x, sn_y). Without it the
+        # 500/250/250 and 500/500/15 style transformers get impedances that are off by a
+        # factor of 2 to ~33, which drives large voltage and reactive-power differences
+        # versus pandapower.
+        sn_hv_mva_val = sn_hv / 1000.0  # sn_hv above is already converted to kVA
+        sn_mv_mva_val = sn_mv / 1000.0
+        sn_lv_mva_val = sn_lv / 1000.0
+        base_hm = min(sn_hv_mva_val, sn_mv_mva_val) if min(sn_hv_mva_val, sn_mv_mva_val) > 0 else sn_hv_mva_val
+        base_ml = min(sn_mv_mva_val, sn_lv_mva_val) if min(sn_mv_mva_val, sn_lv_mva_val) > 0 else sn_hv_mva_val
+        base_lh = min(sn_hv_mva_val, sn_lv_mva_val) if min(sn_hv_mva_val, sn_lv_mva_val) > 0 else sn_hv_mva_val
+
+        vk_hm_snhv = vk_hv * sn_hv_mva_val / base_hm
+        vk_ml_snhv = vk_mv * sn_hv_mva_val / base_ml
+        vk_lh_snhv = vk_lv * sn_hv_mva_val / base_lh
+        vkr_hm_snhv = vkr_hv * sn_hv_mva_val / base_hm
+        vkr_ml_snhv = vkr_mv * sn_hv_mva_val / base_ml
+        vkr_lh_snhv = vkr_lv * sn_hv_mva_val / base_lh
+
+        xhl = math.sqrt(max(0.0, vk_hm_snhv ** 2 - vkr_hm_snhv ** 2))
+        xht = math.sqrt(max(0.0, vk_lh_snhv ** 2 - vkr_lh_snhv ** 2))
+        xlt = math.sqrt(max(0.0, vk_ml_snhv ** 2 - vkr_ml_snhv ** 2))
+
+        # Per-winding resistances for OpenDSS %Rs=[r1 r2 r3].
+        # OpenDSS treats each %R_i as the resistance of winding i on winding i's own kVA base.
+        # Starting from the three per-pair vkr values on sn_hv base, apply the delta-to-star
+        # conversion pandapower itself uses (see trafo3w docs "Electric Model"):
+        #   R_H = 1/2 (vkr_hm + vkr_lh - vkr_ml)
+        #   R_M = 1/2 (vkr_ml + vkr_hm - vkr_lh)
+        #   R_L = 1/2 (vkr_ml + vkr_lh - vkr_hm)
+        # then rescale R_M and R_L to their own winding bases.
+        rH_snhv = 0.5 * (vkr_hm_snhv + vkr_lh_snhv - vkr_ml_snhv)
+        rM_snhv = 0.5 * (vkr_ml_snhv + vkr_hm_snhv - vkr_lh_snhv)
+        rL_snhv = 0.5 * (vkr_ml_snhv + vkr_lh_snhv - vkr_hm_snhv)
+        r1_pct = max(0.0, rH_snhv)
+        r2_pct = max(0.0, rM_snhv * (sn_mv_mva_val / sn_hv_mva_val)) if sn_hv_mva_val > 0 else 0.0
+        r3_pct = max(0.0, rL_snhv * (sn_lv_mva_val / sn_hv_mva_val)) if sn_hv_mva_val > 0 else 0.0
 
         conns = vector_group_to_opendss_conns_3w(vector_group)
+
+        # OLTC taps — must match create_transformer_element (2w) and pandapower_electrisim 3w branch.
+        # Previously 3w transformers were always exported at Taps=1, which skewed voltages and slack Q.
+        tap_pos_raw = element_data.get('tap_pos', '0')
+        tap_step_percent_raw = element_data.get('tap_step_percent', '1.5')
+        tap_side = str(element_data.get('tap_side', 'hv')).lower()
+        try:
+            tap_pos = float(tap_pos_raw)
+        except (TypeError, ValueError):
+            tap_pos = 0.0
+        try:
+            tap_step_percent = float(tap_step_percent_raw)
+        except (TypeError, ValueError):
+            tap_step_percent = 1.5
+        tap_change = tap_pos * tap_step_percent / 100.0
+        tap_hv, tap_mv, tap_lv = 1.0, 1.0, 1.0
+        if tap_side == 'hv':
+            tap_hv = 1.0 + tap_change
+        elif tap_side == 'mv':
+            tap_mv = 1.0 + tap_change
+        elif tap_side == 'lv':
+            tap_lv = 1.0 + tap_change
 
         # No-load loss and magnetizing
         noloadloss = (pfe_kw / sn_hv * 100) if sn_hv > 0 else 0
@@ -1327,8 +1394,13 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
             f"kVs=({vn_hv} {vn_mv} {vn_lv})",
             f"kVAs=({sn_hv} {sn_mv} {sn_lv})",
             f"conns=({conns})",
-            f"%Rs=[{vkr_hv/2} {vkr_mv/2} {vkr_lv/2}]"
+            f"%Rs=[{r1_pct} {r2_pct} {r3_pct}]",
         ]
+        # Only pass Taps when off-nominal. Explicit Taps=[1 1 1] on Windings=3 has been observed to
+        # yield Converged=True with all bus Voltages() = 0; omit property = default 1.0 per winding.
+        # Use Taps=(...) array form (matches conns=(...) in DSS) when taps are non-neutral.
+        if max(abs(tap_hv - 1.0), abs(tap_mv - 1.0), abs(tap_lv - 1.0)) > 1e-9:
+            cmd_parts.append(f"Taps=({tap_hv} {tap_mv} {tap_lv})")
         if noloadloss > 0:
             cmd_parts.append(f"%noloadloss={noloadloss}")
         if i0_percent > 0:
@@ -1573,6 +1645,9 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         
         # OpenDSS Reactor element: constant impedance (kV + kvar), matches pandapower shunt.
         # Optional Rp = V_LL² / P_total for no-load losses when p_mw > 0.
+        # Sign convention (aligned with pandapower create_shunt):
+        #   q_mvar > 0  -> inductive (absorbs Q)  -> OpenDSS Reactor with kvar > 0
+        #   q_mvar < 0  -> capacitive (delivers Q) -> model as OpenDSS Capacitor
         try:
             reactor_name = f"ShuntReactor_{element_name}"
 
@@ -1583,16 +1658,25 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
                 created_elements.add(element_name)
                 return
 
-            # kvar positive = inductive (reactor absorbs Q at rated voltage)
-            cmd_parts = [f"New Reactor.{reactor_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kvar={abs(q_kvar):.0f}"]
-            if p_kw > 0 and bus_voltage is not None:
-                voltage_kv = float(bus_voltage)
-                p_watts = p_kw * 1000
-                v_volts = voltage_kv * 1000
-                rp_ohms = (v_volts ** 2) / p_watts
-                cmd_parts.append(f" Rp={rp_ohms:.2f}")
-            reactor_cmd = "".join(cmd_parts)
-            execute_dss_command(reactor_cmd)
+            if q_kvar >= 0:
+                # Inductive shunt (reactor)
+                cmd_parts = [f"New Reactor.{reactor_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kvar={q_kvar:.0f}"]
+                if p_kw > 0 and bus_voltage is not None:
+                    voltage_kv = float(bus_voltage)
+                    p_watts = p_kw * 1000
+                    v_volts = voltage_kv * 1000
+                    rp_ohms = (v_volts ** 2) / p_watts
+                    cmd_parts.append(f" Rp={rp_ohms:.2f}")
+                reactor_cmd = "".join(cmd_parts)
+                execute_dss_command(reactor_cmd)
+            else:
+                # Capacitive shunt (negative q_mvar in pandapower). OpenDSS Capacitor kvar is
+                # specified as a positive number (capacitor always delivers Q).
+                cap_kvar = abs(q_kvar)
+                cap_cmd = (f"New Capacitor.{reactor_name} Bus1={bus_name} Phases=3 "
+                           f"kV={bus_voltage} kvar={cap_kvar:.0f}")
+                execute_dss_command(cap_cmd)
+                reactor_cmd = cap_cmd
             
             # Handle in_service status AFTER creating the element
             in_service = element_data.get('in_service', True)
@@ -1607,7 +1691,8 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
                 is_in_service = False
             
             if not is_in_service:
-                cmd = f'Reactor.{reactor_name}.enabled=no'
+                element_type_prefix = 'Reactor' if q_kvar >= 0 else 'Capacitor'
+                cmd = f'{element_type_prefix}.{reactor_name}.enabled=no'
                 print(f"[OpenDSS] {cmd}")
                 dss.Text.Command(cmd)
 
@@ -2116,7 +2201,6 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             vm_pu = corrected_vm_pu
         
         # Ensure short circuit MVA is not zero (would cause singular matrix)
-        # Use a reasonable default if zero or very small
         if s_sc_max_mva <= 0.1:
             s_sc_max_mva = 10000.0  # Default 10000 MVA short circuit capacity
         
@@ -2579,7 +2663,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
          Transformers3WDict, Transformers3WDictId,
          ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
          StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
-         circuit_source_element_name) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands, opendss_commands, execute_dss_command)
+         circuit_source_element_name) = create_other_elements(
+            in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
+            export_commands, opendss_commands, execute_dss_command)
     except ValueError as ve:
         # Validation error - return error message to frontend
         error_response = {
