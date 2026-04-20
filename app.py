@@ -187,14 +187,17 @@ def simulation():
                 calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
                 init = in_data[x]['initialization']
                 export_python = in_data[x].get('exportPython', False)  # Export Python code flag
-                run_control = in_data[x].get('run_control', False)  # Include controllers (DiscreteTapControl, etc.)
+                rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(in_data[x])
 
                 net = pp.create_empty_network(f_hz=frequency)
            
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
 
-                response_data = pandapower_electrisim.powerflow(net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars, run_control=run_control)  
+                response_data = pandapower_electrisim.powerflow(
+                    net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars,
+                    run_control_trafo2w=rc2, run_control_trafo3w=rc3, run_control_shunt=rcs,
+                )  
 
                 # Check if client accepts gzip compression
                 accept_encoding = request.headers.get('Accept-Encoding', '')

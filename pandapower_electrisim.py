@@ -2021,7 +2021,36 @@ def create_other_elements(in_data,net,x, Busbars):
     apply_sgen_q_capability_curves(net, in_data)
 
 
-def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None, run_control=False):
+def _electrisim_boolish(v, default=False):
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() in ('true', '1', 'yes', 'on')
+    return bool(v)
+
+
+def _resolve_controller_family_flags(payload, legacy_key='run_control'):
+    """
+    Returns (rc2, rc3, rcs): whether to run DiscreteTapControl on 2w trafos, 3w trafos,
+    and DiscreteShuntController on shunts. If any granular key is present on payload,
+    those values are used (missing granular keys default to False). Otherwise all three
+    follow legacy run_control (single boolean).
+    """
+    if not isinstance(payload, dict):
+        return False, False, False
+    k2, k3, ks = 'run_control_trafo2w', 'run_control_trafo3w', 'run_control_shunt'
+    if any(k in payload for k in (k2, k3, ks)):
+        return (
+            _electrisim_boolish(payload.get(k2), False),
+            _electrisim_boolish(payload.get(k3), False),
+            _electrisim_boolish(payload.get(ks), False),
+        )
+    u = _electrisim_boolish(payload.get(legacy_key), False)
+    return u, u, u
+
+
+def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None,
+              run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
             #pandapower - rozpływ mocy
             # Initialize tap_control_results before try block so it's accessible in else block
             tap_control_results = []
@@ -2043,85 +2072,109 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 if len(isolated_buses) > 0:
                     raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
                 
-                # DiscreteTapControl + DiscreteShuntController when "Include controllers" is enabled
+                # DiscreteTapControl + DiscreteShuntController (per-family flags from UI)
+                rc2 = bool(run_control_trafo2w)
+                rc3 = bool(run_control_trafo3w)
+                rcs = bool(run_control_shunt)
                 tc2_list = getattr(net, 'trafo_discrete_tap_controllers', None) or []
                 tc3_list = getattr(net, 'trafo3w_discrete_tap_controllers', None) or []
                 shunt_ctrl_list = getattr(net, 'shunt_discrete_controllers', None) or []
-                if run_control and (tc2_list or tc3_list or shunt_ctrl_list):
-                    print(f"Creating DiscreteTapControl: {len(tc2_list)} two-winding, {len(tc3_list)} three-winding; DiscreteShuntController: {len(shunt_ctrl_list)} shunt(s)")
-                    for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in tc2_list:
-                        try:
-                            trafo_name = net.trafo.at[trafo_idx, 'name']
-                            tap_side = net.trafo.at[trafo_idx, 'tap_side'] if 'tap_side' in net.trafo.columns else 'hv'
-                            tap_min = net.trafo.at[trafo_idx, 'tap_min']
-                            tap_max = net.trafo.at[trafo_idx, 'tap_max']
-                            tap_step_percent = net.trafo.at[trafo_idx, 'tap_step_percent']
-                            tap_pos = net.trafo.at[trafo_idx, 'tap_pos']
-                            print(f"  Transformer {trafo_idx} ({trafo_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
-                            print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
-                            if tap_min >= tap_max:
-                                print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
-                            if tap_step_percent == 0:
-                                print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
-                            if tap_pos == tap_max:
-                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
-                            elif tap_pos == tap_min:
-                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
-                        except Exception:
-                            pass
-                    for (t3_idx, control_side, vm_lower_pu, vm_upper_pu) in tc3_list:
-                        try:
-                            t3_name = net.trafo3w.at[t3_idx, 'name']
-                            tap_side = net.trafo3w.at[t3_idx, 'tap_side'] if 'tap_side' in net.trafo3w.columns else 'hv'
-                            tap_min = net.trafo3w.at[t3_idx, 'tap_min']
-                            tap_max = net.trafo3w.at[t3_idx, 'tap_max']
-                            tap_step_percent = net.trafo3w.at[t3_idx, 'tap_step_percent']
-                            tap_pos = net.trafo3w.at[t3_idx, 'tap_pos']
-                            print(f"  Trafo3w {t3_idx} ({t3_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
-                            print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
-                            if tap_min >= tap_max:
-                                print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
-                            if tap_step_percent == 0:
-                                print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
-                            if tap_pos == tap_max:
-                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
-                            elif tap_pos == tap_min:
-                                print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
-                        except Exception:
-                            pass
-                    for spec in shunt_ctrl_list:
-                        try:
-                            si = int(spec['shunt_index'])
-                            sname = net.shunt.at[si, 'name']
-                            st = net.shunt.at[si, 'step']
-                            mx = net.shunt.at[si, 'max_step']
-                            print(f"  Shunt {si} ({sname}): step={st}, max_step={mx}, vm_set_pu={spec.get('vm_set_pu')}, increment={spec.get('increment', 1)}")
-                            if mx is not None and float(mx) < 1:
-                                print(f"    WARNING: max_step ({mx}) < 1 — controller cannot change reactive capability")
-                        except Exception:
-                            pass
-                    _electrisim_attach_discrete_tap_controllers(net)
-                    _electrisim_attach_discrete_shunt_controllers(net)
+                attach_2w = rc2 and bool(tc2_list)
+                attach_3w = rc3 and bool(tc3_list)
+                attach_sh = rcs and bool(shunt_ctrl_list)
+                run_pp_control = attach_2w or attach_3w or attach_sh
+                if run_pp_control:
+                    print(
+                        f"Controllers active: 2w_tap={attach_2w} ({len(tc2_list)} configured), "
+                        f"3w_tap={attach_3w} ({len(tc3_list)} configured), "
+                        f"shunt={attach_sh} ({len(shunt_ctrl_list)} configured)"
+                    )
+                    if attach_2w:
+                        for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in tc2_list:
+                            try:
+                                trafo_name = net.trafo.at[trafo_idx, 'name']
+                                tap_side = net.trafo.at[trafo_idx, 'tap_side'] if 'tap_side' in net.trafo.columns else 'hv'
+                                tap_min = net.trafo.at[trafo_idx, 'tap_min']
+                                tap_max = net.trafo.at[trafo_idx, 'tap_max']
+                                tap_step_percent = net.trafo.at[trafo_idx, 'tap_step_percent']
+                                tap_pos = net.trafo.at[trafo_idx, 'tap_pos']
+                                print(f"  Transformer {trafo_idx} ({trafo_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
+                                print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
+                                if tap_min >= tap_max:
+                                    print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
+                                if tap_step_percent == 0:
+                                    print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
+                                if tap_pos == tap_max:
+                                    print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
+                                elif tap_pos == tap_min:
+                                    print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
+                            except Exception:
+                                pass
+                    if attach_3w:
+                        for (t3_idx, control_side, vm_lower_pu, vm_upper_pu) in tc3_list:
+                            try:
+                                t3_name = net.trafo3w.at[t3_idx, 'name']
+                                tap_side = net.trafo3w.at[t3_idx, 'tap_side'] if 'tap_side' in net.trafo3w.columns else 'hv'
+                                tap_min = net.trafo3w.at[t3_idx, 'tap_min']
+                                tap_max = net.trafo3w.at[t3_idx, 'tap_max']
+                                tap_step_percent = net.trafo3w.at[t3_idx, 'tap_step_percent']
+                                tap_pos = net.trafo3w.at[t3_idx, 'tap_pos']
+                                print(f"  Trafo3w {t3_idx} ({t3_name}): tap_side={tap_side}, control_side={control_side}, range=[{tap_min}, {tap_max}], step={tap_step_percent}%, pos={tap_pos}")
+                                print(f"    Control limits: vm_lower={vm_lower_pu} pu, vm_upper={vm_upper_pu} pu")
+                                if tap_min >= tap_max:
+                                    print(f"    WARNING: tap_min ({tap_min}) >= tap_max ({tap_max}) - controller will not work!")
+                                if tap_step_percent == 0:
+                                    print(f"    WARNING: tap_step_percent is 0 - controller will not work!")
+                                if tap_pos == tap_max:
+                                    print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MAXIMUM - controller cannot increase tap further!")
+                                elif tap_pos == tap_min:
+                                    print(f"    WARNING: Initial tap_pos ({tap_pos}) is at MINIMUM - controller cannot decrease tap further!")
+                            except Exception:
+                                pass
+                    if attach_sh:
+                        for spec in shunt_ctrl_list:
+                            try:
+                                si = int(spec['shunt_index'])
+                                sname = net.shunt.at[si, 'name']
+                                st = net.shunt.at[si, 'step']
+                                mx = net.shunt.at[si, 'max_step']
+                                print(f"  Shunt {si} ({sname}): step={st}, max_step={mx}, vm_set_pu={spec.get('vm_set_pu')}, increment={spec.get('increment', 1)}")
+                                if mx is not None and float(mx) < 1:
+                                    print(f"    WARNING: max_step ({mx}) < 1 — controller cannot change reactive capability")
+                            except Exception:
+                                pass
+                    if attach_2w or attach_3w:
+                        _electrisim_attach_discrete_tap_controllers(net, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
+                    if attach_sh:
+                        _electrisim_attach_discrete_shunt_controllers(net)
                 
                 # Snapshot tap positions before runpp whenever controllers may run (for UI / diagnostics)
                 initial_tap_positions = {}
                 initial_tap3w_positions = {}
                 initial_shunt_steps = {}
-                if run_control:
-                    for idx in net.trafo.index:
-                        initial_tap_positions[idx] = float(net.trafo.at[idx, 'tap_pos'])
-                    if hasattr(net, 'trafo3w') and not net.trafo3w.empty:
-                        for idx in net.trafo3w.index:
-                            initial_tap3w_positions[idx] = float(net.trafo3w.at[idx, 'tap_pos'])
-                    for spec in shunt_ctrl_list:
-                        try:
-                            si = int(spec['shunt_index'])
-                            initial_shunt_steps[si] = float(net.shunt.at[si, 'step'])
-                        except Exception:
-                            pass
+                if run_pp_control:
+                    if attach_2w:
+                        for (trafo_idx, _, _, _) in tc2_list:
+                            try:
+                                initial_tap_positions[trafo_idx] = float(net.trafo.at[trafo_idx, 'tap_pos'])
+                            except Exception:
+                                pass
+                    if attach_3w:
+                        for (t3_idx, _, _, _) in tc3_list:
+                            try:
+                                initial_tap3w_positions[t3_idx] = float(net.trafo3w.at[t3_idx, 'tap_pos'])
+                            except Exception:
+                                pass
+                    if attach_sh:
+                        for spec in shunt_ctrl_list:
+                            try:
+                                si = int(spec['shunt_index'])
+                                initial_shunt_steps[si] = float(net.shunt.at[si, 'step'])
+                            except Exception:
+                                pass
 
                 # Log controller status before power flow
-                if run_control and hasattr(net, 'controller') and not net.controller.empty:
+                if run_pp_control and hasattr(net, 'controller') and not net.controller.empty:
                     print(f"Running power flow WITH controllers (run_control=True)")
                     print(f"   Controllers in net: {len(net.controller)}")
                     print(net.controller[['object', 'in_service']])
@@ -2129,13 +2182,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     print(f"   Initial tap positions (3w): {initial_tap3w_positions}")
                     print(f"   Initial shunt steps: {initial_shunt_steps}")
                 else:
-                    print(f"Running power flow WITHOUT controllers (run_control={run_control})")
+                    print(f"Running power flow WITHOUT controllers (run_pp_control={run_pp_control})")
                 
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
-                         run_control=run_control, **_electrisim_enforce_q_lims_kw(net))
+                         run_control=run_pp_control, **_electrisim_enforce_q_lims_kw(net))
                 
                 # Check if tap positions changed
-                if run_control and (initial_tap_positions or initial_tap3w_positions):
+                if run_pp_control and (initial_tap_positions or initial_tap3w_positions):
                     changed = False
                     for idx, initial_pos in initial_tap_positions.items():
                         final_pos = net.trafo.at[idx, 'tap_pos']
@@ -2147,9 +2200,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         if initial_pos != final_pos:
                             print(f"   Tap changed: Trafo3w {idx}: {initial_pos} -> {final_pos}")
                             changed = True
-                    if not changed and (tc2_list or tc3_list):
+                    if not changed and ((attach_2w and tc2_list) or (attach_3w and tc3_list)):
                         print(f"   WARNING: No tap positions changed during controlled power flow!")
-                if run_control and initial_shunt_steps:
+                if attach_sh and initial_shunt_steps:
                     sh_changed = False
                     for si, s0 in initial_shunt_steps.items():
                         s1 = float(net.shunt.at[si, 'step'])
@@ -2162,7 +2215,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Log transformer tap positions after power flow (only for controlled transformers)
                 # Also build tap_control_results for frontend display
                 
-                if run_control and not net.trafo.empty and getattr(net, 'trafo_discrete_tap_controllers', None):
+                if attach_2w and not net.trafo.empty and getattr(net, 'trafo_discrete_tap_controllers', None):
                     # Get list of transformer indices that have controllers
                     controlled_trafo_indices = set(ctrl_data[0] for ctrl_data in net.trafo_discrete_tap_controllers)
                     
@@ -2245,7 +2298,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 'taps_needed': int(taps_needed) if taps_needed is not None else None
                             })
 
-                if run_control and hasattr(net, 'trafo3w') and not net.trafo3w.empty and getattr(net, 'trafo3w_discrete_tap_controllers', None):
+                if attach_3w and hasattr(net, 'trafo3w') and not net.trafo3w.empty and getattr(net, 'trafo3w_discrete_tap_controllers', None):
                     controlled_t3_indices = set(c[0] for c in net.trafo3w_discrete_tap_controllers)
                     print(f"Controlled three-winding transformer tap positions after power flow:")
                     for idx in net.trafo3w.index:
@@ -2316,7 +2369,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             'taps_needed': int(taps_needed) if taps_needed is not None else None
                         })
 
-                if run_control and shunt_ctrl_list and hasattr(net, 'shunt') and not net.shunt.empty:
+                if attach_sh and shunt_ctrl_list and hasattr(net, 'shunt') and not net.shunt.empty:
                     for spec in shunt_ctrl_list:
                         try:
                             si = int(spec['shunt_index'])
@@ -6754,11 +6807,8 @@ def reactive_power_capability(net, rpc_params):
         grid_code_template_name = rpc_params.get('grid_code_template_name')
         verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
         progress_cb = rpc_params.get('_progress_callback')
-        _rc = rpc_params.get('run_control', False)
-        if isinstance(_rc, str):
-            run_control = _rc.lower() in ('true', '1', 'yes', 'on')
-        else:
-            run_control = bool(_rc)
+        rc2, rc3, rcs = _resolve_controller_family_flags(rpc_params)
+        run_control_any = rc2 or rc3 or rcs
 
         print(f"=== RPC Analysis ===")
         print(f"  PCC bus: {pcc_bus_name}")
@@ -6768,7 +6818,10 @@ def reactive_power_capability(net, rpc_params):
         print(f"  P range: {p_min_mw} - {p_max_mw} MW, {p_steps} steps")
         print(f"  Q capability mode: {q_capability_mode}")
         print(f"  Limit overloads: {limit_overloads}")
-        print(f"  run_control (DiscreteTapControl / DiscreteShuntController): {run_control}")
+        print(
+            f"  controllers: 2w_tap={rc2}, 3w_tap={rc3}, shunt={rcs} "
+            f"(any={run_control_any})"
+        )
         if verbose_iwamoto:
             print(f"  verbose_iwamoto: True (pandapower will print each Iwamoto multiplier line)")
 
@@ -6870,9 +6923,11 @@ def reactive_power_capability(net, rpc_params):
             except Exception:
                 tc_names.append('3w:' + str(row[0]) if row else '?')
         shc_list = getattr(net, 'shunt_discrete_controllers', None) or []
-        if run_control and not tc2_list and not tc3_list and not shc_list:
+        has_applicable = (rc2 and tc2_list) or (rc3 and tc3_list) or (rcs and shc_list)
+        if run_control_any and not has_applicable:
             warnings_list.append(
                 'Include controller is on, but no elements have discrete controllers configured '
+                'for the selected controller types '
                 '(enable discrete tap on transformers or discrete shunt control on shunt reactors). RPC runs as unconstrained PF.'
             )
         compliance = {}
@@ -6904,7 +6959,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy.sgen.at[g['idx'], 'q_mvar'] = q_pos_cap * q_frac
 
-                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto, run_control):
+                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto, rc2, rc3, rcs):
                         q_max_pcc = _rpc_pcc_q_for_chart(net_copy, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
@@ -6917,7 +6972,10 @@ def reactive_power_capability(net, rpc_params):
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
                                     'max', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto, run_control=run_control
+                                    verbose_iwamoto=verbose_iwamoto,
+                                    run_control_trafo2w=rc2,
+                                    run_control_trafo3w=rc3,
+                                    run_control_shunt=rcs,
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited due to overload"
@@ -6946,7 +7004,7 @@ def reactive_power_capability(net, rpc_params):
                         net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
                         net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_neg_cap * q_frac
 
-                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto, run_control):
+                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto, rc2, rc3, rcs):
                         q_min_pcc = _rpc_pcc_q_for_chart(net_copy2, pcc_bus_idx, ext_grid_idx)
                         if limit_overloads:
                             overloaded = False
@@ -6959,7 +7017,10 @@ def reactive_power_capability(net, rpc_params):
                                     net, ext_grid_idx, float(v_pu), gen_info,
                                     total_installed_mw, p_val, q_capability_mode,
                                     'min', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto, run_control=run_control
+                                    verbose_iwamoto=verbose_iwamoto,
+                                    run_control_trafo2w=rc2,
+                                    run_control_trafo3w=rc3,
+                                    run_control_shunt=rcs,
                                 )
                                 warnings_list.append(
                                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited due to overload"
@@ -7050,8 +7111,8 @@ def reactive_power_capability(net, rpc_params):
                 'grid_code_template_name': grid_code_template_name,
                 'q_capability_mode': q_capability_mode,
                 'tap_changer_control': {
-                    'run_control_requested': run_control,
-                    'controllers_applied': bool(run_control and (tc2_list or tc3_list or shc_list)),
+                    'run_control_requested': run_control_any,
+                    'controllers_applied': bool(has_applicable),
                     'transformer_count': len(tc2_list) + len(tc3_list),
                     'shunt_controller_count': len(shc_list),
                     'transformer_names': tc_names,
@@ -7073,7 +7134,7 @@ def reactive_power_capability(net, rpc_params):
         return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
 
 
-def _electrisim_attach_discrete_tap_controllers(net):
+def _electrisim_attach_discrete_tap_controllers(net, attach_trafo=True, attach_trafo3w=True):
     """
     Register pandapower DiscreteTapControl for 2-winding (element trafo) and 3-winding (trafo3w)
     entries from create_other_elements.
@@ -7113,10 +7174,12 @@ def _electrisim_attach_discrete_tap_controllers(net):
         except Exception:
             pass
 
-    for row in getattr(net, 'trafo_discrete_tap_controllers', None) or []:
-        _attach_one('trafo', row[0], row[1], row[2], row[3])
-    for row in getattr(net, 'trafo3w_discrete_tap_controllers', None) or []:
-        _attach_one('trafo3w', row[0], row[1], row[2], row[3])
+    if attach_trafo:
+        for row in getattr(net, 'trafo_discrete_tap_controllers', None) or []:
+            _attach_one('trafo', row[0], row[1], row[2], row[3])
+    if attach_trafo3w:
+        for row in getattr(net, 'trafo3w_discrete_tap_controllers', None) or []:
+            _attach_one('trafo3w', row[0], row[1], row[2], row[3])
 
 
 def _electrisim_attach_discrete_shunt_controllers(net):
@@ -7177,15 +7240,15 @@ def _rpc_pcc_q_for_chart(net_pf, pcc_bus_idx, ext_grid_idx):
     return -q_raw
 
 
-def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control=False):
+def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
     """
     Run power flow for RPC with multiple solver fallbacks (nr first, then iwamoto_nr).
     Pandapower's iwamoto_nr prints one line per iteration ("iwamoto muliplier: ...").
     By default those prints are captured and discarded so RPC does not flood server logs;
     pass verbose_iwamoto=True to forward them to stdout (for debugging).
 
-    When run_control is True and the net lists trafo / trafo3w tap controllers and/or
-    shunt_discrete_controllers, registers DiscreteTapControl / DiscreteShuntController and runs
+    When any of run_control_trafo2w / run_control_trafo3w / run_control_shunt is True and the net
+    lists matching controller specs, registers DiscreteTapControl / DiscreteShuntController and runs
     pp.runpp(..., run_control=True) with a single NR strategy (controller state is not reliable across
     solver fallbacks on the same net).
     """
@@ -7195,10 +7258,15 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control=False):
     tc2 = getattr(net_pf, 'trafo_discrete_tap_controllers', None) or []
     tc3 = getattr(net_pf, 'trafo3w_discrete_tap_controllers', None) or []
     shc = getattr(net_pf, 'shunt_discrete_controllers', None) or []
-    rc = bool(run_control) and (bool(tc2) or bool(tc3) or bool(shc))
+    attach_2w = bool(run_control_trafo2w) and bool(tc2)
+    attach_3w = bool(run_control_trafo3w) and bool(tc3)
+    attach_sh = bool(run_control_shunt) and bool(shc)
+    rc = attach_2w or attach_3w or attach_sh
     if rc:
-        _electrisim_attach_discrete_tap_controllers(net_pf)
-        _electrisim_attach_discrete_shunt_controllers(net_pf)
+        if attach_2w or attach_3w:
+            _electrisim_attach_discrete_tap_controllers(net_pf, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
+        if attach_sh:
+            _electrisim_attach_discrete_shunt_controllers(net_pf)
         strategies = [{'algorithm': 'nr', 'init': 'auto', 'max_iteration': 100}]
     else:
         strategies = [
@@ -7242,7 +7310,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control=False):
 def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
                           total_installed_mw, p_val, q_capability_mode,
                           direction, max_loading_percent, pcc_bus_idx,
-                          iterations=12, verbose_iwamoto=False, run_control=False):
+                          iterations=12, verbose_iwamoto=False,
+                          run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
     """
     Binary search to find the maximum (or minimum) Q at PCC that keeps
     all branch loadings within max_loading_percent.
@@ -7267,7 +7336,9 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
             net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
 
-        converged = _rpc_run_pf_robust(net_try, verbose_iwamoto, run_control)
+        converged = _rpc_run_pf_robust(
+            net_try, verbose_iwamoto,
+            run_control_trafo2w, run_control_trafo3w, run_control_shunt)
 
         if not converged:
             hi = mid
