@@ -826,6 +826,92 @@ def _electrisim_enforce_q_lims_kw(net):
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
 
 
+def _ensure_shunt_characteristic_table(net):
+    """Ensure pandapower net has net.shunt_characteristic_table DataFrame for step-dependent shunts."""
+    if "shunt_characteristic_table" not in net or net["shunt_characteristic_table"] is None:
+        net["shunt_characteristic_table"] = pd.DataFrame(columns=["id_characteristic", "step", "q_mvar", "p_mw"])
+
+
+def _electrisim_parse_shunt_characteristic_table_json(raw_json):
+    """
+    Parse Electrisim diagram JSON: [{'step','p_mw','q_mvar'}, ...] → rows for pandapower.
+    Duplicate step keys use the last occurrence. Returns sorted list of dicts or [].
+    """
+    if raw_json is None:
+        return []
+    try:
+        if isinstance(raw_json, list):
+            data = raw_json
+        elif isinstance(raw_json, str):
+            data = json.loads(raw_json.strip() or "[]")
+        else:
+            return []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    by_step = {}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            st = int(round(float(row.get("step", 0))))
+            pm = float(row.get("p_mw", 0.0))
+            qv = float(row.get("q_mvar", 0.0))
+        except (TypeError, ValueError):
+            continue
+        by_step[st] = {"step": st, "p_mw": pm, "q_mvar": qv}
+    return sorted(by_step.values(), key=lambda r: r["step"])
+
+
+def _electrisim_append_shunt_characteristic_table(net, rows):
+    """
+    Append one characteristic family (multiple steps) under a new id_characteristic index.
+    Returns id_characteristic (int), or None if rows empty.
+    """
+    if not rows:
+        return None
+    _ensure_shunt_characteristic_table(net)
+    df_existing = net["shunt_characteristic_table"]
+    if df_existing.empty:
+        nid = 0
+    else:
+        try:
+            mx = pd.to_numeric(df_existing["id_characteristic"], errors="coerce")
+            nid = int(mx.fillna(-1).max()) + 1
+        except Exception:
+            nid = int(len(df_existing))
+    add_rows = []
+    for r in rows:
+        add_rows.append({
+            "id_characteristic": nid,
+            "step": int(r["step"]),
+            "q_mvar": float(r["q_mvar"]),
+            "p_mw": float(r["p_mw"]),
+        })
+    new_df = pd.DataFrame(add_rows, columns=["id_characteristic", "step", "q_mvar", "p_mw"])
+    if df_existing.empty:
+        net["shunt_characteristic_table"] = new_df
+    else:
+        net["shunt_characteristic_table"] = pd.concat([df_existing, new_df], ignore_index=True)
+    return nid
+
+
+def _electrisim_shunt_nominals_for_step(rows, step_val, p_fallback, q_fallback):
+    """Nominal p_mw, q_mvar at v = 1.0 pu for the discrete step matching step_val."""
+    try:
+        si = int(round(float(step_val)))
+    except (TypeError, ValueError):
+        si = 1
+    for r in rows:
+        if int(r["step"]) == si:
+            return float(r["p_mw"]), float(r["q_mvar"])
+    try:
+        return float(p_fallback), float(q_fallback)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+
 def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
@@ -1450,7 +1536,31 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            shunt_idx = pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service)
+            p_mw_use = safe_float(in_data[x]['p_mw'])
+            q_mvar_use = safe_float(in_data[x]['q_mvar'])
+            sdt = in_data[x].get('step_dependency_table')
+            use_characteristic = sdt in (True, 'true', 'True', '1')
+            raw_char_json = in_data[x].get('shunt_characteristic_table_json')
+            characteristic_rows = _electrisim_parse_shunt_characteristic_table_json(raw_char_json)
+            id_characteristic_table = None
+            step_dependency_table = False
+            if use_characteristic and characteristic_rows:
+                id_characteristic_table = _electrisim_append_shunt_characteristic_table(net, characteristic_rows)
+                step_dependency_table = id_characteristic_table is not None
+                if step_dependency_table:
+                    st_raw = safe_float(in_data[x].get('step', 1))
+                    step_for_nom = st_raw if st_raw is not None else in_data[x].get('step', 1)
+                    p_mw_use, q_mvar_use = _electrisim_shunt_nominals_for_step(
+                        characteristic_rows,
+                        step_for_nom,
+                        p_mw_use,
+                        q_mvar_use,
+                    )
+            elif use_characteristic and not characteristic_rows:
+                print(f"Warning: Shunt reactor '{in_data[x].get('name', '?')}': step_dependency_table is enabled "
+                      f"but shunt_characteristic_table_json is missing or invalid; using nominal p_mw/q_mvar only.")
+
+            shunt_idx = pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=p_mw_use, q_mvar=q_mvar_use, vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service, step_dependency_table=step_dependency_table, id_characteristic_table=id_characteristic_table if step_dependency_table else None)
             # DiscreteShuntController (pandapower): step shunt to regulate vm at shunt bus toward vm_set_pu
             dsc = in_data[x].get('discrete_shunt_control')
             if dsc in (True, 'true', 'True', '1'):
