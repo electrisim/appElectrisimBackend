@@ -28,7 +28,7 @@ The Electrisim backend provides computational engines for:
 - **Scientific Computing**: NumPy, SciPy, pandas
 - **Web Server**: Gunicorn (production WSGI server)
 - **Testing**: pytest
-- **Deployment**: Heroku/Render ready with Procfile
+- **Deployment**: Heroku/Render ready with Procfile 
 
 ## Architecture
 
