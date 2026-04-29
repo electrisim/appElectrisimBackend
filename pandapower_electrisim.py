@@ -11,6 +11,7 @@ import json
 import numpy as np
 import pandas as pd
 import pandapower.control as control
+from pandapower.control.controller.characteristic_control import CharacteristicControl
 import pandapower.timeseries as ts
 from pandapower.timeseries import DFData
 from copy import deepcopy
@@ -587,23 +588,29 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                         f"p_mw={p_mw}, vm_pu={vm_pu}, sn_mva={sn_mva}, rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
         lines.append("")
     
-    # Create B2B VSC elements
-    if hasattr(net, 'b2b_vsc') and not net.b2b_vsc.empty:
-        lines.append("# Create B2B VSC (Back-to-Back Voltage Source Converter) elements")
-        for idx, row in net.b2b_vsc.iterrows():
-            bus1 = row['bus1']
-            bus2 = row['bus2']
-            name = row['name'] if 'name' in row else f"B2BVSC_{idx}"
-            p_mw = row.get('p_mw', 0.0)
-            vm1_pu = row.get('vm1_pu', 1.0)
-            vm2_pu = row.get('vm2_pu', 1.0)
-            sn_mva = row.get('sn_mva', 0.0)
-            rx = row.get('rx', 0.1)
-            max_ik_ka = row.get('max_ik_ka', 0.0)
+    # Create stacked VSC (B2B / dual DC) elements — pandapower 3.4+: net.vsc_stacked, create_vsc_stacked
+    vsc_s = getattr(net, 'vsc_stacked', None)
+    if vsc_s is not None and not vsc_s.empty:
+        lines.append("# Create stacked VSC (dual DC bus) elements (pandapower: vsc_stacked / former b2b_vsc)")
+        for idx, row in vsc_s.iterrows():
+            bus = row['bus']
+            bdp = row.get('bus_dc_plus')
+            bdm = row.get('bus_dc_minus')
+            name = row['name'] if 'name' in row else f"VscStacked_{idx}"
+            r_ohm = row.get('r_ohm', 0.01)
+            x_ohm = row.get('x_ohm', 0.1)
+            r_dc_ohm = row.get('r_dc_ohm', 0.01)
+            cma = row.get('control_mode_ac', 'vm_pu')
+            cva = row.get('control_value_ac', 1.0)
+            cmd = row.get('control_mode_dc', 'p_mw')
+            cvd = row.get('control_value_dc', 0.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_b2b_vsc(net, bus1=bus_{bus1}, bus2=bus_{bus2}, name='{name}', "
-                        f"p_mw={p_mw}, vm1_pu={vm1_pu}, vm2_pu={vm2_pu}, sn_mva={sn_mva}, "
-                        f"rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
+            lines.append(
+                f"pp.create_vsc_stacked(net, bus=bus_{bus}, bus_dc_plus=bus_dc_{bdp}, bus_dc_minus=bus_dc_{bdm}, "
+                f"r_ohm={r_ohm}, x_ohm={x_ohm}, r_dc_ohm={r_dc_ohm}, "
+                f"control_mode_ac='{cma}', control_value_ac={cva}, control_mode_dc='{cmd}', control_value_dc={cvd}, "
+                f"name='{name}', in_service={in_service})"
+            )
         lines.append("")
     
     # Create DC line elements
@@ -652,7 +659,7 @@ def create_busbars(in_data, net):
     has_dc_bus_support = hasattr(pp, 'create_bus_dc')
     if not has_dc_bus_support:
         print(f"Note: pandapower version {pp.__version__} does not support DC buses (create_bus_dc).")
-        print("   DC Bus, VSC, and B2B VSC elements will be skipped.")
+        print("   DC Bus, VSC, and B2B VSC (vsc_stacked) elements will be skipped.")
         print("   You can still use 'DC Line' which connects two AC buses directly.")
         print("   Upgrade to pandapower 3.1+ for full DC grid support.")
     
@@ -824,6 +831,260 @@ def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
 def _electrisim_enforce_q_lims_kw(net):
     """Keyword args for pp.runpp when static generator Q capability curves are present."""
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
+
+
+def _ensure_shunt_characteristic_table(net):
+    """pandapower >=3.2: net.shunt_characteristic_table holds step-wise p_mw, q_mvar (see docs)."""
+    if "shunt_characteristic_table" not in net or net["shunt_characteristic_table"] is None:
+        net["shunt_characteristic_table"] = pd.DataFrame(columns=['id_characteristic', 'step', 'q_mvar', 'p_mw'])
+    return net
+
+
+def _next_shunt_characteristic_id(net):
+    _ensure_shunt_characteristic_table(net)
+    t = net["shunt_characteristic_table"]
+    if t is None or t.empty or 'id_characteristic' not in t.columns:
+        return 0
+    m = t['id_characteristic'].max()
+    if pd.isna(m):
+        return 0
+    return int(m) + 1
+
+
+def _parse_shunt_characteristic_rows(d):
+    """From diagram JSON: [{step, p_mw, q_mvar}, ...]"""
+    raw = d.get('shunt_characteristic_table_json') or d.get('shunt_characteristic_table')
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _electrisim_parse_float(x, default=0.0):
+    """Parse numeric UI values; accept comma as decimal separator (e.g. European 0,1)."""
+    if x is None or x == '' or x == 'None':
+        return default
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        return float(x)
+    s = str(x).strip().replace(' ', '')
+    s = s.replace(',', '.', 1) if s.count(',') == 1 and s.count('.') == 0 else s.replace(',', '')
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
+def _p_mw_q_mvar_for_step(rows, step_val, fallback_p, fallback_q):
+    """Pick table row for current shunt step, else first row, else power-tab fallbacks."""
+    if not rows:
+        return float(fallback_p), float(fallback_q)
+    try:
+        step_val = int(step_val)
+    except (TypeError, ValueError):
+        step_val = int(float(step_val)) if step_val is not None else 0
+    for r in rows:
+        try:
+            st = int(r.get('step', 0))
+        except (TypeError, ValueError):
+            st = 0
+        if st == step_val:
+            return _electrisim_parse_float(r.get('p_mw', 0), 0.0), _electrisim_parse_float(r.get('q_mvar', 0), 0.0)
+    r0 = rows[0]
+    return _electrisim_parse_float(r0.get('p_mw', 0), 0.0), _electrisim_parse_float(r0.get('q_mvar', 0), 0.0)
+
+
+def _append_shunt_characteristic_table_rows(net, id_characteristic, rows):
+    _ensure_shunt_characteristic_table(net)
+    if not rows:
+        return
+    new_df = pd.DataFrame([
+        {
+            'id_characteristic': int(id_characteristic),
+            'step': int(r.get('step', 0) or 0),
+            'q_mvar': _electrisim_parse_float(r.get('q_mvar', 0), 0.0),
+            'p_mw': _electrisim_parse_float(r.get('p_mw', 0), 0.0),
+        }
+        for r in rows
+    ])
+    net['shunt_characteristic_table'] = pd.concat(
+        [net['shunt_characteristic_table'], new_df], ignore_index=True
+    )
+
+
+def _parse_line_flow_step_table_rows(d):
+    """From diagram JSON: [{p_mw_min, p_mw_max, step}, ...]"""
+    raw = d.get('line_flow_step_table_json') or d.get('line_flow_step_table')
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _normalize_line_flow_step_bands(rows):
+    """Sort P-bands; each row needs p_mw_min, p_mw_max, step."""
+    out = []
+    for r in rows or []:
+        try:
+            lo = _electrisim_parse_float(r.get('p_mw_min'), None)
+            hi = _electrisim_parse_float(r.get('p_mw_max'), None)
+            st = r.get('step', 0)
+            st_i = int(float(st)) if st is not None else 0
+            if lo is None or hi is None:
+                continue
+            out.append({'p_mw_min': float(lo), 'p_mw_max': float(hi), 'step': st_i})
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: (x['p_mw_min'], x['p_mw_max']))
+    return out
+
+
+def _lookup_shunt_step_from_line_p_mw(p_mw, bands):
+    """Pick step from sorted non-overlapping [p_mw_min, p_mw_max) bands; last band closed on right."""
+    if not bands:
+        return None
+    p = float(p_mw)
+    n = len(bands)
+    for i, b in enumerate(bands):
+        lo = b['p_mw_min']
+        hi = b['p_mw_max']
+        last = i == n - 1
+        if last:
+            if lo <= p <= hi:
+                return int(b['step'])
+        else:
+            if lo <= p < hi:
+                return int(b['step'])
+    if p < bands[0]['p_mw_min']:
+        return int(bands[0]['step'])
+    return int(bands[-1]['step'])
+
+
+def _resolve_line_index_by_cell_id(net, cell_id):
+    """Map diagram Line cell id -> pandapower net.line index."""
+    if cell_id is None or not str(cell_id).strip():
+        return None
+    s = str(cell_id).strip()
+    if net.line is None or getattr(net.line, 'empty', True):
+        return None
+    if 'id' not in net.line.columns:
+        return None
+    for li in net.line.index:
+        try:
+            if str(net.line.at[li, 'id']) == s:
+                return int(li)
+        except Exception:
+            continue
+    return None
+
+
+def _bands_to_scipy_previous_knots(bands):
+    """
+    Build (x, y) arrays for scipy interp1d(kind='previous') so y is piecewise-constant P [MW] -> shunt step.
+    """
+    b = _normalize_line_flow_step_bands(bands)
+    if not b:
+        return [0.0, 1.0], [0.0, 0.0]
+    splits = sorted(
+        {float(bb['p_mw_min']) for bb in b} | {float(bb['p_mw_max']) for bb in b}
+    )
+    if len(splits) < 2:
+        s0 = float(_lookup_shunt_step_from_line_p_mw(splits[0], b) or 0)
+        return [float(splits[0]), float(splits[0]) + 1.0], [s0, s0]
+    ys = []
+    for i in range(len(splits) - 1):
+        mid = (splits[i] + splits[i + 1]) / 2.0
+        ys.append(float(_lookup_shunt_step_from_line_p_mw(mid, b) or 0))
+    ys.append(ys[-1])
+    return [float(x) for x in splits], ys
+
+
+class ElectrisimShuntStepFromLineCharacteristicControl(CharacteristicControl):
+    """
+    Same pattern as VmSetTapControl: extends CharacteristicControl (pandapower) to map a line
+    power-flow result (e.g. res_line.p_from_mw) to shunt step via net.characteristic.
+
+    Adds: optional abs(P), max_step clamp, and sync of p_mw/q_mvar from shunt characteristic table.
+    """
+    def __init__(self, net, shunt_index, line_index, characteristic_index, variable='p_from_mw',
+                 use_abs_p=True, tol=0.49, in_service=True, order=0, level=0,
+                 drop_same_existing_ctrl=False, matching_params=None, **kwargs):
+        if matching_params is None:
+            matching_params = {
+                'shunt_index': int(shunt_index),
+                'line_index': int(line_index),
+                'variable': str(variable),
+            }
+        super().__init__(
+            net,
+            output_element='shunt',
+            output_variable='step',
+            output_element_index=int(shunt_index),
+            input_element='res_line',
+            input_variable=str(variable),
+            input_element_index=int(line_index),
+            characteristic_index=int(characteristic_index),
+            tol=float(tol),
+            in_service=in_service,
+            order=order,
+            level=level,
+            drop_same_existing_ctrl=drop_same_existing_ctrl,
+            matching_params=matching_params,
+            **kwargs
+        )
+        self._shunt_index = int(shunt_index)
+        self._use_abs_p = bool(use_abs_p)
+
+    def initialize_control(self, net):
+        super().initialize_control(net)
+        _sync_shunt_pq_from_characteristic_table(net, self._shunt_index)
+
+    def is_converged(self, net):
+        from pandapower.auxiliary import read_from_net, write_to_net
+        input_values = read_from_net(
+            net, self.input_element, self.input_element_index, self.input_variable, self.read_flag
+        )
+        try:
+            v = float(np.asarray(input_values).reshape(-1)[0])
+        except Exception:
+            v = float(input_values)
+        if self._use_abs_p:
+            v = abs(v)
+        ch = net.characteristic.object.at[self.characteristic_index]
+        target = float(ch(v))
+        try:
+            mx = int(float(net.shunt.at[self._shunt_index, 'max_step']))
+        except Exception:
+            mx = 9999
+        target = int(max(0, min(round(target), mx)))
+        self.values = target
+        output_values = read_from_net(
+            net, self.output_element, self.output_element_index, self.output_variable, self.write_flag
+        )
+        try:
+            ov = int(float(np.asarray(output_values).reshape(-1)[0]))
+        except Exception:
+            ov = int(float(output_values))
+        diff = float(target - ov)
+        write_to_net(
+            net, self.output_element, self.output_element_index, self.output_variable,
+            float(target), self.write_flag
+        )
+        _sync_shunt_pq_from_characteristic_table(net, self._shunt_index)
+        return self.applied and abs(diff) < self.tol
 
 
 def create_other_elements(in_data,net,x, Busbars):
@@ -1450,10 +1711,62 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            shunt_idx = pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service)
+            step_val = float(safe_float(in_data[x].get('step', 1)) or 1)
+            max_step_val = float(safe_float(in_data[x].get('max_step', 1)) or 1)
+            p_mw_base = safe_float(in_data[x]['p_mw'])
+            q_mvar_base = safe_float(in_data[x]['q_mvar'])
+            dep_tbl = in_data[x].get('step_dependency_table', False) in (True, 'true', 'True', '1')
+            char_rows = _parse_shunt_characteristic_rows(in_data[x])
+            if dep_tbl and not char_rows:
+                dep_tbl = False
+            if dep_tbl and char_rows:
+                _ensure_shunt_characteristic_table(net)
+                id_char = _next_shunt_characteristic_id(net)
+                _append_shunt_characteristic_table_rows(net, id_char, char_rows)
+                p_mw_use, q_mvar_use = _p_mw_q_mvar_for_step(char_rows, step_val, p_mw_base, q_mvar_base)
+                shunt_idx = pp.create_shunt(
+                    net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'],
+                    p_mw=p_mw_use, q_mvar=q_mvar_use, vn_kv=safe_float(in_data[x]['vn_kv']),
+                    step=step_val, max_step=max_step_val, in_service=in_service,
+                    step_dependency_table=True, id_characteristic_table=id_char
+                )
+            else:
+                shunt_idx = pp.create_shunt(
+                    net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'],
+                    p_mw=p_mw_base, q_mvar=q_mvar_base, vn_kv=safe_float(in_data[x]['vn_kv']),
+                    step=step_val, max_step=max_step_val, in_service=in_service,
+                    step_dependency_table=False, id_characteristic_table=None
+                )
+            # Line P -> shunt step lookup (mutually exclusive with voltage-based DiscreteShuntController)
+            lf_sc = in_data[x].get('line_flow_step_control', False) in (True, 'true', 'True', '1')
+            lft_rows = _normalize_line_flow_step_bands(_parse_line_flow_step_table_rows(in_data[x]))
+            lref = (in_data[x].get('line_flow_reference_line_id') or in_data[x].get('line_flow_reference_line') or '').strip()
+            if lf_sc and lft_rows and lref:
+                if not hasattr(net, 'shunt_line_flow_controllers'):
+                    net.shunt_line_flow_controllers = []
+                use_abs = in_data[x].get('line_flow_p_use_abs', True) in (True, 'true', 'True', '1', None, '')
+                pref = in_data[x].get('line_flow_p_reference') or 'p_from_mw'
+                if str(pref) not in ('p_from_mw', 'p_to_mw'):
+                    pref = 'p_from_mw'
+                net.shunt_line_flow_controllers.append({
+                    'shunt_index': int(shunt_idx),
+                    'line_id': lref,
+                    'table_rows': lft_rows,
+                    'use_abs_p': bool(use_abs),
+                    'p_reference': str(pref),
+                })
+                print(
+                    f"Line-flow shunt step control: shunt index {int(shunt_idx)} uses line id '{lref}' "
+                    f"({len(lft_rows)} P-band(s), p={pref}, abs={bool(use_abs)})."
+                )
+            elif lf_sc:
+                print(
+                    "Warning: line_flow_step_control is enabled but line_flow_reference_line_id or "
+                    "line_flow_step_table_json is missing/empty; line-flow shunt control skipped."
+                )
             # DiscreteShuntController (pandapower): step shunt to regulate vm at shunt bus toward vm_set_pu
             dsc = in_data[x].get('discrete_shunt_control')
-            if dsc in (True, 'true', 'True', '1'):
+            if dsc in (True, 'true', 'True', '1') and not (lf_sc and lft_rows and lref):
                 vm_set = safe_float_local(in_data[x].get('vm_set_pu'), 1.0)
                 vm_set = 1.0 if vm_set is None else float(vm_set)
                 try:
@@ -1462,8 +1775,8 @@ def create_other_elements(in_data,net,x, Busbars):
                     incr = 1
                 if incr < 1:
                     incr = 1
-                tol = safe_float_local(in_data[x].get('shunt_control_tol'), 1e-3)
-                tol = 1e-3 if tol is None else float(tol)
+                tol = safe_float_local(in_data[x].get('shunt_control_tol'), 1e-2)
+                tol = 1e-2 if tol is None else float(tol)
                 reset_init = in_data[x].get('shunt_reset_at_init', False) in (True, 'true', 'True', '1')
                 if not hasattr(net, 'shunt_discrete_controllers'):
                     net.shunt_discrete_controllers = []
@@ -1872,8 +2185,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 net.vsc.at[vsc_b2b_idx, 'id'] = in_data[x].get('id', '')
             else:
                 # Try full B2B VSC mode with bus_dc_plus/bus_dc_minus
-                if not hasattr(pp, 'create_b2b_vsc'):
-                    print(f"Warning: B2B VSC '{element_name}' skipped - B2B VSC not supported in pandapower {pp.__version__}. Upgrade to pandapower 3.1+")
+                if not hasattr(pp, 'create_vsc_stacked'):
+                    print(f"Warning: B2B VSC '{element_name}' skipped - create_vsc_stacked not in pandapower {pp.__version__} (use pandapower 3.4+)")
                     continue
                     
                 bus_dc_plus_idx = Busbars.get(in_data[x].get('bus_dc_plus', ''))
@@ -1902,11 +2215,16 @@ def create_other_elements(in_data,net,x, Busbars):
                 control_mode_dc = in_data[x].get('control_mode_dc', 'p_mw')
                 control_value_dc = safe_float(in_data[x].get('control_value_dc', in_data[x].get('p_mw', 0.0)))
                 
-                pp.create_b2b_vsc(net, bus=bus_idx, bus_dc_plus=bus_dc_plus_idx, bus_dc_minus=bus_dc_minus_idx,
-                                r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
-                                control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
-                                control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
-                                name=in_data[x]['name'], id=in_data[x].get('id', ''), in_service=in_service)
+                b2b_idx = pp.create_vsc_stacked(
+                    net, bus=bus_idx, bus_dc_plus=bus_dc_plus_idx, bus_dc_minus=bus_dc_minus_idx,
+                    r_ohm=r_ohm, x_ohm=x_ohm, r_dc_ohm=r_dc_ohm,
+                    control_mode_ac=control_mode_ac, control_value_ac=control_value_ac,
+                    control_mode_dc=control_mode_dc, control_value_dc=control_value_dc,
+                    name=in_data[x]['name'], in_service=in_service,
+                )
+                if 'id' not in net.vsc_stacked.columns:
+                    net.vsc_stacked['id'] = ''
+                net.vsc_stacked.at[b2b_idx, 'id'] = in_data[x].get('id', '')
             
             # Store user-friendly name
             b2b_vsc_name = in_data[x]['name']
@@ -2079,15 +2397,18 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 tc2_list = getattr(net, 'trafo_discrete_tap_controllers', None) or []
                 tc3_list = getattr(net, 'trafo3w_discrete_tap_controllers', None) or []
                 shunt_ctrl_list = getattr(net, 'shunt_discrete_controllers', None) or []
+                shunt_lf_list = getattr(net, 'shunt_line_flow_controllers', None) or []
                 attach_2w = rc2 and bool(tc2_list)
                 attach_3w = rc3 and bool(tc3_list)
                 attach_sh = rcs and bool(shunt_ctrl_list)
-                run_pp_control = attach_2w or attach_3w or attach_sh
+                attach_lf = rcs and bool(shunt_lf_list)
+                run_pp_control = attach_2w or attach_3w or attach_sh or attach_lf
                 if run_pp_control:
                     print(
                         f"Controllers active: 2w_tap={attach_2w} ({len(tc2_list)} configured), "
                         f"3w_tap={attach_3w} ({len(tc3_list)} configured), "
-                        f"shunt={attach_sh} ({len(shunt_ctrl_list)} configured)"
+                        f"shunt_vm={attach_sh} ({len(shunt_ctrl_list)} configured), "
+                        f"shunt_line_p={attach_lf} ({len(shunt_lf_list)} configured)"
                     )
                     if attach_2w:
                         for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in tc2_list:
@@ -2145,6 +2466,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 pass
                     if attach_2w or attach_3w:
                         _electrisim_attach_discrete_tap_controllers(net, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
+                    if attach_lf:
+                        _electrisim_attach_line_flow_shunt_controllers(net)
                     if attach_sh:
                         _electrisim_attach_discrete_shunt_controllers(net)
                 
@@ -2165,8 +2488,14 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 initial_tap3w_positions[t3_idx] = float(net.trafo3w.at[t3_idx, 'tap_pos'])
                             except Exception:
                                 pass
-                    if attach_sh:
+                    if attach_sh or attach_lf:
                         for spec in shunt_ctrl_list:
+                            try:
+                                si = int(spec['shunt_index'])
+                                initial_shunt_steps[si] = float(net.shunt.at[si, 'step'])
+                            except Exception:
+                                pass
+                        for spec in shunt_lf_list:
                             try:
                                 si = int(spec['shunt_index'])
                                 initial_shunt_steps[si] = float(net.shunt.at[si, 'step'])
@@ -2184,8 +2513,12 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 else:
                     print(f"Running power flow WITHOUT controllers (run_pp_control={run_pp_control})")
                 
+                q_lims_kw = _electrisim_enforce_q_lims_kw(net)
+                if run_pp_control:
+                    # pandapower run_control() defaults to max_iter=30 outer controller iterations
+                    q_lims_kw = {**q_lims_kw, "max_iter": 100}
                 pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
-                         run_control=run_pp_control, **_electrisim_enforce_q_lims_kw(net))
+                         run_control=run_pp_control, **q_lims_kw)
                 
                 # Check if tap positions changed
                 if run_pp_control and (initial_tap_positions or initial_tap3w_positions):
@@ -2202,14 +2535,14 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             changed = True
                     if not changed and ((attach_2w and tc2_list) or (attach_3w and tc3_list)):
                         print(f"   WARNING: No tap positions changed during controlled power flow!")
-                if attach_sh and initial_shunt_steps:
+                if (attach_sh or attach_lf) and initial_shunt_steps:
                     sh_changed = False
                     for si, s0 in initial_shunt_steps.items():
                         s1 = float(net.shunt.at[si, 'step'])
                         if s0 != s1:
                             print(f"   Shunt step changed: Shunt {si}: {s0} -> {s1}")
                             sh_changed = True
-                    if not sh_changed and shunt_ctrl_list:
+                    if not sh_changed and (shunt_ctrl_list or shunt_lf_list):
                         print(f"   WARNING: No shunt step positions changed during controlled power flow!")
                 
                 # Log transformer tap positions after power flow (only for controlled transformers)
@@ -2396,8 +2729,52 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 'max_step': max_st,
                                 'vm_set_pu': float(spec.get('vm_set_pu', 1.0)),
                                 'vm_pu': round(vm_pu, 4),
-                                'tol': float(spec.get('tol', 1e-3)),
+                                'tol': float(spec.get('tol', 1e-2)),
                                 'increment': int(spec.get('increment', 1)),
+                            })
+                        except Exception:
+                            pass
+
+                if attach_lf and shunt_lf_list and hasattr(net, 'shunt') and not net.shunt.empty:
+                    for spec in shunt_lf_list:
+                        try:
+                            si = int(spec['shunt_index'])
+                            name = net.shunt.at[si, 'name']
+                            step_f = float(net.shunt.at[si, 'step'])
+                            max_st = float(net.shunt.at[si, 'max_step'])
+                            user_friendly_name = net.user_friendly_names.get(name, name) if hasattr(net, 'user_friendly_names') else name
+                            cell_id = None
+                            if 'id' in net.shunt.columns:
+                                try:
+                                    cell_id = str(net.shunt.at[si, 'id'])
+                                except Exception:
+                                    cell_id = None
+                            s0 = float(initial_shunt_steps[si]) if si in initial_shunt_steps else step_f
+                            lix = _resolve_line_index_by_cell_id(net, spec.get('line_id'))
+                            p_meas = None
+                            if lix is not None and hasattr(net, 'res_line') and not net.res_line.empty and lix in net.res_line.index:
+                                col = spec.get('p_reference', 'p_from_mw')
+                                if col not in ('p_from_mw', 'p_to_mw'):
+                                    col = 'p_from_mw'
+                                try:
+                                    pv = float(net.res_line.at[lix, col])
+                                    p_meas = abs(pv) if spec.get('use_abs_p', True) else pv
+                                except Exception:
+                                    p_meas = None
+                            shunt_control_results.append({
+                                'element': 'shunt',
+                                'control_mode': 'line_flow_p',
+                                'name': str(user_friendly_name),
+                                'id': str(name),
+                                'cell_id': cell_id,
+                                'step_initial': s0,
+                                'step': step_f,
+                                'max_step': max_st,
+                                'line_reference_id': str(spec.get('line_id', '')),
+                                'line_index': int(lix) if lix is not None else None,
+                                'p_mw_line': None if p_meas is None else round(float(p_meas), 6),
+                                'p_reference': str(spec.get('p_reference', 'p_from_mw')),
+                                'use_abs_p': bool(spec.get('use_abs_p', True)),
                             })
                         except Exception:
                             pass
@@ -3584,11 +3961,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result = {**result, **vscs.__dict__}
                 
                 #B2B VSC
-                if(hasattr(net, 'res_b2b_vsc') and not net.res_b2b_vsc.empty):
-                    for index, row in net.res_b2b_vsc.iterrows():    
-                        b2b_name = net.b2b_vsc.at[index, 'name'] if 'name' in net.b2b_vsc.columns else f'B2B_VSC_{index}'
-                        b2b_id = net.b2b_vsc.at[index, 'id'] if 'id' in net.b2b_vsc.columns else str(index)
-                        b2bvsc = B2bVSCOut(name=b2b_name, id=b2b_id, p_mw=row['p_mw'], vm1_pu=row['vm1_pu'], vm2_pu=row['vm2_pu'])        
+                if hasattr(net, 'res_vsc_stacked') and not net.res_vsc_stacked.empty:
+                    for index, row in net.res_vsc_stacked.iterrows():
+                        b2b_name = net.vsc_stacked.at[index, 'name'] if 'name' in net.vsc_stacked.columns else f'B2B_VSC_{index}'
+                        b2b_id = net.vsc_stacked.at[index, 'id'] if 'id' in net.vsc_stacked.columns else str(index)
+                        vm1 = row.get('vm1_pu', row.get('vm_dc_pu_p', 0.0))
+                        vm2 = row.get('vm2_pu', row.get('vm_dc_pu_m', 0.0))
+                        b2bvsc = B2bVSCOut(
+                            name=b2b_name, id=b2b_id, p_mw=row['p_mw'],
+                            vm1_pu=vm1, vm2_pu=vm2,
+                        )
                         b2bvscsList.append(b2bvsc) 
                         b2bvscs = B2bVSCsOut(b2bvscs = b2bvscsList) 
                     result = {**result, **b2bvscs.__dict__}
@@ -5323,221 +5705,6 @@ def get_element_display_name(net, element_type, element_index):
         # Fallback if any error occurs
         return f"{element_type.capitalize()} no. {element_index + 1}"
 
-def controller_simulation(net, controller_params):
-    """
-    Run controller simulation using pandapower control module
-    Based on: https://pandapower.readthedocs.io/en/latest/control/run.html#pandapower.control.run_control
-    """
-    
-    # Try to import control module, but don't fail if not available
- 
-    from pandapower.control import run_control
-    
-    try:
-        # Clear any existing controllers
-        if hasattr(net, 'controller') and len(net.controller) > 0:
-            net.controller = net.controller.drop(net.controller.index)
-        
-        # Create controllers based on parameters
-        controllers = []
-        
-        # Use proper pandapower control module
-        
-        # Voltage control using generator voltage setpoints
-        if controller_params.get('voltage_control', False):
-            for idx, gen in net.gen.iterrows():
-                if 'vm_pu' in gen and gen['vm_pu'] != 1.0:
-                    # Create a simple voltage controller
-                    # Note: This is a simplified controller - in a full implementation,
-                    # you would use specific controller classes like VoltageController
-                    pass
-        
-        # Tap control using transformer tap positions
-        if controller_params.get('tap_control', False):
-            if len(net.trafo) > 0:
-                for idx, trafo in net.trafo.iterrows():
-                    # Create a simple tap controller
-                    # Note: This is a simplified controller - in a full implementation,
-                    # you would use specific controller classes like TapController
-                    pass
-        
-        # Run controller simulation using the proper run_control function
-        run_control(net, 
-                   max_iter=30,
-                   continue_on_divergence=False,
-                   check_each_level=True)
-        
-        
-        # Prepare results
-        class ControllerBusOut(object):
-            def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float):
-                self.name = name
-                self.id = id
-                self.vm_pu = vm_pu
-                self.va_degree = va_degree
-                self.p_mw = p_mw
-                self.q_mvar = q_mvar
-        
-        class ControllerLineOut(object):
-            def __init__(self, name: str, id: str, p_from_mw: float, q_from_mvar: float, p_to_mw: float, q_to_mvar: float, 
-                         i_from_ka: float, i_to_ka: float, loading_percent: float):
-                self.name = name
-                self.id = id
-                self.p_from_mw = p_from_mw
-                self.q_from_mvar = q_from_mvar
-                self.p_to_mw = p_to_mw
-                self.q_to_mvar = q_to_mvar
-                self.i_from_ka = i_from_ka
-                self.i_to_ka = i_to_ka
-                self.loading_percent = loading_percent
-        
-        class ControllerGeneratorOut(object):
-            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, va_degree: float, vm_pu: float):
-                self.name = name
-                self.id = id
-                self.p_mw = p_mw
-                self.q_mvar = q_mvar
-                self.va_degree = va_degree
-                self.vm_pu = vm_pu
-        
-        class ControllerLoadOut(object):
-            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float):
-                self.name = name
-                self.id = id
-                self.p_mw = p_mw
-                self.q_mvar = q_mvar
-        
-        # Collect results with display names (user-friendly + technical ID)
-        busbars = []
-        for idx, bus in net.res_bus.iterrows():
-            bus_name = net.bus.loc[idx, 'name']
-            # Get user-friendly name from stored mapping
-            user_friendly_name = getattr(net, 'user_friendly_names', {}).get(bus_name, bus_name)
-            
-            busbars.append(ControllerBusOut(
-                name=get_display_name(user_friendly_name, bus_name, 'Bus', idx, 'controller'),
-                id=str(bus_name),
-                vm_pu=safe_float(bus['vm_pu']),
-                va_degree=safe_float(bus['va_degree']),
-                p_mw=safe_float(bus['p_mw']),
-                q_mvar=safe_float(bus['q_mvar'])
-            ))
-        
-        lines = []
-        for idx, line in net.res_line.iterrows():
-            line_name = net.line.loc[idx, 'name']
-            # Get user-friendly name from stored mapping
-            user_friendly_name = getattr(net, 'user_friendly_names', {}).get(line_name, line_name)
-            
-            lines.append(ControllerLineOut(
-                name=get_display_name(user_friendly_name, line_name, 'Line', idx, 'controller'),
-                id=str(line_name),
-                p_from_mw=safe_float(line['p_from_mw']),
-                q_from_mvar=safe_float(line['q_from_mvar']),
-                p_to_mw=safe_float(line['p_to_mw']),
-                q_to_mvar=safe_float(line['q_to_mvar']),
-                i_from_ka=safe_float(line['i_from_ka']),
-                i_to_ka=safe_float(line['i_to_ka']),
-                loading_percent=safe_float(line['loading_percent'])
-            ))
-        
-        generators = []
-        for idx, gen in net.res_gen.iterrows():
-            gen_name = net.gen.loc[idx, 'name']
-            # Get user-friendly name from stored mapping
-            user_friendly_name = getattr(net, 'user_friendly_names', {}).get(gen_name, gen_name)
-            
-            generators.append(ControllerGeneratorOut(
-                name=get_display_name(user_friendly_name, gen_name, 'Generator', idx, 'controller'),
-                id=str(gen_name),
-                p_mw=safe_float(gen['p_mw']),
-                q_mvar=safe_float(gen['q_mvar']),
-                va_degree=safe_float(gen['va_degree']),
-                vm_pu=safe_float(gen['vm_pu'])
-            ))
-        
-        loads = []
-        for idx, load in net.res_load.iterrows():
-            load_name = net.load.loc[idx, 'name']
-            # Get user-friendly name from stored mapping
-            user_friendly_name = getattr(net, 'user_friendly_names', {}).get(load_name, load_name)
-            
-            loads.append(ControllerLoadOut(
-                name=get_display_name(user_friendly_name, load_name, 'Load', idx, 'controller'),
-                id=str(load_name),
-                p_mw=safe_float(load['p_mw']),
-                q_mvar=safe_float(load['q_mvar'])
-            ))
-        
-        # Controller status for pandapower.control simulation
-        controller_status = []
-        if controller_params.get('voltage_control', False):
-            controller_status.append({
-                'controller_id': 0,
-                'controller_type': 'VoltageControl',
-                'active': True,
-                'description': 'Generator voltage control using pandapower.control.run_control',
-                'method': 'pandapower.control.run_control',
-                'max_iterations': 30
-            })
-        if controller_params.get('tap_control', False):
-            controller_status.append({
-                'controller_id': 1,
-                'controller_type': 'TapControl',
-                'active': True,
-                'description': 'Transformer tap control using pandapower.control.run_control',
-                'method': 'pandapower.control.run_control',
-                'max_iterations': 30
-            })
-        
-        return {
-            'controller_converged': net.converged,
-            'controller_status': controller_status,
-            'busbars': [vars(bus) for bus in busbars],
-            'lines': [vars(line) for line in lines],
-            'generators': [vars(gen) for gen in generators],
-            'loads': [vars(load) for load in loads]
-        }
-        
-    except Exception as e:
-        
-        # Initialize diagnostic response
-        diagnostic_response = {
-            "error": True,
-            "message": "Controller simulation failed",
-            "exception": str(e),
-            "diagnostic": {}
-        }
-        
-        # Try to get diagnostic information
-        try:
-            diag_result_dict = pp.diagnostic(net, report_style='detailed')
-            
-            # Check for isolated buses
-            isolated_buses = pp.topology.unsupplied_buses(net)
-            if len(isolated_buses) > 0:
-                # Convert set to list (isolated_buses is a set, not numpy array)
-                if isinstance(isolated_buses, set):
-                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
-                elif hasattr(isolated_buses, 'tolist'):
-                    diagnostic_response["diagnostic"]["isolated_buses"] = isolated_buses.tolist()
-                else:
-                    diagnostic_response["diagnostic"]["isolated_buses"] = list(isolated_buses)
-            
-            # Process diagnostic data to convert element indices to user-friendly names
-            processed_diagnostic = process_diagnostic_data(net, diag_result_dict)
-            # Merge processed diagnostic with isolated_buses (don't overwrite)
-            diagnostic_response["diagnostic"].update(processed_diagnostic)
-                    
-        except Exception as diag_error:
-            pass
-        
-        # If no specific diagnostic was found, include the original exception
-        if not diagnostic_response["diagnostic"]:
-            diagnostic_response["diagnostic"]["general_error"] = str(e)
-        
-        return diagnostic_response
-
 
 def time_series_simulation(net, timeseries_params):
     """
@@ -7182,12 +7349,135 @@ def _electrisim_attach_discrete_tap_controllers(net, attach_trafo=True, attach_t
             _attach_one('trafo3w', row[0], row[1], row[2], row[3])
 
 
+def _sync_shunt_pq_from_characteristic_table(net, shunt_idx):
+    """
+    Align net.shunt p_mw / q_mvar with shunt_characteristic_table for the current step.
+
+    Pandapower's DiscreteShuntController uses net.shunt.q_mvar for np.sign() and for
+    is_converged() boundaries. When step_dependency_table is True, Ybus uses the table
+    while the shunt row was only set at create time; after the controller changes step,
+    stale q_mvar (including 0) breaks control direction and outer convergence.
+    """
+    try:
+        shunt_idx = int(shunt_idx)
+        if "step_dependency_table" not in net.shunt.columns:
+            return
+        if not bool(net.shunt.at[shunt_idx, "step_dependency_table"]):
+            return
+        idc = net.shunt.at[shunt_idx, "id_characteristic_table"]
+        if pd.isna(idc):
+            return
+        step_raw = net.shunt.at[shunt_idx, "step"]
+        try:
+            step_val = int(step_raw)
+        except (TypeError, ValueError):
+            step_val = int(float(step_raw))
+        tbl = net.get("shunt_characteristic_table")
+        if tbl is None or getattr(tbl, "empty", True):
+            return
+        sub = tbl.loc[tbl["id_characteristic"] == int(idc)]
+        if sub.empty:
+            return
+        p_sel, q_sel = 0.0, 0.0
+        found = False
+        for _, r in sub.iterrows():
+            st = r["step"]
+            try:
+                st_i = int(st)
+            except (TypeError, ValueError):
+                st_i = int(float(st))
+            if st_i == step_val:
+                p_sel = _electrisim_parse_float(r.get("p_mw"), 0.0)
+                q_sel = _electrisim_parse_float(r.get("q_mvar"), 0.0)
+                found = True
+                break
+        if not found:
+            return
+        net.shunt.at[shunt_idx, "p_mw"] = p_sel
+        net.shunt.at[shunt_idx, "q_mvar"] = q_sel
+    except Exception:
+        pass
+
+
+try:
+    from pandapower.control.controller.shunt_control import DiscreteShuntController as _ElectrisimDscBase
+except Exception:  # pragma: no cover
+    _ElectrisimDscBase = object
+
+
+if _ElectrisimDscBase is not object:
+    class ElectrisimDiscreteShuntController(_ElectrisimDscBase):
+        def initialize_control(self, net):
+            super().initialize_control(net)
+            _sync_shunt_pq_from_characteristic_table(net, self.shunt_index)
+
+        def control_step(self, net):
+            super().control_step(net)
+            _sync_shunt_pq_from_characteristic_table(net, self.shunt_index)
+else:  # pragma: no cover
+    ElectrisimDiscreteShuntController = None  # type: ignore
+
+
+def _electrisim_shunt_controller_class():
+    return ElectrisimDiscreteShuntController or control.DiscreteShuntController
+
+
+def _electrisim_attach_line_flow_shunt_controllers(net):
+    """
+    Map measured line active power (res_line) to shunt step via pandapower CharacteristicControl
+    (same pattern as VmSetTapControl) + SplineCharacteristic(interp1d kind='previous').
+    """
+    from pandapower.control.util.characteristic import SplineCharacteristic
+
+    lst = getattr(net, 'shunt_line_flow_controllers', None) or []
+    if not lst:
+        return
+    for spec in lst:
+        try:
+            lid = spec.get('line_id')
+            li = _resolve_line_index_by_cell_id(net, lid)
+            if li is None:
+                print(f"Warning: line_flow shunt control: no line with id '{lid}' — controller skipped.")
+                continue
+            rows = spec.get('table_rows') or []
+            if not rows:
+                continue
+            xs, ys = _bands_to_scipy_previous_knots(rows)
+            ch = SplineCharacteristic(
+                net,
+                x_values=xs,
+                y_values=ys,
+                interpolator_kind='interp1d',
+                kind='previous',
+                bounds_error=False,
+                fill_value=(ys[0], ys[-1]),
+            )
+            var = str(spec.get('p_reference', 'p_from_mw'))
+            if var not in ('p_from_mw', 'p_to_mw'):
+                var = 'p_from_mw'
+            ElectrisimShuntStepFromLineCharacteristicControl(
+                net,
+                shunt_index=int(spec['shunt_index']),
+                line_index=li,
+                characteristic_index=int(ch.index),
+                variable=var,
+                use_abs_p=bool(spec.get('use_abs_p', True)),
+                tol=0.49,
+                in_service=True,
+                order=0,
+                level=0,
+            )
+        except Exception as ex:
+            print(f"Warning: could not attach line-flow shunt controller: {ex}")
+
+
 def _electrisim_attach_discrete_shunt_controllers(net):
     """
     Register pandapower DiscreteShuntController for specs in net.shunt_discrete_controllers
     (populated during create_other_elements for Shunt Reactor).
     See https://pandapower.readthedocs.io/en/latest/control/controller.html#discrete-shunt-control
     """
+    Dsc = _electrisim_shunt_controller_class()
     lst = getattr(net, 'shunt_discrete_controllers', None) or []
     if not lst:
         return
@@ -7198,14 +7488,14 @@ def _electrisim_attach_discrete_shunt_controllers(net):
                 net=net,
                 shunt_index=int(spec['shunt_index']),
                 vm_set_pu=float(spec['vm_set_pu']),
-                tol=float(spec.get('tol', 1e-3)),
+                tol=float(spec.get('tol', 1e-2)),
                 increment=int(spec.get('increment', 1)),
                 reset_at_init=bool(spec.get('reset_at_init', False)),
             )
             if bi is not None:
                 kwargs['bus_index'] = bi
             try:
-                control.DiscreteShuntController(**kwargs)
+                Dsc(**kwargs)
             except TypeError:
                 args = [net, kwargs['shunt_index'], kwargs['vm_set_pu']]
                 k2 = dict(
@@ -7215,7 +7505,7 @@ def _electrisim_attach_discrete_shunt_controllers(net):
                 )
                 if bi is not None:
                     k2['bus_index'] = bi
-                control.DiscreteShuntController(*args, **k2)
+                Dsc(*args, **k2)
         except Exception:
             pass
 
@@ -7267,7 +7557,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
             _electrisim_attach_discrete_tap_controllers(net_pf, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
         if attach_sh:
             _electrisim_attach_discrete_shunt_controllers(net_pf)
-        strategies = [{'algorithm': 'nr', 'init': 'auto', 'max_iteration': 100}]
+        strategies = [{'algorithm': 'nr', 'init': 'auto', 'max_iteration': 100, 'max_iter': 100}]
     else:
         strategies = [
             {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
@@ -7283,24 +7573,30 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
                 old_out, old_err = sys.stdout, sys.stderr
                 sys.stdout = sys.stderr = buf
                 try:
+                    pkw = {**q_kw}
+                    if rc and s.get('max_iter') is not None:
+                        pkw['max_iter'] = s['max_iter']
                     pp.runpp(net_pf,
                              algorithm=algo,
                              calculate_voltage_angles=True,
                              init=s['init'],
                              max_iteration=s['max_iteration'],
                              run_control=rc,
-                             **q_kw)
+                             **pkw)
                 finally:
                     sys.stdout = old_out
                     sys.stderr = old_err
             else:
+                pkw = {**q_kw}
+                if rc and s.get('max_iter') is not None:
+                    pkw['max_iter'] = s['max_iter']
                 pp.runpp(net_pf,
                          algorithm=algo,
                          calculate_voltage_angles=True,
                          init=s['init'],
                          max_iteration=s['max_iteration'],
                          run_control=rc,
-                         **q_kw)
+                         **pkw)
             return True
         except Exception:
             continue

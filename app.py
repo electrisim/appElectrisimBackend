@@ -227,6 +227,10 @@ def simulation():
                     pandapower_electrisim.apply_sgen_q_capability_curves(
                         net, in_data, rpc_use_diagram_curves=True)
 
+                rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(
+                    in_data[x], legacy_key='run_control'
+                )
+
                 rpc_params = {
                     'pcc_bus_name': in_data[x].get('pcc_bus_name'),
                     'ext_grid_name': in_data[x].get('ext_grid_name'),
@@ -240,7 +244,10 @@ def simulation():
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),
                     'verbose_iwamoto': in_data[x].get('verbose_iwamoto', False),
-                    'run_control': in_data[x].get('run_control', False),
+                    'run_control': bool(rc2 or rc3 or rcs),
+                    'run_control_trafo2w': rc2,
+                    'run_control_trafo3w': rc3,
+                    'run_control_shunt': rcs,
                     'grid_code_template_key': in_data[x].get('grid_code_template_key'),
                     'grid_code_template_name': in_data[x].get('grid_code_template_name'),
                 }
@@ -485,31 +492,6 @@ def simulation():
                 # Run economic analysis
                 response = pandapower_electrisim.economic_analysis(net, in_data, economic_params)
                 print(f"=== ECONOMIC ANALYSIS RESPONSE: total_capex={response.get('total_capex')}, total_power_losses_mw={response.get('total_power_losses_mw')}, error={response.get('error')} ===")
-                return jsonify(response)
-                
-            if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
-                # Extract user email for logging
-                user_email = in_data[x].get('user_email', 'unknown@user.com')
-                
-                # Extract controller simulation parameters
-                controller_params = {
-                    'voltage_control': in_data[x].get('voltage_control', False),
-                    'tap_control': in_data[x].get('tap_control', False),
-                    'discrete_tap_control': in_data[x].get('discrete_tap_control', False),
-                    'continuous_tap_control': in_data[x].get('continuous_tap_control', False),
-                    'frequency': eval(in_data[x].get('frequency', '50')),
-                    'algorithm': in_data[x].get('algorithm', 'nr'),
-                    'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
-                    'init': in_data[x].get('init', 'dc')
-                }
-                
-                # Create network
-                net = pp.create_empty_network(f_hz=controller_params['frequency'])
-                Busbars = pandapower_electrisim.create_busbars(in_data, net)
-                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
-                
-                # Run controller simulation
-                response = pandapower_electrisim.controller_simulation(net, controller_params)
                 return jsonify(response)
                 
             if "TimeSeriesSimulationPandaPower Parameters" in in_data[x]['typ']:
