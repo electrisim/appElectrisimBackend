@@ -1,4 +1,6 @@
 import sys
+import io
+import contextlib
 import pandapower as pp
 import pandapower.contingency as contingency
 import pandapower.shortcircuit as sc
@@ -59,6 +61,11 @@ def _json_serialize_default(obj):
     if hasattr(obj, '__dict__'):
         return obj.__dict__
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _jsonify_safe(obj):
+    """Deep-convert numpy/pandas scalars and arrays so Flask jsonify succeeds."""
+    return json.loads(json.dumps(obj, default=_json_serialize_default))
 
 
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
@@ -690,14 +697,24 @@ def create_busbars(in_data, net):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            Busbars[bus_name] = pp.create_bus(
-                net,
+            bus_kw = dict(
                 name=bus_name,
                 id=in_data[x]['id'],
                 vn_kv=float(in_data[x]['vn_kv']),
                 type='b',
-                in_service=in_service
+                in_service=in_service,
             )
+            for vm_key in ('min_vm_pu', 'max_vm_pu'):
+                raw = in_data[x].get(vm_key)
+                if raw is None or str(raw).strip().lower() in ('', 'none', 'null'):
+                    continue
+                try:
+                    v = float(raw)
+                    if v == v and math.isfinite(v) and v >= 0.0:
+                        bus_kw[vm_key] = v
+                except (TypeError, ValueError):
+                    pass
+            Busbars[bus_name] = pp.create_bus(net, **bus_kw)
             
             # Store the user-friendly name mapping
             net.user_friendly_names[bus_name] = user_friendly_name
@@ -1264,6 +1281,10 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 line_params["in_service"] = True
 
+            _mlp_line = _electrisim_optional_max_loading_percent(in_data[x].get('max_loading_percent'))
+            if _mlp_line is not None:
+                line_params['max_loading_percent'] = _mlp_line
+
             # Call the function with the prepared parameters
             line_idx = pp.create_line_from_parameters(net, **line_params)
             LinesDict[in_data[x]['name']] = line_idx
@@ -1340,11 +1361,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 )
                 ext_grid_vm_pu = corrected_vm_pu
             
-            pp.create_ext_grid(
-                net,
-                bus=bus_idx,
-                name=in_data[x]['name'],
-                id=in_data[x]['id'],
+            ext_grid_kw = dict(
                 vm_pu=ext_grid_vm_pu,
                 va_degree=safe_float(in_data[x]['va_degree']),
                 s_sc_max_mva=safe_float(in_data[x]['s_sc_max_mva']),
@@ -1353,7 +1370,51 @@ def create_other_elements(in_data,net,x, Busbars):
                 rx_min=safe_float(in_data[x]['rx_min']),
                 r0x0_max=safe_float(in_data[x]['r0x0_max']),
                 x0x_max=safe_float(in_data[x]['x0x_max']),
-                in_service=in_service
+                in_service=in_service,
+            )
+            for fld in ('max_p_mw', 'min_p_mw'):
+                raw = in_data[x].get(fld)
+                if raw is None or str(raw).lower() in ('null', 'none', ''):
+                    continue
+                try:
+                    ext_grid_kw[fld] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+            # OPF: leaving min_q=max_q=0 (diagram defaults) fixes slack Q to exactly 0 MVar — AC OPF then often
+            # fails to converge because the reference cannot exchange reactive power with PV machines / loads.
+            qmin_raw = in_data[x].get('min_q_mvar')
+            qmax_raw = in_data[x].get('max_q_mvar')
+            qmin_parsed = None
+            qmax_parsed = None
+            if qmin_raw is not None and str(qmin_raw).lower() not in ('null', 'none', ''):
+                try:
+                    qmin_parsed = float(qmin_raw)
+                except (TypeError, ValueError):
+                    qmin_parsed = None
+            if qmax_raw is not None and str(qmax_raw).lower() not in ('null', 'none', ''):
+                try:
+                    qmax_parsed = float(qmax_raw)
+                except (TypeError, ValueError):
+                    qmax_parsed = None
+            if qmin_parsed is not None and qmax_parsed is not None and qmin_parsed == 0.0 and qmax_parsed == 0.0:
+                pass
+            else:
+                if qmin_parsed is not None:
+                    ext_grid_kw['min_q_mvar'] = qmin_parsed
+                if qmax_parsed is not None:
+                    ext_grid_kw['max_q_mvar'] = qmax_parsed
+            cont_raw = in_data[x].get('controllable')
+            if cont_raw is not None:
+                ext_grid_kw['controllable'] = (
+                    bool(cont_raw) if isinstance(cont_raw, bool)
+                    else str(cont_raw).lower() in ('true', '1')
+                )
+            pp.create_ext_grid(
+                net,
+                bus=bus_idx,
+                name=in_data[x]['name'],
+                id=in_data[x]['id'],
+                **ext_grid_kw
             )
             
             # Store user-friendly name for external grid
@@ -1432,8 +1493,54 @@ def create_other_elements(in_data,net,x, Busbars):
                     f"leading to unrealistic results."
                 )
             
-            pp.create_gen(net, bus = bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), vm_pu=gen_vm_pu, sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0),
-                          vn_kv=safe_float(in_data[x]['vn_kv']), xdss_pu=safe_float(in_data[x]['xdss_pu']), rdss_ohm=safe_float(in_data[x]['rdss_ohm']), cos_phi=safe_float(in_data[x]['cos_phi']), pg_percent=safe_float(in_data[x]['pg_percent']), in_service=in_service, slack=slack)    #, power_station_trafo=in_data[x]['power_station_trafo']
+            gen_kw = dict(
+                bus=bus_idx,
+                name=in_data[x]['name'],
+                id=in_data[x]['id'],
+                p_mw=safe_float(in_data[x]['p_mw']),
+                vm_pu=gen_vm_pu,
+                scaling=safe_float(in_data[x].get('scaling'), 1.0),
+                in_service=in_service,
+                slack=slack,
+            )
+            # Only pass short-circuit / rating fields when they are physical (diagram often sends zeros).
+            # Passing sn_mva=0, cos_phi=0, etc. overrides pandapower defaults and shifts reactive dispatch vs tutorial networks.
+            _sn = safe_float(in_data[x]['sn_mva'])
+            if _sn > 0:
+                gen_kw['sn_mva'] = _sn
+            _vn = safe_float(in_data[x]['vn_kv'])
+            if _vn > 0:
+                gen_kw['vn_kv'] = _vn
+            _xd = safe_float(in_data[x]['xdss_pu'])
+            if _xd > 0:
+                gen_kw['xdss_pu'] = _xd
+            _rd = safe_float(in_data[x]['rdss_ohm'])
+            if _rd > 0:
+                gen_kw['rdss_ohm'] = _rd
+            _cos = safe_float(in_data[x]['cos_phi'])
+            if 0 < _cos <= 1:
+                gen_kw['cos_phi'] = _cos
+            _pg = safe_float(in_data[x]['pg_percent'])
+            if _pg > 0:
+                gen_kw['pg_percent'] = _pg
+            pst_raw = in_data[x].get('power_station_trafo')
+            if pst_raw is not None and str(pst_raw).strip() not in ('', 'None', 'null', 'none'):
+                try:
+                    pst_f = float(safe_float(pst_raw, 0.0))
+                except (TypeError, ValueError):
+                    pst_f = 0.0
+                if pst_f > 0:
+                    gen_kw['power_station_trafo'] = int(pst_f)
+
+            # OPF: pandapower tutorial (opf_basic) uses controllable=True; missing attr must not imply "fixed P".
+            gen_kw['controllable'] = _electrisim_boolish(in_data[x].get('controllable'), True)
+
+            # OPF payloads send explicit P limits — pass through when present (otherwise pandapower uses NaN / internal defaults).
+            if in_data[x].get('min_p_mw') is not None and str(in_data[x].get('min_p_mw')).lower() not in ('null', 'none', ''):
+                gen_kw['min_p_mw'] = safe_float(in_data[x]['min_p_mw'], 0.0)
+            if in_data[x].get('max_p_mw') is not None and str(in_data[x].get('max_p_mw')).lower() not in ('null', 'none', ''):
+                gen_kw['max_p_mw'] = safe_float(in_data[x]['max_p_mw'], safe_float(in_data[x]['p_mw']) * 1.2)
+            pp.create_gen(net, **gen_kw)
             
             # Store user-friendly name for generator
             gen_name = in_data[x]['name']
@@ -1473,8 +1580,14 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
+            _sgen_opf = _electrisim_opf_optional_fields_from_payload(
+                in_data[x],
+                float_keys=('min_p_mw', 'max_p_mw', 'min_q_mvar', 'max_q_mvar'),
+                bool_keys=('controllable',),
+            )
             pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'],
-                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service)
+                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service,
+                           **_sgen_opf)
             
             # Store user-friendly name for static generator
             sgen_name = in_data[x]['name']
@@ -1603,7 +1716,11 @@ def create_other_elements(in_data,net,x, Busbars):
                 transformer_params['in_service'] = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             else:
                 transformer_params['in_service'] = True
-            
+
+            _mlp_t2 = _electrisim_optional_max_loading_percent(in_data[x].get('max_loading_percent'))
+            if _mlp_t2 is not None:
+                transformer_params['max_loading_percent'] = _mlp_t2
+
             trafo_idx = pp.create_transformer_from_parameters(net, **transformer_params)
             TrafoDict[in_data[x]['name']] = trafo_idx
             
@@ -1702,6 +1819,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 transformer_params['in_service'] = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             else:
                 transformer_params['in_service'] = True
+
+            _mlp_t3 = _electrisim_optional_max_loading_percent(in_data[x].get('max_loading_percent'))
+            if _mlp_t3 is not None:
+                transformer_params['max_loading_percent'] = _mlp_t3
             
             trafo3w_id = transformer_params.pop('id', None)
             trafo3w_idx = pp.create_transformer3w_from_parameters(net, **transformer_params)
@@ -1850,7 +1971,17 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=safe_float(in_data[x].get('scaling'), 1.0),type=in_data[x]['type'], in_service=in_service)
+            _load_opf = _electrisim_opf_optional_fields_from_payload(
+                in_data[x],
+                float_keys=('min_p_mw', 'max_p_mw', 'min_q_mvar', 'max_q_mvar'),
+                bool_keys=('controllable',),
+            )
+            load_ctrl = _electrisim_boolish(_load_opf.get('controllable', in_data[x].get('controllable')), False)
+            if not load_ctrl:
+                for _lk in ('min_p_mw', 'max_p_mw', 'min_q_mvar', 'max_q_mvar'):
+                    _load_opf.pop(_lk, None)
+            pp.create_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']),q_mvar=safe_float(in_data[x]['q_mvar']),const_z_percent=safe_float(in_data[x]['const_z_percent']),const_i_percent=safe_float(in_data[x]['const_i_percent']), sn_mva=safe_float(in_data[x]['sn_mva']),scaling=safe_float(in_data[x].get('scaling'), 1.0),type=in_data[x]['type'], in_service=in_service,
+                           **_load_opf)
             
             # Store user-friendly name for load
             load_name = in_data[x]['name']
@@ -2018,6 +2149,11 @@ def create_other_elements(in_data,net,x, Busbars):
                 except (TypeError, ValueError):
                     pass
             pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], **storage_kwargs)
+            stor_nm = in_data[x]['name']
+            uf_storage = in_data[x].get('userFriendlyName', stor_nm)
+            if not hasattr(net, 'user_friendly_names'):
+                net.user_friendly_names = {}
+            net.user_friendly_names[stor_nm] = uf_storage
    
         if (in_data[x]['typ'].startswith("Load DC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -2336,6 +2472,11 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 # DC Line connecting two AC buses - use create_dcline (simplified HVDC model)
                 print(f"Creating DC line (dcline) '{element_name}': AC bus {bus_from} -> AC bus {bus_to}")
+                _dcl_opf = _electrisim_opf_optional_fields_from_payload(
+                    in_data[x],
+                    float_keys=('max_p_mw', 'min_q_from_mvar', 'max_q_from_mvar', 'min_q_to_mvar', 'max_q_to_mvar'),
+                    bool_keys=(),
+                )
                 pp.create_dcline(net, from_bus=from_bus_idx, to_bus=to_bus_idx, 
                                name=in_data[x]['name'], 
                                p_mw=safe_float(in_data[x].get('p_mw', 0.0)), 
@@ -2343,7 +2484,8 @@ def create_other_elements(in_data,net,x, Busbars):
                                loss_mw=safe_float(in_data[x].get('loss_mw', 0.0)), 
                                vm_from_pu=safe_float(in_data[x].get('vm_from_pu', 1.0)), 
                                vm_to_pu=safe_float(in_data[x].get('vm_to_pu', 1.0)), 
-                               in_service=in_service)
+                               in_service=in_service,
+                               **_dcl_opf)
             
             # Store user-friendly name for DC Line
             dcline_name = in_data[x]['name']
@@ -2361,6 +2503,27 @@ def _electrisim_boolish(v, default=False):
     if isinstance(v, str):
         return v.strip().lower() in ('true', '1', 'yes', 'on')
     return bool(v)
+
+
+def _electrisim_opf_optional_fields_from_payload(row, float_keys=(), bool_keys=()):
+    """Parse optional OPF-related keys from a frontend element dict (skip empty / NaN)."""
+    out = {}
+    if not isinstance(row, dict):
+        return out
+    for k in bool_keys:
+        if k not in row:
+            continue
+        out[k] = _electrisim_boolish(row.get(k), False)
+    for k in float_keys:
+        if k not in row:
+            continue
+        raw = row[k]
+        if raw is None or raw == '' or str(raw).strip() == '':
+            continue
+        v = safe_float(raw, float('nan'))
+        if v == v:
+            out[k] = v
+    return out
 
 
 def _resolve_controller_family_flags(payload, legacy_key='run_control'):
@@ -4971,6 +5134,15 @@ def contingency_analysis(net, contingency_params):
         return json.dumps({'error': error_message}) 
 
 
+def _truncate_solver_verbose_log(text: str, max_chars: int = 750_000) -> str:
+    """Avoid oversized JSON payloads from verbose PyPower printpf output."""
+    if not text or not isinstance(text, str):
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n… [output truncated — reduce diagram size or keep Suppress warnings enabled]\n"
+
+
 def optimalPowerFlow(net, opf_params):
     """
     Run optimal power flow using pandapower.runopp (AC) or pandapower.rundcopp (DC)
@@ -4983,6 +5155,8 @@ def optimalPowerFlow(net, opf_params):
         JSON response with optimal power flow results or error message
     """
     
+    solver_verbose_text = ""
+
     try:
         # Extract OPF parameters
         opf_type = opf_params.get('opf_type', 'ac')
@@ -4996,62 +5170,487 @@ def optimalPowerFlow(net, opf_params):
         numba = opf_params.get('numba', True)
         suppress_warnings = opf_params.get('suppress_warnings', True)
         cost_function = opf_params.get('cost_function', 'none')
+        generator_cost_cp1 = opf_params.get('generator_cost_cp1') or {}
+        if not isinstance(generator_cost_cp1, dict):
+            generator_cost_cp1 = {}
+        generator_cost_cp2 = opf_params.get('generator_cost_cp2') or {}
+        if not isinstance(generator_cost_cp2, dict):
+            generator_cost_cp2 = {}
+        ext_grid_cost_cp1 = opf_params.get('ext_grid_cost_cp1') or {}
+        if not isinstance(ext_grid_cost_cp1, dict):
+            ext_grid_cost_cp1 = {}
+        ext_grid_cost_cp2 = opf_params.get('ext_grid_cost_cp2') or {}
+        if not isinstance(ext_grid_cost_cp2, dict):
+            ext_grid_cost_cp2 = {}
+        storage_cost_cp1 = opf_params.get('storage_cost_cp1') or {}
+        if not isinstance(storage_cost_cp1, dict):
+            storage_cost_cp1 = {}
+        storage_cost_cp2 = opf_params.get('storage_cost_cp2') or {}
+        if not isinstance(storage_cost_cp2, dict):
+            storage_cost_cp2 = {}
+        sgen_cost_cp1 = opf_params.get('sgen_cost_cp1') or {}
+        if not isinstance(sgen_cost_cp1, dict):
+            sgen_cost_cp1 = {}
+        sgen_cost_cp2 = opf_params.get('sgen_cost_cp2') or {}
+        if not isinstance(sgen_cost_cp2, dict):
+            sgen_cost_cp2 = {}
+        load_cost_cp1 = opf_params.get('load_cost_cp1') or {}
+        if not isinstance(load_cost_cp1, dict):
+            load_cost_cp1 = {}
+        load_cost_cp2 = opf_params.get('load_cost_cp2') or {}
+        if not isinstance(load_cost_cp2, dict):
+            load_cost_cp2 = {}
+        dcline_cost_cp1 = opf_params.get('dcline_cost_cp1') or {}
+        if not isinstance(dcline_cost_cp1, dict):
+            dcline_cost_cp1 = {}
+        dcline_cost_cp2 = opf_params.get('dcline_cost_cp2') or {}
+        if not isinstance(dcline_cost_cp2, dict):
+            dcline_cost_cp2 = {}
         
         # Check for isolated buses
         isolated_buses = top.unsupplied_buses(net)
         if len(isolated_buses) > 0:
             raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
         
-        # Set up cost functions if specified and not already present
-        if cost_function != 'none':
-            setup_default_cost_functions(net, cost_function)
-        
-        # Check if any cost functions are defined
-        if len(net.poly_cost) == 0 and len(net.pwl_cost) == 0:
-            setup_default_cost_functions(net, 'polynomial')
-        
-        # Ensure min/max p_mw columns exist for OPF
+        # Ensure min/max p_mw columns exist before default cost setup (PWL uses these breakpoints)
         if 'min_p_mw' not in net.gen.columns:
             net.gen['min_p_mw'] = 0.0
+        else:
+            net.gen['min_p_mw'] = net.gen['min_p_mw'].fillna(0.0)
         if 'max_p_mw' not in net.gen.columns:
             net.gen['max_p_mw'] = net.gen['p_mw'] * 1.2
+        else:
+            net.gen['max_p_mw'] = net.gen['max_p_mw'].where(
+                net.gen['max_p_mw'].notna(), net.gen['p_mw'] * 1.2
+            )
+        net.gen.loc[net.gen['max_p_mw'] <= net.gen['min_p_mw'], 'max_p_mw'] = (
+            net.gen.loc[net.gen['max_p_mw'] <= net.gen['min_p_mw'], 'min_p_mw'] + 1e-3
+        )
+
+        # OPF limits for external grids / storage (needed for PWL breakpoints)
+        if not net.ext_grid.empty:
+            if 'min_p_mw' not in net.ext_grid.columns:
+                net.ext_grid['min_p_mw'] = 0.0
+            else:
+                net.ext_grid['min_p_mw'] = pd.to_numeric(net.ext_grid['min_p_mw'], errors='coerce').fillna(0.0)
+            if 'max_p_mw' not in net.ext_grid.columns:
+                net.ext_grid['max_p_mw'] = 1e6
+            else:
+                net.ext_grid['max_p_mw'] = pd.to_numeric(net.ext_grid['max_p_mw'], errors='coerce')
+                net.ext_grid['max_p_mw'] = net.ext_grid['max_p_mw'].where(net.ext_grid['max_p_mw'].notna(), 1e6)
+            slack_need_wide_cap = net.ext_grid['max_p_mw'] <= net.ext_grid['min_p_mw']
+            net.ext_grid.loc[slack_need_wide_cap, 'max_p_mw'] = net.ext_grid.loc[slack_need_wide_cap, 'min_p_mw'] + 1e6
+
+        if hasattr(net, 'storage') and not net.storage.empty:
+            if 'min_p_mw' not in net.storage.columns:
+                net.storage['min_p_mw'] = 0.0
+            else:
+                net.storage['min_p_mw'] = pd.to_numeric(net.storage['min_p_mw'], errors='coerce').fillna(0.0)
+            if 'max_p_mw' not in net.storage.columns:
+                net.storage['max_p_mw'] = net.storage['p_mw'].fillna(0.0).abs() * 1.2 + 1e-3
+            else:
+                net.storage['max_p_mw'] = pd.to_numeric(net.storage['max_p_mw'], errors='coerce')
+                fb = net.storage['p_mw'].fillna(0.0).abs() * 1.2 + 1e-3
+                net.storage['max_p_mw'] = net.storage['max_p_mw'].where(net.storage['max_p_mw'].notna(), fb)
+            bad = net.storage['max_p_mw'] <= net.storage['min_p_mw']
+            net.storage.loc[bad, 'max_p_mw'] = net.storage.loc[bad, 'min_p_mw'] + 1e-3
+
+        # Static generators: P/Q limits for OPF (PWL breakpoints)
+        if hasattr(net, 'sgen') and not net.sgen.empty:
+            if 'min_p_mw' not in net.sgen.columns:
+                net.sgen['min_p_mw'] = 0.0
+            else:
+                net.sgen['min_p_mw'] = pd.to_numeric(net.sgen['min_p_mw'], errors='coerce').fillna(0.0)
+            if 'max_p_mw' not in net.sgen.columns:
+                net.sgen['max_p_mw'] = net.sgen['p_mw'].fillna(0.0).abs() * 1.2 + 1e-3
+            else:
+                net.sgen['max_p_mw'] = pd.to_numeric(net.sgen['max_p_mw'], errors='coerce')
+                fb = net.sgen['p_mw'].fillna(0.0).abs() * 1.2 + 1e-3
+                net.sgen['max_p_mw'] = net.sgen['max_p_mw'].where(net.sgen['max_p_mw'].notna(), fb)
+            bad = net.sgen['max_p_mw'] <= net.sgen['min_p_mw']
+            net.sgen.loc[bad, 'max_p_mw'] = net.sgen.loc[bad, 'min_p_mw'] + 1e-3
+
+        # Controllable loads / DC lines: ensure finite P (and Q) bounds before cost setup
+        if not net.load.empty:
+            if 'controllable' not in net.load.columns:
+                net.load['controllable'] = False
+            else:
+                net.load['controllable'] = net.load['controllable'].fillna(value=False)
+
+            for li in net.load.index:
+                try:
+                    cflag = bool(net.load.loc[li, 'controllable'])
+                except (TypeError, ValueError):
+                    cflag = False
+                if not cflag:
+                    continue
+                try:
+                    p0 = float(net.load.loc[li, 'p_mw'])
+                except (TypeError, ValueError):
+                    p0 = 0.0
+                mn = net.load.loc[li, 'min_p_mw'] if 'min_p_mw' in net.load.columns else float('nan')
+                mx = net.load.loc[li, 'max_p_mw'] if 'max_p_mw' in net.load.columns else float('nan')
+                mn = pd.to_numeric(mn, errors='coerce')
+                mx = pd.to_numeric(mx, errors='coerce')
+                if pd.isna(mn):
+                    mn = 0.0
+                if pd.isna(mx):
+                    mx = max(p0 * 1.2, p0 + 1e-3, 1e-3)
+                if float(mx) <= float(mn):
+                    mx = float(mn) + 1e-3
+                net.load.loc[li, 'min_p_mw'] = float(mn)
+                net.load.loc[li, 'max_p_mw'] = float(mx)
+
+        if hasattr(net, 'dcline') and not net.dcline.empty:
+            BIG_Q = 999999.0
+            for qc in ('min_q_from_mvar', 'max_q_from_mvar', 'min_q_to_mvar', 'max_q_to_mvar'):
+                if qc not in net.dcline.columns:
+                    net.dcline[qc] = float('nan')
+            for di in net.dcline.index:
+                try:
+                    p0 = float(net.dcline.loc[di, 'p_mw'])
+                except (TypeError, ValueError):
+                    p0 = 0.0
+                mxp = net.dcline.loc[di, 'max_p_mw'] if 'max_p_mw' in net.dcline.columns else float('nan')
+                mxp = pd.to_numeric(mxp, errors='coerce')
+                if pd.isna(mxp) or float(mxp) <= 0:
+                    net.dcline.loc[di, 'max_p_mw'] = max(abs(p0) * 1.2, 1e-3)
+                for qcol, qdef in (
+                    ('min_q_from_mvar', -BIG_Q),
+                    ('max_q_from_mvar', BIG_Q),
+                    ('min_q_to_mvar', -BIG_Q),
+                    ('max_q_to_mvar', BIG_Q),
+                ):
+                    v = pd.to_numeric(net.dcline.loc[di, qcol], errors='coerce')
+                    if pd.isna(v):
+                        net.dcline.loc[di, qcol] = qdef
+        
+        # Set up cost functions if specified and not already present
+        if cost_function != 'none':
+            setup_default_cost_functions(
+                net, cost_function,
+                generator_cost_cp1, generator_cost_cp2,
+                ext_grid_cost_cp1, ext_grid_cost_cp2,
+                storage_cost_cp1, storage_cost_cp2,
+                sgen_cost_cp1, sgen_cost_cp2,
+                load_cost_cp1, load_cost_cp2,
+                dcline_cost_cp1, dcline_cost_cp2,
+            )
+        
+        # If an economic model was requested but no cost rows exist (edge case), fall back to polynomial gens.
+        # Do NOT add costs when the user explicitly chose "none" — they expect no poly_cost / pwl_cost objective.
+        if cost_function != 'none' and len(net.poly_cost) == 0 and len(net.pwl_cost) == 0:
+            setup_default_cost_functions(
+                net, 'polynomial',
+                generator_cost_cp1, generator_cost_cp2,
+                ext_grid_cost_cp1, ext_grid_cost_cp2,
+                storage_cost_cp1, storage_cost_cp2,
+                sgen_cost_cp1, sgen_cost_cp2,
+                load_cost_cp1, load_cost_cp2,
+                dcline_cost_cp1, dcline_cost_cp2,
+            )
         # Optionally ensure min_q_mvar/max_q_mvar as well
         if 'min_q_mvar' not in net.gen.columns:
             net.gen['min_q_mvar'] = -9999.0
         if 'max_q_mvar' not in net.gen.columns:
             net.gen['max_q_mvar'] = 9999.0
+
+        # AC OPF: pandapower needs finite sn_mva for some paths. Using ~1.05×P made Q limits unrealistically tight
+        # vs opf_basic.ipynb (unset sn_mva), shifting voltages (~1.12 pu) while P stayed correct. Use a loose rating
+        # when the diagram omits sn_mva (NaN/0) so Q does not bind before active dispatch.
+        if not net.gen.empty and 'sn_mva' in net.gen.columns:
+            for gi in net.gen.index:
+                raw_sn = net.gen.loc[gi, 'sn_mva']
+                try:
+                    if pd.notna(raw_sn):
+                        sn = float(raw_sn)
+                        if sn > 0:
+                            continue
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    p0 = float(net.gen.loc[gi, 'p_mw'])
+                except (TypeError, ValueError):
+                    p0 = 0.0
+                try:
+                    pmax = float(net.gen.loc[gi, 'max_p_mw'])
+                except (TypeError, ValueError):
+                    pmax = abs(p0) * 1.2 if p0 != 0 else 10.0
+                base_mw = max(abs(p0), abs(pmax), 1.0)
+                net.gen.loc[gi, 'sn_mva'] = max(base_mw * 500.0, 5e4)
+
+        # External grid OPF prep:
+        # 1. Diagram defaults leave Q limits degenerate (0|0, NaN, empty span, inverted span) which traps slack
+        #    reactive power; widen to ±BIG_Q.
+        # 2. Diagram default max_p_mw=1e6 wrecks IPOPT scaling when the slack is controllable. Cap P bounds only
+        #    for ext_grid rows that are already controllable (user/diagram), to something proportional to demand.
+        # 3. Do **not** force controllable=True just because a poly_cost row exists: pandapower's opf_basic.ipynb
+        #    keeps the slack non-controllable while still minimizing slack + gen cost; forcing True changes the
+        #    OPF (notably coupled with trafo-from-parameters + manual lines) and can inflate voltages (~1.12 pu).
+        if not net.ext_grid.empty:
+            BIG_Q = 999999.0
+            if 'min_q_mvar' not in net.ext_grid.columns:
+                net.ext_grid['min_q_mvar'] = -BIG_Q
+            if 'max_q_mvar' not in net.ext_grid.columns:
+                net.ext_grid['max_q_mvar'] = BIG_Q
+            net.ext_grid['min_q_mvar'] = pd.to_numeric(net.ext_grid['min_q_mvar'], errors='coerce')
+            net.ext_grid['max_q_mvar'] = pd.to_numeric(net.ext_grid['max_q_mvar'], errors='coerce')
+            for ei in net.ext_grid.index:
+                qmn = net.ext_grid.loc[ei, 'min_q_mvar']
+                qmx = net.ext_grid.loc[ei, 'max_q_mvar']
+                widen = False
+                if pd.isna(qmn) or pd.isna(qmx):
+                    widen = True
+                else:
+                    try:
+                        qmn_f = float(qmn)
+                        qmx_f = float(qmx)
+                    except (TypeError, ValueError):
+                        widen = True
+                    else:
+                        if qmx_f <= qmn_f or abs(qmx_f - qmn_f) < 1e-12:
+                            widen = True
+                if widen:
+                    net.ext_grid.loc[ei, 'min_q_mvar'] = -BIG_Q
+                    net.ext_grid.loc[ei, 'max_q_mvar'] = BIG_Q
+
+            # Reasonable slack capacity = max(loads + gens + 2× headroom, 1000 MW).
+            try:
+                load_total = float(net.load['p_mw'].fillna(0).abs().sum()) if not net.load.empty else 0.0
+            except Exception:
+                load_total = 0.0
+            try:
+                gen_total = float(net.gen['max_p_mw'].fillna(0).abs().sum()) if not net.gen.empty else 0.0
+            except Exception:
+                gen_total = 0.0
+            slack_cap = max((load_total + gen_total) * 2.0, 1000.0)
+
+            if 'controllable' in net.ext_grid.columns:
+                for ei in net.ext_grid.index:
+                    if not bool(net.ext_grid.loc[ei, 'controllable']):
+                        continue
+                    try:
+                        mxp = float(net.ext_grid.loc[ei, 'max_p_mw'])
+                    except (TypeError, ValueError):
+                        mxp = float('inf')
+                    try:
+                        mnp = float(net.ext_grid.loc[ei, 'min_p_mw'])
+                    except (TypeError, ValueError):
+                        mnp = 0.0
+                    if not (mxp == mxp) or mxp > slack_cap:
+                        net.ext_grid.loc[ei, 'max_p_mw'] = slack_cap
+                    if not (mnp == mnp) or mnp < -slack_cap:
+                        net.ext_grid.loc[ei, 'min_p_mw'] = -slack_cap
+
+        def _opf_element_indices_with_cost(et):
+            idx = set()
+            try:
+                if not net.poly_cost.empty and 'et' in net.poly_cost.columns:
+                    idx.update(int(i) for i in net.poly_cost.loc[net.poly_cost['et'] == et, 'element'].tolist())
+                if not net.pwl_cost.empty and 'et' in net.pwl_cost.columns:
+                    idx.update(int(i) for i in net.pwl_cost.loc[net.pwl_cost['et'] == et, 'element'].tolist())
+            except Exception:
+                pass
+            return idx
+
+        BIG_Q_GEN = 999999.0
+        if hasattr(net, 'sgen') and not net.sgen.empty:
+            if 'controllable' not in net.sgen.columns:
+                net.sgen['controllable'] = False
+            else:
+                net.sgen['controllable'] = net.sgen['controllable'].fillna(value=False)
+            sgen_c = _opf_element_indices_with_cost('sgen')
+            for si in net.sgen.index:
+                if int(si) in sgen_c:
+                    net.sgen.loc[si, 'controllable'] = True
+                if not bool(net.sgen.loc[si, 'controllable']):
+                    continue
+                if 'min_q_mvar' not in net.sgen.columns:
+                    net.sgen['min_q_mvar'] = -BIG_Q_GEN
+                if 'max_q_mvar' not in net.sgen.columns:
+                    net.sgen['max_q_mvar'] = BIG_Q_GEN
+                qmn = net.sgen.loc[si, 'min_q_mvar']
+                qmx = net.sgen.loc[si, 'max_q_mvar']
+                widen = False
+                try:
+                    qmn_f = float(pd.to_numeric(qmn, errors='coerce'))
+                    qmx_f = float(pd.to_numeric(qmx, errors='coerce'))
+                    if not (qmn_f == qmn_f and qmx_f == qmx_f) or qmx_f <= qmn_f or abs(qmx_f - qmn_f) < 1e-12:
+                        widen = True
+                except (TypeError, ValueError):
+                    widen = True
+                if widen:
+                    net.sgen.loc[si, 'min_q_mvar'] = -BIG_Q_GEN
+                    net.sgen.loc[si, 'max_q_mvar'] = BIG_Q_GEN
+
+        if not net.load.empty:
+            if 'controllable' not in net.load.columns:
+                net.load['controllable'] = False
+            else:
+                net.load['controllable'] = net.load['controllable'].fillna(value=False)
+            load_c = _opf_element_indices_with_cost('load')
+            for li in net.load.index:
+                if int(li) in load_c:
+                    net.load.loc[li, 'controllable'] = True
+                if not bool(net.load.loc[li, 'controllable']):
+                    continue
+                if 'min_q_mvar' not in net.load.columns:
+                    net.load['min_q_mvar'] = -BIG_Q_GEN
+                if 'max_q_mvar' not in net.load.columns:
+                    net.load['max_q_mvar'] = BIG_Q_GEN
+                qmn = net.load.loc[li, 'min_q_mvar']
+                qmx = net.load.loc[li, 'max_q_mvar']
+                widen = False
+                try:
+                    qmn_f = float(pd.to_numeric(qmn, errors='coerce'))
+                    qmx_f = float(pd.to_numeric(qmx, errors='coerce'))
+                    if not (qmn_f == qmn_f and qmx_f == qmx_f) or qmx_f <= qmn_f or abs(qmx_f - qmn_f) < 1e-12:
+                        widen = True
+                except (TypeError, ValueError):
+                    widen = True
+                if widen:
+                    net.load.loc[li, 'min_q_mvar'] = -BIG_Q_GEN
+                    net.load.loc[li, 'max_q_mvar'] = BIG_Q_GEN
+
+        # Bus voltage limits for AC OPF: honor per-bus values from the diagram (create_bus). Where missing or
+        # invalid, use loose defaults 0.8–1.2 pu so small networks still converge (see comment below).
+        if not net.bus.empty:
+            DEFAULT_OPF_VM_MIN = 0.8
+            DEFAULT_OPF_VM_MAX = 1.2
+            if 'min_vm_pu' not in net.bus.columns:
+                net.bus['min_vm_pu'] = np.nan
+            else:
+                net.bus['min_vm_pu'] = pd.to_numeric(net.bus['min_vm_pu'], errors='coerce')
+            if 'max_vm_pu' not in net.bus.columns:
+                net.bus['max_vm_pu'] = np.nan
+            else:
+                net.bus['max_vm_pu'] = pd.to_numeric(net.bus['max_vm_pu'], errors='coerce')
+            for bi in net.bus.index:
+                try:
+                    mn = net.bus.at[bi, 'min_vm_pu']
+                    mx = net.bus.at[bi, 'max_vm_pu']
+                except (KeyError, TypeError):
+                    mn = mx = float('nan')
+                if pd.isna(mn) or not (mn == mn) or not math.isfinite(float(mn)):
+                    mn = DEFAULT_OPF_VM_MIN
+                else:
+                    mn = float(mn)
+                if pd.isna(mx) or not (mx == mx) or not math.isfinite(float(mx)):
+                    mx = DEFAULT_OPF_VM_MAX
+                else:
+                    mx = float(mx)
+                if mx <= mn:
+                    mn, mx = DEFAULT_OPF_VM_MIN, DEFAULT_OPF_VM_MAX
+                net.bus.at[bi, 'min_vm_pu'] = mn
+                net.bus.at[bi, 'max_vm_pu'] = mx
         
         # Run optimal power flow based on type
-        if opf_type == 'ac':
-            pp.runopp(net, 
-                     verbose=not suppress_warnings,
-                     suppress_warnings=suppress_warnings,
-                     delta=delta,
-                     trafo_model=trafo_model,
-                     trafo_loading=trafo_loading,
-                     ac_line_model=ac_line_model,
-                     calculate_voltage_angles=calculate_voltage_angles,
-                     init=init,
-                     numba=numba)
-        else:  # dc
-            pp.rundcopp(net,
-                       verbose=not suppress_warnings,
-                       suppress_warnings=suppress_warnings,
-                       delta=delta,
-                       trafo_model=trafo_model,
-                       trafo_loading=trafo_loading,
-                       calculate_voltage_angles=calculate_voltage_angles,
-                       init=init,
-                       numba=numba)
+        from pandapower.auxiliary import OPFNotConverged as _OPFNotConverged
+
+        def _run_opf_once(use_init, use_numba, verbose_solver):
+            if opf_type == 'ac':
+                pp.runopp(
+                    net,
+                    verbose=verbose_solver,
+                    suppress_warnings=not verbose_solver,
+                    delta=delta,
+                    trafo_model=trafo_model,
+                    trafo_loading=trafo_loading,
+                    ac_line_model=ac_line_model,
+                    calculate_voltage_angles=calculate_voltage_angles,
+                    init=use_init,
+                    numba=use_numba,
+                )
+            else:
+                pp.rundcopp(
+                    net,
+                    verbose=verbose_solver,
+                    suppress_warnings=not verbose_solver,
+                    delta=delta,
+                    trafo_model=trafo_model,
+                    trafo_loading=trafo_loading,
+                    calculate_voltage_angles=calculate_voltage_angles,
+                    init=use_init,
+                    numba=use_numba,
+                )
+
+        _solver_attempts = []
+        if opf_type != 'ac':
+            _solver_attempts = [(init, numba)]
+        else:
+            def _push(ii, nn):
+                if not _solver_attempts or _solver_attempts[-1] != (ii, nn):
+                    _solver_attempts.append((ii, nn))
+
+            _push(init, numba)
+            if str(init).lower() == 'pf':
+                _push('flat', numba)
+            if numba:
+                _push('flat', False)
+
+        buf = None
+        if not suppress_warnings:
+            buf = io.StringIO()
+
+        try:
+            if buf is not None:
+                # pandapower.optimal_powerflow does `from sys import stdout` and passes that handle to printpf()
+                # as fd=stdout. redirect_stdout() only replaces sys.stdout; the module-local `stdout` still points at
+                # the process console, so verbose tables went to Flask logs but not our buffer. Point it at the
+                # redirected sys.stdout while OPF runs, then restore (see pandapower optimal_powerflow.py).
+                import pandapower.optimal_powerflow as _pp_opf_core
+
+                _saved_printpf_fd = _pp_opf_core.stdout
+                try:
+                    for attempt_idx, (use_init, use_numba) in enumerate(_solver_attempts):
+                        if attempt_idx > 0:
+                            buf.write(
+                                f"\n\n===== OPF retry {attempt_idx + 1}/{len(_solver_attempts)} "
+                                f"(init={use_init!r}, numba={use_numba}) =====\n"
+                            )
+                        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                            _pp_opf_core.stdout = sys.stdout
+                            try:
+                                _run_opf_once(use_init, use_numba, verbose_solver=True)
+                                break
+                            except _OPFNotConverged:
+                                if attempt_idx == len(_solver_attempts) - 1:
+                                    raise
+                finally:
+                    _pp_opf_core.stdout = _saved_printpf_fd
+                solver_verbose_text = buf.getvalue()
+            else:
+                for attempt_idx, (use_init, use_numba) in enumerate(_solver_attempts):
+                    try:
+                        _run_opf_once(use_init, use_numba, verbose_solver=False)
+                        break
+                    except _OPFNotConverged:
+                        if attempt_idx == len(_solver_attempts) - 1:
+                            raise
+        except Exception:
+            if buf is not None:
+                solver_verbose_text = buf.getvalue()
+            raise
         
         
     except Exception as e:
+        from pandapower.auxiliary import OPFNotConverged
         
         # Initialize diagnostic response
+        exc_text = str(e)
+        if isinstance(e, OPFNotConverged) or "did not converge" in exc_text.lower():
+            exc_text += (
+                "\n\nTips:\n"
+                "• The backend already retries AC OPF with **init=flat** (and **numba off** if needed) after a "
+                "failed **pf** start — if you still see this, try **Polynomial** costs if you use piecewise linear.\n"
+                "• Manually set **Initialization = flat** in the OPF dialog if you want to skip the first attempt.\n"
+                "• Ensure generators have sensible **min/max active power** (per-unit voltage setpoints near 1.0)."
+            )
+        
         diagnostic_response = {
             "error": True,
             "message": "Optimal Power Flow calculation failed",
-            "exception": str(e),
+            "exception": exc_text,
             "diagnostic": {}
         }
         
@@ -5081,8 +5680,11 @@ def optimalPowerFlow(net, opf_params):
         # If no specific diagnostic was found, include the original exception
         if not diagnostic_response["diagnostic"]:
             diagnostic_response["diagnostic"]["general_error"] = str(e)
+
+        if solver_verbose_text.strip():
+            diagnostic_response["solver_verbose_log"] = _truncate_solver_verbose_log(solver_verbose_text)
         
-        return diagnostic_response
+        return _jsonify_safe(diagnostic_response)
     
     # Build response with OPF results
     else:
@@ -5130,27 +5732,70 @@ def optimalPowerFlow(net, opf_params):
         
         # Similar classes for other components (simplified for space)
         class ExternalGridOut(object):
-            def __init__(self,  name: str, id: str, p_mw: float, q_mvar: float, pf: float, q_p:float):        
+            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, pf: float, q_p: float,
+                        gen_cost: float = 0.0, marginal_cost: float = 0.0):
                 self.name = name
                 self.id = id
-                self.p_mw = p_mw 
-                self.q_mvar = q_mvar  
-                self.pf = pf            
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
+                self.pf = pf
                 self.q_p = q_p
+                self.gen_cost = gen_cost
+                self.marginal_cost = marginal_cost
         
         class LoadOut(object):
-            def __init__(self, name: str, id:str, p_mw: float, q_mvar: float):          
+            def __init__(self, name: str, id:str, p_mw: float, q_mvar: float,
+                         gen_cost: float = 0.0, marginal_cost: float = 0.0):
                 self.name = name
                 self.id = id
-                self.p_mw = p_mw 
-                self.q_mvar = q_mvar 
-        
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
+                self.gen_cost = gen_cost
+                self.marginal_cost = marginal_cost
+
+        class StorageOpfOut(object):
+            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float,
+                         gen_cost: float = 0.0, marginal_cost: float = 0.0):
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
+                self.gen_cost = gen_cost
+                self.marginal_cost = marginal_cost
+
+        class SgenOpfOut(object):
+            def __init__(self, name: str, id: str, p_mw: float, q_mvar: float,
+                         gen_cost: float = 0.0, marginal_cost: float = 0.0):
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
+                self.gen_cost = gen_cost
+                self.marginal_cost = marginal_cost
+
+        class DclineOpfOut(object):
+            def __init__(self, name: str, id: str, p_mw: float,
+                         p_from_mw: float = 0.0, p_to_mw: float = 0.0,
+                         pl_mw: float = 0.0,
+                         gen_cost: float = 0.0, marginal_cost: float = 0.0):
+                self.name = name
+                self.id = id
+                self.p_mw = p_mw
+                self.p_from_mw = p_from_mw
+                self.p_to_mw = p_to_mw
+                self.pl_mw = pl_mw
+                self.gen_cost = gen_cost
+                self.marginal_cost = marginal_cost
+
         # Initialize result lists
         busbarList = list()
         linesList = list()
         generatorsList = list()
         externalgridsList = list()
+        storagesList = list()
         loadsList = list()
+        staticgeneratorsList = list()
+        dclinesList = list()
         
         # Process bus results with OPF-specific data
         for index, row in net.res_bus.iterrows():
@@ -5244,7 +5889,14 @@ def optimalPowerFlow(net, opf_params):
                 marginal_cost = 0.0
                 
                 # Get costs from poly_cost table
-                poly_costs = net.poly_cost[net.poly_cost['element'] == index]
+                pc = net.poly_cost
+                if pc.empty:
+                    poly_costs = pc
+                elif 'et' in pc.columns:
+                    poly_costs = pc[(pc['element'] == index) & (pc['et'] == 'gen')]
+                else:
+                    poly_costs = pc[pc['element'] == index]
+                got_poly = False
                 if not poly_costs.empty:
                     poly_cost_row = poly_costs.iloc[0]
                     p_gen = row['p_mw']
@@ -5255,6 +5907,11 @@ def optimalPowerFlow(net, opf_params):
                         c0 = poly_cost_row['cp0_eur']
                         gen_cost = c2 * p_gen**2 + c1 * p_gen + c0
                         marginal_cost = 2 * c2 * p_gen + c1
+                        got_poly = True
+                if not got_poly:
+                    pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'gen', row['p_mw'])
+                    gen_cost = pw_c
+                    marginal_cost = pw_m
                 
                 generator = GeneratorOut(
                     name=get_display_name(user_friendly_name, gen_name, 'Generator', index),
@@ -5287,6 +5944,31 @@ def optimalPowerFlow(net, opf_params):
                 s_mva = (p_mw**2 + q_mvar**2)**0.5
                 pf = p_mw / s_mva if s_mva > 0 else 0.0
                 q_p = q_mvar / p_mw if p_mw > 0 else 0.0
+
+                gen_cost = 0.0
+                marginal_cost = 0.0
+                pc_eg = net.poly_cost
+                if pc_eg.empty:
+                    poly_eg = pc_eg
+                elif 'et' in pc_eg.columns:
+                    poly_eg = pc_eg[(pc_eg['element'] == index) & (pc_eg['et'] == 'ext_grid')]
+                else:
+                    poly_eg = pc_eg[pc_eg['element'] == index]
+                got_poly = False
+                if not poly_eg.empty:
+                    poly_cost_row = poly_eg.iloc[0]
+                    p_ext = p_mw
+                    if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                        c2 = poly_cost_row['cp2_eur_per_mw2']
+                        c1 = poly_cost_row['cp1_eur_per_mw']
+                        c0 = poly_cost_row['cp0_eur']
+                        gen_cost = c2 * p_ext**2 + c1 * p_ext + c0
+                        marginal_cost = 2 * c2 * p_ext + c1
+                        got_poly = True
+                if not got_poly:
+                    pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'ext_grid', p_mw)
+                    gen_cost = pw_c
+                    marginal_cost = pw_m
                 
                 ext_grid = ExternalGridOut(
                     name=get_display_name(user_friendly_name, ext_grid_name, 'External Grid', index),
@@ -5294,13 +5976,104 @@ def optimalPowerFlow(net, opf_params):
                     p_mw=p_mw,
                     q_mvar=q_mvar,
                     pf=pf,
-                    q_p=q_p
+                    q_p=q_p,
+                    gen_cost=gen_cost,
+                    marginal_cost=marginal_cost,
                 )
                 externalgridsList.append(ext_grid)
                 
             except Exception as e:
                 continue
+
+        # Storage results (OPF dispatch when present)
+        if hasattr(net, 'storage') and not net.storage.empty and hasattr(net, 'res_storage') and not net.res_storage.empty:
+            for index, row in net.res_storage.iterrows():
+                try:
+                    stor_name = net.storage.loc[index, 'name']
+                    stor_id = net.storage.loc[index, 'id'] if 'id' in net.storage.columns else str(index)
+                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(stor_name, stor_name)
+
+                    p_mw = row['p_mw'] if 'p_mw' in row else 0.0
+                    q_mvar = row['q_mvar'] if 'q_mvar' in row else 0.0
+
+                    gen_cost = 0.0
+                    marginal_cost = 0.0
+                    pc_st = net.poly_cost
+                    if pc_st.empty:
+                        poly_st = pc_st
+                    elif 'et' in pc_st.columns:
+                        poly_st = pc_st[(pc_st['element'] == index) & (pc_st['et'] == 'storage')]
+                    else:
+                        poly_st = pc_st[pc_st['element'] == index]
+                    got_poly = False
+                    if not poly_st.empty:
+                        poly_cost_row = poly_st.iloc[0]
+                        if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                            c2 = poly_cost_row['cp2_eur_per_mw2']
+                            c1 = poly_cost_row['cp1_eur_per_mw']
+                            c0 = poly_cost_row['cp0_eur']
+                            gen_cost = c2 * p_mw**2 + c1 * p_mw + c0
+                            marginal_cost = 2 * c2 * p_mw + c1
+                            got_poly = True
+                    if not got_poly:
+                        pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'storage', p_mw)
+                        gen_cost = pw_c
+                        marginal_cost = pw_m
+
+                    storagesList.append(StorageOpfOut(
+                        name=get_display_name(user_friendly_name, stor_name, 'Storage', index),
+                        id=stor_id,
+                        p_mw=p_mw,
+                        q_mvar=q_mvar,
+                        gen_cost=gen_cost,
+                        marginal_cost=marginal_cost,
+                    ))
+                except Exception:
+                    continue
         
+        # Static generator OPF results
+        if hasattr(net, 'sgen') and not net.sgen.empty and hasattr(net, 'res_sgen') and not net.res_sgen.empty:
+            for index, row in net.res_sgen.iterrows():
+                try:
+                    sg_name = net.sgen.loc[index, 'name']
+                    sg_id = net.sgen.loc[index, 'id'] if 'id' in net.sgen.columns else str(index)
+                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(sg_name, sg_name)
+                    p_mw = row['p_mw'] if 'p_mw' in row else 0.0
+                    q_mvar = row['q_mvar'] if 'q_mvar' in row else 0.0
+                    gen_cost = 0.0
+                    marginal_cost = 0.0
+                    pc_sg = net.poly_cost
+                    if pc_sg.empty:
+                        poly_sg = pc_sg
+                    elif 'et' in pc_sg.columns:
+                        poly_sg = pc_sg[(pc_sg['element'] == index) & (pc_sg['et'] == 'sgen')]
+                    else:
+                        poly_sg = pc_sg[pc_sg['element'] == index]
+                    got_poly = False
+                    if not poly_sg.empty:
+                        poly_cost_row = poly_sg.iloc[0]
+                        if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                            c2 = poly_cost_row['cp2_eur_per_mw2']
+                            c1 = poly_cost_row['cp1_eur_per_mw']
+                            c0 = poly_cost_row['cp0_eur']
+                            gen_cost = c2 * p_mw**2 + c1 * p_mw + c0
+                            marginal_cost = 2 * c2 * p_mw + c1
+                            got_poly = True
+                    if not got_poly:
+                        pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'sgen', p_mw)
+                        gen_cost = pw_c
+                        marginal_cost = pw_m
+                    staticgeneratorsList.append(SgenOpfOut(
+                        name=get_display_name(user_friendly_name, sg_name, 'Static Generator', index),
+                        id=sg_id,
+                        p_mw=p_mw,
+                        q_mvar=q_mvar,
+                        gen_cost=gen_cost,
+                        marginal_cost=marginal_cost,
+                    ))
+                except Exception:
+                    continue
+
         # Process load results
         for index, row in net.res_load.iterrows():
             try:
@@ -5310,16 +6083,93 @@ def optimalPowerFlow(net, opf_params):
                 # Get user-friendly name from stored mapping
                 user_friendly_name = getattr(net, 'user_friendly_names', {}).get(load_name, load_name)
                 
-                load = LoadOut(
+                p_mw = row['p_mw'] if 'p_mw' in row else 0.0
+                q_mvar = row['q_mvar'] if 'q_mvar' in row else 0.0
+                gen_cost = 0.0
+                marginal_cost = 0.0
+                pc_ld = net.poly_cost
+                if pc_ld.empty:
+                    poly_ld = pc_ld
+                elif 'et' in pc_ld.columns:
+                    poly_ld = pc_ld[(pc_ld['element'] == index) & (pc_ld['et'] == 'load')]
+                else:
+                    poly_ld = pc_ld[pc_ld['element'] == index]
+                got_poly = False
+                if not poly_ld.empty:
+                    poly_cost_row = poly_ld.iloc[0]
+                    if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                        c2 = poly_cost_row['cp2_eur_per_mw2']
+                        c1 = poly_cost_row['cp1_eur_per_mw']
+                        c0 = poly_cost_row['cp0_eur']
+                        gen_cost = c2 * p_mw**2 + c1 * p_mw + c0
+                        marginal_cost = 2 * c2 * p_mw + c1
+                        got_poly = True
+                if not got_poly:
+                    pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'load', p_mw)
+                    gen_cost = pw_c
+                    marginal_cost = pw_m
+
+                loadsList.append(LoadOut(
                     name=get_display_name(user_friendly_name, load_name, 'Load', index),
                     id=load_id,
-                    p_mw=row['p_mw'],
-                    q_mvar=row['q_mvar']
-                )
-                loadsList.append(load)
+                    p_mw=p_mw,
+                    q_mvar=q_mvar,
+                    gen_cost=gen_cost,
+                    marginal_cost=marginal_cost,
+                ))
                 
             except Exception as e:
                 continue
+
+        # DC line (AC-model HVDC) OPF results
+        if hasattr(net, 'dcline') and not net.dcline.empty and hasattr(net, 'res_dcline') and not net.res_dcline.empty:
+            for index, row in net.res_dcline.iterrows():
+                try:
+                    dc_name = net.dcline.loc[index, 'name']
+                    dc_id = net.dcline.loc[index, 'id'] if 'id' in net.dcline.columns else str(index)
+                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(dc_name, dc_name)
+                    try:
+                        p_sched = float(net.dcline.loc[index, 'p_mw'])
+                    except (TypeError, ValueError):
+                        p_sched = float(row['p_from_mw']) if 'p_from_mw' in row else 0.0
+                    p_from = float(row['p_from_mw']) if 'p_from_mw' in row else 0.0
+                    p_to = float(row['p_to_mw']) if 'p_to_mw' in row else 0.0
+                    pl = float(row['pl_mw']) if 'pl_mw' in row else 0.0
+                    gen_cost = 0.0
+                    marginal_cost = 0.0
+                    pc_dc = net.poly_cost
+                    if pc_dc.empty:
+                        poly_dc = pc_dc
+                    elif 'et' in pc_dc.columns:
+                        poly_dc = pc_dc[(pc_dc['element'] == index) & (pc_dc['et'] == 'dcline')]
+                    else:
+                        poly_dc = pc_dc[pc_dc['element'] == index]
+                    got_poly = False
+                    if not poly_dc.empty:
+                        poly_cost_row = poly_dc.iloc[0]
+                        if 'cp2_eur_per_mw2' in poly_cost_row and 'cp1_eur_per_mw' in poly_cost_row and 'cp0_eur' in poly_cost_row:
+                            c2 = poly_cost_row['cp2_eur_per_mw2']
+                            c1 = poly_cost_row['cp1_eur_per_mw']
+                            c0 = poly_cost_row['cp0_eur']
+                            gen_cost = c2 * p_sched**2 + c1 * p_sched + c0
+                            marginal_cost = 2 * c2 * p_sched + c1
+                            got_poly = True
+                    if not got_poly:
+                        pw_c, pw_m = _opf_cost_from_pwl_net(net, index, 'dcline', p_sched)
+                        gen_cost = pw_c
+                        marginal_cost = pw_m
+                    dclinesList.append(DclineOpfOut(
+                        name=get_display_name(user_friendly_name, dc_name, 'DC Line', index),
+                        id=dc_id,
+                        p_mw=p_sched,
+                        p_from_mw=p_from,
+                        p_to_mw=p_to,
+                        pl_mw=pl,
+                        gen_cost=gen_cost,
+                        marginal_cost=marginal_cost,
+                    ))
+                except Exception:
+                    continue
         
         # Create response dictionary
         response_data = {
@@ -5327,7 +6177,10 @@ def optimalPowerFlow(net, opf_params):
             'lines': [line.__dict__ for line in linesList],
             'generators': [gen.__dict__ for gen in generatorsList],
             'externalgrids': [ext_grid.__dict__ for ext_grid in externalgridsList],
-            'loads': [load.__dict__ for load in loadsList]
+            'storages': [s.__dict__ for s in storagesList],
+            'loads': [load.__dict__ for load in loadsList],
+            'staticgenerators': [sg.__dict__ for sg in staticgeneratorsList],
+            'dclines': [dc.__dict__ for dc in dclinesList],
         }
         
         # Add optimization results summary if available
@@ -5338,46 +6191,412 @@ def optimalPowerFlow(net, opf_params):
         else:
             response_data['opf_converged'] = False
         
-        
-        return response_data
+        if solver_verbose_text.strip():
+            response_data['solver_verbose_log'] = _truncate_solver_verbose_log(solver_verbose_text)
+
+        # Label for UI: study currency from OPF payload (coefficient column names stay EUR-style in pandapower).
+        response_data['cost_currency'] = str(opf_params.get('cost_currency') or 'EUR')
+
+        return _jsonify_safe(response_data)
 
 
-def setup_default_cost_functions(net, cost_type='polynomial'):
+def _lookup_generator_cost_scalar(cost_by_id, gen_row_id, default):
+    """Resolve a per-generator OPF cost scalar from frontend dict keyed by diagram cell id."""
+    if cost_by_id is None or len(cost_by_id) == 0:
+        return default
+    gid = gen_row_id
+    if gid is None or (isinstance(gid, float) and pd.isna(gid)):
+        return default
+    candidates = [gid, str(gid)]
+    try:
+        if isinstance(gid, str) and gid.strip().isdigit():
+            candidates.append(int(gid))
+        elif isinstance(gid, (int, float)) and not isinstance(gid, bool):
+            candidates.append(int(gid))
+            candidates.append(str(int(gid)))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    for key in candidates:
+        if key in cost_by_id:
+            return safe_float(cost_by_id[key], default)
+    return default
+
+
+def _lookup_cp2_from_payload(cost_by_id, row_id):
     """
-    Set up default cost functions for generators if none exist
-    
+    Polynomial cp2 only if the frontend included that cell id in *_cost_cp2.
+    Empty dict or missing id → 0 (linear-only poly_cost, as in pandapower opf_basic tutorial).
+    """
+    if cost_by_id is None or len(cost_by_id) == 0:
+        return 0.0
+    gid = row_id
+    if gid is None or (isinstance(gid, float) and pd.isna(gid)):
+        return 0.0
+    candidates = [gid, str(gid)]
+    try:
+        if isinstance(gid, str) and gid.strip().isdigit():
+            candidates.append(int(gid))
+        elif isinstance(gid, (int, float)) and not isinstance(gid, bool):
+            candidates.append(int(gid))
+            candidates.append(str(int(gid)))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    for key in candidates:
+        if key in cost_by_id:
+            v = safe_float(cost_by_id[key], float('nan'))
+            if v == v:
+                return max(0.0, v)
+            return 0.0
+    return 0.0
+
+
+def _opf_pwl_dispatch_cost(points, p_mw):
+    """
+    Map pandapower piecewise-linear cost *points* to (variable_cost_eur, marginal_eur_per_mw) for reporting.
+
+    create_pwl_cost format: [[p_lo, p_hi, slope], ...] with *slope* = ∂C/∂P in €/MW on that interval
+    (see pandapower.create.create_pwl_cost docstring).
+    """
+    p = float(p_mw)
+    if points is None:
+        return 0.0, 0.0
+    if hasattr(points, 'tolist'):
+        points = points.tolist()
+    if not isinstance(points, (list, tuple)) or len(points) == 0:
+        return 0.0, 0.0
+    segments = []
+    for seg in points:
+        try:
+            if seg is None or not hasattr(seg, '__len__') or len(seg) < 3:
+                continue
+            p1, p2, m = float(seg[0]), float(seg[1]), float(seg[2])
+            if not (p1 == p1 and p2 == p2 and m == m):
+                continue
+            if p2 < p1:
+                p1, p2 = p2, p1
+            segments.append((p1, p2, m))
+        except (TypeError, ValueError):
+            continue
+    if not segments:
+        return 0.0, 0.0
+    segments.sort(key=lambda s: s[0])
+    tol = 1e-6
+    if p < segments[0][0] - tol:
+        m0 = segments[0][2]
+        return m0 * p, m0
+    total = 0.0
+    marginal = segments[-1][2]
+    for i, (p1, p2, m) in enumerate(segments):
+        if p <= p2 + tol:
+            for j in range(i):
+                sj1, sj2, mj = segments[j]
+                total += mj * (sj2 - sj1)
+            total += m * (p - p1)
+            marginal = m
+            return total, marginal
+        marginal = m
+    for sj1, sj2, mj in segments:
+        total += mj * (sj2 - sj1)
+    _p1, p2_last, m_last = segments[-1]
+    total += m_last * (p - p2_last)
+    return total, m_last
+
+
+def _opf_cost_from_pwl_net(net, element_idx, et, p_mw, power_type='p'):
+    """Return (variable_cost, marginal) from net.pwl_cost for one element, or (0, 0) if none."""
+    pw = getattr(net, 'pwl_cost', None)
+    if pw is None or pw.empty:
+        return 0.0, 0.0
+    rows = pw
+    if 'power_type' in rows.columns:
+        sub = rows[rows['power_type'] == power_type]
+        if not sub.empty:
+            rows = sub
+    if 'et' in rows.columns:
+        rows = rows[(rows['element'] == element_idx) & (rows['et'] == et)]
+    else:
+        rows = rows[rows['element'] == element_idx]
+    if rows.empty:
+        return 0.0, 0.0
+    try:
+        return _opf_pwl_dispatch_cost(rows.iloc[0]['points'], p_mw)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _lookup_explicit_cp1(cost_by_id, row_id):
+    """Finite marginal cp1 only when an entry exists for row_id (no default). Used for ext_grid/storage."""
+    if not cost_by_id:
+        return None
+    gid = row_id
+    if gid is None or (isinstance(gid, float) and pd.isna(gid)):
+        return None
+    candidates = [gid, str(gid)]
+    try:
+        if isinstance(gid, str) and gid.strip().isdigit():
+            candidates.append(int(gid))
+        elif isinstance(gid, (int, float)) and not isinstance(gid, bool):
+            candidates.append(int(gid))
+            candidates.append(str(int(gid)))
+    except (ValueError, TypeError, OverflowError):
+        pass
+    for key in candidates:
+        if key in cost_by_id:
+            v = safe_float(cost_by_id[key], float('nan'))
+            if v == v:
+                return v
+    return None
+
+
+def setup_default_cost_functions(
+    net,
+    cost_type='polynomial',
+    cp1_by_gen_id=None,
+    cp2_by_gen_id=None,
+    ext_cp1_by_id=None,
+    ext_cp2_by_id=None,
+    stor_cp1_by_id=None,
+    stor_cp2_by_id=None,
+    sgen_cp1_by_id=None,
+    sgen_cp2_by_id=None,
+    load_cp1_by_id=None,
+    load_cp2_by_id=None,
+    dcline_cp1_by_id=None,
+    dcline_cp2_by_id=None,
+):
+    """
+    Set up polynomial / piecewise-linear OPF costs on generators, static generators, loads, DC lines,
+    and optionally on external grids and storage.
+
     Args:
         net: pandapower network
         cost_type: 'polynomial' or 'piecewise_linear'
+        cp1_by_gen_id / cp2_by_gen_id: per synchronous generator (defaults applied when polynomial/PWL)
+        sgen_cp1_by_id / load_cp1_by_id / dcline_cp1_by_id: same pattern for sgen, controllable load, dcline
+        ext_cp1_by_id / stor_cp1_by_id: marginal slopes — rows are created only when a finite value is supplied
+        ext_cp2_by_id / stor_cp2_by_id: optional quadratic term for polynomial mode (0 if omitted from payload)
     """
-    
+    cp1_by_gen_id = cp1_by_gen_id if isinstance(cp1_by_gen_id, dict) else {}
+    cp2_by_gen_id = cp2_by_gen_id if isinstance(cp2_by_gen_id, dict) else {}
+    ext_cp1_by_id = ext_cp1_by_id if isinstance(ext_cp1_by_id, dict) else {}
+    ext_cp2_by_id = ext_cp2_by_id if isinstance(ext_cp2_by_id, dict) else {}
+    stor_cp1_by_id = stor_cp1_by_id if isinstance(stor_cp1_by_id, dict) else {}
+    stor_cp2_by_id = stor_cp2_by_id if isinstance(stor_cp2_by_id, dict) else {}
+    sgen_cp1_by_id = sgen_cp1_by_id if isinstance(sgen_cp1_by_id, dict) else {}
+    sgen_cp2_by_id = sgen_cp2_by_id if isinstance(sgen_cp2_by_id, dict) else {}
+    load_cp1_by_id = load_cp1_by_id if isinstance(load_cp1_by_id, dict) else {}
+    load_cp2_by_id = load_cp2_by_id if isinstance(load_cp2_by_id, dict) else {}
+    dcline_cp1_by_id = dcline_cp1_by_id if isinstance(dcline_cp1_by_id, dict) else {}
+    dcline_cp2_by_id = dcline_cp2_by_id if isinstance(dcline_cp2_by_id, dict) else {}
+
+    def _poly_row_exists(idx, et):
+        pc = net.poly_cost
+        if pc.empty or 'et' not in pc.columns:
+            return not pc[pc['element'] == idx].empty
+        return not pc[(pc['element'] == idx) & (pc['et'] == et)].empty
+
+    def _pwl_row_exists(idx, et):
+        pw = net.pwl_cost
+        if pw.empty or 'et' not in pw.columns:
+            return not pw[pw['element'] == idx].empty
+        return not pw[(pw['element'] == idx) & (pw['et'] == et)].empty
+
     if cost_type == 'polynomial':
-        # Add polynomial costs for generators without costs
         for gen_idx in net.gen.index:
-            # Check if this generator already has a cost function
-            existing_costs = net.poly_cost[net.poly_cost['element'] == gen_idx]
-            if existing_costs.empty:
-                # Default quadratic cost function: 0.01*P^2 + 20*P + 0
+            if not _poly_row_exists(gen_idx, 'gen'):
+                row_id = net.gen.loc[gen_idx, 'id'] if 'id' in net.gen.columns else None
+                cp1 = _lookup_generator_cost_scalar(cp1_by_gen_id, row_id, 20.0)
+                cp2 = _lookup_cp2_from_payload(cp2_by_gen_id, row_id)
                 pp.create_poly_cost(net, element=gen_idx, et='gen',
-                                   cp2_eur_per_mw2=0.01,    # Quadratic term
-                                   cp1_eur_per_mw=20,       # Linear term  
-                                   cp0_eur=0)               # Constant term
-    
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
+        if not net.ext_grid.empty:
+            for eg_idx in net.ext_grid.index:
+                if _poly_row_exists(eg_idx, 'ext_grid'):
+                    continue
+                row_id = net.ext_grid.loc[eg_idx, 'id'] if 'id' in net.ext_grid.columns else None
+                cp1 = _lookup_explicit_cp1(ext_cp1_by_id, row_id)
+                if cp1 is None:
+                    continue
+                cp2 = _lookup_cp2_from_payload(ext_cp2_by_id, row_id)
+                pp.create_poly_cost(net, element=eg_idx, et='ext_grid',
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
+        if hasattr(net, 'storage') and not net.storage.empty:
+            for sto_idx in net.storage.index:
+                if _poly_row_exists(sto_idx, 'storage'):
+                    continue
+                row_id = net.storage.loc[sto_idx, 'id'] if 'id' in net.storage.columns else None
+                cp1 = _lookup_explicit_cp1(stor_cp1_by_id, row_id)
+                if cp1 is None:
+                    continue
+                cp2 = _lookup_cp2_from_payload(stor_cp2_by_id, row_id)
+                pp.create_poly_cost(net, element=sto_idx, et='storage',
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
+        if hasattr(net, 'sgen') and not net.sgen.empty:
+            for sg_idx in net.sgen.index:
+                if _poly_row_exists(sg_idx, 'sgen'):
+                    continue
+                row_id = net.sgen.loc[sg_idx, 'id'] if 'id' in net.sgen.columns else None
+                cp1 = _lookup_generator_cost_scalar(sgen_cp1_by_id, row_id, 20.0)
+                cp2 = _lookup_cp2_from_payload(sgen_cp2_by_id, row_id)
+                pp.create_poly_cost(net, element=sg_idx, et='sgen',
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
+        if not net.load.empty:
+            for ld_idx in net.load.index:
+                if _poly_row_exists(ld_idx, 'load'):
+                    continue
+                row_id = net.load.loc[ld_idx, 'id'] if 'id' in net.load.columns else None
+                cp1 = _lookup_explicit_cp1(load_cp1_by_id, row_id)
+                if cp1 is None:
+                    continue
+                cp2 = _lookup_cp2_from_payload(load_cp2_by_id, row_id)
+                pp.create_poly_cost(net, element=ld_idx, et='load',
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
+        if hasattr(net, 'dcline') and not net.dcline.empty:
+            for dc_idx in net.dcline.index:
+                if _poly_row_exists(dc_idx, 'dcline'):
+                    continue
+                row_id = net.dcline.loc[dc_idx, 'id'] if 'id' in net.dcline.columns else None
+                cp1 = _lookup_explicit_cp1(dcline_cp1_by_id, row_id)
+                if cp1 is None:
+                    continue
+                cp2 = _lookup_cp2_from_payload(dcline_cp2_by_id, row_id)
+                pp.create_poly_cost(net, element=dc_idx, et='dcline',
+                                   cp2_eur_per_mw2=cp2,
+                                   cp1_eur_per_mw=cp1,
+                                   cp0_eur=0)
+
     elif cost_type == 'piecewise_linear':
-        # Add piecewise linear costs for generators without costs
         for gen_idx in net.gen.index:
-            # Check if this generator already has a cost function
-            existing_costs = net.pwl_cost[net.pwl_cost['element'] == gen_idx]
-            if existing_costs.empty:
-                # Get generator capacity
-                gen_max_p = net.gen.loc[gen_idx, 'max_p_mw'] if 'max_p_mw' in net.gen.columns else 100
-                gen_min_p = net.gen.loc[gen_idx, 'min_p_mw'] if 'min_p_mw' in net.gen.columns else 0
-                
-                # Create simple 2-point piecewise linear cost
-                # From min to max power with cost increasing from 15 to 25 $/MWh
-                pp.create_pwl_cost(net, element=gen_idx, et='gen',
-                                  points=[[gen_min_p, gen_min_p * 15],    # [P_min, Cost_min]
-                                         [gen_max_p, gen_max_p * 25]])    # [P_max, Cost_max]
+            if not _pwl_row_exists(gen_idx, 'gen'):
+                gen_max_p = float(net.gen.loc[gen_idx, 'max_p_mw']) if 'max_p_mw' in net.gen.columns else 100.0
+                gen_min_p = float(net.gen.loc[gen_idx, 'min_p_mw']) if 'min_p_mw' in net.gen.columns else 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                    span = 1.0
+                row_id = net.gen.loc[gen_idx, 'id'] if 'id' in net.gen.columns else None
+                slope = _lookup_generator_cost_scalar(cp1_by_gen_id, row_id, 20.0)
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=gen_idx, et='gen', points=points)
+
+        if not net.ext_grid.empty:
+            for eg_idx in net.ext_grid.index:
+                if _pwl_row_exists(eg_idx, 'ext_grid'):
+                    continue
+                row_id = net.ext_grid.loc[eg_idx, 'id'] if 'id' in net.ext_grid.columns else None
+                slope = _lookup_explicit_cp1(ext_cp1_by_id, row_id)
+                if slope is None:
+                    continue
+                gen_max_p = float(net.ext_grid.loc[eg_idx, 'max_p_mw']) if 'max_p_mw' in net.ext_grid.columns else 1e6
+                gen_min_p = float(net.ext_grid.loc[eg_idx, 'min_p_mw']) if 'min_p_mw' in net.ext_grid.columns else 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                    span = 1.0
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=eg_idx, et='ext_grid', points=points)
+
+        if hasattr(net, 'storage') and not net.storage.empty:
+            for sto_idx in net.storage.index:
+                if _pwl_row_exists(sto_idx, 'storage'):
+                    continue
+                row_id = net.storage.loc[sto_idx, 'id'] if 'id' in net.storage.columns else None
+                slope = _lookup_explicit_cp1(stor_cp1_by_id, row_id)
+                if slope is None:
+                    continue
+                gen_max_p = float(net.storage.loc[sto_idx, 'max_p_mw']) if 'max_p_mw' in net.storage.columns else 100.0
+                gen_min_p = float(net.storage.loc[sto_idx, 'min_p_mw']) if 'min_p_mw' in net.storage.columns else 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                    span = 1.0
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=sto_idx, et='storage', points=points)
+
+        if hasattr(net, 'sgen') and not net.sgen.empty:
+            for sg_idx in net.sgen.index:
+                if _pwl_row_exists(sg_idx, 'sgen'):
+                    continue
+                row_id = net.sgen.loc[sg_idx, 'id'] if 'id' in net.sgen.columns else None
+                slope = _lookup_generator_cost_scalar(sgen_cp1_by_id, row_id, 20.0)
+                gen_max_p = float(net.sgen.loc[sg_idx, 'max_p_mw']) if 'max_p_mw' in net.sgen.columns else 100.0
+                gen_min_p = float(net.sgen.loc[sg_idx, 'min_p_mw']) if 'min_p_mw' in net.sgen.columns else 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                    span = 1.0
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=sg_idx, et='sgen', points=points)
+
+        if not net.load.empty:
+            for ld_idx in net.load.index:
+                if _pwl_row_exists(ld_idx, 'load'):
+                    continue
+                row_id = net.load.loc[ld_idx, 'id'] if 'id' in net.load.columns else None
+                slope = _lookup_explicit_cp1(load_cp1_by_id, row_id)
+                if slope is None:
+                    continue
+                gen_max_p = float(net.load.loc[ld_idx, 'max_p_mw']) if 'max_p_mw' in net.load.columns else 1e3
+                gen_min_p = float(net.load.loc[ld_idx, 'min_p_mw']) if 'min_p_mw' in net.load.columns else 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                    span = 1.0
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=ld_idx, et='load', points=points)
+
+        if hasattr(net, 'dcline') and not net.dcline.empty:
+            for dc_idx in net.dcline.index:
+                if _pwl_row_exists(dc_idx, 'dcline'):
+                    continue
+                row_id = net.dcline.loc[dc_idx, 'id'] if 'id' in net.dcline.columns else None
+                slope = _lookup_explicit_cp1(dcline_cp1_by_id, row_id)
+                if slope is None:
+                    continue
+                try:
+                    p0 = float(net.dcline.loc[dc_idx, 'p_mw'])
+                except (TypeError, ValueError):
+                    p0 = 0.0
+                gen_max_p = float(net.dcline.loc[dc_idx, 'max_p_mw']) if 'max_p_mw' in net.dcline.columns else float('nan')
+                if not (gen_max_p == gen_max_p) or gen_max_p <= 0:
+                    gen_max_p = max(abs(p0) * 1.2, 1e-3)
+                gen_min_p = 0.0
+                span = gen_max_p - gen_min_p
+                if span <= 0:
+                    gen_max_p = gen_min_p + 1.0
+                points = [[float(gen_min_p), float(gen_max_p), slope]]
+                pp.create_pwl_cost(net, element=dc_idx, et='dcline', points=points)
+
+
+def _electrisim_optional_max_loading_percent(raw):
+    """pandapower line/trafo/trafo3w: max_loading_percent constrains OPF loading when > 0; omit otherwise."""
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ('', 'none', 'null', 'nan'):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v <= 0:
+        return None
+    return v
+
 
 def safe_float(value, default=0.0):
     """Convert value to float. Returns default for None, 'null', 'None', empty string, or invalid values."""
@@ -5957,17 +7176,14 @@ def controller_simulation(net, controller_params):
 
 def time_series_simulation(net, timeseries_params):
     """
-    Run time series simulation using pandapower timeseries module
+    Sequential AC power flow over time steps with scaled loads and generators.
+
+    Electrisim uses repeated pandapower ``runpp`` calls with profile shapes (similar in spirit to
+    `pandapower.timeseries <https://pandapower.readthedocs.io/en/v3.4.0/timeseries.html>`_ but
+    without ``run_timeseries`` / OutputWriter). Imports of ``pandapower.timeseries`` are optional
+    and do not change this execution path.
     """
     try:
-        # Try to import timeseries module, but don't fail if not available
-        try:
-            import pandapower.timeseries as ts
-            from pandapower.timeseries import DFData
-            timeseries_available = True
-        except ImportError:
-            timeseries_available = False
-        
         # Get time series parameters
         time_steps = int(timeseries_params.get('time_steps', 24))
         load_profile = timeseries_params.get('load_profile', 'constant')
@@ -5977,183 +7193,126 @@ def time_series_simulation(net, timeseries_params):
         import datetime
         time_stamps = [datetime.datetime(2024, 1, 1, hour=h) for h in range(time_steps)]
         
-        # Apply load and generation profiles
-        if not timeseries_available:
-            # Simplified approach: run multiple power flows with different profiles
-            
-            # Create enhanced load profiles with more variation
-            import random
-            import math
-            
-            if load_profile == 'daily':
-                # Enhanced daily load profile with more variation
-                base_profile = [0.3, 0.25, 0.2, 0.15, 0.2, 0.4, 0.7, 0.9, 1.0, 1.1, 1.05, 1.0,
-                               0.95, 1.0, 1.05, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35]
-                # Add significant random variation
-                load_profile_values = []
-                for i, val in enumerate(base_profile):
-                    # Use time-based seed for more variation
-                    random.seed(42 + i)
-                    variation = random.uniform(-0.2, 0.2)  # ±20% variation
-                    load_value = max(0.1, min(1.3, val + variation))
-                    load_profile_values.append(load_value)
-                    
-            elif load_profile == 'industrial':
-                # Enhanced industrial load profile with startup/shutdown effects
-                base_profile = [0.1, 0.05, 0.05, 0.05, 0.1, 0.2, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0,
-                               1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05]
-                # Add variation
-                load_profile_values = []
-                for i, val in enumerate(base_profile):
-                    random.seed(42 + i)
-                    variation = random.uniform(-0.1, 0.1)  # ±10% variation
-                    load_value = max(0.02, min(1.1, val + variation))
-                    load_profile_values.append(load_value)
-                    
-            elif load_profile == 'variable':
-                # Variable load profile with dramatic changes for testing voltage variation
-                load_profile_values = []
-                for hour in range(24):
-                    # Use time-based seed for more variation
-                    random.seed(42 + hour)
-                    # Create dramatic load variations
-                    base_load = 0.4 + 0.6 * math.sin(2 * math.pi * hour / 8)  # 8-hour cycle
-                    # Add random spikes and drops
-                    spike = random.uniform(0.6, 1.6) if random.random() < 0.4 else 1.0
-                    load_value = max(0.05, min(1.8, base_load * spike))
-                    load_profile_values.append(load_value)
-                    
-            else:  # constant with more variation
-                load_profile_values = []
-                for hour in range(24):
-                    random.seed(42 + hour)
-                    variation = random.uniform(-0.15, 0.15)  # ±15% variation
-                    load_value = max(0.7, min(1.3, 1.0 + variation))
-                    load_profile_values.append(load_value)
-            
-            # Create enhanced generation profiles with more variation
-            if generation_profile == 'solar':
-                # Enhanced solar generation profile with cloud effects
-                base_profile = [0, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0,
-                               1.0, 0.95, 0.8, 0.5, 0.2, 0.05, 0, 0, 0, 0, 0, 0]
-                # Add cloud effects (random drops)
-                gen_profile_values = []
-                for i, val in enumerate(base_profile):
-                    random.seed(42 + i)
-                    if val > 0.3:  # Only add cloud effects during daylight
-                        cloud_effect = random.uniform(0.7, 1.1)  # ±30% random variation
-                        gen_value = max(0, min(1.2, val * cloud_effect))
-                        gen_profile_values.append(gen_value)
-                    else:
-                        gen_profile_values.append(val)
-                        
-            elif generation_profile == 'wind':
-                # Enhanced wind generation profile with realistic patterns
-                gen_profile_values = []
-                for hour in range(24):
-                    random.seed(42 + hour)
-                    # Create a more realistic wind pattern with diurnal variation
-                    base_wind = 0.5 + 0.5 * math.sin(2 * math.pi * hour / 24)
-                    # Add random gusts and lulls
-                    wind_variation = random.uniform(0.6, 1.4)  # ±40% variation
-                    wind_value = max(0.1, min(1.1, base_wind * wind_variation))
-                    gen_profile_values.append(wind_value)
-                    
-            elif generation_profile == 'variable':
-                # Variable generation profile with dramatic changes for testing voltage variation
-                gen_profile_values = []
-                for hour in range(24):
-                    random.seed(42 + hour)
-                    # Create dramatic generation variations
-                    base_gen = 0.5 + 0.5 * math.cos(2 * math.pi * hour / 6)  # 6-hour cycle
-                    # Add random fluctuations
-                    fluctuation = random.uniform(0.5, 1.5) if random.random() < 0.5 else 1.0
-                    gen_value = max(0.1, min(1.4, base_gen * fluctuation))
-                    gen_profile_values.append(gen_value)
-                    
-            else:  # constant with more variation
-                gen_profile_values = []
-                for hour in range(24):
-                    random.seed(42 + hour)
-                    variation = random.uniform(-0.2, 0.2)  # ±20% variation
-                    gen_value = max(0.6, min(1.4, 1.0 + variation))
-                    gen_profile_values.append(gen_value)
-            
-            # Run power flow for each time step
-            all_results = []
-            for t in range(time_steps):
-                # Use time-based seed for consistent variation
-                random.seed(42 + t)
-                
-                # Apply load scaling with enhanced variation
-                for idx, load in net.load.iterrows():
-                    load_scale = load_profile_values[t % len(load_profile_values)]
-                    # Add more dramatic reactive power variation
-                    pf_variation = 1.0 + random.uniform(-0.2, 0.2)  # ±20% power factor variation
-                    
-                    # Store original values for reference
-                    original_p = load['p_mw']
-                    original_q = load['q_mvar']
-                    
-                    net.load.loc[idx, 'p_mw'] = original_p * load_scale
-                    net.load.loc[idx, 'q_mvar'] = original_q * load_scale * pf_variation
-                
-                # Apply generation scaling with enhanced variation
-                for idx, gen in net.gen.iterrows():
-                    gen_scale = gen_profile_values[t % len(gen_profile_values)]
-                    # Add more dramatic reactive power variation for generators
-                    q_variation = 1.0 + random.uniform(-0.25, 0.25)  # ±25% Q variation
-                    
-                    # Store original values for reference
-                    original_p = gen['p_mw']
-                    original_q = gen.get('q_mvar', 0)
-                    
-                    net.gen.loc[idx, 'p_mw'] = original_p * gen_scale
-                    # Adjust reactive power based on generation level
-                    if original_q != 0:
-                        net.gen.loc[idx, 'q_mvar'] = original_q * gen_scale * q_variation
-                
-                # Add more dramatic network effects
-                if len(net.line) > 0:
-                    for idx, line in net.line.iterrows():
-                        # Simulate temperature effects on line resistance (higher temp = higher resistance)
-                        temp_factor = 1.0 + random.uniform(-0.1, 0.1)  # ±10% temperature effect
-                        if 'r_ohm_per_km' in line:
-                            original_r = line['r_ohm_per_km']
-                            net.line.loc[idx, 'r_ohm_per_km'] = original_r * temp_factor
-                
-                # Run power flow
-                pp.runpp(net, 
-                        algorithm=timeseries_params.get('algorithm', 'nr'),
-                        calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'True'),
-                        init=timeseries_params.get('init', 'dc'),
-                        **_electrisim_enforce_q_lims_kw(net))
-                
-                all_results.append({
-                    'time_step': t,
-                    'converged': net.converged,
-                    'bus_results': net.res_bus.copy(),
-                    'line_results': net.res_line.copy(),
-                    'gen_results': net.res_gen.copy()
-                })
+        # Baseline element data (must not compound across time steps)
+        orig_load_p = net.load['p_mw'].copy() if len(net.load) > 0 else None
+        orig_load_q = net.load['q_mvar'].copy() if len(net.load) > 0 else None
+        orig_gen_p = net.gen['p_mw'].copy() if len(net.gen) > 0 else None
+        orig_gen_q = net.gen['q_mvar'].copy() if len(net.gen) > 0 and 'q_mvar' in net.gen.columns else None
+        orig_line_r = net.line['r_ohm_per_km'].copy() if len(net.line) > 0 and 'r_ohm_per_km' in net.line.columns else None
+
+        # Create enhanced load profiles with more variation
+        import random
+        import math
+
+        if load_profile == 'daily':
+            base_profile = [0.3, 0.25, 0.2, 0.15, 0.2, 0.4, 0.7, 0.9, 1.0, 1.1, 1.05, 1.0,
+                           0.95, 1.0, 1.05, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35]
+            load_profile_values = []
+            for i, val in enumerate(base_profile):
+                random.seed(42 + i)
+                variation = random.uniform(-0.2, 0.2)
+                load_value = max(0.1, min(1.3, val + variation))
+                load_profile_values.append(load_value)
+        elif load_profile == 'industrial':
+            base_profile = [0.1, 0.05, 0.05, 0.05, 0.1, 0.2, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0,
+                           1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05]
+            load_profile_values = []
+            for i, val in enumerate(base_profile):
+                random.seed(42 + i)
+                variation = random.uniform(-0.1, 0.1)
+                load_value = max(0.02, min(1.1, val + variation))
+                load_profile_values.append(load_value)
+        elif load_profile == 'variable':
+            load_profile_values = []
+            for hour in range(24):
+                random.seed(42 + hour)
+                base_load = 0.4 + 0.6 * math.sin(2 * math.pi * hour / 8)
+                spike = random.uniform(0.6, 1.6) if random.random() < 0.4 else 1.0
+                load_value = max(0.05, min(1.8, base_load * spike))
+                load_profile_values.append(load_value)
         else:
-            # Use full timeseries module if available
-            # For now, always use simplified approach since full module is not working
-            # Run a single power flow as fallback
-            pp.runpp(net, 
-                    algorithm=timeseries_params.get('algorithm', 'nr'),
-                    calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'auto'),
-                    init=timeseries_params.get('init', 'dc'),
-                    **_electrisim_enforce_q_lims_kw(net))
-            
-            all_results = [{
-                'time_step': 0,
+            load_profile_values = []
+            for hour in range(24):
+                random.seed(42 + hour)
+                variation = random.uniform(-0.15, 0.15)
+                load_value = max(0.7, min(1.3, 1.0 + variation))
+                load_profile_values.append(load_value)
+
+        if generation_profile == 'solar':
+            base_profile = [0, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0,
+                           1.0, 0.95, 0.8, 0.5, 0.2, 0.05, 0, 0, 0, 0, 0, 0]
+            gen_profile_values = []
+            for i, val in enumerate(base_profile):
+                random.seed(42 + i)
+                if val > 0.3:
+                    cloud_effect = random.uniform(0.7, 1.1)
+                    gen_value = max(0, min(1.2, val * cloud_effect))
+                    gen_profile_values.append(gen_value)
+                else:
+                    gen_profile_values.append(val)
+        elif generation_profile == 'wind':
+            gen_profile_values = []
+            for hour in range(24):
+                random.seed(42 + hour)
+                base_wind = 0.5 + 0.5 * math.sin(2 * math.pi * hour / 24)
+                wind_variation = random.uniform(0.6, 1.4)
+                wind_value = max(0.1, min(1.1, base_wind * wind_variation))
+                gen_profile_values.append(wind_value)
+        elif generation_profile == 'variable':
+            gen_profile_values = []
+            for hour in range(24):
+                random.seed(42 + hour)
+                base_gen = 0.5 + 0.5 * math.cos(2 * math.pi * hour / 6)
+                fluctuation = random.uniform(0.5, 1.5) if random.random() < 0.5 else 1.0
+                gen_value = max(0.1, min(1.4, base_gen * fluctuation))
+                gen_profile_values.append(gen_value)
+        else:
+            gen_profile_values = []
+            for hour in range(24):
+                random.seed(42 + hour)
+                variation = random.uniform(-0.2, 0.2)
+                gen_value = max(0.6, min(1.4, 1.0 + variation))
+                gen_profile_values.append(gen_value)
+
+        all_results = []
+        for t in range(time_steps):
+            random.seed(42 + t)
+
+            if orig_load_p is not None:
+                for idx in net.load.index:
+                    load_scale = load_profile_values[t % len(load_profile_values)]
+                    pf_variation = 1.0 + random.uniform(-0.2, 0.2)
+                    net.load.loc[idx, 'p_mw'] = float(orig_load_p.loc[idx]) * load_scale
+                    net.load.loc[idx, 'q_mvar'] = float(orig_load_q.loc[idx]) * load_scale * pf_variation
+
+            if orig_gen_p is not None:
+                for idx in net.gen.index:
+                    gen_scale = gen_profile_values[t % len(gen_profile_values)]
+                    q_variation = 1.0 + random.uniform(-0.25, 0.25)
+                    net.gen.loc[idx, 'p_mw'] = float(orig_gen_p.loc[idx]) * gen_scale
+                    oq = float(orig_gen_q.loc[idx]) if orig_gen_q is not None else 0.0
+                    if oq != 0:
+                        net.gen.loc[idx, 'q_mvar'] = oq * gen_scale * q_variation
+
+            if orig_line_r is not None:
+                for idx in net.line.index:
+                    temp_factor = 1.0 + random.uniform(-0.1, 0.1)
+                    net.line.loc[idx, 'r_ohm_per_km'] = float(orig_line_r.loc[idx]) * temp_factor
+
+            pp.runpp(net,
+                     algorithm=timeseries_params.get('algorithm', 'nr'),
+                     calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'True'),
+                     init=timeseries_params.get('init', 'dc'),
+                     **_electrisim_enforce_q_lims_kw(net))
+
+            all_results.append({
+                'time_step': t,
                 'converged': net.converged,
                 'bus_results': net.res_bus.copy(),
                 'line_results': net.res_line.copy(),
                 'gen_results': net.res_gen.copy()
-            }]
-        
+            })
+
         # Prepare results
         class TimeSeriesBusOut(object):
             def __init__(self, name: str, id: str, time_step: int, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float):
@@ -6174,73 +7333,40 @@ def time_series_simulation(net, timeseries_params):
                 self.p_from_mw = p_from_mw
                 self.p_to_mw = p_to_mw
         
-        # Collect results for each time step
+        # Collect results for each time step (from sequential runpp snapshots)
         all_busbars = []
         all_lines = []
-        
-        if not timeseries_available:
-            # Use results from simplified simulation
-            for result in all_results:
-                t = result['time_step']
-                bus_results = result['bus_results']
-                line_results = result['line_results']
-                
-                # Bus results for this time step
-                for idx, bus in bus_results.iterrows():
-                    bus_name = net.bus.loc[idx, 'name']
-                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(bus_name, bus_name)
-                    all_busbars.append(TimeSeriesBusOut(
-                        name=get_display_name(user_friendly_name, bus_name, 'Bus', idx, 'timeseries'),
-                        id=str(bus_name),
-                        time_step=t,
-                        vm_pu=safe_float(bus['vm_pu']),
-                        va_degree=safe_float(bus['va_degree']),
-                        p_mw=safe_float(bus['p_mw']),
-                        q_mvar=safe_float(bus['q_mvar'])
-                    ))
-                
-                # Line results for this time step
-                for idx, line in line_results.iterrows():
-                    line_name = net.line.loc[idx, 'name']
-                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(line_name, line_name)
-                    all_lines.append(TimeSeriesLineOut(
-                        name=get_display_name(user_friendly_name, line_name, 'Line', idx, 'timeseries'),
-                        id=str(line_name),
-                        time_step=t,
-                        loading_percent=safe_float(line['loading_percent']),
-                        p_from_mw=safe_float(line['p_from_mw']),
-                        p_to_mw=safe_float(line['p_to_mw'])
-                    ))
-        else:
-            # Use results from full timeseries simulation
-            for t in range(time_steps):
-                # Bus results for this time step
-                for idx, bus in net.res_bus.iterrows():
-                    bus_name = net.bus.loc[idx, 'name']
-                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(bus_name, bus_name)
-                    all_busbars.append(TimeSeriesBusOut(
-                        name=get_display_name(user_friendly_name, bus_name, 'Bus', idx, 'timeseries'),
-                        id=str(bus_name),
-                        time_step=t,
-                        vm_pu=safe_float(bus['vm_pu']),
-                        va_degree=safe_float(bus['va_degree']),
-                        p_mw=safe_float(bus['p_mw']),
-                        q_mvar=safe_float(bus['q_mvar'])
-                    ))
-                
-                # Line results for this time step
-                for idx, line in net.res_line.iterrows():
-                    line_name = net.line.loc[idx, 'name']
-                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(line_name, line_name)
-                    all_lines.append(TimeSeriesLineOut(
-                        name=get_display_name(user_friendly_name, line_name, 'Line', idx, 'timeseries'),
-                        id=str(line_name),
-                        time_step=t,
-                        loading_percent=safe_float(line['loading_percent']),
-                        p_from_mw=safe_float(line['p_from_mw']),
-                        p_to_mw=safe_float(line['p_to_mw'])
-                    ))
-        
+
+        for result in all_results:
+            t = result['time_step']
+            bus_results = result['bus_results']
+            line_results = result['line_results']
+
+            for idx, bus in bus_results.iterrows():
+                bus_name = net.bus.loc[idx, 'name']
+                user_friendly_name = getattr(net, 'user_friendly_names', {}).get(bus_name, bus_name)
+                all_busbars.append(TimeSeriesBusOut(
+                    name=get_display_name(user_friendly_name, bus_name, 'Bus', idx, 'timeseries'),
+                    id=str(bus_name),
+                    time_step=t,
+                    vm_pu=safe_float(bus['vm_pu']),
+                    va_degree=safe_float(bus['va_degree']),
+                    p_mw=safe_float(bus['p_mw']),
+                    q_mvar=safe_float(bus['q_mvar'])
+                ))
+
+            for idx, line in line_results.iterrows():
+                line_name = net.line.loc[idx, 'name']
+                user_friendly_name = getattr(net, 'user_friendly_names', {}).get(line_name, line_name)
+                all_lines.append(TimeSeriesLineOut(
+                    name=get_display_name(user_friendly_name, line_name, 'Line', idx, 'timeseries'),
+                    id=str(line_name),
+                    time_step=t,
+                    loading_percent=safe_float(line['loading_percent']),
+                    p_from_mw=safe_float(line['p_from_mw']),
+                    p_to_mw=safe_float(line['p_to_mw'])
+                ))
+
         # Summary statistics with display names (user-friendly + technical ID)
         vm_stats = {}
         for idx, bus in net.bus.iterrows():
@@ -6282,11 +7408,7 @@ def time_series_simulation(net, timeseries_params):
                     'avg_loading_percent': 0.0
                 }
         
-        # Check convergence
-        if not timeseries_available or 'all_results' in locals():
-            timeseries_converged = all(result['converged'] for result in all_results)
-        else:
-            timeseries_converged = net.converged
+        timeseries_converged = all(result['converged'] for result in all_results)
         
         return {
             'timeseries_converged': timeseries_converged,
@@ -6812,8 +7934,8 @@ def economic_analysis(net, in_data, params):
         
     Returns:
     --------
-    dict : Results with total_capex, total_power_losses_mw, total_energy_losses_mwh (optional),
-           energy_loss_cost (optional), capex_breakdown, power_losses_breakdown, currency
+    dict : Results with total_capex, total_power_losses_mw, total_energy_losses_mwh (optional lifetime total),
+           total_energy_losses_period_mwh (optional), energy_loss_cost (optional), capex_breakdown, power_losses_breakdown, currency
     """
     try:
         currency = params.get('currency', 'EUR').upper()
@@ -6961,6 +8083,7 @@ def economic_analysis(net, in_data, params):
                     total_power_losses_mw += pl_mw
         
         total_energy_losses_mwh = None
+        total_energy_losses_period_mwh = None
         energy_loss_cost = None
         energy_loss_period_hours = None
         
@@ -7022,7 +8145,7 @@ def economic_analysis(net, in_data, params):
                 interp = RegularGridInterpolator((load_vals, gen_vals), loss_grid, method='linear', bounds_error=False, fill_value=0.0)
                 pts = np.column_stack((load_scale, gen_scale))
                 losses_per_hour = interp(pts)
-            total_energy_mwh = float(np.sum(np.maximum(losses_per_hour, 0)))
+            total_energy_period_mwh = float(np.sum(np.maximum(losses_per_hour, 0)))
 
             if orig_load_p is not None:
                 net.load['p_mw'] = orig_load_p
@@ -7033,7 +8156,9 @@ def economic_analysis(net, in_data, params):
                 net.sgen['p_mw'] = orig_sgen_p
                 if orig_sgen_q is not None:
                     net.sgen['q_mvar'] = orig_sgen_q
-            total_energy_losses_mwh = round(total_energy_mwh, 4)
+            lifetime_years_econ = max(1, min(100, int(params.get('lifetime_years', 30))))
+            total_energy_losses_period_mwh = round(total_energy_period_mwh, 4)
+            total_energy_losses_mwh = round(total_energy_period_mwh * lifetime_years_econ, 4)
             energy_loss_period_hours = time_steps
             if energy_price is not None and energy_price > 0:
                 energy_loss_cost = round(total_energy_losses_mwh * energy_price, 2)
@@ -7047,6 +8172,7 @@ def economic_analysis(net, in_data, params):
         }
         if total_energy_losses_mwh is not None:
             lifetime_years = max(1, min(100, int(params.get('lifetime_years', 30))))
+            result['total_energy_losses_period_mwh'] = total_energy_losses_period_mwh
             result['total_energy_losses_mwh'] = total_energy_losses_mwh
             result['energy_loss_cost'] = energy_loss_cost
             result['energy_loss_cost_currency'] = energy_price_currency
