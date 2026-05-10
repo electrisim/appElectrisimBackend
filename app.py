@@ -165,7 +165,20 @@ def simulation():
                     'ac_line_model': in_data[x]['ac_line_model'],
                     'numba': in_data[x]['numba'],
                     'suppress_warnings': in_data[x]['suppress_warnings'],
-                    'cost_function': in_data[x]['cost_function']
+                    'cost_function': in_data[x]['cost_function'],
+                    'cost_currency': in_data[x].get('cost_currency') or 'EUR',
+                    'generator_cost_cp1': in_data[x].get('generator_cost_cp1') or {},
+                    'generator_cost_cp2': in_data[x].get('generator_cost_cp2') or {},
+                    'ext_grid_cost_cp1': in_data[x].get('ext_grid_cost_cp1') or {},
+                    'ext_grid_cost_cp2': in_data[x].get('ext_grid_cost_cp2') or {},
+                    'storage_cost_cp1': in_data[x].get('storage_cost_cp1') or {},
+                    'storage_cost_cp2': in_data[x].get('storage_cost_cp2') or {},
+                    'sgen_cost_cp1': in_data[x].get('sgen_cost_cp1') or {},
+                    'sgen_cost_cp2': in_data[x].get('sgen_cost_cp2') or {},
+                    'load_cost_cp1': in_data[x].get('load_cost_cp1') or {},
+                    'load_cost_cp2': in_data[x].get('load_cost_cp2') or {},
+                    'dcline_cost_cp1': in_data[x].get('dcline_cost_cp1') or {},
+                    'dcline_cost_cp2': in_data[x].get('dcline_cost_cp2') or {},
                 }
                 
                 # Create network
@@ -566,38 +579,229 @@ def pandapower_net_to_json(net):
     """
     Convert a pandapower network to the JSON structure expected by the frontend.
     This matches the format used by insertComponentsForData in supportingFunctions.js
+
+    pandapower 3.x DataFrames include extra columns (e.g. zone, controllable) vs the
+    fixed tuple positions assumed by the frontend. Missing bus names become None and
+    render as "null", so findVertexByBusId matches the same bus for every element.
+    We normalize rows/columns here so import layouts resolve correctly.
     """
     import json
     import numpy as np
-    
+
     def dataframe_to_list(df):
         """Convert a pandapower DataFrame to a list of lists for the frontend"""
         if df.empty:
             return []
-        # Replace NaN, NA, and other non-serializable values with None
         return df.replace({np.nan: None, pd.NA: None}).values.tolist()
-    
-    # Build the structure matching example_simple.json format
+
+    def _is_blank_name(val):
+        if val is None:
+            return True
+        try:
+            if pd.isna(val):
+                return True
+        except Exception:
+            pass
+        s = str(val).strip()
+        return s == '' or s.lower() == 'none'
+
+    def _scalar(val):
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except Exception:
+            pass
+        if hasattr(val, 'item'):
+            try:
+                return val.item()
+            except Exception:
+                pass
+        return val
+
+    def normalize_bus_rows():
+        df = net.bus
+        if df.empty:
+            return []
+        used = set()
+        names_out = []
+        for idx in df.index:
+            raw = df.at[idx, 'name'] if 'name' in df.columns else None
+            if _is_blank_name(raw):
+                base = f'Bus_{idx}'
+            else:
+                base = str(raw).strip()
+            uniq = base
+            dup = 0
+            while uniq in used:
+                dup += 1
+                uniq = f'{base}_{dup}'
+            used.add(uniq)
+            names_out.append(uniq)
+        slim = pd.DataFrame({
+            'name': names_out,
+            'vn_kv': df['vn_kv'].values if 'vn_kv' in df.columns else 0.0,
+            'type': df['type'].values if 'type' in df.columns else 'b',
+            'in_service': df['in_service'].values if 'in_service' in df.columns else True,
+        }, index=df.index)
+        return dataframe_to_list(slim)
+
+    def normalize_ext_grid_rows():
+        df = net.ext_grid
+        if df.empty:
+            return []
+        rows = []
+        for idx in df.index:
+            r = df.loc[idx]
+            nm = r['name'] if 'name' in df.columns else None
+            if _is_blank_name(nm):
+                nm = f'ExtGrid_{idx}'
+            rows.append([
+                nm,
+                int(_scalar(r['bus'])),
+                _scalar(r['vm_pu']),
+                _scalar(r['va_degree']),
+                _scalar(r['slack_weight']),
+                bool(_scalar(r['in_service'])) if r.get('in_service') is not None else True,
+            ])
+        return rows
+
+    def normalize_gen_rows():
+        df = net.gen
+        if df.empty:
+            return []
+        rows = []
+        for idx in df.index:
+            r = df.loc[idx]
+            nm = r['name'] if 'name' in df.columns else None
+            if _is_blank_name(nm):
+                nm = f'Gen_{idx}'
+            rows.append([
+                nm,
+                int(_scalar(r['bus'])),
+                _scalar(r['p_mw']),
+                _scalar(r['vm_pu']),
+                _scalar(r['sn_mva']),
+                _scalar(r['min_q_mvar']),
+                _scalar(r['max_q_mvar']),
+                _scalar(r['scaling']),
+                bool(_scalar(r['slack'])) if 'slack' in df.columns and r.get('slack') is not None else False,
+                bool(_scalar(r['in_service'])) if r.get('in_service') is not None else True,
+                float(_scalar(r['slack_weight'])) if 'slack_weight' in df.columns and r.get('slack_weight') is not None else 0.0,
+                _scalar(r['type']) if r.get('type') is not None else 'async',
+            ])
+        return rows
+
+    def normalize_load_rows():
+        df = net.load
+        if df.empty:
+            return []
+        rows = []
+        for idx in df.index:
+            r = df.loc[idx]
+            nm = r['name'] if 'name' in df.columns else None
+            if _is_blank_name(nm):
+                nm = f'Load_{idx}'
+            cz = None
+            if 'const_z_percent' in df.columns:
+                cz = _scalar(r['const_z_percent'])
+            elif 'const_z_p_percent' in df.columns:
+                cz = _scalar(r['const_z_p_percent'])
+            ci = None
+            if 'const_i_percent' in df.columns:
+                ci = _scalar(r['const_i_percent'])
+            elif 'const_i_p_percent' in df.columns:
+                ci = _scalar(r['const_i_p_percent'])
+            rows.append([
+                nm,
+                int(_scalar(r['bus'])),
+                _scalar(r['p_mw']),
+                _scalar(r['q_mvar']),
+                cz,
+                ci,
+                _scalar(r['sn_mva']),
+                _scalar(r['scaling']),
+                _scalar(r['type']) if r.get('type') is not None else 'wye',
+            ])
+        return rows
+
+    def normalize_trafo_rows():
+        df = net.trafo
+        if df.empty:
+            return []
+        rows = []
+        for idx in df.index:
+            r = df.loc[idx]
+            nm = r['name'] if 'name' in df.columns else None
+            if _is_blank_name(nm):
+                nm = f'Trafo_{idx}'
+            tap_phase = False
+            if 'tap_phase_shifter' in df.columns and r.get('tap_phase_shifter') is not None:
+                tap_phase = bool(_scalar(r['tap_phase_shifter']))
+            rows.append([
+                nm,
+                _scalar(r['std_type']),
+                int(_scalar(r['hv_bus'])),
+                int(_scalar(r['lv_bus'])),
+                _scalar(r['sn_mva']),
+                _scalar(r['vn_hv_kv']),
+                _scalar(r['vn_lv_kv']),
+                _scalar(r['vk_percent']),
+                _scalar(r['vkr_percent']),
+                _scalar(r['pfe_kw']),
+                _scalar(r['i0_percent']),
+                _scalar(r['shift_degree']),
+                _scalar(r['tap_side']),
+                _scalar(r['tap_neutral']),
+                _scalar(r['tap_min']),
+                _scalar(r['tap_max']),
+                _scalar(r['tap_step_percent']),
+                _scalar(r['tap_step_degree']),
+                _scalar(r['tap_pos']),
+                tap_phase,
+                _scalar(r['parallel']),
+                _scalar(r['df']),
+                bool(_scalar(r['in_service'])) if r.get('in_service') is not None else True,
+            ])
+        return rows
+
+    line_cols = [
+        'name', 'std_type', 'from_bus', 'to_bus', 'length_km', 'r_ohm_per_km',
+        'x_ohm_per_km', 'c_nf_per_km', 'g_us_per_km', 'max_i_ka', 'df',
+        'parallel', 'type', 'in_service',
+    ]
+
+    def normalize_line_rows():
+        df = net.line
+        if df.empty:
+            return []
+        slim = df[[c for c in line_cols if c in df.columns]].copy()
+        for idx in slim.index:
+            if _is_blank_name(slim.at[idx, 'name']):
+                slim.at[idx, 'name'] = f'Line_{idx}'
+        return dataframe_to_list(slim)
+
     model = {
         "_object": {
             "bus": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.bus)
+                    "data": normalize_bus_rows()
                 })
             },
             "line": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.line) if hasattr(net, 'line') and not net.line.empty else []
+                    "data": normalize_line_rows()
                 })
             },
             "ext_grid": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.ext_grid) if hasattr(net, 'ext_grid') and not net.ext_grid.empty else []
+                    "data": normalize_ext_grid_rows()
                 })
             },
             "gen": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.gen) if hasattr(net, 'gen') and not net.gen.empty else []
+                    "data": normalize_gen_rows()
                 })
             },
             "sgen": {
@@ -612,7 +816,7 @@ def pandapower_net_to_json(net):
             },
             "trafo": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.trafo) if hasattr(net, 'trafo') and not net.trafo.empty else []
+                    "data": normalize_trafo_rows()
                 })
             },
             "trafo3w": {
@@ -627,7 +831,7 @@ def pandapower_net_to_json(net):
             },
             "load": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.load) if hasattr(net, 'load') and not net.load.empty else []
+                    "data": normalize_load_rows()
                 })
             },
             "asymmetric_load": {
@@ -677,7 +881,7 @@ def pandapower_net_to_json(net):
             }
         }
     }
-    
+
     return json.dumps(model)
 
 
