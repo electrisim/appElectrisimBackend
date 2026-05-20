@@ -68,6 +68,420 @@ def _jsonify_safe(obj):
     return json.loads(json.dumps(obj, default=_json_serialize_default))
 
 
+def _sanitize_for_strict_json(obj):
+    """
+    Recursively replace NaN/Inf with None so payloads are valid RFC 8259 JSON.
+    Browser Response.json() / JSON.parse reject unquoted NaN/Infinity tokens.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, np.ndarray):
+        return _sanitize_for_strict_json(obj.tolist())
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_strict_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_strict_json(v) for v in obj]
+    if hasattr(obj, 'item') and callable(getattr(obj, 'item')):
+        try:
+            return _sanitize_for_strict_json(obj.item())
+        except Exception:
+            return None
+    if hasattr(obj, '__dict__') and not isinstance(obj, type):
+        return _sanitize_for_strict_json(vars(obj))
+    return obj
+
+
+def _electrisim_switch_res_for_output(net, sw_idx, row):
+    """
+    Fill ``net.res_switch``-like quantities for JSON / SwitchOut.
+
+    pandapower 3.x often leaves ``p_from_mw`` / ``q_*`` as NaN for switches (it copies ``i_ka`` only
+    for line/trafo switches). Ideal ``z_ohm=0`` bus–bus ties also yield NaN. The frontend maps null/NaN
+    to \"N/A\", so we repair rows here.
+
+    Bus–Switch–injecting element exports ``et='b'`` between the diagram bus and ``_electrisim_aux_*``; we detect
+    the aux on **either** terminal and derive P/Q/I from ``res_sgen``, ``res_storage``, ``res_load``,
+    ``res_asymmetric_load``, or ``res_shunt`` on that bus. Line / 2W-trafo
+    switches copy branch P/Q (and current if missing) from ``res_line`` / ``res_trafo``.
+    """
+    def _as_float(x, default=float('nan')):
+        try:
+            v = float(x)
+            if math.isnan(v) or math.isinf(v):
+                return default
+            return v
+        except (TypeError, ValueError):
+            return default
+
+    def _is_nan(v):
+        try:
+            v = float(v)
+            return not (v == v)
+        except (TypeError, ValueError):
+            return True
+
+    def _fin(v):
+        try:
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return 0.0
+            return x
+        except (TypeError, ValueError):
+            return 0.0
+
+    i_ka = _as_float(row.get('i_ka'), float('nan'))
+    p_from = _as_float(row.get('p_from_mw'), float('nan'))
+    q_from = _as_float(row.get('q_from_mvar'), float('nan'))
+    p_to = _as_float(row.get('p_to_mw'), float('nan'))
+    q_to = _as_float(row.get('q_to_mvar'), float('nan'))
+    loading = _as_float(row.get('loading_percent'), float('nan'))
+
+    try:
+        if getattr(net, 'switch', None) is None or net.switch.empty or sw_idx not in net.switch.index:
+            return _fin(i_ka), _fin(p_from), _fin(q_from), _fin(p_to), _fin(q_to), _fin(loading)
+
+        sw = net.switch.loc[sw_idx]
+        et = str(sw['et'])
+
+        # --- Bus–bus: Electrisim aux stub + sgen / storage / load / shunt / … on aux ---
+        if et == 'b':
+            bus_a = int(sw['bus'])
+            bus_b = int(sw['element'])
+            aux_bus = None
+            for cand in (bus_a, bus_b):
+                try:
+                    nm = str(net.bus.at[cand, 'name'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if nm.startswith('_electrisim_aux_'):
+                    aux_bus = cand
+                    break
+            if aux_bus is not None:
+                try:
+                    vn = float(net.bus.at[aux_bus, 'vn_kv'])
+                    vm = float(net.res_bus.at[aux_bus, 'vm_pu'])
+                except (KeyError, TypeError, ValueError):
+                    vn, vm = 0.0, 0.0
+
+                def _i_switch_loading(pm, qm):
+                    smva = math.hypot(float(pm), float(qm))
+                    i_new = smva / (math.sqrt(3) * vn * vm) if vn > 0 and vm > 0 and smva > 1e-12 else 0.0
+                    ink = float('nan')
+                    if 'in_ka' in net.switch.columns:
+                        try:
+                            ink = float(net.switch.at[sw_idx, 'in_ka'])
+                        except (TypeError, ValueError):
+                            ink = float('nan')
+                    load_pct = 0.0
+                    if ink == ink and ink > 0:
+                        load_pct = abs(i_new) / ink * 100.0
+                    return i_new, load_pct
+
+                if not net.sgen.empty and hasattr(net, 'res_sgen') and net.res_sgen is not None and not net.res_sgen.empty:
+                    sel = net.sgen['bus'] == aux_bus
+                    if sel.any():
+                        si = int(net.sgen.index[sel][0])
+                        pm = float(net.res_sgen.at[si, 'p_mw'])
+                        qm = float(net.res_sgen.at[si, 'q_mvar'])
+                        i_new, load_pct = _i_switch_loading(pm, qm)
+                        return _fin(i_new), _fin(-pm), _fin(-qm), _fin(pm), _fin(qm), _fin(load_pct)
+
+                if hasattr(net, 'storage') and net.storage is not None and not net.storage.empty \
+                        and hasattr(net, 'res_storage') and net.res_storage is not None and not net.res_storage.empty:
+                    sel = net.storage['bus'] == aux_bus
+                    if sel.any():
+                        si = int(net.storage.index[sel][0])
+                        pm = float(net.res_storage.at[si, 'p_mw'])
+                        qm = float(net.res_storage.at[si, 'q_mvar'])
+                        i_new, load_pct = _i_switch_loading(pm, qm)
+                        return _fin(i_new), _fin(-pm), _fin(-qm), _fin(pm), _fin(qm), _fin(load_pct)
+
+                if not net.load.empty and hasattr(net, 'res_load') and net.res_load is not None and not net.res_load.empty:
+                    sel = net.load['bus'] == aux_bus
+                    if sel.any():
+                        li = int(net.load.index[sel][0])
+                        pl = float(net.res_load.at[li, 'p_mw'])
+                        ql = float(net.res_load.at[li, 'q_mvar'])
+                        i_new, load_pct = _i_switch_loading(pl, ql)
+                        return _fin(i_new), _fin(pl), _fin(ql), _fin(-pl), _fin(-ql), _fin(load_pct)
+
+                if hasattr(net, 'asymmetric_load') and net.asymmetric_load is not None and not net.asymmetric_load.empty \
+                        and hasattr(net, 'res_asymmetric_load') and net.res_asymmetric_load is not None \
+                        and not net.res_asymmetric_load.empty:
+                    sel = net.asymmetric_load['bus'] == aux_bus
+                    if sel.any():
+                        ai = int(net.asymmetric_load.index[sel][0])
+                        ra = net.res_asymmetric_load.loc[ai]
+                        pl = float(ra.get('p_mw', 0.0))
+                        ql = float(ra.get('q_mvar', 0.0))
+                        i_new, load_pct = _i_switch_loading(pl, ql)
+                        return _fin(i_new), _fin(pl), _fin(ql), _fin(-pl), _fin(-ql), _fin(load_pct)
+
+                if not net.shunt.empty and hasattr(net, 'res_shunt') and net.res_shunt is not None and not net.res_shunt.empty:
+                    sel = net.shunt['bus'] == aux_bus
+                    if sel.any():
+                        hi = int(net.shunt.index[sel][0])
+                        pm = float(net.res_shunt.at[hi, 'p_mw'])
+                        qm = float(net.res_shunt.at[hi, 'q_mvar'])
+                        i_new, load_pct = _i_switch_loading(pm, qm)
+                        return _fin(i_new), _fin(pm), _fin(qm), _fin(-pm), _fin(-qm), _fin(load_pct)
+
+            # Plain bus–tie (no aux, or aux had no mapped injection): a single AC line between the
+            # same two buses — copy ``res_line`` like ``et='l'`` so the switch result box is not all zeros
+            # when the frontend exported a parallel ``et='b'`` next to that line.
+            pair = {bus_a, bus_b}
+            par_line_idx = None
+            if not net.line.empty:
+                for li in net.line.index:
+                    lf = int(net.line.at[li, 'from_bus'])
+                    lt = int(net.line.at[li, 'to_bus'])
+                    if {lf, lt} == pair:
+                        if par_line_idx is not None:
+                            par_line_idx = None
+                            break
+                        par_line_idx = li
+            if (
+                par_line_idx is not None
+                and par_line_idx in net.line.index
+                and hasattr(net, 'res_line')
+                and par_line_idx in net.res_line.index
+            ):
+                li = int(par_line_idx)
+                bsw = bus_a
+                lf = int(net.line.at[li, 'from_bus'])
+                lt = int(net.line.at[li, 'to_bus'])
+                rl = net.res_line.loc[li]
+                if bsw == lf:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rl.get('p_from_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rl.get('q_from_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rl.get('p_to_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rl.get('q_to_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rl.get('i_from_ka'), i_ka)
+                elif bsw == lt:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rl.get('p_to_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rl.get('q_to_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rl.get('p_from_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rl.get('q_from_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rl.get('i_to_ka'), i_ka)
+
+        # --- Line switch: copy P/Q from res_line (same idea as pandapower i_ka copy) ---
+        if et == 'l':
+            li = int(sw['element'])
+            bsw = int(sw['bus'])
+            if not net.line.empty and li in net.line.index and hasattr(net, 'res_line') and li in net.res_line.index:
+                lf = int(net.line.at[li, 'from_bus'])
+                lt = int(net.line.at[li, 'to_bus'])
+                rl = net.res_line.loc[li]
+                if bsw == lf:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rl.get('p_from_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rl.get('q_from_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rl.get('p_to_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rl.get('q_to_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rl.get('i_from_ka'), i_ka)
+                elif bsw == lt:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rl.get('p_to_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rl.get('q_to_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rl.get('p_from_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rl.get('q_from_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rl.get('i_to_ka'), i_ka)
+
+        # --- 2W transformer switch ---
+        if et == 't':
+            ti = int(sw['element'])
+            bsw = int(sw['bus'])
+            if not net.trafo.empty and ti in net.trafo.index and hasattr(net, 'res_trafo') and ti in net.res_trafo.index:
+                hv = int(net.trafo.at[ti, 'hv_bus'])
+                lv = int(net.trafo.at[ti, 'lv_bus'])
+                rt = net.res_trafo.loc[ti]
+                if bsw == hv:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rt.get('p_hv_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rt.get('q_hv_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rt.get('p_lv_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rt.get('q_lv_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rt.get('i_hv_ka'), i_ka)
+                elif bsw == lv:
+                    if _is_nan(p_from):
+                        p_from = _as_float(rt.get('p_lv_mw'), p_from)
+                    if _is_nan(q_from):
+                        q_from = _as_float(rt.get('q_lv_mvar'), q_from)
+                    if _is_nan(p_to):
+                        p_to = _as_float(rt.get('p_hv_mw'), p_to)
+                    if _is_nan(q_to):
+                        q_to = _as_float(rt.get('q_hv_mvar'), q_to)
+                    if _is_nan(i_ka):
+                        i_ka = _as_float(rt.get('i_lv_ka'), i_ka)
+
+        # Loading % from i_ka and switch rating
+        ink = float('nan')
+        if 'in_ka' in net.switch.columns:
+            try:
+                ink = float(net.switch.at[sw_idx, 'in_ka'])
+            except (TypeError, ValueError):
+                ink = float('nan')
+        if _is_nan(loading) and not _is_nan(i_ka) and ink == ink and ink > 0:
+            loading = abs(float(i_ka)) / ink * 100.0
+
+        return _fin(i_ka), _fin(p_from), _fin(q_from), _fin(p_to), _fin(q_to), _fin(loading)
+    except Exception:
+        return _fin(i_ka), _fin(p_from), _fin(q_from), _fin(p_to), _fin(q_to), _fin(loading)
+
+
+def _electrisim_bus_branch_p_q_sum(net, bus_idx):
+    """
+    Compute "through power" for ``bus_idx`` from AC branch results (lines, 2W/3W trafos, impedances).
+
+    pandapower ``res_bus.p_mw`` / ``q_mvar`` are *lumped* injections (load, sgen, ext_grid, …) at that bus.
+    On a pass-through bus (e.g. LV node with trafo + gen behind a bus–bus switch on an aux bus) net
+    ``res_bus`` injection can be **zero** while line/trafo terminals still carry power.
+
+    Terminal convention: ``p_from_mw`` / ``p_to_mw`` / ``p_hv_mw`` / ``p_lv_mw`` is the active power
+    **from the bus into the branch** (positive ⇒ leaves the bus). We accumulate:
+
+    - **inflow** ``(p_in, q_in)``: contribution when ``p < 0`` (or ``q < 0``) — power/var flowing into the bus.
+    - **outflow** ``(p_out, q_out)``: contribution when ``p > 0`` (or ``q > 0``) — leaving the bus.
+
+    At a pass-through node, inflow and outflow magnitudes match (Kirchhoff). Earlier code only kept
+    *inflow*, so buses that **only** export into a trafo (``p_lv > 0``, gen behind an aux switch) got
+    ``p_branch_mw = 0``. We return the pair from whichever side has larger |P| so the UI shows the
+    correct through-power **magnitude**.
+
+    **Sign:** pandapower ``res_bus.p_mw`` on a bus with local generation is typically **negative** (same
+    sign as ``P_from`` on an intervening bus–bus switch). Branch outflow uses terminal ``p > 0`` (power
+    *leaving* the bus into the branch), so it comes out **positive**. When outflow dominates
+    (``p_out > p_in``), we **negate** P and Q so the bus label matches the normal ``res_bus`` convention
+    and stays consistent with the “no aux / no switch” case.
+    """
+    p_in = 0.0
+    p_out = 0.0
+    q_in_s = 0.0  # signed Σ Q at terminals with P flowing into the bus (p < 0)
+    q_out_s = 0.0  # signed Σ Q at terminals with P flowing out of the bus (p > 0)
+
+    def _f(v, default=0.0):
+        try:
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return default
+            return x
+        except (TypeError, ValueError):
+            return default
+
+    def _add_in_out(p_term, q_term):
+        nonlocal p_in, p_out, q_in_s, q_out_s
+        pt = _f(p_term)
+        qt = _f(q_term)
+        if pt < 0:
+            p_in += -pt
+            q_in_s += qt
+        elif pt > 0:
+            p_out += pt
+            q_out_s += qt
+
+    try:
+        if hasattr(net, "line") and net.line is not None and not net.line.empty \
+                and hasattr(net, "res_line") and net.res_line is not None and not net.res_line.empty:
+            for i in net.line.index:
+                if i not in net.res_line.index:
+                    continue
+                fr = net.line.at[i, "from_bus"]
+                to = net.line.at[i, "to_bus"]
+                rl = net.res_line.loc[i]
+                if fr == bus_idx:
+                    _add_in_out(rl.get("p_from_mw", 0.0), rl.get("q_from_mvar", 0.0))
+                if to == bus_idx:
+                    _add_in_out(rl.get("p_to_mw", 0.0), rl.get("q_to_mvar", 0.0))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(net, "trafo") and net.trafo is not None and not net.trafo.empty \
+                and hasattr(net, "res_trafo") and net.res_trafo is not None and not net.res_trafo.empty:
+            for i in net.trafo.index:
+                if i not in net.res_trafo.index:
+                    continue
+                hv = net.trafo.at[i, "hv_bus"]
+                lv = net.trafo.at[i, "lv_bus"]
+                rt = net.res_trafo.loc[i]
+                if hv == bus_idx:
+                    _add_in_out(rt.get("p_hv_mw", 0.0), rt.get("q_hv_mvar", 0.0))
+                if lv == bus_idx:
+                    _add_in_out(rt.get("p_lv_mw", 0.0), rt.get("q_lv_mvar", 0.0))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(net, "trafo3w") and net.trafo3w is not None and not net.trafo3w.empty \
+                and hasattr(net, "res_trafo3w") and net.res_trafo3w is not None and not net.res_trafo3w.empty:
+            for i in net.trafo3w.index:
+                if i not in net.res_trafo3w.index:
+                    continue
+                row = net.trafo3w.loc[i]
+                r3 = net.res_trafo3w.loc[i]
+                if row["hv_bus"] == bus_idx:
+                    _add_in_out(r3.get("p_hv_mw", 0.0), r3.get("q_hv_mvar", 0.0))
+                if row["mv_bus"] == bus_idx:
+                    _add_in_out(r3.get("p_mv_mw", 0.0), r3.get("q_mv_mvar", 0.0))
+                if row["lv_bus"] == bus_idx:
+                    _add_in_out(r3.get("p_lv_mw", 0.0), r3.get("q_lv_mvar", 0.0))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(net, "impedance") and net.impedance is not None and not net.impedance.empty \
+                and hasattr(net, "res_impedance") and net.res_impedance is not None and not net.res_impedance.empty:
+            for i in net.impedance.index:
+                if i not in net.res_impedance.index:
+                    continue
+                fr = net.impedance.at[i, "from_bus"]
+                to = net.impedance.at[i, "to_bus"]
+                r = net.res_impedance.loc[i]
+                if fr == bus_idx:
+                    _add_in_out(r.get("p_from_mw", 0.0), r.get("q_from_mvar", 0.0))
+                if to == bus_idx:
+                    _add_in_out(r.get("p_to_mw", 0.0), r.get("q_to_mvar", 0.0))
+    except Exception:
+        pass
+
+    if p_in >= p_out:
+        return p_in, q_in_s
+    return -p_out, -q_out_s
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
     """Generate Python code to recreate the pandapower network"""
     lines = []
@@ -714,7 +1128,13 @@ def create_busbars(in_data, net):
                         bus_kw[vm_key] = v
                 except (TypeError, ValueError):
                     pass
-            Busbars[bus_name] = pp.create_bus(net, **bus_kw)
+            bus_idx = pp.create_bus(net, **bus_kw)
+            Busbars[bus_name] = bus_idx
+            # Diagram XML often stores the pandapower semantic name as userFriendlyName while `name`
+            # stays as mxObjectId — duplicate the mapping so Switch payloads resolve either key.
+            _ufn_b = in_data[x].get('userFriendlyName')
+            if _ufn_b not in (None, '') and str(_ufn_b) != str(bus_name):
+                Busbars[str(_ufn_b)] = bus_idx
             
             # Store the user-friendly name mapping
             net.user_friendly_names[bus_name] = user_friendly_name
@@ -1165,10 +1585,26 @@ def create_other_elements(in_data,net,x, Busbars):
             return 'b'
         return et_lower[0] if et_lower else 'l'
 
+    _payload_keys = list(in_data.keys())
+    _key_pos = {k: i for i, k in enumerate(_payload_keys)}
+
+    def _creation_order_key(k):
+        row = in_data.get(k)
+        if not isinstance(row, dict):
+            return (1, _key_pos.get(k, 0))
+        typ = str(row.get('typ', ''))
+        if typ.startswith('Switch'):
+            return (2, _key_pos.get(k, 0))
+        if typ.startswith('Line'):
+            return (0, _key_pos.get(k, 0))
+        return (1, _key_pos.get(k, 0))
+
+    _ordered_keys = sorted(_payload_keys, key=_creation_order_key)
+
     for name,value in Busbars.items():
         globals()[name] = value    
        
-    for x in in_data:
+    for x in _ordered_keys:
       
         #eval - rozwiazuje problem z wartosciami NaN
         if (in_data[x]['typ'].startswith("Line")):
@@ -1288,6 +1724,9 @@ def create_other_elements(in_data,net,x, Busbars):
             # Call the function with the prepared parameters
             line_idx = pp.create_line_from_parameters(net, **line_params)
             LinesDict[in_data[x]['name']] = line_idx
+            _ufn_ln = in_data[x].get('userFriendlyName')
+            if _ufn_ln not in (None, '') and str(_ufn_ln) != str(in_data[x]['name']):
+                LinesDict[str(_ufn_ln)] = line_idx
             
             # Store user-friendly name for line
             line_name = in_data[x]['name']
@@ -1723,6 +2162,9 @@ def create_other_elements(in_data,net,x, Busbars):
 
             trafo_idx = pp.create_transformer_from_parameters(net, **transformer_params)
             TrafoDict[in_data[x]['name']] = trafo_idx
+            _ufn_tr = in_data[x].get('userFriendlyName')
+            if _ufn_tr not in (None, '') and str(_ufn_tr) != str(in_data[x]['name']):
+                TrafoDict[str(_ufn_tr)] = trafo_idx
             
             # Store user-friendly name for transformer
             trafo_name = in_data[x]['name']
@@ -1829,6 +2271,9 @@ def create_other_elements(in_data,net,x, Busbars):
             if trafo3w_id is not None:
                 net.trafo3w.at[trafo3w_idx, 'id'] = trafo3w_id
             Trafo3wDict[in_data[x]['name']] = trafo3w_idx
+            _ufn_t3 = in_data[x].get('userFriendlyName')
+            if _ufn_t3 not in (None, '') and str(_ufn_t3) != str(in_data[x]['name']):
+                Trafo3wDict[str(_ufn_t3)] = trafo3w_idx
             
             # Store user-friendly name for three-winding transformer
             trafo3w_name = in_data[x]['name']
@@ -2230,7 +2675,8 @@ def create_other_elements(in_data,net,x, Busbars):
             in_ka_val = in_data[x].get('in_ka')
             in_ka = safe_float(in_ka_val) if in_ka_val not in (None, '', 'nan') else float('nan')
             switch_name = in_data[x].get('name', in_data[x].get('userFriendlyName', f'Switch_{x}'))
-            
+            in_service = True
+
             sw_idx = pp.create_switch(net, bus=bus_idx, element=int(element_idx), et=et, name=switch_name,
                            closed=closed, type=switch_type, z_ohm=z_ohm, in_ka=in_ka, in_service=in_service)
             # Store frontend cell id for result matching
@@ -3165,14 +3611,19 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 # Convert any remaining numpy types
                 diagnostic_response = convert_numpy_types(diagnostic_response)
-                return json.dumps(diagnostic_response, separators=(',', ':'))
+                return json.dumps(
+                    _sanitize_for_strict_json(diagnostic_response),
+                    separators=(',', ':'),
+                    allow_nan=False,
+                )
             else:
                 # Restore stdout/stderr after successful power flow
                 sys.stdout = _orig_stdout
                 sys.stderr = _orig_stderr
                 
                 class BusbarOut(object):
-                    def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float, q_p: float):          
+                    def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float, q_p: float,
+                                 p_branch_mw: float = 0.0, q_branch_mvar: float = 0.0):
                         self.name = name
                         self.id = id
                         self.vm_pu = vm_pu
@@ -3181,6 +3632,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         self.q_mvar = q_mvar  
                         self.pf = pf #p_mw/math.sqrt(math.pow(p_mw,2)+math.pow(q_mvar,2))  
                         self.q_p = q_p
+                        self.p_branch_mw = p_branch_mw
+                        self.q_branch_mvar = q_branch_mvar
                         
                 class BusbarsOut(object):
                     def __init__(self, busbars: List[BusbarOut]):
@@ -3629,7 +4082,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         q_p = 0.0
                     if math.isnan(q_p) or math.isinf(q_p):
                         q_p = 0.0
-                    busbar = BusbarOut(name=net.bus._get_value(index, 'name'), id = net.bus._get_value(index, 'id'), vm_pu=row['vm_pu'], va_degree=row['va_degree'], p_mw=p_mw, q_mvar=q_mvar, pf = pf, q_p=q_p)         
+                    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, index)
+                    busbar = BusbarOut(
+                        name=net.bus._get_value(index, 'name'), id=net.bus._get_value(index, 'id'),
+                        vm_pu=row['vm_pu'], va_degree=row['va_degree'],
+                        p_mw=p_mw, q_mvar=q_mvar, pf=pf, q_p=q_p,
+                        p_branch_mw=p_br, q_branch_mvar=q_br,
+                    )
                     busbarList.append(busbar) 
                     busbars = BusbarsOut(busbars = busbarList)
                 
@@ -4141,12 +4600,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         sw_name = net.switch._get_value(index, 'name')
                         sw_id = net.switch._get_value(index, 'id') if 'id' in net.switch.columns else str(index)
                         sw_closed = net.switch._get_value(index, 'closed') if 'closed' in net.switch.columns else True
+                        fk, fpf, fqff, fpt, fqtf, fld = _electrisim_switch_res_for_output(net, index, row)
                         switch = SwitchOut(
                             name=sw_name, id=sw_id, closed=sw_closed,
-                            i_ka=row.get('i_ka', 0.0),
-                            p_from_mw=row.get('p_from_mw', 0.0), q_from_mvar=row.get('q_from_mvar', 0.0),
-                            p_to_mw=row.get('p_to_mw', 0.0), q_to_mvar=row.get('q_to_mvar', 0.0),
-                            loading_percent=row.get('loading_percent', 0.0)
+                            i_ka=fk,
+                            p_from_mw=fpf, q_from_mvar=fqff,
+                            p_to_mw=fpt, q_to_mvar=fqtf,
+                            loading_percent=fld
                         )
                         switchesList.append(switch) 
                         switches = SwitchesOut(switches = switchesList) 
@@ -4246,7 +4706,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
                 # OPTIMIZED: Removed indent=4, using compact separators for ~40% size reduction
-                response = json.dumps(result, default=_json_serialize_default, separators=(',', ':')) 
+                # Sanitize NaN/Inf so the body is strict JSON (browser JSON.parse rejects NaN tokens).
+                response = json.dumps(
+                    _sanitize_for_strict_json(result),
+                    default=_json_serialize_default,
+                    allow_nan=False,
+                    separators=(',', ':'),
+                ) 
             
                 print("Response to FRONTEND CORRECT")   
                    
@@ -8904,3 +9370,1078 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
             best_q_pcc = _rpc_pcc_q_for_chart(net_try, pcc_bus_idx, ext_grid_idx)
 
     return best_q_pcc
+
+
+# ============================================================================
+# Protection Coordination
+# ----------------------------------------------------------------------------
+# End-to-end implementation built on pandapower.protection:
+#   - OCRelay (DTOC / IDMT / IDTOC) with IEC 60255 curves
+#   - Fuse with the pandapower fuse standard library (16-1000 A)
+#   - calculate_protection_times() for tripping table
+#   - device.create_characteristic() for time-current grading curves
+# Differential (87) and Distance (21) devices are accepted as configuration but
+# returned with `not_computed=true` because pandapower has no native 87/21 model.
+# ============================================================================
+
+
+# Map switch frontend `protection_type` (UI) -> internal kind used by the engine.
+# OCR is one logical kind (DTOC/IDMT/IDTOC drives the subtype).
+_PROTECTION_KIND_OCR = "ocr"
+_PROTECTION_KIND_FUSE = "fuse"
+_PROTECTION_KIND_DIFF = "differential"
+_PROTECTION_KIND_DIST = "distance"
+_PROTECTION_KIND_NONE = "none"
+
+# OC relay subtype -> pandapower switch.type marker used internally by the library.
+_OC_SUBTYPE_TO_SWITCH_TYPE = {
+    "DTOC": "CB_DTOC",
+    "IDMT": "CB_IDMT",
+    "IDTOC": "CB_IDTOC",
+}
+
+# IEC 60255 curve aliases the dialog might send.
+_VALID_OC_CURVE_TYPES = {
+    "standard_inverse",
+    "very_inverse",
+    "extremely_inverse",
+    "long_inverse",
+}
+
+
+def _prot_safe_float(value, default=None):
+    """safe_float that tolerates None / empty / 'nan' and returns `default` instead of 0.0."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        v = value.strip()
+        if v == "" or v.lower() == "nan" or v.lower() == "none":
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+    try:
+        f = float(value)
+        if math.isnan(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _prot_collect_switch_protection_specs(in_data):
+    """
+    Walk the raw frontend payload and collect the protection spec for every Switch
+    component that has `protection_type` set. Returns a dict keyed by the frontend
+    switch identifier (id, falling back to name) so we can match it back to the
+    pandapower switch row after `pp.create_switch`.
+    """
+    specs = {}
+    if not isinstance(in_data, dict):
+        return specs
+    for key, row in in_data.items():
+        if not isinstance(row, dict):
+            continue
+        typ = row.get('typ') or row.get('type')
+        if not isinstance(typ, str) or not typ.startswith('Switch'):
+            continue
+        protection_type = str(row.get('protection_type', _PROTECTION_KIND_NONE) or _PROTECTION_KIND_NONE).strip().lower()
+        if protection_type in ('', _PROTECTION_KIND_NONE):
+            continue
+        sw_id = row.get('id') or row.get('name')
+        if sw_id is None:
+            continue
+        specs[str(sw_id)] = {
+            'protection_type': protection_type,
+            'oc_relay_type': str(row.get('oc_relay_type', 'DTOC') or 'DTOC').upper(),
+            'curve_type': str(row.get('curve_type', 'standard_inverse') or 'standard_inverse').lower(),
+            'tms': _prot_safe_float(row.get('tms'), 1.0),
+            't_grade': _prot_safe_float(row.get('t_grade'), 0.5),
+            't_gg': _prot_safe_float(row.get('t_gg'), 0.07),
+            't_g': _prot_safe_float(row.get('t_g'), 0.5),
+            't_diff': _prot_safe_float(row.get('t_diff'), 0.3),
+            'pickup_mode': str(row.get('pickup_mode', 'auto') or 'auto').lower(),
+            'I_s_a': _prot_safe_float(row.get('I_s_a')),
+            'I_g_a': _prot_safe_float(row.get('I_g_a')),
+            'I_gg_a': _prot_safe_float(row.get('I_gg_a')),
+            'fuse_type': row.get('fuse_type'),
+            'fuse_mode': str(row.get('fuse_mode', 'library') or 'library').strip().lower(),
+            'fuse_custom_std_json': row.get('fuse_custom_std_json'),
+            'rated_i_a': _prot_safe_float(row.get('rated_i_a')),
+            'overload_factor': _prot_safe_float(row.get('overload_factor'), 1.25),
+            'ct_current_factor': _prot_safe_float(row.get('ct_current_factor'), 1.2),
+            'safety_factor': _prot_safe_float(row.get('safety_factor'), 1.0),
+            'sw_id': str(sw_id),
+            'sw_name': str(row.get('name', sw_id)),
+            'user_friendly_name': str(row.get('userFriendlyName', row.get('name', sw_id))),
+        }
+    return specs
+
+
+def _prot_resolve_sw_idx_for_id(net, frontend_id):
+    """Locate pandapower switch row index given the frontend cell id we wrote into net.switch['id']."""
+    if 'id' not in net.switch.columns:
+        return None
+    matches = net.switch.index[net.switch['id'].astype(str) == str(frontend_id)].tolist()
+    if matches:
+        return int(matches[0])
+    # Fallback: try matching by name
+    if 'name' in net.switch.columns:
+        name_matches = net.switch.index[net.switch['name'].astype(str) == str(frontend_id)].tolist()
+        if name_matches:
+            return int(name_matches[0])
+    return None
+
+
+def _prot_build_pickup_current_manual_df(spec):
+    """Build a manual pickup dataframe for OCRelay when pickup_mode == 'manual'."""
+    if spec.get('pickup_mode') != 'manual':
+        return None
+    subtype = spec.get('oc_relay_type', 'DTOC')
+    cols = {}
+    if subtype == 'DTOC':
+        if spec.get('I_gg_a') is None or spec.get('I_g_a') is None:
+            return None
+        cols = {'switch_id': [0], 'I_gg': [float(spec['I_gg_a'])], 'I_g': [float(spec['I_g_a'])]}
+    elif subtype == 'IDMT':
+        if spec.get('I_s_a') is None:
+            return None
+        cols = {'switch_id': [0], 'I_s': [float(spec['I_s_a'])]}
+    elif subtype == 'IDTOC':
+        if spec.get('I_gg_a') is None or spec.get('I_g_a') is None or spec.get('I_s_a') is None:
+            return None
+        cols = {'switch_id': [0], 'I_gg': [float(spec['I_gg_a'])], 'I_g': [float(spec['I_g_a'])], 'I_s': [float(spec['I_s_a'])]}
+    if not cols:
+        return None
+    return pd.DataFrame(cols)
+
+
+def _prot_build_oc_relay_time_settings(spec):
+    """Build the `time_settings` list expected by OCRelay for the chosen subtype."""
+    subtype = spec.get('oc_relay_type', 'DTOC')
+    t_gg = spec.get('t_gg', 0.07)
+    t_g = spec.get('t_g', 0.5)
+    t_diff = spec.get('t_diff', 0.3)
+    tms = spec.get('tms', 1.0)
+    t_grade = spec.get('t_grade', 0.5)
+    if subtype == 'DTOC':
+        return [t_gg, t_g, t_diff]
+    if subtype == 'IDMT':
+        return [tms, t_grade]
+    if subtype == 'IDTOC':
+        return [t_gg, t_g, t_diff, tms, t_grade]
+    return [t_gg, t_g, t_diff]
+
+
+def _prot_ensure_bus_geodata(net):
+    """
+    pandapower.protection.utility_functions.create_sc_bus reads bus coordinates from
+    `net.bus.geo` (pandapower 3.x) or `net.bus_geodata` (older), so we synthesize
+    sequential placeholder coordinates for any bus that is missing them. The
+    coordinates themselves do not affect the calculation, they only satisfy the
+    geodata lookup.
+    """
+    # pandapower 3.x stores geo on the bus DataFrame as JSON in column 'geo'
+    try:
+        if 'geo' in net.bus.columns:
+            for idx, bus_row in net.bus.iterrows():
+                geo_val = bus_row['geo']
+                if geo_val is None or (isinstance(geo_val, float) and math.isnan(geo_val)) or geo_val == '' or geo_val == 'null':
+                    net.bus.at[idx, 'geo'] = json.dumps({
+                        "type": "Point",
+                        "coordinates": [float(idx) * 1.0, 0.0]
+                    })
+        else:
+            # Add the column so pandapower.protection can read it consistently.
+            net.bus['geo'] = [
+                json.dumps({"type": "Point", "coordinates": [float(i) * 1.0, 0.0]})
+                for i in net.bus.index
+            ]
+    except Exception as e:
+        print(f"Protection: failed to ensure net.bus.geo - {e}")
+
+    # Legacy net.bus_geodata table (pre-3.x)
+    try:
+        if hasattr(net, 'bus_geodata'):
+            for idx in net.bus.index:
+                if idx not in net.bus_geodata.index:
+                    net.bus_geodata.loc[idx] = [float(idx) * 1.0, 0.0]
+    except Exception:
+        pass
+
+
+def _prot_register_custom_fuse_std_types(net, specs):
+    """
+    For each switch with protection_type=fuse and fuse_mode=custom, register
+    net.std_types['fuse'][name] via pp.create_std_type so Fuse() can load curves.
+    """
+    errors = []
+    if not hasattr(pp, 'create_std_type'):
+        return errors
+    for sw_id, spec in specs.items():
+        if spec.get('protection_type') != _PROTECTION_KIND_FUSE:
+            continue
+        mode = str(spec.get('fuse_mode', 'library') or 'library').strip().lower()
+        if mode != 'custom':
+            continue
+        fuse_name = str(spec.get('fuse_type') or '').strip()
+        if not fuse_name:
+            errors.append({
+                'switch_id': sw_id,
+                'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'kind': 'Fuse',
+                'fuse_register': True,
+                'attached': False,
+                'not_computed': False,
+                'reason': 'Custom fuse: missing fuse name (fuse_type).',
+            })
+            continue
+        rated = spec.get('rated_i_a')
+        if rated is None or float(rated) <= 0:
+            errors.append({
+                'switch_id': sw_id,
+                'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'kind': 'Fuse',
+                'fuse_register': True,
+                'attached': False,
+                'not_computed': False,
+                'reason': 'Custom fuse: rated_i_a must be positive.',
+            })
+            continue
+        raw_json = spec.get('fuse_custom_std_json')
+        extra = {}
+        if raw_json is not None and str(raw_json).strip():
+            try:
+                if isinstance(raw_json, dict):
+                    extra = raw_json
+                else:
+                    extra = json.loads(str(raw_json))
+                if not isinstance(extra, dict):
+                    raise ValueError('curve JSON must be a JSON object')
+            except Exception as e:
+                errors.append({
+                    'switch_id': sw_id,
+                    'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'kind': 'Fuse',
+                    'fuse_register': True,
+                    'attached': False,
+                    'not_computed': False,
+                    'reason': f'Custom fuse curve JSON: {e}',
+                })
+                continue
+        try:
+            data = {'fuse_type': fuse_name, 'i_rated_a': float(rated)}
+            for k in ('t_avg', 't_min', 't_total', 'x_avg', 'x_min', 'x_total'):
+                if k in extra:
+                    data[k] = extra[k]
+            pp.create_std_type(net, data, name=fuse_name, element='fuse', overwrite=True)
+        except Exception as e:
+            errors.append({
+                'switch_id': sw_id,
+                'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'kind': 'Fuse',
+                'fuse_register': True,
+                'attached': False,
+                'not_computed': False,
+                'reason': f'create_std_type failed: {e}',
+            })
+    return errors
+
+
+def _attach_protection_devices(net, specs):
+    """
+    Instantiate pandapower protection devices for every collected spec. Returns a list of
+    summaries (one per device) describing what was attached (or why it was skipped).
+    """
+    summaries = []
+    if not specs:
+        return summaries
+
+    # Ensure bus coordinates are present (required by pandapower.protection.create_sc_bus).
+    _prot_ensure_bus_geodata(net)
+
+    summaries.extend(_prot_register_custom_fuse_std_types(net, specs))
+
+    # Lazy imports: OCRelay pulls matplotlib via pandapower; Fuse does not. Import separately so
+    # fuse-only studies still run on minimal environments (pip install matplotlib for OCR).
+    OCRelay = None
+    _ocrelay_import_err = None
+    try:
+        from pandapower.protection.protection_devices.ocrelay import OCRelay as _OCRelay
+        OCRelay = _OCRelay
+    except ImportError as e:
+        _ocrelay_import_err = str(e)
+
+    Fuse = None
+    try:
+        from pandapower.protection.protection_devices.fuse import Fuse as _Fuse
+        Fuse = _Fuse
+    except ImportError:
+        Fuse = None
+
+    for sw_id, spec in specs.items():
+        sw_idx = _prot_resolve_sw_idx_for_id(net, sw_id)
+        if sw_idx is None:
+            summaries.append({
+                'switch_id': sw_id,
+                'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'kind': spec.get('protection_type'),
+                'attached': False,
+                'not_computed': False,
+                'reason': 'Switch index not found in pandapower net (switch may have been skipped).',
+            })
+            continue
+
+        kind = spec.get('protection_type', _PROTECTION_KIND_NONE)
+
+        # --- OCR --------------------------------------------------------------------
+        if kind == _PROTECTION_KIND_OCR:
+            if OCRelay is None:
+                summaries.append({
+                    'switch_id': sw_id,
+                    'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'kind': kind,
+                    'attached': False,
+                    'not_computed': True,
+                    'reason': (
+                        f'pandapower.protection.OCRelay unavailable ({_ocrelay_import_err or "unknown"}). '
+                        'Install matplotlib in the backend environment for OCR relays (e.g. pip install matplotlib).'
+                    ),
+                })
+                continue
+            subtype = spec.get('oc_relay_type', 'DTOC')
+            if subtype not in _OC_SUBTYPE_TO_SWITCH_TYPE:
+                summaries.append({
+                    'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'kind': kind, 'subtype': subtype, 'attached': False, 'not_computed': False,
+                    'reason': f'Unknown OCR subtype "{subtype}". Expected DTOC / IDMT / IDTOC.',
+                })
+                continue
+            try:
+                net.switch.at[sw_idx, 'type'] = _OC_SUBTYPE_TO_SWITCH_TYPE[subtype]
+            except Exception:
+                pass
+            curve_type = spec.get('curve_type', 'standard_inverse')
+            if curve_type not in _VALID_OC_CURVE_TYPES:
+                curve_type = 'standard_inverse'
+            time_settings = _prot_build_oc_relay_time_settings(spec)
+            pickup_df = _prot_build_pickup_current_manual_df(spec)
+            try:
+                kwargs = dict(
+                    switch_index=int(sw_idx),
+                    oc_relay_type=subtype,
+                    time_settings=time_settings,
+                    curve_type=curve_type,
+                )
+                if spec.get('overload_factor') is not None:
+                    kwargs['overload_factor'] = float(spec['overload_factor'])
+                if spec.get('ct_current_factor') is not None:
+                    kwargs['ct_current_factor'] = float(spec['ct_current_factor'])
+                if spec.get('safety_factor') is not None:
+                    kwargs['safety_factor'] = float(spec['safety_factor'])
+                if pickup_df is not None:
+                    # OCRelay expects switch_id column to match the actual sw_idx.
+                    pickup_df = pickup_df.copy()
+                    pickup_df['switch_id'] = int(sw_idx)
+                    kwargs['pickup_current_manual'] = pickup_df
+                OCRelay(net, **kwargs)
+                summaries.append({
+                    'switch_id': sw_id,
+                    'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'sw_idx': int(sw_idx),
+                    'kind': 'OCR',
+                    'subtype': subtype,
+                    'curve_type': curve_type,
+                    'time_settings': time_settings,
+                    'pickup_mode': spec.get('pickup_mode'),
+                    'attached': True,
+                    'not_computed': False,
+                })
+            except Exception as e:
+                import traceback as _tb
+                tb_text = _tb.format_exc(limit=10)
+                summaries.append({
+                    'switch_id': sw_id,
+                    'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'sw_idx': int(sw_idx),
+                    'kind': 'OCR',
+                    'subtype': subtype,
+                    'attached': False,
+                    'not_computed': False,
+                    'reason': f'OCRelay instantiation failed: {e}',
+                    'traceback': tb_text,
+                })
+
+        # --- Fuse -------------------------------------------------------------------
+        elif kind == _PROTECTION_KIND_FUSE:
+            if Fuse is None:
+                summaries.append({
+                    'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'kind': 'Fuse', 'attached': False, 'not_computed': True,
+                    'reason': 'pandapower.protection.Fuse not available in this pandapower version.',
+                })
+                continue
+            try:
+                kwargs = {'switch_index': int(sw_idx)}
+                if spec.get('fuse_type'):
+                    kwargs['fuse_type'] = str(spec['fuse_type'])
+                if spec.get('rated_i_a') is not None:
+                    kwargs['rated_i_a'] = float(spec['rated_i_a'])
+                Fuse(net, **kwargs)
+                summaries.append({
+                    'switch_id': sw_id,
+                    'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'sw_idx': int(sw_idx),
+                    'kind': 'Fuse',
+                    'fuse_type': spec.get('fuse_type'),
+                    'rated_i_a': spec.get('rated_i_a'),
+                    'attached': True,
+                    'not_computed': False,
+                })
+            except Exception as e:
+                summaries.append({
+                    'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'),
+                    'kind': 'Fuse', 'attached': False, 'not_computed': False,
+                    'reason': f'Fuse instantiation failed: {e}',
+                })
+
+        # --- Differential / Distance (stubs) ----------------------------------------
+        elif kind in (_PROTECTION_KIND_DIFF, _PROTECTION_KIND_DIST):
+            summaries.append({
+                'switch_id': sw_id,
+                'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'sw_idx': int(sw_idx),
+                'kind': 'Differential' if kind == _PROTECTION_KIND_DIFF else 'Distance',
+                'attached': False,
+                'not_computed': True,
+                'reason': 'Differential (87) / Distance (21) is not modeled in pandapower. UI placeholder only.',
+            })
+        else:
+            summaries.append({
+                'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
+                'user_friendly_name': spec.get('user_friendly_name'),
+                'kind': kind, 'attached': False, 'not_computed': False,
+                'reason': f'Unknown protection_type "{kind}".',
+            })
+
+    return summaries
+
+
+def _prot_sample_oc_relay_characteristic(device, x_min=10.0, x_max=1.0e5, n_points=80):
+    """
+    Sample an OCRelay (DTOC / IDMT / IDTOC) time-current characteristic into
+    (I [A], t [s]) arrays. Mirrors pandapower's plot_protection_characteristic
+    but writes raw arrays instead of drawing a matplotlib figure.
+
+    OCRelay stores currents in kA, so we convert to A for the UI.
+    """
+    try:
+        subtype = getattr(device, 'oc_relay_type', None)
+        if subtype is None:
+            return [], []
+        x = np.logspace(math.log10(max(x_min, 1.0)), math.log10(max(x_max, x_min * 10.0)), int(n_points))
+        I_g = getattr(device, 'I_g', None)
+        I_gg = getattr(device, 'I_gg', None)
+        I_s = getattr(device, 'I_s', None)
+        t_g = getattr(device, 't_g', None)
+        t_gg = getattr(device, 't_gg', None)
+        t_grade = getattr(device, 't_grade', None)
+        tms = getattr(device, 'tms', None)
+        k = getattr(device, 'k', None)
+        alpha = getattr(device, 'alpha', None)
+
+        currents = []
+        times = []
+        for i_a in x:
+            i_ka = float(i_a) / 1000.0
+            t = float('inf')
+            if subtype == 'DTOC':
+                if I_gg is not None and i_ka >= I_gg:
+                    t = float(t_gg) if t_gg is not None else float('inf')
+                elif I_g is not None and i_ka >= I_g:
+                    t = float(t_g) if t_g is not None else float('inf')
+            elif subtype == 'IDMT':
+                if I_s is not None and i_ka > I_s and tms is not None and k is not None and alpha is not None:
+                    denom = ((i_ka / float(I_s)) ** float(alpha)) - 1.0
+                    if denom > 0:
+                        t = (float(tms) * float(k)) / denom + (float(t_grade) if t_grade is not None else 0.0)
+            elif subtype == 'IDTOC':
+                if I_gg is not None and i_ka >= I_gg:
+                    t = float(t_gg) if t_gg is not None else float('inf')
+                elif I_g is not None and i_ka >= I_g:
+                    t = float(t_g) if t_g is not None else float('inf')
+                elif I_s is not None and i_ka > I_s and tms is not None and k is not None and alpha is not None:
+                    denom = ((i_ka / float(I_s)) ** float(alpha)) - 1.0
+                    if denom > 0:
+                        t = (float(tms) * float(k)) / denom + (float(t_grade) if t_grade is not None else 0.0)
+            currents.append(float(i_a))
+            times.append(t if math.isfinite(t) else None)
+        return currents, times
+    except Exception as e:
+        print(f"Protection: failed to sample OCRelay characteristic - {e}")
+        return [], []
+
+
+def fuse_characteristic_preview(row):
+    """
+    Sample a fuse I–t melting curve for the Switch dialog (library or custom std_types).
+    Mirrors what ``Fuse.plot_protection_characteristic(net)`` visualizes, as JSON for Chart.js.
+
+    Expected keys on ``row`` (same request object shape as other *PandaPower types):
+    fuse_mode, fuse_type, rated_i_a, fuse_custom_std_json (optional).
+    """
+    try:
+        from pandapower.protection.protection_devices.fuse import Fuse
+    except ImportError as e:
+        return json.dumps({
+            'error': True,
+            'message': f'pandapower Fuse unavailable: {e}',
+            'i_a': [], 't_s': [],
+        }, separators=(',', ':'))
+
+    fuse_mode = str(row.get('fuse_mode', 'library') or 'library').strip().lower()
+    fuse_type = str(row.get('fuse_type') or '').strip()
+    rated = _prot_safe_float(row.get('rated_i_a'))
+
+    if fuse_mode != 'custom' and not fuse_type:
+        return json.dumps({
+            'error': True, 'message': 'No fuse type selected.',
+            'i_a': [], 't_s': [],
+        }, separators=(',', ':'))
+    if fuse_mode == 'custom' and not fuse_type:
+        return json.dumps({
+            'error': True, 'message': 'Enter a custom fuse name.',
+            'i_a': [], 't_s': [],
+        }, separators=(',', ':'))
+    if fuse_mode == 'custom' and (rated is None or float(rated) <= 0):
+        return json.dumps({
+            'error': True, 'message': 'Rated current must be positive for a custom fuse preview.',
+            'i_a': [], 't_s': [],
+        }, separators=(',', ':'))
+
+    try:
+        net = pp.create_empty_network()
+        pp.create_bus(net, vn_kv=20.0, name='fuse_preview_a')
+        pp.create_bus(net, vn_kv=20.0, name='fuse_preview_b')
+        sw_idx = pp.create_switch(net, bus=0, element=1, et='b', closed=True,
+                                  name='fuse_preview_sw', type='CB')
+        _prot_ensure_bus_geodata(net)
+
+        if fuse_mode == 'custom':
+            spec = {
+                'protection_type': _PROTECTION_KIND_FUSE,
+                'fuse_type': fuse_type,
+                'fuse_mode': 'custom',
+                'rated_i_a': rated,
+                'fuse_custom_std_json': row.get('fuse_custom_std_json'),
+            }
+            reg_errs = _prot_register_custom_fuse_std_types(net, {'preview': spec})
+            if reg_errs:
+                return json.dumps({
+                    'error': True,
+                    'message': str(reg_errs[0].get('reason', 'Custom fuse registration failed')),
+                    'i_a': [], 't_s': [],
+                }, separators=(',', ':'))
+
+        kwargs = {'switch_index': int(sw_idx)}
+        if fuse_type:
+            kwargs['fuse_type'] = fuse_type
+        if rated is not None:
+            kwargs['rated_i_a'] = float(rated)
+        device = Fuse(net, **kwargs)
+        i_a, t_s = _prot_sample_fuse_characteristic(device, net, n_points=120)
+
+        out_i, out_t = [], []
+        for a, t in zip(i_a, t_s):
+            if t is None:
+                continue
+            try:
+                tf = float(t)
+                af = float(a)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(tf) or tf <= 0 or not math.isfinite(af) or af <= 0:
+                continue
+            out_i.append(af)
+            out_t.append(tf)
+
+        axis_payload = {}
+        try:
+            char_obj = net.characteristic.at[int(device.characteristic_index), 'object']
+            xv = np.asarray(char_obj.x_vals, dtype=float)
+            yv = np.asarray(char_obj.y_vals, dtype=float)
+            if xv.size and yv.size:
+                t_hi = max(float(np.max(out_t)) if out_t else 0.0, float(10 ** np.ceil(np.max(yv))))
+                axis_payload = {
+                    'i_a_min': float(10 ** np.floor(np.min(xv))),
+                    'i_a_max': float(10 ** np.ceil(np.max(xv))),
+                    't_s_min': float(10 ** np.floor(np.min(yv))),
+                    't_s_max': float(max(t_hi * 1.05, 10 ** np.ceil(np.max(yv)))),
+                }
+        except Exception:
+            pass
+
+        return json.dumps({
+            'error': False,
+            'fuse_type': fuse_type,
+            'fuse_mode': fuse_mode,
+            'i_a': out_i,
+            't_s': out_t,
+            'axis': axis_payload,
+        }, separators=(',', ':'))
+    except Exception as e:
+        import traceback
+        traceback.print_exc(limit=8)
+        return json.dumps({
+            'error': True,
+            'message': str(e),
+            'i_a': [], 't_s': [],
+            'axis': {},
+        }, separators=(',', ':'))
+
+
+def _prot_sample_fuse_characteristic(device, net, n_points=80):
+    """Sample the fuse melting curve from net.characteristic[char_idx]."""
+    try:
+        char_idx = getattr(device, 'characteristic_index', None)
+        if char_idx is None or not hasattr(net, 'characteristic'):
+            return [], []
+        char_obj = net.characteristic.at[char_idx, 'object']
+        x_vals_arr = getattr(char_obj, 'x_vals', None)
+        if x_vals_arr is None:
+            return [], []
+        x_vals = list(np.asarray(x_vals_arr).flatten())
+        if len(x_vals) == 0:
+            return [], []
+        # pandapower's LogSplineCharacteristic stores log10 values in x_vals.
+        x_min_log = float(min(x_vals))
+        x_max_log = float(max(x_vals))
+        x_logspaced = np.logspace(x_min_log, x_max_log, int(n_points))
+        try:
+            y_logspaced = np.asarray(char_obj(x_logspaced)).flatten()
+        except Exception:
+            y_logspaced = np.asarray([char_obj(float(v)) for v in x_logspaced]).flatten()
+        currents = [float(v) for v in np.asarray(x_logspaced).flatten()]
+        times = []
+        for v in y_logspaced:
+            try:
+                fv = float(v)
+                times.append(fv if math.isfinite(fv) and fv > 0 else None)
+            except (TypeError, ValueError):
+                times.append(None)
+        pairs = [(c, t) for c, t in zip(currents, times) if t is not None]
+        pairs.sort(key=lambda p: p[0])
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+    except Exception as e:
+        print(f"Protection: failed to sample Fuse characteristic - {e}")
+        return [], []
+
+
+def _prot_device_settings_for_ui(device, attach_summary):
+    """
+    Extract user-visible settings from a pandapower protection device object.
+
+    OCRelay stores pickup currents (I_g, I_gg, I_s) in kA; we expose those plus
+    Ampere-scaled aliases (I_g_a, I_gg_a, I_s_a) so the UI can pick the unit it
+    wants without re-deriving conversions.
+    """
+    out = {}
+    for attr in ('oc_relay_type', 'curve_type', 'tms', 't_grade', 't_gg', 't_g', 't_diff',
+                 'pickup_current', 'I_s', 'I_g', 'I_gg',
+                 'rated_i_a', 'fuse_type', 'overload_factor', 'ct_current_factor', 'safety_factor'):
+        v = getattr(device, attr, None)
+        if v is None:
+            continue
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            fv = float(v)
+            if not math.isnan(fv) and math.isfinite(fv):
+                out[attr] = fv
+        elif isinstance(v, str):
+            out[attr] = v
+
+    # Add Ampere-scaled aliases (OCRelay internal currents are kA).
+    if 'I_g' in out and 'I_g_a' not in out:
+        out['I_g_a'] = out['I_g'] * 1000.0
+    if 'I_gg' in out and 'I_gg_a' not in out:
+        out['I_gg_a'] = out['I_gg'] * 1000.0
+    if 'I_s' in out and 'I_s_a' not in out:
+        out['I_s_a'] = out['I_s'] * 1000.0
+    return out
+
+
+def _prot_extract_devices_for_ui(net, attach_summaries):
+    """
+    Iterate pandapower's net.protection table and produce per-device payloads:
+    settings + sampled I-t characteristic. attach_summaries provides the
+    mapping back to the frontend switch id.
+    """
+    devices = []
+    if not hasattr(net, 'protection'):
+        return devices
+    prot_df = getattr(net, 'protection', None)
+    if prot_df is None or len(prot_df) == 0:
+        return devices
+
+    summary_by_sw_idx = {}
+    for s in attach_summaries:
+        sw_idx = s.get('sw_idx')
+        if sw_idx is not None:
+            summary_by_sw_idx[int(sw_idx)] = s
+
+    for idx, prow in prot_df.iterrows():
+        device = prow.get('object') if 'object' in prow.index else None
+        if device is None:
+            continue
+        sw_idx = getattr(device, 'switch_index', None)
+        if sw_idx is None and 'switch_index' in prow.index:
+            sw_idx = prow['switch_index']
+        sw_idx = int(sw_idx) if sw_idx is not None and not (isinstance(sw_idx, float) and math.isnan(sw_idx)) else None
+        summary = summary_by_sw_idx.get(sw_idx, {}) if sw_idx is not None else {}
+
+        device_class = type(device).__name__  # 'OCRelay' / 'Fuse' / ...
+        kind = summary.get('kind') or device_class
+        if device_class == 'OCRelay':
+            subtype = summary.get('subtype') or getattr(device, 'oc_relay_type', None)
+            curve_type = summary.get('curve_type') or getattr(device, 'curve_type', None)
+        elif device_class == 'Fuse':
+            subtype = getattr(device, 'fuse_type', None) or summary.get('fuse_type')
+            curve_type = 'fuse_melting_curve'
+        else:
+            subtype = summary.get('subtype')
+            curve_type = summary.get('curve_type')
+
+        settings = _prot_device_settings_for_ui(device, summary)
+
+        if device_class == 'OCRelay':
+            i_a, t_s = _prot_sample_oc_relay_characteristic(device)
+        elif device_class == 'Fuse':
+            # Dense sampling helps Chart.js draw smooth fuse melting curves on log-log axes.
+            i_a, t_s = _prot_sample_fuse_characteristic(device, net, n_points=180)
+        else:
+            i_a, t_s = [], []
+
+        devices.append({
+            'protection_idx': int(idx),
+            'switch_idx': sw_idx,
+            'switch_id': summary.get('switch_id'),
+            'switch_name': summary.get('switch_name'),
+            'user_friendly_name': summary.get('user_friendly_name'),
+            'type': kind,
+            'subtype': subtype,
+            'curve_type': curve_type,
+            'settings': settings,
+            'characteristic': {'i_a': i_a, 't_s': t_s},
+        })
+
+    return devices
+
+
+def _prot_fault_bus_label(net, fault_bus_idx):
+    """Best-effort label for the fault bus (id, name, or index)."""
+    try:
+        if fault_bus_idx in net.bus.index:
+            row = net.bus.loc[fault_bus_idx]
+            label_id = row['id'] if 'id' in row.index and pd.notna(row['id']) else None
+            label_name = row['name'] if 'name' in row.index and pd.notna(row['name']) else None
+            return str(label_id or label_name or fault_bus_idx)
+    except Exception:
+        pass
+    return str(fault_bus_idx)
+
+
+def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, attach_summaries):
+    """
+    Run a single fault scenario on a copy of the network and return:
+    - per-device trip rows (switch_id, tripped, t_trip_s, ikss_ka)
+    - the fault bus label
+    Uses pandapower.protection.utility_functions.create_sc_bus + sc.calc_sc +
+    calculate_protection_times.
+    """
+    try:
+        from pandapower.protection.utility_functions import create_sc_bus
+        from pandapower.protection.run_protection import calculate_protection_times
+    except ImportError as e:
+        return {
+            'sc_line_id': int(sc_line_id),
+            'sc_fraction': float(sc_fraction),
+            'error': f'pandapower.protection is unavailable: {e}',
+            'fault_bus': None,
+            'trip': [],
+        }
+
+    # Map sw_idx -> frontend summary so the trip rows show user-friendly labels.
+    summary_by_sw_idx = {int(s['sw_idx']): s for s in attach_summaries if s.get('sw_idx') is not None}
+
+    try:
+        net_sc = create_sc_bus(deepcopy(base_net), sc_line_id=int(sc_line_id), sc_fraction=float(sc_fraction))
+    except Exception as e:
+        return {
+            'sc_line_id': int(sc_line_id),
+            'sc_fraction': float(sc_fraction),
+            'error': f'create_sc_bus failed: {e}',
+            'fault_bus': None,
+            'trip': [],
+        }
+
+    try:
+        fault_bus = int(max(net_sc.bus.index))
+        sc.calc_sc(net_sc, bus=fault_bus, branch_results=True, fault=fault_type, case=case)
+    except Exception as e:
+        return {
+            'sc_line_id': int(sc_line_id),
+            'sc_fraction': float(sc_fraction),
+            'error': f'calc_sc failed: {e}',
+            'fault_bus': None,
+            'trip': [],
+        }
+
+    try:
+        prot_results = calculate_protection_times(net_sc, scenario='sc')
+    except Exception as e:
+        return {
+            'sc_line_id': int(sc_line_id),
+            'sc_fraction': float(sc_fraction),
+            'error': f'calculate_protection_times failed: {e}',
+            'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
+            'trip': [],
+        }
+
+    trip_rows = []
+
+    def _clean(v):
+        if v is None:
+            return None
+        if isinstance(v, (float, np.floating)):
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                return None
+            return fv
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if isinstance(v, (int, np.integer)):
+            return int(v)
+        return str(v)
+
+    if prot_results is not None and not getattr(prot_results, 'empty', True):
+        for _, row in prot_results.iterrows():
+            # pandapower 3.x calculate_protection_times columns: switch_id, protection_type,
+            # trip_melt, activation_parameter, activation_parameter_value, trip_melt_time_s.
+            sw_idx_val = row.get('switch_id') if 'switch_id' in row.index else None
+            try:
+                sw_idx_int = int(sw_idx_val) if sw_idx_val is not None else None
+            except (TypeError, ValueError):
+                sw_idx_int = None
+            summary = summary_by_sw_idx.get(sw_idx_int, {}) if sw_idx_int is not None else {}
+
+            t_trip = None
+            for col in ('trip_melt_time_s', 'trip_time', 'trip time [s]', 'trip_time_s'):
+                if col in row.index:
+                    t_trip = row[col]
+                    break
+
+            ikss = None
+            for col in ('activation_parameter_value', 'ikss_ka', 'ikss'):
+                if col in row.index:
+                    ikss = row[col]
+                    break
+
+            tripped = None
+            for col in ('trip_melt', 'tripped'):
+                if col in row.index:
+                    tripped = row[col]
+                    break
+            if tripped is None and t_trip is not None:
+                try:
+                    tripped = math.isfinite(float(t_trip))
+                except (TypeError, ValueError):
+                    tripped = False
+
+            device_kind = summary.get('kind') or row.get('protection_type', 'Unknown')
+            device_subtype = summary.get('subtype') or summary.get('fuse_type')
+            device_label = f"{device_kind}-{device_subtype}".strip('-') if device_subtype else str(device_kind)
+
+            trip_rows.append({
+                'switch_idx': sw_idx_int,
+                'switch_id': summary.get('switch_id'),
+                'switch_name': summary.get('switch_name'),
+                'user_friendly_name': summary.get('user_friendly_name'),
+                'device': device_label,
+                'tripped': bool(_clean(tripped)) if tripped is not None else False,
+                't_trip_s': _clean(t_trip),
+                'ikss_ka': _clean(ikss),
+            })
+
+    return {
+        'sc_line_id': int(sc_line_id),
+        'sc_fraction': float(sc_fraction),
+        'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
+        'fault_type': fault_type,
+        'case': case,
+        'trip': trip_rows,
+    }
+
+
+def _prot_check_miscoordination(scenarios, t_diff):
+    """
+    Identify primary/backup pairs whose `t_backup - t_primary < t_diff`.
+    For each scenario, sort tripped devices by t_trip_s and flag adjacent pairs.
+    """
+    miscoord = []
+    for scenario in scenarios:
+        trips = [t for t in scenario.get('trip', []) if t.get('tripped') and t.get('t_trip_s') is not None]
+        trips.sort(key=lambda r: r['t_trip_s'])
+        for i in range(len(trips) - 1):
+            primary = trips[i]
+            backup = trips[i + 1]
+            delta_t = float(backup['t_trip_s']) - float(primary['t_trip_s'])
+            if delta_t < t_diff:
+                miscoord.append({
+                    'sc_line_id': scenario.get('sc_line_id'),
+                    'sc_fraction': scenario.get('sc_fraction'),
+                    'fault_bus': scenario.get('fault_bus'),
+                    'primary_switch_id': primary.get('switch_id'),
+                    'primary_user_friendly_name': primary.get('user_friendly_name'),
+                    'primary_t_s': primary.get('t_trip_s'),
+                    'backup_switch_id': backup.get('switch_id'),
+                    'backup_user_friendly_name': backup.get('user_friendly_name'),
+                    'backup_t_s': backup.get('t_trip_s'),
+                    'delta_t_s': delta_t,
+                    'required_t_diff_s': float(t_diff),
+                })
+    return miscoord
+
+
+def protection_coordination(net, prot_params, in_data):
+    """
+    Run a complete protection coordination study.
+
+    Returns a JSON string containing scenarios (trip tables), per-device settings +
+    sampled time-current characteristics for the UI to plot, and a miscoordination
+    summary. The function never raises into Flask: any failure is wrapped in an
+    error JSON so the frontend can show a meaningful message.
+    """
+    try:
+        fault_type = prot_params.get('fault_type', '3ph')
+        if fault_type not in ('3ph', '2ph', '1ph'):
+            fault_type = '3ph'
+        case = prot_params.get('case', 'max')
+        if case not in ('max', 'min'):
+            case = 'max'
+        sc_line_id_raw = prot_params.get('sc_line_id')
+        sc_fraction = float(prot_params.get('sc_fraction', 0.5))
+        if not (0.0 < sc_fraction < 1.0):
+            sc_fraction = 0.5
+        t_diff = float(prot_params.get('t_diff', 0.3))
+
+        # Validate connectivity early so we surface a clear message before sc.calc_sc.
+        isolated_buses = top.unsupplied_buses(net)
+        if len(isolated_buses) > 0:
+            return json.dumps({
+                'error': True,
+                'message': f'Isolated buses found: {sorted(isolated_buses)}. Connect every component to a supplied bus before running protection coordination.',
+                'scenarios': [],
+                'devices': [],
+                'summary': {'converged': False},
+            }, separators=(',', ':'))
+
+        if net.switch.empty:
+            return json.dumps({
+                'error': True,
+                'message': 'No switches found. Protection coordination requires Switch components on the diagram (one per protected element).',
+                'scenarios': [],
+                'devices': [],
+                'summary': {'converged': False},
+            }, separators=(',', ':'))
+
+        # Attach protection devices based on the frontend Switch attributes.
+        specs = _prot_collect_switch_protection_specs(in_data)
+        if not specs:
+            return json.dumps({
+                'error': True,
+                'message': 'No protection device assigned. Open at least one Switch dialog, go to the Protection tab and pick a protection type (OCR / Fuse).',
+                'scenarios': [],
+                'devices': [],
+                'summary': {'converged': False},
+            }, separators=(',', ':'))
+
+        # Ensure bus geodata exists before any pandapower.protection call so
+        # create_sc_bus and time_grading do not raise on missing coordinates.
+        _prot_ensure_bus_geodata(net)
+
+        attach_summaries = _attach_protection_devices(net, specs)
+        attached_count = sum(1 for s in attach_summaries if s.get('attached'))
+        not_computed_count = sum(1 for s in attach_summaries if s.get('not_computed'))
+
+        if attached_count == 0:
+            return json.dumps({
+                'error': True,
+                'message': 'No protection device could be attached to the network. See `attach_summaries` for details.',
+                'attach_summaries': attach_summaries,
+                'scenarios': [],
+                'devices': [],
+                'summary': {'converged': False, 'n_devices': 0, 'n_attached': 0, 'n_not_computed': not_computed_count},
+            }, separators=(',', ':'))
+
+        # Build the list of fault scenarios.
+        if sc_line_id_raw in (None, '', 'all'):
+            line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
+        else:
+            try:
+                line_ids = [int(sc_line_id_raw)]
+            except (TypeError, ValueError):
+                line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
+
+        scenarios = []
+        for line_id in line_ids:
+            scenarios.append(_prot_run_scenario(net, line_id, sc_fraction, fault_type, case, attach_summaries))
+
+        # Sample characteristics on the unmodified net so curves do not include the sc_bus.
+        devices = _prot_extract_devices_for_ui(net, attach_summaries)
+
+        miscoord = _prot_check_miscoordination(scenarios, t_diff)
+
+        n_tripped = sum(1 for sc_res in scenarios for trip in sc_res.get('trip', []) if trip.get('tripped'))
+        response = {
+            'error': False,
+            'scenarios': scenarios,
+            'devices': devices,
+            'attach_summaries': attach_summaries,
+            'summary': {
+                'converged': True,
+                'n_devices': len(devices),
+                'n_attached': attached_count,
+                'n_not_computed': not_computed_count,
+                'n_scenarios': len(scenarios),
+                'n_tripped': n_tripped,
+                'n_miscoordination': len(miscoord),
+                'fault_type': fault_type,
+                'case': case,
+                't_diff_s': t_diff,
+            },
+            'miscoordination': miscoord,
+        }
+        return json.dumps(response, default=_json_serialize_default, separators=(',', ':'))
+    except Exception as e:
+        import traceback
+        return json.dumps({
+            'error': True,
+            'message': f'Protection coordination failed: {e}',
+            'traceback': traceback.format_exc(limit=20),
+            'scenarios': [],
+            'devices': [],
+            'summary': {'converged': False},
+        }, separators=(',', ':'))

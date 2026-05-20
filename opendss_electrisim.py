@@ -1209,6 +1209,43 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             pass
     else:
         pass
+
+
+def _opendss_n_per_terminal(n_conductors, n_phases):
+    """P/Q pairs per terminal in CktElement.Powers() / Currents()."""
+    if n_conductors:
+        return int(n_conductors) * 2
+    return int(n_phases or 3) * 2
+
+
+def _opendss_terminal_pq_kw(powers, terminal_index, n_conductors=0, n_phases=3):
+    """Sum active (kW) and reactive (kvar) power for one OpenDSS terminal."""
+    n_per_terminal = _opendss_n_per_terminal(n_conductors, n_phases)
+    start = terminal_index * n_per_terminal
+    p_kw = 0.0
+    q_kvar = 0.0
+    for i in range(0, min(n_per_terminal, max(0, len(powers) - start)), 2):
+        p_kw += float(powers[start + i])
+        if start + i + 1 < len(powers):
+            q_kvar += float(powers[start + i + 1])
+    return p_kw, q_kvar
+
+
+def _opendss_terminal_i_ka(currents, terminal_index, n_conductors=0, n_phases=3):
+    """Average phase/conductor current magnitude (kA) for one OpenDSS terminal."""
+    n_per_terminal = _opendss_n_per_terminal(n_conductors, n_phases)
+    start = terminal_index * n_per_terminal
+    n_cond = int(n_conductors) if n_conductors else int(n_phases or 3)
+    i_sum = 0.0
+    count = 0
+    for c in range(n_cond):
+        idx = start + c * 2
+        if idx + 1 < len(currents):
+            i_sum += math.sqrt(float(currents[idx]) ** 2 + float(currents[idx + 1]) ** 2)
+            count += 1
+    return (i_sum / count / 1000.0) if count else 0.0
+
+
 def vector_group_to_opendss_conns(vector_group):
     """Convert vector group notation to OpenDSS connection format
     
@@ -3164,15 +3201,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Initialize power values
                 p_hv_mw = q_hv_mvar = p_lv_mw = q_lv_mvar = pl_mw = ql_mvar = 0.0
                 
-                if len(powers) >= 12:
-                    # Debug: Print per-phase powers for detailed analysis
-
-                    # HV side (Terminal 1): phases 1, 2, 3
-                    p_hv_kw = powers[0] + powers[2] + powers[4]
-                    q_hv_kvar = powers[1] + powers[3] + powers[5]
-                    # LV side (Terminal 2): phases 1, 2, 3 — indices 6..11 (pairs P,Q per phase), same layout as lines code below
-                    p_lv_kw = powers[6] + powers[8] + powers[10]
-                    q_lv_kvar = powers[7] + powers[9] + powers[11]
+                if len(powers) >= 6:
+                    n_conductors = dss.CktElement.NumConductors()
+                    n_phases = dss.CktElement.NumPhases()
+                    p_hv_kw, q_hv_kvar = _opendss_terminal_pq_kw(powers, 0, n_conductors, n_phases)
+                    p_lv_kw, q_lv_kvar = _opendss_terminal_pq_kw(powers, 1, n_conductors, n_phases)
                     
                     # Convert to MW/MVAr
                     p_hv_mw = p_hv_kw / 1000.0 if not math.isnan(p_hv_kw) else 0.0
@@ -3205,18 +3238,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Get complex currents [I1_real, I1_imag, I2_real, I2_imag, I3_real, I3_imag, ...] in Amperes
                 currents = dss.CktElement.Currents()
                 
-                if len(currents) >= 12:
-                    # Terminal 1 (HV): Calculate magnitude for each phase
-                    i1_hv = math.sqrt(currents[0]**2 + currents[1]**2)  # Phase 1
-                    i2_hv = math.sqrt(currents[2]**2 + currents[3]**2)  # Phase 2
-                    i3_hv = math.sqrt(currents[4]**2 + currents[5]**2)  # Phase 3
-                    i_hv_ka = (i1_hv + i2_hv + i3_hv) / 3 / 1000  # Average magnitude in kA
-                    
-                    # Terminal 2 (LV): Calculate magnitude for each phase
-                    i1_lv = math.sqrt(currents[6]**2 + currents[7]**2)   # Phase 1
-                    i2_lv = math.sqrt(currents[8]**2 + currents[9]**2)   # Phase 2
-                    i3_lv = math.sqrt(currents[10]**2 + currents[11]**2) # Phase 3
-                    i_lv_ka = (i1_lv + i2_lv + i3_lv) / 3 / 1000  # Average magnitude in kA
+                if len(currents) >= 6:
+                    n_conductors = dss.CktElement.NumConductors()
+                    n_phases = dss.CktElement.NumPhases()
+                    i_hv_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases)
+                    i_lv_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases)
                 else:
                     i_hv_ka = i_lv_ka = 0.0
 
@@ -3361,17 +3387,23 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             if is_enabled:
                 powers = dss.CktElement.Powers()
                 currents = dss.CktElement.Currents()
-                if len(powers) >= 18:
-                    p_hv_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
-                    q_hv_mvar = (powers[1] + powers[3] + powers[5]) / 1000.0
-                    p_mv_mw = (powers[6] + powers[8] + powers[10]) / 1000.0
-                    q_mv_mvar = (powers[7] + powers[9] + powers[11]) / 1000.0
-                    p_lv_mw = (powers[12] + powers[14] + powers[16]) / 1000.0
-                    q_lv_mvar = (powers[13] + powers[15] + powers[17]) / 1000.0
-                if len(currents) >= 18:
-                    i_hv_ka = (math.sqrt(currents[0]**2 + currents[1]**2) + math.sqrt(currents[2]**2 + currents[3]**2) + math.sqrt(currents[4]**2 + currents[5]**2)) / 3 / 1000.0
-                    i_mv_ka = (math.sqrt(currents[6]**2 + currents[7]**2) + math.sqrt(currents[8]**2 + currents[9]**2) + math.sqrt(currents[10]**2 + currents[11]**2)) / 3 / 1000.0
-                    i_lv_ka = (math.sqrt(currents[12]**2 + currents[13]**2) + math.sqrt(currents[14]**2 + currents[15]**2) + math.sqrt(currents[16]**2 + currents[17]**2)) / 3 / 1000.0
+                n_conductors = dss.CktElement.NumConductors()
+                n_phases = dss.CktElement.NumPhases()
+                n_terminals = dss.CktElement.NumTerminals()
+                if len(powers) >= 6 and n_terminals >= 3:
+                    p_hv_kw, q_hv_kvar = _opendss_terminal_pq_kw(powers, 0, n_conductors, n_phases)
+                    p_mv_kw, q_mv_kvar = _opendss_terminal_pq_kw(powers, 1, n_conductors, n_phases)
+                    p_lv_kw, q_lv_kvar = _opendss_terminal_pq_kw(powers, 2, n_conductors, n_phases)
+                    p_hv_mw = p_hv_kw / 1000.0
+                    q_hv_mvar = q_hv_kvar / 1000.0
+                    p_mv_mw = p_mv_kw / 1000.0
+                    q_mv_mvar = q_mv_kvar / 1000.0
+                    p_lv_mw = p_lv_kw / 1000.0
+                    q_lv_mvar = q_lv_kvar / 1000.0
+                if len(currents) >= 6 and n_terminals >= 3:
+                    i_hv_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases)
+                    i_mv_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases)
+                    i_lv_ka = _opendss_terminal_i_ka(currents, 2, n_conductors, n_phases)
                 sn_hv = 100.0  # default
                 for elem_key, elem_data in in_data.items():
                     if isinstance(elem_data, dict) and elem_data.get('typ', '').startswith('Three Winding'):

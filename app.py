@@ -147,6 +147,12 @@ def simulation():
         #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
         for x in in_data:    
             #print(x)
+            if "FuseCharacteristicPreviewPandaPower" in in_data[x].get('typ', ''):
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== FUSE CHARACTERISTIC PREVIEW: {user_email} ===")
+                body = pandapower_electrisim.fuse_characteristic_preview(in_data[x])
+                return Response(body, mimetype='application/json')
+
             if "OptimalPowerFlowPandaPower" in in_data[x]['typ']:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
@@ -467,7 +473,46 @@ def simulation():
                     return response
                 else:
                     return response_data
-            
+
+            if "ProtectionCoordinationPandaPower" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== PROTECTION COORDINATION REQUESTED BY USER: {user_email} ===")
+
+                prot_params = {
+                    'fault_type': in_data[x].get('fault_type', '3ph'),
+                    'case': in_data[x].get('case', 'max'),
+                    'sc_line_id': in_data[x].get('sc_line_id'),
+                    'sc_fraction': in_data[x].get('sc_fraction', 0.5),
+                    'grading_mode': in_data[x].get('grading_mode', 'auto'),
+                    'curve_type': in_data[x].get('curve_type', 'standard_inverse'),
+                    'overload_factor': in_data[x].get('overload_factor', 1.25),
+                    'ct_current_factor': in_data[x].get('ct_current_factor', 1.2),
+                    'safety_factor': in_data[x].get('safety_factor', 1.0),
+                    't_diff': in_data[x].get('t_diff', 0.3),
+                    't_g': in_data[x].get('t_g', 0.5),
+                    't_gg': in_data[x].get('t_gg', 0.07),
+                    'tms': in_data[x].get('tms', 1.0),
+                    't_grade': in_data[x].get('t_grade', 0.5),
+                    'export_results': in_data[x].get('export_results', False),
+                }
+
+                net = pp.create_empty_network()
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+
+                response_data = pandapower_electrisim.protection_coordination(net, prot_params, in_data)
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
             if "EconomicAnalysisPandaPower" in in_data[x]['typ']:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
@@ -620,12 +665,32 @@ def pandapower_net_to_json(net):
                 pass
         return val
 
+    def _bus_geo_xy_from_cell(val):
+        """Return (x, y) from pandapower bus ``geo`` cell (GeoJSON Point) or (None, None)."""
+        if val is None:
+            return None, None
+        try:
+            if pd.isna(val):
+                return None, None
+        except Exception:
+            pass
+        try:
+            if isinstance(val, dict):
+                coord = val.get('coordinates')
+                if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                    return float(coord[0]), float(coord[1])
+        except (TypeError, ValueError):
+            return None, None
+        return None, None
+
     def normalize_bus_rows():
         df = net.bus
         if df.empty:
             return []
         used = set()
         names_out = []
+        geo_x_out = []
+        geo_y_out = []
         for idx in df.index:
             raw = df.at[idx, 'name'] if 'name' in df.columns else None
             if _is_blank_name(raw):
@@ -639,11 +704,18 @@ def pandapower_net_to_json(net):
                 uniq = f'{base}_{dup}'
             used.add(uniq)
             names_out.append(uniq)
+            gx, gy = None, None
+            if 'geo' in df.columns:
+                gx, gy = _bus_geo_xy_from_cell(df.at[idx, 'geo'])
+            geo_x_out.append(gx)
+            geo_y_out.append(gy)
         slim = pd.DataFrame({
             'name': names_out,
             'vn_kv': df['vn_kv'].values if 'vn_kv' in df.columns else 0.0,
             'type': df['type'].values if 'type' in df.columns else 'b',
             'in_service': df['in_service'].values if 'in_service' in df.columns else True,
+            'geo_x': geo_x_out,
+            'geo_y': geo_y_out,
         }, index=df.index)
         return dataframe_to_list(slim)
 
@@ -782,6 +854,55 @@ def pandapower_net_to_json(net):
                 slim.at[idx, 'name'] = f'Line_{idx}'
         return dataframe_to_list(slim)
 
+    def normalize_switch_rows():
+        """Export pandapower switches for Electrisim import (protection coordination).
+
+        Each row: [name, bus_name, element_name, et, closed, type, z_ohm, in_ka]
+        bus_name / element_name match XML ``name`` on imported buses / lines / trafos.
+        """
+        if not hasattr(net, 'switch') or net.switch is None or getattr(net.switch, 'empty', True):
+            return []
+        rows = []
+        for idx in net.switch.index:
+            r = net.switch.loc[idx]
+            nm = r['name'] if 'name' in net.switch.columns else None
+            if _is_blank_name(nm):
+                nm = f'Switch_{idx}'
+            bus_i = int(_scalar(r['bus']))
+            try:
+                bus_nm = net.bus.at[bus_i, 'name'] if bus_i in net.bus.index else None
+            except Exception:
+                bus_nm = None
+            if _is_blank_name(bus_nm):
+                bus_nm = f'Bus_{bus_i}'
+            et = _scalar(r['et']) if 'et' in net.switch.columns else 'l'
+            if et is None or str(et).strip() == '':
+                et = 'l'
+            et = str(et)
+            el_i = int(_scalar(r['element']))
+            elem_nm = None
+            try:
+                if et == 'l' and not net.line.empty and el_i in net.line.index:
+                    elem_nm = net.line.at[el_i, 'name']
+                elif et == 't' and not net.trafo.empty and el_i in net.trafo.index:
+                    elem_nm = net.trafo.at[el_i, 'name']
+                elif et == 't3' and hasattr(net, 'trafo3w') and not net.trafo3w.empty and el_i in net.trafo3w.index:
+                    elem_nm = net.trafo3w.at[el_i, 'name']
+                elif et == 'b' and el_i in net.bus.index:
+                    elem_nm = net.bus.at[el_i, 'name']
+            except Exception:
+                elem_nm = None
+            if _is_blank_name(elem_nm):
+                elem_nm = str(el_i)
+            closed = True
+            if 'closed' in net.switch.columns and r.get('closed') is not None:
+                closed = bool(_scalar(r['closed']))
+            sw_type = _scalar(r['type']) if 'type' in net.switch.columns and r.get('type') is not None else 'CB'
+            zohm = _scalar(r['z_ohm']) if 'z_ohm' in net.switch.columns else 0.0
+            inka = _scalar(r['in_ka']) if 'in_ka' in net.switch.columns else float('nan')
+            rows.append([nm, bus_nm, elem_nm, et, closed, sw_type, zohm, inka])
+        return rows
+
     model = {
         "_object": {
             "bus": {
@@ -792,6 +913,11 @@ def pandapower_net_to_json(net):
             "line": {
                 "_object": json.dumps({
                     "data": normalize_line_rows()
+                })
+            },
+            "switch": {
+                "_object": json.dumps({
+                    "data": normalize_switch_rows()
                 })
             },
             "ext_grid": {
