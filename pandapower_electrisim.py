@@ -3623,7 +3623,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 class BusbarOut(object):
                     def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float, q_p: float,
-                                 p_branch_mw: float = 0.0, q_branch_mvar: float = 0.0):
+                                 p_branch_mw: float = 0.0, q_branch_mvar: float = 0.0, vm_kv: float = None):
                         self.name = name
                         self.id = id
                         self.vm_pu = vm_pu
@@ -3634,6 +3634,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         self.q_p = q_p
                         self.p_branch_mw = p_branch_mw
                         self.q_branch_mvar = q_branch_mvar
+                        self.vm_kv = vm_kv
                         
                 class BusbarsOut(object):
                     def __init__(self, busbars: List[BusbarOut]):
@@ -4083,11 +4084,17 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     if math.isnan(q_p) or math.isinf(q_p):
                         q_p = 0.0
                     p_br, q_br = _electrisim_bus_branch_p_q_sum(net, index)
+                    _vm_pu = row['vm_pu']
+                    _vn_kv = float(net.bus.at[index, 'vn_kv'])
+                    _vm_kv = None
+                    if _vn_kv > 0 and _vm_pu == _vm_pu and not math.isnan(_vm_pu):
+                        _vm_kv = float(_vm_pu) * _vn_kv
                     busbar = BusbarOut(
                         name=net.bus._get_value(index, 'name'), id=net.bus._get_value(index, 'id'),
-                        vm_pu=row['vm_pu'], va_degree=row['va_degree'],
+                        vm_pu=_vm_pu, va_degree=row['va_degree'],
                         p_mw=p_mw, q_mvar=q_mvar, pf=pf, q_p=q_p,
                         p_branch_mw=p_br, q_branch_mvar=q_br,
+                        vm_kv=_vm_kv,
                     )
                     busbarList.append(busbar) 
                     busbars = BusbarsOut(busbars = busbarList)

@@ -7,7 +7,8 @@ import re
 # Output classes for OpenDSS results (similar to pandapower_electrisim.py structure)
 class BusbarOut(object):
     def __init__(self, name: str, id: str, vm_pu: float, va_degree: float,
-                 p_mw: float = None, q_mvar: float = None, pf: float = None, q_p: float = None):
+                 p_mw: float = None, q_mvar: float = None, pf: float = None, q_p: float = None,
+                 vm_kv: float = None):
         self.name = name
         self.id = id
         self.vm_pu = vm_pu
@@ -16,6 +17,7 @@ class BusbarOut(object):
         self.q_mvar = q_mvar
         self.pf = pf
         self.q_p = q_p
+        self.vm_kv = vm_kv
                         
 class BusbarsOut(object):
     def __init__(self, busbars: List[BusbarOut]):
@@ -2913,7 +2915,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     p_mw=p_mw,
                     q_mvar=q_mvar,
                     pf=pf,
-                    q_p=q_p
+                    q_p=q_p,
+                    vm_kv=V1_mag_ll_kv if V1_mag_ll_kv == V1_mag_ll_kv else None,
                 )
                 busbarList.append(busbar)
                 # print(f"    ✓ Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")  # Reduced logging
@@ -2922,6 +2925,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Add with default values - use name/id as stored
                 frontend_bus_id = matched_bus_id
                 frontend_bus_name = matched_bus_name
+                _fb_kv = float(BusbarsDictVoltage.get(matched_bus_id, 0) or 0)
                 busbar = BusbarOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
@@ -2930,7 +2934,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     p_mw=None,
                     q_mvar=None,
                     pf=None,
-                    q_p=None
+                    q_p=None,
+                    vm_kv=_fb_kv if _fb_kv > 0 else None,
                 )
                 busbarList.append(busbar)
                 
@@ -2952,6 +2957,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Use name/id as stored (underscore format to match pandapower/frontend)
                 frontend_bus_name = bus_name
                 frontend_bus_id = bus_name
+                _fb_vn = float(BusbarsDictVoltage.get(bus_name, 0) or 0)
                 busbar = BusbarOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
@@ -2960,7 +2966,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     p_mw=p_mw,
                     q_mvar=q_mvar,
                     pf=pf,
-                    q_p=q_p
+                    q_p=q_p,
+                    vm_kv=_fb_vn if _fb_vn > 0 else None,
                 )
                 busbarList.append(busbar)
                 
