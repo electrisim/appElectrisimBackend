@@ -481,6 +481,8 @@ def simulation():
                 prot_params = {
                     'fault_type': in_data[x].get('fault_type', '3ph'),
                     'case': in_data[x].get('case', 'max'),
+                    'fault_location_mode': in_data[x].get('fault_location_mode', 'line'),
+                    'fault_bus_id': in_data[x].get('fault_bus_id', ''),
                     'sc_line_id': in_data[x].get('sc_line_id'),
                     'sc_fraction': in_data[x].get('sc_fraction', 0.5),
                     'grading_mode': in_data[x].get('grading_mode', 'auto'),

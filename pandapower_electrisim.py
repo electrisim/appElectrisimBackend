@@ -10170,6 +10170,216 @@ def _prot_fault_bus_label(net, fault_bus_idx):
     return str(fault_bus_idx)
 
 
+def _prot_clean_scalar(v):
+    if v is None:
+        return None
+    if isinstance(v, (float, np.floating)):
+        fv = float(v)
+        if math.isnan(fv) or math.isinf(fv):
+            return None
+        return fv
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    return str(v)
+
+
+def _prot_parse_prot_results(prot_results, summary_by_sw_idx):
+    """Turn pandapower calculate_protection_times dataframe into UI trip rows."""
+    trip_rows = []
+    if prot_results is None or getattr(prot_results, 'empty', True):
+        return trip_rows
+
+    for _, row in prot_results.iterrows():
+        sw_idx_val = row.get('switch_id') if 'switch_id' in row.index else None
+        try:
+            sw_idx_int = int(sw_idx_val) if sw_idx_val is not None else None
+        except (TypeError, ValueError):
+            sw_idx_int = None
+        summary = summary_by_sw_idx.get(sw_idx_int, {}) if sw_idx_int is not None else {}
+
+        t_trip = None
+        trip_melt_time_s = None
+        for col in ('trip_melt_time_s', 'trip_time', 'trip time [s]', 'trip_time_s'):
+            if col in row.index:
+                val = row[col]
+                if col == 'trip_melt_time_s':
+                    trip_melt_time_s = val
+                if t_trip is None:
+                    t_trip = val
+
+        activation_parameter_value = None
+        if 'activation_parameter_value' in row.index:
+            activation_parameter_value = row['activation_parameter_value']
+
+        ikss = None
+        for col in ('activation_parameter_value', 'ikss_ka', 'ikss'):
+            if col in row.index:
+                ikss = row[col]
+                break
+
+        tripped = None
+        for col in ('trip_melt', 'tripped'):
+            if col in row.index:
+                tripped = row[col]
+                break
+        if tripped is None and t_trip is not None:
+            try:
+                tripped = math.isfinite(float(t_trip))
+            except (TypeError, ValueError):
+                tripped = False
+
+        device_kind = summary.get('kind') or row.get('protection_type', 'Unknown')
+        device_subtype = summary.get('subtype') or summary.get('fuse_type')
+        device_label = f"{device_kind}-{device_subtype}".strip('-') if device_subtype else str(device_kind)
+        is_fuse = str(device_kind).lower() == 'fuse' or str(row.get('protection_type', '')).lower() == 'fuse'
+        t_trip_clean = _prot_clean_scalar(t_trip)
+        trip_melt_clean = _prot_clean_scalar(trip_melt_time_s if trip_melt_time_s is not None else t_trip)
+        act_param_clean = _prot_clean_scalar(
+            activation_parameter_value if activation_parameter_value is not None else ikss
+        )
+
+        trip_rows.append({
+            'switch_idx': sw_idx_int,
+            'switch_id': summary.get('switch_id'),
+            'switch_name': summary.get('switch_name'),
+            'user_friendly_name': summary.get('user_friendly_name'),
+            'device': device_label,
+            'device_kind': str(device_kind),
+            'is_fuse': is_fuse,
+            'tripped': bool(_prot_clean_scalar(tripped)) if tripped is not None else False,
+            't_trip_s': t_trip_clean,
+            't_melt_s': trip_melt_clean if is_fuse else None,
+            'trip_melt_time_s': trip_melt_clean,
+            'ikss_ka': _prot_clean_scalar(ikss),
+            'activation_parameter_value': act_param_clean,
+        })
+    return trip_rows
+
+
+def _prot_extract_short_circuit_at_bus(net_sc, bus_idx):
+    """Read Ikss / Ip / Ith at the fault bus from res_bus_sc after calc_sc."""
+    out = {
+        'bus_idx': int(bus_idx),
+        'ikss_ka': None,
+        'ip_ka': None,
+        'ith_ka': None,
+        'skss_mva': None,
+    }
+    res = getattr(net_sc, 'res_bus_sc', None)
+    if res is None or getattr(res, 'empty', True) or bus_idx not in res.index:
+        return out
+    row = res.loc[bus_idx]
+    for key, col in (
+        ('ikss_ka', 'ikss_ka'),
+        ('ip_ka', 'ip_ka'),
+        ('ith_ka', 'ith_ka'),
+        ('skss_mva', 'skss_mva'),
+    ):
+        if col in row.index:
+            out[key] = _prot_clean_scalar(row[col])
+    return out
+
+
+def _prot_resolve_fault_bus_idx(in_data, net, fault_bus_cell_id):
+    """Map frontend bus cell id (diagram id) to pandapower bus index."""
+    if fault_bus_cell_id in (None, ''):
+        return None
+    target = str(fault_bus_cell_id).strip()
+    bus_name = None
+    user_friendly = None
+    for x in in_data:
+        row = in_data.get(x)
+        if not isinstance(row, dict):
+            continue
+        typ = str(row.get('typ', ''))
+        if 'Bus' not in typ or 'DC Bus' in typ:
+            continue
+        rid = str(row.get('id', '')).strip()
+        rname = str(row.get('name', '')).strip()
+        if rid == target or rname == target:
+            bus_name = row.get('name')
+            user_friendly = row.get('userFriendlyName')
+            break
+    if bus_name is None and 'name' in net.bus.columns:
+        for idx in net.bus.index:
+            if str(net.bus.at[idx, 'name']).strip() == target:
+                return int(idx)
+    if bus_name is None:
+        try:
+            idx = int(target)
+            if idx in net.bus.index:
+                return int(idx)
+        except (TypeError, ValueError):
+            return None
+        return None
+    if 'name' in net.bus.columns:
+        for candidate in (bus_name, user_friendly):
+            if candidate in (None, ''):
+                continue
+            matches = net.bus.index[net.bus['name'].astype(str) == str(candidate)].tolist()
+            if matches:
+                return int(matches[0])
+    return None
+
+
+def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_summaries):
+    """Short-circuit and protection times for a fault placed directly on a bus."""
+    try:
+        from pandapower.protection.run_protection import calculate_protection_times
+    except ImportError as e:
+        return {
+            'fault_location_mode': 'bus',
+            'fault_bus_idx': int(fault_bus_idx),
+            'error': f'pandapower.protection is unavailable: {e}',
+            'fault_bus': _prot_fault_bus_label(base_net, fault_bus_idx),
+            'trip': [],
+            'short_circuit': {},
+        }
+
+    summary_by_sw_idx = {int(s['sw_idx']): s for s in attach_summaries if s.get('sw_idx') is not None}
+    net_sc = deepcopy(base_net)
+    try:
+        sc.calc_sc(net_sc, bus=int(fault_bus_idx), branch_results=True, fault=fault_type, case=case)
+    except Exception as e:
+        return {
+            'fault_location_mode': 'bus',
+            'fault_bus_idx': int(fault_bus_idx),
+            'error': f'calc_sc failed: {e}',
+            'fault_bus': _prot_fault_bus_label(net_sc, fault_bus_idx),
+            'trip': [],
+            'short_circuit': {},
+        }
+
+    sc_info = _prot_extract_short_circuit_at_bus(net_sc, fault_bus_idx)
+    try:
+        prot_results = calculate_protection_times(net_sc, scenario='sc')
+    except Exception as e:
+        return {
+            'fault_location_mode': 'bus',
+            'fault_bus_idx': int(fault_bus_idx),
+            'error': f'calculate_protection_times failed: {e}',
+            'fault_bus': _prot_fault_bus_label(net_sc, fault_bus_idx),
+            'fault_type': fault_type,
+            'case': case,
+            'short_circuit': sc_info,
+            'trip': [],
+        }
+
+    return {
+        'fault_location_mode': 'bus',
+        'fault_bus_idx': int(fault_bus_idx),
+        'sc_line_id': None,
+        'sc_fraction': None,
+        'fault_bus': _prot_fault_bus_label(net_sc, fault_bus_idx),
+        'fault_type': fault_type,
+        'case': case,
+        'short_circuit': sc_info,
+        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx),
+    }
+
+
 def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, attach_summaries):
     """
     Run a single fault scenario on a copy of the network and return:
@@ -10220,85 +10430,25 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
         prot_results = calculate_protection_times(net_sc, scenario='sc')
     except Exception as e:
         return {
+            'fault_location_mode': 'line',
             'sc_line_id': int(sc_line_id),
             'sc_fraction': float(sc_fraction),
             'error': f'calculate_protection_times failed: {e}',
             'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
+            'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
             'trip': [],
         }
 
-    trip_rows = []
-
-    def _clean(v):
-        if v is None:
-            return None
-        if isinstance(v, (float, np.floating)):
-            fv = float(v)
-            if math.isnan(fv) or math.isinf(fv):
-                return None
-            return fv
-        if isinstance(v, (bool, np.bool_)):
-            return bool(v)
-        if isinstance(v, (int, np.integer)):
-            return int(v)
-        return str(v)
-
-    if prot_results is not None and not getattr(prot_results, 'empty', True):
-        for _, row in prot_results.iterrows():
-            # pandapower 3.x calculate_protection_times columns: switch_id, protection_type,
-            # trip_melt, activation_parameter, activation_parameter_value, trip_melt_time_s.
-            sw_idx_val = row.get('switch_id') if 'switch_id' in row.index else None
-            try:
-                sw_idx_int = int(sw_idx_val) if sw_idx_val is not None else None
-            except (TypeError, ValueError):
-                sw_idx_int = None
-            summary = summary_by_sw_idx.get(sw_idx_int, {}) if sw_idx_int is not None else {}
-
-            t_trip = None
-            for col in ('trip_melt_time_s', 'trip_time', 'trip time [s]', 'trip_time_s'):
-                if col in row.index:
-                    t_trip = row[col]
-                    break
-
-            ikss = None
-            for col in ('activation_parameter_value', 'ikss_ka', 'ikss'):
-                if col in row.index:
-                    ikss = row[col]
-                    break
-
-            tripped = None
-            for col in ('trip_melt', 'tripped'):
-                if col in row.index:
-                    tripped = row[col]
-                    break
-            if tripped is None and t_trip is not None:
-                try:
-                    tripped = math.isfinite(float(t_trip))
-                except (TypeError, ValueError):
-                    tripped = False
-
-            device_kind = summary.get('kind') or row.get('protection_type', 'Unknown')
-            device_subtype = summary.get('subtype') or summary.get('fuse_type')
-            device_label = f"{device_kind}-{device_subtype}".strip('-') if device_subtype else str(device_kind)
-
-            trip_rows.append({
-                'switch_idx': sw_idx_int,
-                'switch_id': summary.get('switch_id'),
-                'switch_name': summary.get('switch_name'),
-                'user_friendly_name': summary.get('user_friendly_name'),
-                'device': device_label,
-                'tripped': bool(_clean(tripped)) if tripped is not None else False,
-                't_trip_s': _clean(t_trip),
-                'ikss_ka': _clean(ikss),
-            })
-
     return {
+        'fault_location_mode': 'line',
         'sc_line_id': int(sc_line_id),
         'sc_fraction': float(sc_fraction),
         'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
+        'fault_bus_idx': int(fault_bus),
         'fault_type': fault_type,
         'case': case,
-        'trip': trip_rows,
+        'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
+        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx),
     }
 
 
@@ -10403,18 +10553,34 @@ def protection_coordination(net, prot_params, in_data):
                 'summary': {'converged': False, 'n_devices': 0, 'n_attached': 0, 'n_not_computed': not_computed_count},
             }, separators=(',', ':'))
 
-        # Build the list of fault scenarios.
-        if sc_line_id_raw in (None, '', 'all'):
-            line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
-        else:
-            try:
-                line_ids = [int(sc_line_id_raw)]
-            except (TypeError, ValueError):
-                line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
+        fault_location_mode = str(prot_params.get('fault_location_mode', 'line') or 'line').strip().lower()
+        if fault_location_mode not in ('line', 'bus'):
+            fault_location_mode = 'line'
+        fault_bus_cell_id = prot_params.get('fault_bus_id')
 
+        # Build the list of fault scenarios.
         scenarios = []
-        for line_id in line_ids:
-            scenarios.append(_prot_run_scenario(net, line_id, sc_fraction, fault_type, case, attach_summaries))
+        if fault_location_mode == 'bus':
+            fault_bus_idx = _prot_resolve_fault_bus_idx(in_data, net, fault_bus_cell_id)
+            if fault_bus_idx is None:
+                return json.dumps({
+                    'error': True,
+                    'message': 'Could not resolve the selected fault busbar. Place a Bus on the diagram and pick it in the Fault tab.',
+                    'scenarios': [],
+                    'devices': [],
+                    'summary': {'converged': False},
+                }, separators=(',', ':'))
+            scenarios.append(_prot_run_bus_scenario(net, fault_bus_idx, fault_type, case, attach_summaries))
+        else:
+            if sc_line_id_raw in (None, '', 'all'):
+                line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
+            else:
+                try:
+                    line_ids = [int(sc_line_id_raw)]
+                except (TypeError, ValueError):
+                    line_ids = [int(idx) for idx in net.line.index if net.line.at[idx, 'in_service']]
+            for line_id in line_ids:
+                scenarios.append(_prot_run_scenario(net, line_id, sc_fraction, fault_type, case, attach_summaries))
 
         # Sample characteristics on the unmodified net so curves do not include the sc_bus.
         devices = _prot_extract_devices_for_ui(net, attach_summaries)
@@ -10437,6 +10603,7 @@ def protection_coordination(net, prot_params, in_data):
                 'n_miscoordination': len(miscoord),
                 'fault_type': fault_type,
                 'case': case,
+                'fault_location_mode': fault_location_mode,
                 't_diff_s': t_diff,
             },
             'miscoordination': miscoord,
