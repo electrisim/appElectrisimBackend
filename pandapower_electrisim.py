@@ -5283,6 +5283,20 @@ def process_short_circuit_diagnostic(diagnostic_output, net):
     
     return processed 
 
+
+def _contingency_friendly_name(net, raw_name):
+    """Resolve diagram userFriendlyName for contingency result labels."""
+    if raw_name is None:
+        return 'Unknown'
+    name = str(raw_name)
+    ufn_map = getattr(net, 'user_friendly_names', None)
+    if isinstance(ufn_map, dict):
+        friendly = ufn_map.get(name)
+        if friendly not in (None, '') and str(friendly).strip():
+            return str(friendly).strip()
+    return name
+
+
 def contingency_analysis(net, contingency_params):
     """
     Perform contingency analysis on the network.
@@ -5319,33 +5333,36 @@ def contingency_analysis(net, contingency_params):
             # Add line contingencies
             for line_idx in net.line.index:
                 if net.line.loc[line_idx, 'in_service']:
+                    line_name = _contingency_friendly_name(net, net.line.loc[line_idx, 'name'])
                     contingency_cases.append({
-                        'name': f"Line_{net.line.loc[line_idx, 'name']}",
+                        'name': f"Line_{line_name}",
                         'type': 'line',
                         'element_idx': line_idx,
-                        'description': f"Outage of line {net.line.loc[line_idx, 'name']}"
+                        'description': f"Outage of line {line_name}"
                     })
         
         if element_type == 'transformer' or element_type == 'all':
             # Add transformer contingencies
             for trafo_idx in net.trafo.index:
                 if net.trafo.loc[trafo_idx, 'in_service']:
+                    trafo_name = _contingency_friendly_name(net, net.trafo.loc[trafo_idx, 'name'])
                     contingency_cases.append({
-                        'name': f"Trafo_{net.trafo.loc[trafo_idx, 'name']}",
+                        'name': f"Trafo_{trafo_name}",
                         'type': 'trafo',
                         'element_idx': trafo_idx,
-                        'description': f"Outage of transformer {net.trafo.loc[trafo_idx, 'name']}"
+                        'description': f"Outage of transformer {trafo_name}"
                     })
         
         if element_type == 'generator' or element_type == 'all':
             # Add generator contingencies
             for gen_idx in net.gen.index:
                 if net.gen.loc[gen_idx, 'in_service']:
+                    gen_name = _contingency_friendly_name(net, net.gen.loc[gen_idx, 'name'])
                     contingency_cases.append({
-                        'name': f"Gen_{net.gen.loc[gen_idx, 'name']}",
+                        'name': f"Gen_{gen_name}",
                         'type': 'gen',
                         'element_idx': gen_idx,
-                        'description': f"Outage of generator {net.gen.loc[gen_idx, 'name']}"
+                        'description': f"Outage of generator {gen_name}"
                     })
         
         # Results storage
@@ -5364,8 +5381,8 @@ def contingency_analysis(net, contingency_params):
         # Run contingency analysis
         for i, contingency_case in enumerate(contingency_cases):
             try:
-                # Create a copy of the network for this contingency
-                net_cont = net.copy()
+                # Deep copy required — net.copy() returns a plain dict without .line / .bus accessors
+                net_cont = deepcopy(net)
                 
                 # Apply contingency
                 if contingency_case['type'] == 'line':
@@ -5388,9 +5405,10 @@ def contingency_analysis(net, contingency_params):
                         (net_cont.res_bus.vm_pu > max_vm_pu)
                     ]
                     for bus_idx, bus_data in voltage_violations.iterrows():
+                        bus_name = _contingency_friendly_name(net, net_cont.bus.loc[bus_idx, 'name'])
                         case_violations.append({
                             'type': 'voltage',
-                            'element': f"Bus_{net_cont.bus.loc[bus_idx, 'name']}",
+                            'element': f"Bus_{bus_name}",
                             'description': f"Voltage violation: {bus_data.vm_pu:.3f} p.u.",
                             'severity': 'high' if bus_data.vm_pu < 0.9 or bus_data.vm_pu > 1.1 else 'medium'
                         })
@@ -5403,9 +5421,10 @@ def contingency_analysis(net, contingency_params):
                             net_cont.res_line.loading_percent > max_loading_percent
                         ]
                         for line_idx, line_data in line_overloads.iterrows():
+                            line_name = _contingency_friendly_name(net, net_cont.line.loc[line_idx, 'name'])
                             case_violations.append({
                                 'type': 'thermal',
-                                'element': f"Line_{net_cont.line.loc[line_idx, 'name']}",
+                                'element': f"Line_{line_name}",
                                 'description': f"Line overload: {line_data.loading_percent:.1f}%",
                                 'severity': 'high' if line_data.loading_percent > 120 else 'medium'
                             })
@@ -5416,9 +5435,10 @@ def contingency_analysis(net, contingency_params):
                             net_cont.res_trafo.loading_percent > max_loading_percent
                         ]
                         for trafo_idx, trafo_data in trafo_overloads.iterrows():
+                            trafo_name = _contingency_friendly_name(net, net_cont.trafo.loc[trafo_idx, 'name'])
                             case_violations.append({
                                 'type': 'thermal',
-                                'element': f"Trafo_{net_cont.trafo.loc[trafo_idx, 'name']}",
+                                'element': f"Trafo_{trafo_name}",
                                 'description': f"Transformer overload: {trafo_data.loading_percent:.1f}%",
                                 'severity': 'high' if trafo_data.loading_percent > 120 else 'medium'
                             })
@@ -5438,7 +5458,7 @@ def contingency_analysis(net, contingency_params):
                 for bus_idx, bus_data in net_cont.res_bus.iterrows():
                     contingency_result['bus_results'].append({
                         'bus_id': net_cont.bus.loc[bus_idx, 'id'],
-                        'name': net_cont.bus.loc[bus_idx, 'name'],
+                        'name': _contingency_friendly_name(net, net_cont.bus.loc[bus_idx, 'name']),
                         'vm_pu': bus_data.vm_pu,
                         'va_degree': bus_data.va_degree,
                         'p_mw': bus_data.p_mw,
@@ -5449,7 +5469,7 @@ def contingency_analysis(net, contingency_params):
                 for line_idx, line_data in net_cont.res_line.iterrows():
                     contingency_result['line_results'].append({
                         'line_id': net_cont.line.loc[line_idx, 'id'],
-                        'name': net_cont.line.loc[line_idx, 'name'],
+                        'name': _contingency_friendly_name(net, net_cont.line.loc[line_idx, 'name']),
                         'loading_percent': line_data.loading_percent,
                         'p_from_mw': line_data.p_from_mw,
                         'q_from_mvar': line_data.q_from_mvar,
@@ -5461,7 +5481,7 @@ def contingency_analysis(net, contingency_params):
                 for trafo_idx, trafo_data in net_cont.res_trafo.iterrows():
                     contingency_result['trafo_results'].append({
                         'trafo_id': net_cont.trafo.loc[trafo_idx, 'id'],
-                        'name': net_cont.trafo.loc[trafo_idx, 'name'],
+                        'name': _contingency_friendly_name(net, net_cont.trafo.loc[trafo_idx, 'name']),
                         'loading_percent': trafo_data.loading_percent,
                         'p_hv_mw': trafo_data.p_hv_mw,
                         'q_hv_mvar': trafo_data.q_hv_mvar,
@@ -5482,18 +5502,40 @@ def contingency_analysis(net, contingency_params):
                 contingency_results.append(contingency_result)
                 
             except Exception as e:
-                # Handle non-convergent cases
+                err_text = str(e)
+                err_lower = err_text.lower()
+                is_convergence = 'did not converge' in err_lower
+                try:
+                    from pandapower.auxiliary import LoadFlowNotConverged
+                    is_convergence = is_convergence or isinstance(e, LoadFlowNotConverged)
+                except ImportError:
+                    pass
+
+                if is_convergence:
+                    failure_desc = 'Non-convergent case'
+                    violation_desc = 'Power flow did not converge'
+                    violation_type = 'convergence'
+                else:
+                    failure_desc = err_text
+                    violation_desc = err_text
+                    violation_type = 'error'
+
                 contingency_result = {
                     'name': contingency_case['name'],
                     'description': contingency_case['description'],
                     'converged': False,
-                    'error': str(e),
-                    'violations': [{'type': 'convergence', 'element': 'System', 'description': 'Power flow did not converge', 'severity': 'high'}]
+                    'error': err_text,
+                    'violations': [{
+                        'type': violation_type,
+                        'element': 'System',
+                        'description': violation_desc,
+                        'severity': 'high'
+                    }]
                 }
                 contingency_results.append(contingency_result)
                 critical_contingencies.append({
                     'name': contingency_case['name'],
-                    'description': 'Non-convergent case',
+                    'description': failure_desc,
                     'violations': 1
                 })
         
@@ -5597,8 +5639,13 @@ def contingency_analysis(net, contingency_params):
             'contingency_results': contingency_results
         }
         
-        # OPTIMIZED: Compact JSON for faster transfer
-        response = json.dumps(result, default=_json_serialize_default, separators=(',', ':'))
+        # Sanitize NaN/Inf so the body is strict JSON (browser JSON.parse rejects NaN tokens).
+        response = json.dumps(
+            _sanitize_for_strict_json(result),
+            default=_json_serialize_default,
+            allow_nan=False,
+            separators=(',', ':'),
+        )
         
         return response
         

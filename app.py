@@ -441,16 +441,12 @@ def simulation():
                 
                 # Extract contingency analysis parameters
                 contingency_params = {
-                    'contingency_type': in_data[x]['contingency_type'],
-                    'element_type': in_data[x]['element_type'],
-                    'elements_to_analyze': in_data[x]['elements_to_analyze'],
-                    'voltage_limits': in_data[x]['voltage_limits'],
-                    'thermal_limits': in_data[x]['thermal_limits'],
-                    'min_vm_pu': in_data[x]['min_vm_pu'],
-                    'max_vm_pu': in_data[x]['max_vm_pu'],
+                    'element_type': in_data[x].get('element_type', 'line'),
+                    'voltage_limits': in_data[x].get('voltage_limits', 'true'),
+                    'thermal_limits': in_data[x].get('thermal_limits', 'true'),
+                    'min_vm_pu': in_data[x].get('min_vm_pu', '0.95'),
+                    'max_vm_pu': in_data[x].get('max_vm_pu', '1.05'),
                     'max_loading_percent': in_data[x].get('max_loading_percent', '100'),
-                    'post_contingency_actions': in_data[x].get('post_contingency_actions', 'none'),
-                    'analysis_mode': in_data[x].get('analysis_mode', 'fast')
                 }
                 
                 # Create network
@@ -1066,6 +1062,104 @@ def import_pandapower():
         return jsonify({'error': str(e), 'details': error_details}), 400
 
 
+def _infer_opendss_voltage_bases(dss, dss_text=''):
+    """Collect line-to-line voltage levels (kV) for OpenDSS calcv from equipment."""
+    import re
+    import math
+
+    levels = set()
+    for vname in dss.Vsources.AllNames() or []:
+        try:
+            dss.Vsources.Name(vname)
+            levels.add(float(dss.Vsources.BasekV()))
+        except (TypeError, ValueError):
+            pass
+    for tname in dss.Transformers.AllNames() or []:
+        try:
+            dss.Transformers.Name(tname)
+            for wdg in (1, 2, 3):
+                try:
+                    dss.Transformers.Wdg(wdg)
+                    kv = float(dss.Transformers.kV())
+                    if kv > 0:
+                        levels.add(kv)
+                except Exception:
+                    break
+        except (TypeError, ValueError):
+            pass
+    for pname in dss.PVsystems.AllNames() or []:
+        try:
+            dss.Circuit.SetActiveClass('PVSystem')
+            dss.ActiveClass.Name(pname)
+            kv = float(dss.Properties.Value('kV'))
+            if kv > 0:
+                levels.add(kv)
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r'voltagebases\s*=\s*\[([^\]]+)\]', dss_text, re.IGNORECASE)
+    if m:
+        for part in m.group(1).split(','):
+            try:
+                levels.add(float(part.strip()))
+            except ValueError:
+                pass
+    positive = sorted((v for v in levels if v > 0), reverse=True)
+    return positive
+
+
+def _bus_voltages_from_equipment(dss, bus_names):
+    """Map each bus to line-to-line kV from Vsource, transformer windings, and PV kV."""
+    canon = {b.lower(): b for b in bus_names}
+    vn = {}
+
+    def set_vn(bus_raw, kv_ll):
+        key = bus_raw.split('.')[0]
+        c = canon.get(key.lower())
+        if c is None:
+            return
+        prev = vn.get(c)
+        if prev is None or kv_ll > prev:
+            vn[c] = kv_ll
+
+    for vname in dss.Vsources.AllNames() or []:
+        try:
+            dss.Circuit.SetActiveElement(f'Vsource.{vname}')
+            bus_raw = dss.CktElement.BusNames()[0]
+            dss.Vsources.Name(vname)
+            set_vn(bus_raw, float(dss.Vsources.BasekV()))
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    for tname in dss.Transformers.AllNames() or []:
+        try:
+            dss.Circuit.SetActiveElement(f'Transformer.{tname}')
+            buses = [b.split('.')[0] for b in dss.CktElement.BusNames()]
+            dss.Transformers.Name(tname)
+            kvs = []
+            for wdg in (1, 2, 3):
+                try:
+                    dss.Transformers.Wdg(wdg)
+                    kvs.append(float(dss.Transformers.kV()))
+                except Exception:
+                    break
+            for bus, kv in zip(buses, kvs):
+                set_vn(bus, kv)
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    for pname in dss.PVsystems.AllNames() or []:
+        try:
+            dss.Circuit.SetActiveClass('PVSystem')
+            dss.ActiveClass.Name(pname)
+            kv = float(dss.Properties.Value('kV'))
+            dss.Circuit.SetActiveElement(f'PVSystem.{pname}')
+            set_vn(dss.CktElement.BusNames()[0], kv)
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    return vn
+
+
 @app.route('/import-opendss', methods=['POST'])
 def import_opendss():
     """
@@ -1124,18 +1218,25 @@ def import_opendss():
             dss.Text.Command("Clear")
             dss.Text.Command(f"Redirect \"{temp_path}\"")
 
-            # Solve once to ensure circuit is initialized
+            # Assign per-bus kV bases (HV + LV) before reading bus nominal voltages
+            vb_list = _infer_opendss_voltage_bases(dss, dss_text_to_use)
+            if vb_list:
+                dss.Text.Command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
+            dss.Text.Command('calcv')
             dss.Solution.Solve()
 
             # Build a complete model JSON with all OpenDSS elements
             import math
             bus_names = dss.Circuit.AllBusNames()
+            equip_vn = _bus_voltages_from_equipment(dss, bus_names)
             buses = []
             for idx, bname in enumerate(bus_names):
                 dss.Circuit.SetActiveBus(bname)
                 kv_base = dss.Bus.kVBase()
                 # OpenDSS kVBase is line-to-neutral; Electrisim vn_kv expects line-to-line (pandapower convention)
                 vn_kv_ll = float(kv_base) * math.sqrt(3) if kv_base is not None else 0.0
+                if bname in equip_vn:
+                    vn_kv_ll = equip_vn[bname]
                 buses.append([bname, vn_kv_ll, "b", True])
 
             # Lines
@@ -1245,15 +1346,49 @@ def import_opendss():
                         # Get bus names using CktElement interface
                         bus_names_xfmr = dss.CktElement.BusNames()
                         if len(bus_names_xfmr) >= 2:
-                            hv_bus = bus_names_xfmr[0].split('.')[0]
-                            lv_bus = bus_names_xfmr[1].split('.')[0]
-                            
                             # Get transformer parameters
                             dss.Transformers.Wdg(1)
-                            hv_kv = dss.Transformers.kV()
+                            wdg1_kv = float(dss.Transformers.kV())
+                            wdg1_bus = bus_names_xfmr[0].split('.')[0]
                             dss.Transformers.Wdg(2)
-                            lv_kv = dss.Transformers.kV()
+                            wdg2_kv = float(dss.Transformers.kV())
+                            wdg2_bus = bus_names_xfmr[1].split('.')[0]
                             sn_mva = dss.Transformers.kVA() / 1000.0  # Convert to MVA
+
+                            if wdg1_kv >= wdg2_kv:
+                                hv_kv, lv_kv = wdg1_kv, wdg2_kv
+                                hv_bus, lv_bus = wdg1_bus, wdg2_bus
+                            else:
+                                hv_kv, lv_kv = wdg2_kv, wdg1_kv
+                                hv_bus, lv_bus = wdg2_bus, wdg1_bus
+
+                            xhl = 6.0
+                            vkr = 1.0
+                            pfe_kw = 0.0
+                            i0_pct = 0.0
+                            try:
+                                dss.Circuit.SetActiveClass('Transformer')
+                                dss.ActiveClass.Name(tname)
+                                xhl = float(dss.Properties.Value('XHL'))
+                                rs_raw = dss.Properties.Value('%Rs')
+                                if isinstance(rs_raw, (list, tuple)):
+                                    vkr = sum(float(x) for x in rs_raw if x not in (None, ''))
+                                else:
+                                    import ast
+                                    parsed = ast.literal_eval(str(rs_raw).strip())
+                                    if isinstance(parsed, (list, tuple)):
+                                        vkr = sum(float(x) for x in parsed)
+                                    else:
+                                        vkr = float(parsed)
+                                nll = dss.Properties.Value('%noloadloss')
+                                imag = dss.Properties.Value('%imag')
+                                if nll not in (None, ''):
+                                    pfe_kw = float(nll) * sn_mva * 10.0  # % of kVA -> kW
+                                if imag not in (None, ''):
+                                    i0_pct = float(imag)
+                            except (TypeError, ValueError, SyntaxError):
+                                pass
+                            vk_percent = math.sqrt(xhl ** 2 + vkr ** 2)
                             
                             try:
                                 hv_idx = bus_names.index(hv_bus)
@@ -1266,7 +1401,7 @@ def import_opendss():
                             # [name, std_type, hv_bus, lv_bus, sn_mva, vn_hv_kv, vn_lv_kv, vk_percent, vkr_percent, pfe_kw, i0_percent, shift_degree, ..., vector_group]
                             trafo_row = [
                                 tname, "", hv_idx, lv_idx, sn_mva, hv_kv, lv_kv,
-                                6.0, 1.0, 0.0, 0.0, 0.0,  # Default impedance values
+                                vk_percent, vkr, pfe_kw, i0_pct, 0.0,
                                 None, 0, 0, 0, 0.0, 0.0, 0, False, 1, 1.0, True,
                                 vector_group
                             ]
@@ -1369,20 +1504,54 @@ def import_opendss():
                     bus_names_vsrc = dss.CktElement.BusNames()
                     if bus_names_vsrc:
                         bus = bus_names_vsrc[0].split('.')[0]
-                        dss.Vsources.Name(vname)
-                        basekv = dss.Vsources.BasekV()
-                        pu = dss.Vsources.PU()
-                        angle = dss.Vsources.AngleDeg()
-                        
                         try:
                             bus_idx = bus_names.index(bus)
                         except ValueError:
                             continue
+                        dss.Vsources.Name(vname)
+                        basekv = dss.Vsources.BasekV()
+                        pu = dss.Vsources.PU()
+                        angle = dss.Vsources.AngleDeg()
+                        bus_vn_ll = float(buses[bus_idx][1]) if bus_idx < len(buses) else float(basekv) * math.sqrt(3)
+                        s_sc_max = 1000000.0
+                        s_sc_min = 0.0
+                        rx_max = 0.0
+                        rx_min = 0.0
+                        r0x0_max = 0.0
+                        x0x_max = 0.0
+                        try:
+                            dss.Circuit.SetActiveClass('Vsource')
+                            dss.ActiveClass.Name(vname)
+                            r1 = float(dss.Properties.Value('R1') or 0)
+                            x1 = float(dss.Properties.Value('X1') or 0)
+                            r0 = float(dss.Properties.Value('R0') or 0)
+                            x0 = float(dss.Properties.Value('X0') or 0)
+                            if abs(r1) > 1e-9 or abs(x1) > 1e-9:
+                                z1 = math.hypot(r1, x1)
+                                if z1 > 0 and bus_vn_ll > 0:
+                                    s_sc_max = (bus_vn_ll ** 2) / z1
+                                    rx_max = r1 / x1 if abs(x1) > 1e-9 else 0.0
+                                if abs(r0) > 1e-9 or abs(x0) > 1e-9:
+                                    z0 = math.hypot(r0, x0)
+                                    if z0 > 0 and bus_vn_ll > 0:
+                                        s_sc_min = (bus_vn_ll ** 2) / z0
+                                        r0x0_max = r0 / x0 if abs(x0) > 1e-9 else 0.0
+                            else:
+                                try:
+                                    mvasc3 = float(dss.Vsources.MVAsc3())
+                                    if mvasc3 > 0.1:
+                                        s_sc_max = mvasc3
+                                except (TypeError, ValueError, AttributeError):
+                                    pass
+                        except (TypeError, ValueError, AttributeError):
+                            pass
                         
                         # First Vsource is typically the external grid (slack bus)
                         if idx == 0:
-                            # [name, bus, vm_pu, va_degree, slack_weight, in_service]
-                            ext_grid_row = [vname, bus_idx, pu, angle, 1.0, True]
+                            ext_grid_row = [
+                                vname, bus_idx, pu, angle, 1.0, True,
+                                s_sc_max, s_sc_min, rx_max, rx_min, r0x0_max, x0x_max,
+                            ]
                             ext_grids.append(ext_grid_row)
                         else:
                             # Other Vsources as generators
@@ -1463,6 +1632,52 @@ def import_opendss():
                         shunt_row = [bus_idx, cname, kvar_val/1000.0, 0.0, 1.0, 1, 1, True]
                         shunts.append(shunt_row)
 
+            # PVSystems (OpenDSS-only; mapped to Electrisim PVSystem cells on import)
+            pvsystems = []
+            pv_names = dss.PVsystems.AllNames()
+            if pv_names:
+                def _pv_float(pvname, prop, default=0.0):
+                    try:
+                        dss.Circuit.SetActiveClass('PVSystem')
+                        dss.ActiveClass.Name(pvname)
+                        raw = dss.Properties.Value(prop)
+                        if raw in (None, ''):
+                            return default
+                        return float(raw)
+                    except (TypeError, ValueError, AttributeError):
+                        return default
+
+                for pvname in pv_names:
+                    dss.Circuit.SetActiveElement(f"PVSystem.{pvname}")
+                    bus_names_pv = dss.CktElement.BusNames()
+                    if not bus_names_pv:
+                        continue
+                    bus = bus_names_pv[0].split('.')[0]
+                    try:
+                        bus_idx = bus_names.index(bus)
+                    except ValueError:
+                        continue
+                    pmpp = _pv_float(pvname, 'pmpp', 0.0)
+                    kva = _pv_float(pvname, 'kVA', pmpp if pmpp else 0.0)
+                    cutin_pct = _pv_float(pvname, '%Cutin', 10.0)
+                    cutout_pct = _pv_float(pvname, '%Cutout', 10.0)
+                    # Electrisim stores cut-in/out as per-unit (0.1); OpenDSS uses percent (10)
+                    pvsystems.append([
+                        pvname,
+                        bus_idx,
+                        _pv_float(pvname, 'irradiance', 1.0),
+                        pmpp,
+                        _pv_float(pvname, 'temperature', 25.0),
+                        int(_pv_float(pvname, 'phases', 3)),
+                        _pv_float(pvname, 'kV', 0.4),
+                        _pv_float(pvname, 'pf', 1.0),
+                        _pv_float(pvname, 'kvar', 0.0),
+                        kva,
+                        cutin_pct / 100.0,
+                        cutout_pct / 100.0,
+                        True,
+                    ])
+
             # Compose structure similar to example_simple.json
             model = {
                 "_object": {
@@ -1504,6 +1719,11 @@ def import_opendss():
                     "impedance": {
                         "_object": _json.dumps({
                             "data": impedances
+                        })
+                    },
+                    "pvsystems": {
+                        "_object": _json.dumps({
+                            "data": pvsystems
                         })
                     },
                     # Empty tables for elements not yet extracted

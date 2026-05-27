@@ -202,6 +202,209 @@ def _sanitize_opendss_name(name):
         return name
     return name.replace(' ', '_')
 
+def _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage):
+    """Build OpenDSS voltagebases list from buses and equipment rated voltages."""
+    levels = set()
+    for v in (BusbarsDictVoltage or {}).values():
+        try:
+            fv = float(v)
+            if fv > 0:
+                levels.add(fv)
+        except (TypeError, ValueError):
+            pass
+    for elem in in_data.values():
+        typ = elem.get('typ', '')
+        for key in ('vn_kv', 'vn_hv_kv', 'vn_lv_kv', 'vn_mv_kv', 'kV', 'kv'):
+            raw = elem.get(key)
+            if raw in (None, '', '0'):
+                continue
+            try:
+                fv = float(raw)
+                if fv > 0:
+                    levels.add(fv)
+            except (TypeError, ValueError):
+                pass
+    return sorted(levels, reverse=True)
+
+def _resolve_external_grid_basekv(in_data, bus_basekv):
+    """Use transformer HV rating when slack bus vn_kv was imported at LV level."""
+    try:
+        bus_kv = float(bus_basekv)
+    except (TypeError, ValueError):
+        bus_kv = 110.0
+    hv_levels = []
+    for elem in in_data.values():
+        typ = elem.get('typ', '')
+        if not (typ.startswith('Transformer') or typ.startswith('Two Winding')):
+            continue
+        try:
+            hv = float(elem.get('vn_hv_kv') or 0)
+            if hv > 0:
+                hv_levels.append(hv)
+        except (TypeError, ValueError):
+            pass
+    if hv_levels and bus_kv < max(hv_levels):
+        return max(hv_levels)
+    return bus_kv
+
+
+def _thevenin_impedance_ohm(vn_kv_ll, s_sc_mva, rx, r0x0=None, s_sc_min_mva=None):
+    """Pandapower-compatible Thevenin R/X in Ohm (|Z| = vn_kv^2 / s_sc_mva, rx = R/X)."""
+    import math
+    vn = float(vn_kv_ll)
+    s_sc = float(s_sc_mva)
+    rx = float(rx)
+    if vn <= 0 or s_sc <= 0.1 or rx <= 0:
+        return None
+    z = (vn ** 2) / s_sc
+    x = z / math.sqrt(1.0 + rx * rx)
+    r = rx * x
+    if r0x0 and float(r0x0) > 0 and s_sc_min_mva and float(s_sc_min_mva) > 0.1:
+        z0 = (vn ** 2) / float(s_sc_min_mva)
+        r0x0f = float(r0x0)
+        x0 = z0 / math.sqrt(1.0 + r0x0f * r0x0f)
+        r0 = r0x0f * x0
+    else:
+        r0, x0 = r, x
+    return r, x, r0, x0
+
+
+def _ext_grid_vsource_impedance(element_data, bus_voltage_ll):
+    """Build OpenDSS Vsource impedance clause from external grid SC parameters."""
+    try:
+        s_sc_max = float(element_data.get('s_sc_max_mva') or 10000.0)
+    except (TypeError, ValueError):
+        s_sc_max = 10000.0
+    try:
+        rx_max = float(element_data.get('rx_max') or 0)
+    except (TypeError, ValueError):
+        rx_max = 0.0
+    try:
+        s_sc_min = float(element_data.get('s_sc_min_mva') or 0)
+    except (TypeError, ValueError):
+        s_sc_min = 0.0
+    try:
+        r0x0_max = float(element_data.get('r0x0_max') or 0)
+    except (TypeError, ValueError):
+        r0x0_max = 0.0
+
+    thev = _thevenin_impedance_ohm(
+        bus_voltage_ll, s_sc_max, rx_max, r0x0_max,
+        s_sc_min if s_sc_min > 0.1 else None,
+    )
+    if thev is not None:
+        r, x, r0, x0 = thev
+        return (
+            'thevenin',
+            f" R1={r:.6f} X1={x:.6f} R0={r0:.6f} X0={x0:.6f}",
+            None,
+        )
+    if s_sc_max <= 0.1:
+        s_sc_max = 10000.0
+    return 'mvasc3', '', s_sc_max
+
+
+def _prescan_external_grid(in_data):
+    """Read first External Grid element for New Circuit / Vsource.source setup."""
+    for _elem in in_data.values():
+        if not _elem.get('typ', '').startswith('External Grid'):
+            continue
+        bus_ref = _elem.get('bus', '')
+        ext_bus = _sanitize_opendss_name(bus_ref)
+        try:
+            ext_pu = float(_elem.get('vm_pu', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            ext_pu = 1.0
+        try:
+            ext_angle = float(_elem.get('va_degree', 0) or 0)
+        except (TypeError, ValueError):
+            ext_angle = 0.0
+        if ext_pu == 0:
+            ext_pu = 1.0
+        ext_basekv = None
+        for _belem in in_data.values():
+            if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == ext_bus:
+                ext_basekv = _resolve_external_grid_basekv(in_data, _belem.get('vn_kv', 110))
+                break
+        if ext_basekv is None:
+            ext_basekv = 110.0
+        mode, imp_suffix, mvasc3 = _ext_grid_vsource_impedance(_elem, ext_basekv)
+        return {
+            'bus': ext_bus,
+            'basekv': ext_basekv,
+            'pu': ext_pu,
+            'angle': ext_angle,
+            'mode': mode,
+            'impedance_suffix': imp_suffix,
+            'mvasc3': mvasc3,
+            'element': _elem,
+        }
+    return None
+
+
+def _new_circuit_command(ext_scan):
+    """OpenDSS New Circuit line; Thevenin grid omits Mvasc3 (set on Edit Vsource.source)."""
+    if not ext_scan:
+        return 'New Circuit.OpenDSS_Circuit'
+    parts = [
+        f"New Circuit.OpenDSS_Circuit bus1={ext_scan['bus']}",
+        f"basekv={ext_scan['basekv']}",
+        f"pu={ext_scan['pu']}",
+        'phases=3',
+        f"angle={ext_scan['angle']}",
+    ]
+    if ext_scan['mode'] == 'mvasc3' and ext_scan['mvasc3']:
+        parts.append(f"Mvasc3={ext_scan['mvasc3']}")
+    return ' '.join(parts)
+
+def _bus_vm_pu_from_opendss(V1_mag_ll_kv, BusbarsDictVoltage, matched_bus_id):
+    """Per-unit L-L voltage: prefer OpenDSS calcv base over diagram vn_kv."""
+    try:
+        base_kv_ln = float(dss.Bus.kVBase())
+        base_kv_dss = base_kv_ln * math.sqrt(3)
+        if base_kv_dss > 0 and V1_mag_ll_kv == V1_mag_ll_kv:
+            return V1_mag_ll_kv / base_kv_dss
+    except (TypeError, ValueError):
+        pass
+    base_kv_user = BusbarsDictVoltage.get(matched_bus_id)
+    if base_kv_user is not None and float(base_kv_user) > 0:
+        return V1_mag_ll_kv / float(base_kv_user)
+    return 1.0
+
+
+def _apply_equipment_bus_voltages(in_data, BusbarsDictVoltage, BusbarsDictConnectionToName):
+    """Override bus vn_kv using transformer LV rating, PV kV, and external grid context."""
+    def bus_key(ref):
+        if not ref:
+            return None
+        name = _sanitize_opendss_name(ref)
+        return BusbarsDictConnectionToName.get(name, name)
+
+    for elem in in_data.values():
+        typ = elem.get('typ', '')
+        if typ.startswith('Transformer') or typ.startswith('Two Winding'):
+            bt = bus_key(elem.get('busTo') or elem.get('lv_bus'))
+            try:
+                vn_lv = float(elem.get('vn_lv_kv') or 0)
+            except (TypeError, ValueError):
+                continue
+            # HV bus keeps network vn_kv (e.g. 10.6 kV); vn_hv_kv is transformer nameplate only
+            if vn_lv > 0 and bt in BusbarsDictVoltage:
+                BusbarsDictVoltage[bt] = vn_lv
+        elif typ.startswith('PVSystem'):
+            b = bus_key(elem.get('bus'))
+            try:
+                kv = float(elem.get('kv') or elem.get('kV') or 0)
+            except (TypeError, ValueError):
+                kv = 0
+            if kv > 0 and b in BusbarsDictVoltage:
+                BusbarsDictVoltage[b] = kv
+        elif typ.startswith('External Grid'):
+            b = bus_key(elem.get('bus'))
+            if b in BusbarsDictVoltage:
+                BusbarsDictVoltage[b] = _resolve_external_grid_basekv(
+                    in_data, BusbarsDictVoltage[b])
+
 def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
     """Create busbars in OpenDSS circuit - Let OpenDSS handle bus creation automatically  when elements are connected"""
     BusbarsDictVoltage = {}  
@@ -269,6 +472,8 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
                 BusbarsDictConnectionToName[bus_id] = bus_name
                 BusbarsDictConnectionToName[bus_id.replace('#', '_')] = bus_name
                 BusbarsDictConnectionToName[bus_id.replace('_', '#')] = bus_name  
+
+    _apply_equipment_bus_voltages(in_data, BusbarsDictVoltage, BusbarsDictConnectionToName)
     
     return BusbarsDictVoltage, BusbarsDictConnectionToName
 
@@ -385,16 +590,6 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         except Exception as e:
             continue
 
-    # After lines and transformers: set voltage bases and run calcv so OpenDSS assigns correct base kV to each bus
-    try:
-        if BusbarsDictVoltage:
-            vb_list = sorted(set(float(v) for v in BusbarsDictVoltage.values()), reverse=True)
-            if vb_list:
-                execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
-        execute_dss_command('calcv')
-    except Exception as e:
-        pass
-
     # Fourth pass: create Shunt elements (Reactors, Capacitors) - constant impedance elements
     for x in in_data:
         try:
@@ -454,9 +649,18 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             raise
         except Exception as e:
             continue
-    
-   
-    
+
+    # After all elements: set voltage bases and run calcv so OpenDSS assigns correct base kV
+    # to every bus (including those with PVSystems/Loads). Running calcv before power
+    # injection elements can leave the first solve at zero power until the circuit is rebuilt.
+    try:
+        vb_list = _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage)
+        if vb_list:
+            execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
+        execute_dss_command('calcv')
+    except Exception:
+        pass
+
     return (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
             Transformers3WDict, Transformers3WDictId,
             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
@@ -1527,6 +1731,23 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             sn_mva = float(sn_mva_raw)
             vk_percent = float(vk_percent_raw)
             vkr_percent = float(vkr_percent_raw)
+
+            # Prefer explicit transformer rated voltages over bus vn_kv (import may tag all buses as HV)
+            if vn_hv_kv_raw not in (None, '', '0') and vn_lv_kv_raw not in (None, '', '0'):
+                kv_hv = float(vn_hv_kv_raw)
+                kv_lv = float(vn_lv_kv_raw)
+            else:
+                v_from = float(bus_from_voltage)
+                v_to = float(bus_to_voltage)
+                if v_from >= v_to:
+                    kv_hv, kv_lv = v_from, v_to
+                else:
+                    kv_hv, kv_lv = v_to, v_from
+
+            if float(bus_from_voltage) >= float(bus_to_voltage):
+                bus_hv_name, bus_lv_name = bus_from_name, bus_to_name
+            else:
+                bus_hv_name, bus_lv_name = bus_to_name, bus_from_name
             
             # Convert MVA to kVA
             sn_kva = sn_mva * 1000
@@ -1588,7 +1809,7 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             
             # Create complete OpenDSS transformer command with calculated taps and losses
             # XHL = reactive component, %Rs = resistive components per winding
-            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_from_name} {bus_to_name}) Conns=({conns}) kVs=({bus_from_voltage} {bus_to_voltage}) kVAs=({sn_kva} {sn_kva}) XHL={xhl_percent} %Rs=[{rs_hv} {rs_lv}] Taps=[{tap_hv} {tap_lv}]"
+            transformer_cmd = f"New Transformer.{element_name} Phases=3 Windings=2 Buses=({bus_hv_name} {bus_lv_name}) Conns=({conns}) kVs=({kv_hv} {kv_lv}) kVAs=({sn_kva} {sn_kva}) XHL={xhl_percent} %Rs=[{rs_hv} {rs_lv}] Taps=[{tap_hv} {tap_lv}]"
             
             # Add loss parameters if they are non-zero
             # %noloadloss and %imag are scalar properties in OpenDSS (not per-winding arrays)
@@ -2220,28 +2441,21 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
      
         # Get external grid parameters
         vm_pu_raw = element_data.get('vm_pu')
-        s_sc_max_mva_raw = element_data.get('s_sc_max_mva')
         
         # Convert to float
         vm_pu = float(vm_pu_raw)
-        s_sc_max_mva = float(s_sc_max_mva_raw)
         
         # Validate and auto-correct vm_pu (OpenDSS Vsource 'pu' parameter)
-        # vm_pu should be close to 1.0 (per unit). If user entered kV value instead of p.u., auto-correct.
         if vm_pu == 0:
             vm_pu = 1.0
             print(f"WARNING: External Grid '{element_name}' had vm_pu=0, auto-corrected to 1.0 p.u.")
         elif vm_pu > 1.5 and bus_voltage is not None and float(bus_voltage) > 0:
             corrected_vm_pu = vm_pu / float(bus_voltage)
             print(f"WARNING: External Grid '{element_name}' has vm_pu={vm_pu}, "
-                  f"which is unreasonably high. vm_pu should be close to 1.0 (per unit). "
-                  f"Bus voltage is {bus_voltage} kV. Auto-correcting to {corrected_vm_pu:.4f} p.u. "
-                  f"(assuming user entered kV instead of p.u.)")
+                  f"which is unreasonably high. Auto-correcting to {corrected_vm_pu:.4f} p.u.")
             vm_pu = corrected_vm_pu
         
-        # Ensure short circuit MVA is not zero (would cause singular matrix)
-        if s_sc_max_mva <= 0.1:
-            s_sc_max_mva = 10000.0  # Default 10000 MVA short circuit capacity
+        mode, imp_suffix, mvasc3 = _ext_grid_vsource_impedance(element_data, bus_voltage)
         
         try:
             # Build spectrum parameter if provided (named spectrum or custom CSV -> New Spectrum.*)
@@ -2251,6 +2465,8 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             spectrum_suffix = ''
             if spectrum_resolved:
                 spectrum_suffix = f" spectrum={spectrum_resolved}"
+
+            imp_part = imp_suffix if mode == 'thevenin' else f" mvasc3={mvasc3}"
             
             if 'circuit_source_configured' not in created_elements:
                 # First external grid: configure the default Circuit source directly.
@@ -2260,7 +2476,7 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
                 # This is cleaner and follows the standard OpenDSS pattern where the
                 # Circuit source IS the main grid connection.
                 edit_cmd = (f"Edit Vsource.source Bus1={bus_name} basekv={bus_voltage} "
-                            f"pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}{spectrum_suffix}")
+                            f"pu={vm_pu} Phases=3 angle=0{imp_part}{spectrum_suffix}")
                 execute_dss_command(edit_cmd)
                 created_elements.add('circuit_source_configured')
                 # Track which element name maps to the circuit source for result retrieval
@@ -2268,7 +2484,7 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             else:
                 # Additional external grids: create a new Vsource element
                 external_grid_cmd = (f"New Vsource.{element_name} Bus1={bus_name} basekv={bus_voltage} "
-                                     f"pu={vm_pu} Phases=3 angle=0 mvasc3={s_sc_max_mva}{spectrum_suffix}")
+                                     f"pu={vm_pu} Phases=3 angle=0{imp_part}{spectrum_suffix}")
                 execute_dss_command(external_grid_cmd)
             
             # Handle in_service status AFTER creating the element
@@ -2322,39 +2538,10 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             opendss_commands.append(command)
 
     f = int(frequency) if frequency else 50
-    # Pre-scan for External Grid to embed Vsource params in New Circuit
-    _ext_bus = None
-    _ext_basekv = None
-    _ext_pu = 1.0
-    _ext_mvasc3 = 10000.0
-    _ext_angle = 0
-    for _x in in_data:
-        _elem = in_data[_x]
-        if _elem.get('typ', '').startswith('External Grid'):
-            _bus_ref = _elem.get('bus', '')
-            _ext_bus = _sanitize_opendss_name(_bus_ref)
-            _ext_pu = float(_elem.get('vm_pu', 1.0) or 1.0)
-            _ext_angle = float(_elem.get('va_degree', 0) or 0)
-            _ext_mvasc3 = float(_elem.get('s_sc_max_mva', 10000.0) or 10000.0)
-            if _ext_pu == 0:
-                _ext_pu = 1.0
-            if _ext_mvasc3 <= 0.1:
-                _ext_mvasc3 = 10000.0
-            for _bx in in_data:
-                _belem = in_data[_bx]
-                if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == _ext_bus:
-                    _ext_basekv = float(_belem.get('vn_kv', 110))
-                    break
-            break
+    ext_scan = _prescan_external_grid(in_data)
 
     execute_dss_command('clear')
-    if _ext_bus and _ext_basekv:
-        execute_dss_command(
-            f'New Circuit.OpenDSS_Circuit bus1={_ext_bus} basekv={_ext_basekv} '
-            f'pu={_ext_pu} phases=3 angle={_ext_angle} Mvasc3={_ext_mvasc3}'
-        )
-    else:
-        execute_dss_command('New Circuit.OpenDSS_Circuit')
+    execute_dss_command(_new_circuit_command(ext_scan))
     execute_dss_command(f'set DefaultBaseFrequency={f}')
 
     try:
@@ -2371,11 +2558,9 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
 
     # Set voltage bases (required for fault study and per-unit results)
     try:
-        # Explicit voltage base list helps FaultStudy; calcv refines from equipment
-        if BusbarsDictVoltage:
-            vb_list = sorted(set(float(v) for v in BusbarsDictVoltage.values()), reverse=True)
-            if vb_list:
-                execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
+        vb_list = _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage)
+        if vb_list:
+            execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
         print("[OpenDSS] calcv")
         dss.Text.Command('calcv')
     except Exception:
@@ -2590,6 +2775,21 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     return json.dumps(result, separators=(',', ':'))
 
 
+def _opendss_has_power_injections(LoadsDict, GeneratorsDict, StoragesDict, PVSystemsDict):
+    """Return True when the model has loads, generators, storage, or PV that should draw/inject power."""
+    return bool(LoadsDict or GeneratorsDict or StoragesDict or PVSystemsDict)
+
+
+def _opendss_total_power_is_zero(total_power, threshold_kw=0.01):
+    """Return True when circuit total power is effectively zero (OpenDSS first-solve quirk)."""
+    try:
+        p_kw = float(total_power[0])
+        q_kvar = float(total_power[1])
+    except (TypeError, IndexError, ValueError):
+        return True
+    return abs(p_kw) < threshold_kw and abs(q_kvar) < threshold_kw
+
+
 def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode, export_commands=False):
     """Main powerflow function for OpenDSS
     
@@ -2631,114 +2831,88 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     # Pre-scan in_data for the first External Grid to embed its Vsource parameters
     # directly into "New Circuit". This avoids relying on "Edit Vsource.source" which
     # can silently fail in some opendssdirect versions, leaving zero voltage everywhere.
-    _ext_bus = None
-    _ext_basekv = None
-    _ext_pu = 1.0
-    _ext_mvasc3 = 10000.0
-    _ext_angle = 0
-    for _x in in_data:
-        _elem = in_data[_x]
-        if _elem.get('typ', '').startswith('External Grid'):
-            _bus_ref = _elem.get('bus', '')
-            _ext_bus = _sanitize_opendss_name(_bus_ref)
-            _ext_pu = float(_elem.get('vm_pu', 1.0) or 1.0)
-            _ext_angle = float(_elem.get('va_degree', 0) or 0)
-            _ext_mvasc3 = float(_elem.get('s_sc_max_mva', 10000.0) or 10000.0)
-            if _ext_pu == 0:
-                _ext_pu = 1.0
-            if _ext_mvasc3 <= 0.1:
-                _ext_mvasc3 = 10000.0
-            for _bx in in_data:
-                _belem = in_data[_bx]
-                if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == _ext_bus:
-                    _ext_basekv = float(_belem.get('vn_kv', 110))
-                    break
+    ext_scan = _prescan_external_grid(in_data)
+    
+    element_dicts = None
+    for build_attempt in range(2):
+        if build_attempt > 0:
+            print("[OpenDSS] Zero-power first solve with active injections; rebuilding circuit and solving again")
+
+        execute_dss_command('clear')
+        execute_dss_command(_new_circuit_command(ext_scan))
+        execute_dss_command(f'set DefaultBaseFrequency={f}')
+        execute_dss_command(f'set Mode={mode}')
+        execute_dss_command(f'set Algorithm={algorithm}')
+        execute_dss_command(f'set LoadModel={loadmodel}')
+        execute_dss_command(f'set ControlMode={controlmode}')
+        execute_dss_command(f'set MaxIterations={max_iterations}')
+        execute_dss_command(f'set Tolerance={tolerance}')
+
+        # Create busbars and other elements using helper functions
+        # Wrap in try-except to catch validation errors and return them to frontend
+        try:
+            BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
+                in_data, dss, export_commands, opendss_commands)
+
+            element_dicts = create_other_elements(
+                in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
+                export_commands, opendss_commands, execute_dss_command)
+        except ValueError as ve:
+            error_response = {"error": str(ve)}
+            return json.dumps(error_response)
+        except Exception as e:
+            error_response = {"error": f"Error creating network elements: {str(e)}"}
+            return json.dumps(error_response)
+
+        try:
+            print("[OpenDSS] solve")
+            execute_dss_command('init')
+            dss.Text.Command('solve')
+        except Exception as e:
+            print(f"[OpenDSS] Solve EXCEPTION: {e}")
+
+        try:
+            converged = dss.Solution.Converged()
+            iterations = dss.Solution.Iterations()
+            print(f"[OpenDSS] Converged: {converged}, Iterations: {iterations}")
+            all_buses = dss.Circuit.AllBusNames()
+            print(f"[OpenDSS] AllBusNames: {all_buses}")
+            total_power = dss.Circuit.TotalPower()
+            print(f"[OpenDSS] TotalPower (kW, kvar): {total_power}")
+            for bname in all_buses[:6]:
+                dss.Circuit.SetActiveBus(bname)
+                v = dss.Bus.Voltages()
+                print(f"[OpenDSS] Bus '{bname}' voltages (V): {v[:6] if len(v) >= 6 else v}")
+
+            (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+             Transformers3WDict, Transformers3WDictId,
+             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+             StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+             circuit_source_element_name) = element_dicts
+
+            if (build_attempt == 0
+                    and _opendss_has_power_injections(LoadsDict, GeneratorsDict, StoragesDict, PVSystemsDict)
+                    and _opendss_total_power_is_zero(total_power)):
+                continue
             break
-    
-    execute_dss_command('clear')
-    if _ext_bus and _ext_basekv:
-        execute_dss_command(
-            f'New Circuit.OpenDSS_Circuit bus1={_ext_bus} basekv={_ext_basekv} '
-            f'pu={_ext_pu} phases=3 angle={_ext_angle} Mvasc3={_ext_mvasc3}'
-        )
-    else:
-        execute_dss_command('New Circuit.OpenDSS_Circuit')
-    execute_dss_command(f'set DefaultBaseFrequency={f}')
+        except Exception as e:
+            print(f"[OpenDSS] Post-solve diagnostics EXCEPTION: {e}")
+            if element_dicts is not None:
+                (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+                 Transformers3WDict, Transformers3WDictId,
+                 ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+                 StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+                 circuit_source_element_name) = element_dicts
+            break
 
-    # Set solution mode (Snapshot, Daily, Dutycycle, Yearly, etc.)
-    # Reference: https://opendss.epri.com/PowerFlow.html
-    execute_dss_command(f'set Mode={mode}')
-    
-    # Set solution algorithm (Normal, Newton, or NCIM)
-    # Normal = fast current injection (default)
-    # Newton = more robust for difficult circuits
-    # NCIM = N-Node Current Injection Method for difficult transmission systems
-    execute_dss_command(f'set Algorithm={algorithm}')
-    
-    # Set load model
-    # Powerflow = iterative solution with power injections (default)
-    # Admittance = direct solution with admittances
-    execute_dss_command(f'set LoadModel={loadmodel}')
-    
-    # Set control mode
-    # Static = no control actions (default)
-    # Event = time-based controls
-    # Time = continuous controls
-    execute_dss_command(f'set ControlMode={controlmode}')
-     
-    # Set convergence parameters
-    execute_dss_command(f'set MaxIterations={max_iterations}')
-    execute_dss_command(f'set Tolerance={tolerance}')
-  
-    
-    # Create busbars and other elements using helper functions
-    # Wrap in try-except to catch validation errors and return them to frontend
-    try:
-        # Create busbars - this validates voltage values
-        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, export_commands, opendss_commands)
+    if element_dicts is None:
+        return json.dumps({"error": "Error creating network elements: circuit build failed"})
+    (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+     Transformers3WDict, Transformers3WDictId,
+     ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+     StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+     circuit_source_element_name) = element_dicts
 
-        # Create other elements
-        (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
-         Transformers3WDict, Transformers3WDictId,
-         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
-         circuit_source_element_name) = create_other_elements(
-            in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
-            export_commands, opendss_commands, execute_dss_command)
-    except ValueError as ve:
-        # Validation error - return error message to frontend
-        error_response = {
-            "error": str(ve)
-        }
-        return json.dumps(error_response)
-    except Exception as e:
-        # Other errors during element creation
-        error_response = {
-            "error": f"Error creating network elements: {str(e)}"
-        }
-        return json.dumps(error_response)
-    
-    # Execute solve commands (voltage bases and calcv already run during element creation)
-    try:
-        print("[OpenDSS] solve")
-        dss.Text.Command('solve')
-    except Exception as e:
-        print(f"[OpenDSS] Solve EXCEPTION: {e}")
-    # Check solve status
-    try:
-        converged = dss.Solution.Converged()
-        iterations = dss.Solution.Iterations()
-        print(f"[OpenDSS] Converged: {converged}, Iterations: {iterations}")
-        all_buses = dss.Circuit.AllBusNames()
-        print(f"[OpenDSS] AllBusNames: {all_buses}")
-        total_power = dss.Circuit.TotalPower()
-        print(f"[OpenDSS] TotalPower (kW, kvar): {total_power}")
-        for bname in all_buses[:6]:
-            dss.Circuit.SetActiveBus(bname)
-            v = dss.Bus.Voltages()
-            print(f"[OpenDSS] Bus '{bname}' voltages (V): {v[:6] if len(v) >= 6 else v}")
-    except Exception as e:
-        print(f"[OpenDSS] Post-solve diagnostics EXCEPTION: {e}")
     # Process results using the new output classes
     
     # Initialize result lists
@@ -2872,20 +3046,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Convert to line-to-line voltage
                 V1_mag_ll_kv = V1_mag_ln_kv * math.sqrt(3)
                 
-                # Use the user-specified base voltage from input data (not OpenDSS's internal base)
-                # This is the vn_kv from the bus definition
-                base_kv_user = BusbarsDictVoltage.get(matched_bus_id)
-                
-                if base_kv_user is not None:
-                    # User specified voltage in L-L format
-                    base_kv = float(base_kv_user)
-                else:
-                    # Fallback to OpenDSS's base voltage
-                    base_kv_ln = dss.Bus.kVBase()
-                    base_kv = base_kv_ln * math.sqrt(3)  # Convert L-N to L-L
-                
-                # Calculate per-unit based on user-specified base voltage
-                vm_pu = V1_mag_ll_kv / base_kv if base_kv > 0 else 1.0
+                # Per-unit on OpenDSS calcv base (avoids e.g. bus4 at 10.6 kV with 10.0 kV trafo nameplate)
+                vm_pu = _bus_vm_pu_from_opendss(V1_mag_ll_kv, BusbarsDictVoltage, matched_bus_id)
                 
                 # Get angle from vmag_angle_pu
                 va_degree = dss.Bus.puVmagAngle()[1] if len(dss.Bus.puVmagAngle()) > 1 else 0.0
@@ -3631,8 +3793,12 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 # Get powers (in kW and kvar) - sum all three phases
                                 powers = dss.CktElement.Powers()
                                 if len(powers) >= 6:
-                                    p_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
-                                    q_mvar = (powers[1] + powers[3] + powers[5]) / 1000.0
+                                    p_raw = powers[0] + powers[2] + powers[4]
+                                    q_raw = powers[1] + powers[3] + powers[5]
+                                    # PVSystem reports generation as negative (power OUT of element).
+                                    # Negate to match Electrisim/pandapower convention (+ = injection).
+                                    p_mw = -(p_raw / 1000.0) if not math.isnan(p_raw) else 0.0
+                                    q_mvar = -(q_raw / 1000.0) if not math.isnan(q_raw) else 0.0
                                 else:
                                     p_mw = q_mvar = 0.0
 
