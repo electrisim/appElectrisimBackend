@@ -577,10 +577,12 @@ def simulation():
                     'time_steps': int(in_data[x].get('time_steps', 24)),
                     'load_profile': in_data[x].get('load_profile', 'constant'),
                     'generation_profile': in_data[x].get('generation_profile', 'constant'),
+                    'profile_mode': in_data[x].get('profile_mode', 'preset'),
+                    'element_profiles': in_data[x].get('element_profiles') or {},
                     'frequency': eval(in_data[x].get('frequency', '50')),
                     'algorithm': in_data[x].get('algorithm', 'nr'),
                     'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
-                    'init': in_data[x].get('init', 'dc')
+                    'init': in_data[x].get('init') or in_data[x].get('initialization') or 'auto',
                 }
                 
                 # Create network

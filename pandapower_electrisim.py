@@ -7694,6 +7694,156 @@ def controller_simulation(net, controller_params):
         return diagnostic_response
 
 
+def _ts_normalize_profile(values, time_steps, default=1.0):
+    """Repeat or truncate profile list to match time_steps."""
+    if not values:
+        return [float(default)] * time_steps
+    vals = [float(v) for v in values]
+    if len(vals) >= time_steps:
+        return vals[:time_steps]
+    return [vals[i % len(vals)] for i in range(time_steps)]
+
+
+def _ts_build_load_preset(preset, time_steps):
+    import random
+    import math
+    if preset == 'daily':
+        base_profile = [0.3, 0.25, 0.2, 0.15, 0.2, 0.4, 0.7, 0.9, 1.0, 1.1, 1.05, 1.0,
+                        0.95, 1.0, 1.05, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35]
+        out = []
+        for i, val in enumerate(base_profile):
+            random.seed(42 + i)
+            out.append(max(0.1, min(1.3, val + random.uniform(-0.2, 0.2))))
+        return _ts_normalize_profile(out, time_steps)
+    if preset == 'industrial':
+        base_profile = [0.1, 0.05, 0.05, 0.05, 0.1, 0.2, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0,
+                        1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05]
+        out = []
+        for i, val in enumerate(base_profile):
+            random.seed(42 + i)
+            out.append(max(0.02, min(1.1, val + random.uniform(-0.1, 0.1))))
+        return _ts_normalize_profile(out, time_steps)
+    if preset == 'variable':
+        out = []
+        for hour in range(time_steps):
+            random.seed(42 + hour)
+            base_load = 0.4 + 0.6 * math.sin(2 * math.pi * hour / 8)
+            spike = random.uniform(0.6, 1.6) if random.random() < 0.4 else 1.0
+            out.append(max(0.05, min(1.8, base_load * spike)))
+        return out
+    # constant: unity scale — same as load flow snapshot (no artificial jitter)
+    return [1.0] * time_steps
+
+
+def _ts_build_gen_preset(preset, time_steps):
+    import random
+    import math
+    if preset == 'solar':
+        base_profile = [0, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0,
+                        1.0, 0.95, 0.8, 0.5, 0.2, 0.05, 0, 0, 0, 0, 0, 0]
+        out = []
+        for i, val in enumerate(base_profile):
+            random.seed(42 + i)
+            if val > 0.3:
+                out.append(max(0, min(1.2, val * random.uniform(0.7, 1.1))))
+            else:
+                out.append(val)
+        return _ts_normalize_profile(out, time_steps)
+    if preset == 'wind':
+        out = []
+        for hour in range(time_steps):
+            random.seed(42 + hour)
+            base_wind = 0.5 + 0.5 * math.sin(2 * math.pi * hour / 24)
+            out.append(max(0.1, min(1.1, base_wind * random.uniform(0.6, 1.4))))
+        return out
+    if preset == 'variable':
+        out = []
+        for hour in range(time_steps):
+            random.seed(42 + hour)
+            base_gen = 0.5 + 0.5 * math.cos(2 * math.pi * hour / 6)
+            fluctuation = random.uniform(0.5, 1.5) if random.random() < 0.5 else 1.0
+            out.append(max(0.1, min(1.4, base_gen * fluctuation)))
+        return out
+    # constant: unity scale — same as load flow snapshot (no artificial jitter)
+    return [1.0] * time_steps
+
+
+def _ts_orig_p_for_element(net, elem_name, element_type):
+    """Baseline P (MW) for profile mode detection."""
+    elem_name = str(elem_name)
+    if element_type == 'load' and len(net.load) > 0:
+        for idx in net.load.index:
+            if str(net.load.loc[idx, 'name']) == elem_name:
+                return float(net.load.loc[idx, 'p_mw'])
+    if element_type in ('sgen', 'static_generator') and len(net.sgen) > 0:
+        for idx in net.sgen.index:
+            if str(net.sgen.loc[idx, 'name']) == elem_name:
+                return float(net.sgen.loc[idx, 'p_mw'])
+    if element_type == 'gen' and len(net.gen) > 0:
+        for idx in net.gen.index:
+            if str(net.gen.loc[idx, 'name']) == elem_name:
+                return float(net.gen.loc[idx, 'p_mw'])
+    return None
+
+
+def _ts_resolve_profile_mode(mode, values, orig_p):
+    """
+    Detect notebook-style absolute MW profiles sent with mode='scale'.
+    Scale factors are dimensionless (typically 0–2); values in [0, orig_p] are absolute MW.
+    """
+    if mode != 'scale' or not values:
+        return mode
+    op = abs(float(orig_p)) if orig_p else 0.0
+    vmax = max(abs(float(v)) for v in values)
+    if vmax > 3.0:
+        return 'absolute'
+    if op > 1.0 and vmax >= op * 0.2 and vmax <= op * 1.05:
+        return 'absolute'
+    return mode
+
+
+def _ts_set_pq(table, idx, orig_p, orig_q, value, mode):
+    op = float(orig_p.loc[idx])
+    oq = float(orig_q.loc[idx]) if orig_q is not None else 0.0
+    if mode == 'absolute':
+        new_p = float(value)
+        if op != 0:
+            net_q = oq * (new_p / op)
+        elif oq != 0:
+            net_q = oq
+        else:
+            net_q = new_p * 0.66
+    else:
+        scale = float(value)
+        new_p = op * scale
+        net_q = oq * scale
+    table.loc[idx, 'p_mw'] = new_p
+    if 'q_mvar' in table.columns:
+        table.loc[idx, 'q_mvar'] = net_q
+
+
+def _ts_run_powerflow(net, timeseries_params, time_index, prev_converged):
+    """Run PF for one time step; warm-start from previous step when possible (pandapower timeseries style)."""
+    algorithm = timeseries_params.get('algorithm', 'nr')
+    cva = timeseries_params.get('calculate_voltage_angles', 'auto')
+    init_param = timeseries_params.get('init') or timeseries_params.get('initialization') or 'auto'
+    pf_kwargs = _electrisim_enforce_q_lims_kw(net)
+
+    if time_index == 0 or not prev_converged or init_param in ('dc', 'flat', 'pf'):
+        pf_init = init_param if init_param != 'results' else 'auto'
+    else:
+        pf_init = 'results'
+
+    try:
+        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init=pf_init, **pf_kwargs)
+    except Exception:
+        if pf_init == 'results':
+            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init='auto', **pf_kwargs)
+        else:
+            raise
+    return bool(net.converged)
+
+
 def time_series_simulation(net, timeseries_params):
     """
     Sequential AC power flow over time steps with scaled loads and generators.
@@ -7704,133 +7854,91 @@ def time_series_simulation(net, timeseries_params):
     and do not change this execution path.
     """
     try:
-        # Get time series parameters
         time_steps = int(timeseries_params.get('time_steps', 24))
         load_profile = timeseries_params.get('load_profile', 'constant')
         generation_profile = timeseries_params.get('generation_profile', 'constant')
-        
-        # Create time stamps
+        profile_mode = timeseries_params.get('profile_mode', 'preset')
+        element_profiles = timeseries_params.get('element_profiles') or {}
+
         import datetime
         time_stamps = [datetime.datetime(2024, 1, 1, hour=h) for h in range(time_steps)]
-        
-        # Baseline element data (must not compound across time steps)
+
         orig_load_p = net.load['p_mw'].copy() if len(net.load) > 0 else None
         orig_load_q = net.load['q_mvar'].copy() if len(net.load) > 0 else None
         orig_gen_p = net.gen['p_mw'].copy() if len(net.gen) > 0 else None
         orig_gen_q = net.gen['q_mvar'].copy() if len(net.gen) > 0 and 'q_mvar' in net.gen.columns else None
-        orig_line_r = net.line['r_ohm_per_km'].copy() if len(net.line) > 0 and 'r_ohm_per_km' in net.line.columns else None
+        orig_sgen_p = net.sgen['p_mw'].copy() if len(net.sgen) > 0 else None
+        orig_sgen_q = net.sgen['q_mvar'].copy() if len(net.sgen) > 0 else None
 
-        # Create enhanced load profiles with more variation
-        import random
-        import math
+        load_profile_values = _ts_build_load_preset(load_profile, time_steps)
+        gen_profile_values = _ts_build_gen_preset(generation_profile, time_steps)
 
-        if load_profile == 'daily':
-            base_profile = [0.3, 0.25, 0.2, 0.15, 0.2, 0.4, 0.7, 0.9, 1.0, 1.1, 1.05, 1.0,
-                           0.95, 1.0, 1.05, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35]
-            load_profile_values = []
-            for i, val in enumerate(base_profile):
-                random.seed(42 + i)
-                variation = random.uniform(-0.2, 0.2)
-                load_value = max(0.1, min(1.3, val + variation))
-                load_profile_values.append(load_value)
-        elif load_profile == 'industrial':
-            base_profile = [0.1, 0.05, 0.05, 0.05, 0.1, 0.2, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0,
-                           1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05]
-            load_profile_values = []
-            for i, val in enumerate(base_profile):
-                random.seed(42 + i)
-                variation = random.uniform(-0.1, 0.1)
-                load_value = max(0.02, min(1.1, val + variation))
-                load_profile_values.append(load_value)
-        elif load_profile == 'variable':
-            load_profile_values = []
-            for hour in range(24):
-                random.seed(42 + hour)
-                base_load = 0.4 + 0.6 * math.sin(2 * math.pi * hour / 8)
-                spike = random.uniform(0.6, 1.6) if random.random() < 0.4 else 1.0
-                load_value = max(0.05, min(1.8, base_load * spike))
-                load_profile_values.append(load_value)
-        else:
-            load_profile_values = []
-            for hour in range(24):
-                random.seed(42 + hour)
-                variation = random.uniform(-0.15, 0.15)
-                load_value = max(0.7, min(1.3, 1.0 + variation))
-                load_profile_values.append(load_value)
+        # Resolve per-element profiles for custom mode
+        resolved_profiles = {}
+        profiles_used = {}
+        if profile_mode == 'custom' and element_profiles:
+            for elem_name, spec in element_profiles.items():
+                if not isinstance(spec, dict):
+                    continue
+                values = _ts_normalize_profile(spec.get('values', []), time_steps)
+                declared_mode = spec.get('mode', 'scale')
+                element_type = spec.get('element_type')
+                orig_p = _ts_orig_p_for_element(net, elem_name, element_type)
+                mode = _ts_resolve_profile_mode(declared_mode, values, orig_p)
+                ufn = getattr(net, 'user_friendly_names', {}) or {}
+                display_name = (
+                    spec.get('display_name')
+                    or spec.get('userFriendlyName')
+                    or ufn.get(str(elem_name), str(elem_name))
+                )
+                resolved_profiles[str(elem_name)] = {'values': values, 'mode': mode, 'element_type': element_type}
+                profiles_used[str(elem_name)] = {
+                    'mode': mode,
+                    'declared_mode': declared_mode,
+                    'values': values,
+                    'element_type': element_type,
+                    'display_name': display_name,
+                    'id': str(elem_name),
+                }
 
-        if generation_profile == 'solar':
-            base_profile = [0, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0,
-                           1.0, 0.95, 0.8, 0.5, 0.2, 0.05, 0, 0, 0, 0, 0, 0]
-            gen_profile_values = []
-            for i, val in enumerate(base_profile):
-                random.seed(42 + i)
-                if val > 0.3:
-                    cloud_effect = random.uniform(0.7, 1.1)
-                    gen_value = max(0, min(1.2, val * cloud_effect))
-                    gen_profile_values.append(gen_value)
-                else:
-                    gen_profile_values.append(val)
-        elif generation_profile == 'wind':
-            gen_profile_values = []
-            for hour in range(24):
-                random.seed(42 + hour)
-                base_wind = 0.5 + 0.5 * math.sin(2 * math.pi * hour / 24)
-                wind_variation = random.uniform(0.6, 1.4)
-                wind_value = max(0.1, min(1.1, base_wind * wind_variation))
-                gen_profile_values.append(wind_value)
-        elif generation_profile == 'variable':
-            gen_profile_values = []
-            for hour in range(24):
-                random.seed(42 + hour)
-                base_gen = 0.5 + 0.5 * math.cos(2 * math.pi * hour / 6)
-                fluctuation = random.uniform(0.5, 1.5) if random.random() < 0.5 else 1.0
-                gen_value = max(0.1, min(1.4, base_gen * fluctuation))
-                gen_profile_values.append(gen_value)
-        else:
-            gen_profile_values = []
-            for hour in range(24):
-                random.seed(42 + hour)
-                variation = random.uniform(-0.2, 0.2)
-                gen_value = max(0.6, min(1.4, 1.0 + variation))
-                gen_profile_values.append(gen_value)
+        def _element_profile(name, element_type, t, global_values):
+            spec = resolved_profiles.get(str(name))
+            if spec and spec.get('element_type') == element_type:
+                return spec['values'][t], spec.get('mode', 'scale')
+            return global_values[t % len(global_values)], 'scale'
 
         all_results = []
-        for t in range(time_steps):
-            random.seed(42 + t)
+        prev_converged = False
 
+        for t in range(time_steps):
             if orig_load_p is not None:
                 for idx in net.load.index:
-                    load_scale = load_profile_values[t % len(load_profile_values)]
-                    pf_variation = 1.0 + random.uniform(-0.2, 0.2)
-                    net.load.loc[idx, 'p_mw'] = float(orig_load_p.loc[idx]) * load_scale
-                    net.load.loc[idx, 'q_mvar'] = float(orig_load_q.loc[idx]) * load_scale * pf_variation
+                    elem_name = str(net.load.loc[idx, 'name'])
+                    val, mode = _element_profile(elem_name, 'load', t, load_profile_values)
+                    _ts_set_pq(net.load, idx, orig_load_p, orig_load_q, val, mode)
+
+            if orig_sgen_p is not None:
+                for idx in net.sgen.index:
+                    elem_name = str(net.sgen.loc[idx, 'name'])
+                    val, mode = _element_profile(elem_name, 'sgen', t, gen_profile_values)
+                    _ts_set_pq(net.sgen, idx, orig_sgen_p, orig_sgen_q, val, mode)
 
             if orig_gen_p is not None:
                 for idx in net.gen.index:
-                    gen_scale = gen_profile_values[t % len(gen_profile_values)]
-                    q_variation = 1.0 + random.uniform(-0.25, 0.25)
-                    net.gen.loc[idx, 'p_mw'] = float(orig_gen_p.loc[idx]) * gen_scale
-                    oq = float(orig_gen_q.loc[idx]) if orig_gen_q is not None else 0.0
-                    if oq != 0:
-                        net.gen.loc[idx, 'q_mvar'] = oq * gen_scale * q_variation
+                    elem_name = str(net.gen.loc[idx, 'name'])
+                    val, mode = _element_profile(elem_name, 'gen', t, gen_profile_values)
+                    _ts_set_pq(net.gen, idx, orig_gen_p, orig_gen_q, val, mode)
 
-            if orig_line_r is not None:
-                for idx in net.line.index:
-                    temp_factor = 1.0 + random.uniform(-0.1, 0.1)
-                    net.line.loc[idx, 'r_ohm_per_km'] = float(orig_line_r.loc[idx]) * temp_factor
-
-            pp.runpp(net,
-                     algorithm=timeseries_params.get('algorithm', 'nr'),
-                     calculate_voltage_angles=timeseries_params.get('calculate_voltage_angles', 'True'),
-                     init=timeseries_params.get('init', 'dc'),
-                     **_electrisim_enforce_q_lims_kw(net))
+            prev_converged = _ts_run_powerflow(net, timeseries_params, t, prev_converged)
 
             all_results.append({
                 'time_step': t,
                 'converged': net.converged,
                 'bus_results': net.res_bus.copy(),
                 'line_results': net.res_line.copy(),
-                'gen_results': net.res_gen.copy()
+                'gen_results': net.res_gen.copy() if len(net.gen) > 0 else None,
+                'sgen_results': net.res_sgen.copy() if len(net.sgen) > 0 else None,
+                'load_results': net.res_load.copy() if len(net.load) > 0 else None,
             })
 
         # Prepare results
@@ -7852,15 +7960,35 @@ def time_series_simulation(net, timeseries_params):
                 self.loading_percent = loading_percent
                 self.p_from_mw = p_from_mw
                 self.p_to_mw = p_to_mw
+
+        class TimeSeriesLoadOut(object):
+            def __init__(self, name: str, id: str, time_step: int, p_mw: float, q_mvar: float):
+                self.name = name
+                self.id = id
+                self.time_step = time_step
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
+
+        class TimeSeriesSgenOut(object):
+            def __init__(self, name: str, id: str, time_step: int, p_mw: float, q_mvar: float):
+                self.name = name
+                self.id = id
+                self.time_step = time_step
+                self.p_mw = p_mw
+                self.q_mvar = q_mvar
         
         # Collect results for each time step (from sequential runpp snapshots)
         all_busbars = []
         all_lines = []
+        all_loads = []
+        all_sgens = []
 
         for result in all_results:
             t = result['time_step']
             bus_results = result['bus_results']
             line_results = result['line_results']
+            load_results = result.get('load_results')
+            sgen_results = result.get('sgen_results')
 
             for idx, bus in bus_results.iterrows():
                 bus_name = net.bus.loc[idx, 'name']
@@ -7886,6 +8014,30 @@ def time_series_simulation(net, timeseries_params):
                     p_from_mw=safe_float(line['p_from_mw']),
                     p_to_mw=safe_float(line['p_to_mw'])
                 ))
+
+            if load_results is not None:
+                for idx, load in load_results.iterrows():
+                    load_name = net.load.loc[idx, 'name']
+                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(load_name, load_name)
+                    all_loads.append(TimeSeriesLoadOut(
+                        name=get_display_name(user_friendly_name, load_name, 'Load', idx, 'timeseries'),
+                        id=str(load_name),
+                        time_step=t,
+                        p_mw=safe_float(load['p_mw']),
+                        q_mvar=safe_float(load['q_mvar'])
+                    ))
+
+            if sgen_results is not None:
+                for idx, sgen in sgen_results.iterrows():
+                    sgen_name = net.sgen.loc[idx, 'name']
+                    user_friendly_name = getattr(net, 'user_friendly_names', {}).get(sgen_name, sgen_name)
+                    all_sgens.append(TimeSeriesSgenOut(
+                        name=get_display_name(user_friendly_name, sgen_name, 'Static Generator', idx, 'timeseries'),
+                        id=str(sgen_name),
+                        time_step=t,
+                        p_mw=safe_float(sgen['p_mw']),
+                        q_mvar=safe_float(sgen['q_mvar'])
+                    ))
 
         # Summary statistics with display names (user-friendly + technical ID)
         vm_stats = {}
@@ -7933,8 +8085,16 @@ def time_series_simulation(net, timeseries_params):
         return {
             'timeseries_converged': timeseries_converged,
             'time_steps': time_steps,
+            'profile_mode': profile_mode,
+            'load_profile': load_profile,
+            'generation_profile': generation_profile,
+            'load_profile_values': load_profile_values,
+            'generation_profile_values': gen_profile_values,
+            'profiles_used': profiles_used,
             'busbars': [vars(bus) for bus in all_busbars],
             'lines': [vars(line) for line in all_lines],
+            'loads': [vars(ld) for ld in all_loads],
+            'sgens': [vars(sg) for sg in all_sgens],
             'voltage_statistics': vm_stats,
             'loading_statistics': loading_stats,
             'time_stamps': [str(ts) for ts in time_stamps]
