@@ -9089,23 +9089,26 @@ def reactive_power_capability(net, rpc_params):
         if hasattr(net, 'user_friendly_names') and pcc_bus_name in net.user_friendly_names:
             pcc_bus_friendly = net.user_friendly_names[pcc_bus_name]
 
-        # Compute installed capacity and per-unit Q limits for each generator
+        # Compute installed active-power capacity (P_rated) for P-axis / dispatch shares.
+        # Use p_mw, not sn_mva — apparent power overstates wind-farm MW (e.g. 30×16 MVA vs 30×15 MW).
         gen_info = []
         for idx in sgen_indices:
             sn = net.sgen.at[idx, 'sn_mva'] if 'sn_mva' in net.sgen.columns and not pd.isna(net.sgen.at[idx, 'sn_mva']) else 0
+            p_mw = float(net.sgen.at[idx, 'p_mw']) if not pd.isna(net.sgen.at[idx, 'p_mw']) else 0.0
+            sn_f = float(sn) if sn > 0 else 0.0
+            p_rated = p_mw if p_mw > 0 else sn_f
             name = net.sgen.at[idx, 'name']
             gen_info.append({
                 'type': 'sgen',
                 'idx': idx,
                 'name': name,
-                'sn_mva': float(sn) if sn > 0 else float(net.sgen.at[idx, 'p_mw']),
+                'p_rated_mw': p_rated,
+                'sn_mva': sn_f if sn_f > 0 else p_rated,
             })
 
-        total_installed_mw = sum(g['sn_mva'] for g in gen_info)
+        total_installed_mw = sum(g['p_rated_mw'] for g in gen_info)
         if total_installed_mw <= 0:
-            total_installed_mw = sum(float(net.sgen.at[g['idx'], 'p_mw']) for g in gen_info)
-        if total_installed_mw <= 0:
-            return json.dumps({'error': 'Total installed capacity is zero. Set sn_mva on generators.'}, separators=(',', ':'))
+            return json.dumps({'error': 'Total installed capacity is zero. Set p_mw on static generators.'}, separators=(',', ':'))
 
         if p_max_mw <= 0:
             p_max_mw = total_installed_mw
@@ -9174,7 +9177,7 @@ def reactive_power_capability(net, rpc_params):
                     net_copy = deepcopy(net)
                     net_copy.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
                     for g in gen_info:
-                        share = g['sn_mva'] / total_installed_mw
+                        share = g['p_rated_mw'] / total_installed_mw
                         p_gen = p_val * share
                         q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
                             net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
@@ -9219,7 +9222,7 @@ def reactive_power_capability(net, rpc_params):
                     net_copy2 = deepcopy(net)
                     net_copy2.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
                     for g in gen_info:
-                        share = g['sn_mva'] / total_installed_mw
+                        share = g['p_rated_mw'] / total_installed_mw
                         p_gen = p_val * share
                         q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
                             net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
@@ -9554,7 +9557,7 @@ def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
         net_try.ext_grid.at[ext_grid_idx, 'vm_pu'] = v_pu
 
         for g in gen_info:
-            share = g['sn_mva'] / total_installed_mw
+            share = g['p_rated_mw'] / total_installed_mw
             p_gen = p_val * share
             sn = g['sn_mva']
             q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(net, g['idx'], p_gen, sn, q_capability_mode)

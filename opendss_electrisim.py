@@ -88,11 +88,14 @@ class StaticGeneratorsOut(object):
         self.staticgenerators = staticgenerators
 
 class LoadOut(object):
-    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float):          
+    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float,
+                 p_set_mw: float = None, vm_pu: float = None):
         self.name = name
         self.id = id
-        self.p_mw = p_mw 
-        self.q_mvar = q_mvar                       
+        self.p_mw = p_mw
+        self.q_mvar = q_mvar
+        self.p_set_mw = p_set_mw
+        self.vm_pu = vm_pu                       
                        
 class LoadsOut(object):
     def __init__(self, loads: List[LoadOut]):
@@ -202,6 +205,98 @@ def _sanitize_opendss_name(name):
         return name
     return name.replace(' ', '_')
 
+
+_opendss_warnings = []
+
+
+def _reset_opendss_warnings():
+    global _opendss_warnings
+    _opendss_warnings = []
+
+
+def _opendss_warn(message):
+    """Log a warning and collect it for the frontend response."""
+    print(f"[OpenDSS] WARNING: {message}")
+    _opendss_warnings.append(message)
+
+
+def _format_opendss_bus_terminal(bus_name, phase=1, conn='wye'):
+    """Return OpenDSS bus string with node notation, e.g. 'Bus5.1' or 'Bus5.1.2'."""
+    try:
+        p = int(phase)
+    except (TypeError, ValueError):
+        p = 1
+    if p < 1 or p > 3:
+        p = 1
+    c = (conn or 'wye').strip().lower()
+    if c == 'delta':
+        p2 = 1 if p >= 3 else p + 1
+        return f"{bus_name}.{p}.{p2}"
+    return f"{bus_name}.{p}"
+
+
+def _resolve_1ph_kv(bus_voltage_ll, conn='wye', explicit_kv=None):
+    """Rated kV for single-phase OpenDSS elements."""
+    if explicit_kv not in (None, '', '0'):
+        try:
+            return float(explicit_kv)
+        except (TypeError, ValueError):
+            pass
+    try:
+        v = float(bus_voltage_ll)
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0:
+        return v
+    if (conn or 'wye').strip().lower() == 'delta':
+        return v
+    return v / math.sqrt(3)
+
+
+def _element_phase_conn(element_data):
+    try:
+        phase = int(element_data.get('phase', 1) or 1)
+    except (TypeError, ValueError):
+        phase = 1
+    if phase < 1 or phase > 3:
+        phase = 1
+    conn = (element_data.get('conn') or 'wye').strip().lower()
+    if conn not in ('wye', 'delta'):
+        conn = 'wye'
+    return phase, conn
+
+def _resolve_load_1ph_kv(bus_voltage_ll, conn, explicit_kv=None):
+    """Rated kV for OpenDSS Load (phases=1). Explicit kV from UI is often L-L bus vn_kv."""
+    if explicit_kv not in (None, '', '0'):
+        kv = float(explicit_kv)
+    else:
+        return _resolve_1ph_kv(bus_voltage_ll, conn, None)
+    conn_l = (conn or 'wye').strip().lower()
+    try:
+        v_ll = float(bus_voltage_ll)
+    except (TypeError, ValueError):
+        return kv
+    if conn_l == 'wye' and v_ll > 0 and abs(kv - v_ll) / v_ll < 0.25:
+        return v_ll / math.sqrt(3)
+    return kv
+
+
+def _opendss_ckt_pq_mw(powers, terminal_index=0):
+    """Extract P/Q in MW/MVAr for any element terminal (1ph or 3ph)."""
+    if not powers or len(powers) < 2:
+        return 0.0, 0.0
+    try:
+        n_conductors = dss.CktElement.NumConductors()
+        n_phases = dss.CktElement.NumPhases()
+    except Exception:
+        n_conductors = 0
+        n_phases = 3
+    p_kw, q_kvar = _opendss_terminal_pq_kw(powers, terminal_index, n_conductors, n_phases)
+    p_mw = p_kw / 1000.0 if not math.isnan(p_kw) else 0.0
+    q_mvar = q_kvar / 1000.0 if not math.isnan(q_kvar) else 0.0
+    return p_mw, q_mvar
+
+
 def _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage):
     """Build OpenDSS voltagebases list from buses and equipment rated voltages."""
     levels = set()
@@ -305,9 +400,10 @@ def _ext_grid_vsource_impedance(element_data, bus_voltage_ll):
 
 
 def _prescan_external_grid(in_data):
-    """Read first External Grid element for New Circuit / Vsource.source setup."""
+    """Read first External Grid or Source 1ph element for New Circuit / Vsource.source setup."""
     for _elem in in_data.values():
-        if not _elem.get('typ', '').startswith('External Grid'):
+        typ = _elem.get('typ', '')
+        if not (typ.startswith('External Grid') or typ.startswith('Source 1ph')):
             continue
         bus_ref = _elem.get('bus', '')
         ext_bus = _sanitize_opendss_name(bus_ref)
@@ -329,15 +425,23 @@ def _prescan_external_grid(in_data):
         if ext_basekv is None:
             ext_basekv = 110.0
         mode, imp_suffix, mvasc3 = _ext_grid_vsource_impedance(_elem, ext_basekv)
+        phases = 1 if typ.startswith('Source 1ph') else 3
+        phase, conn = _element_phase_conn(_elem)
+        bus_terminal = _format_opendss_bus_terminal(ext_bus, phase, conn)
+        if phases == 1:
+            ext_basekv = _resolve_1ph_kv(ext_basekv, conn, _elem.get('kv'))
         return {
             'bus': ext_bus,
+            'bus_terminal': bus_terminal,
             'basekv': ext_basekv,
             'pu': ext_pu,
             'angle': ext_angle,
             'mode': mode,
             'impedance_suffix': imp_suffix,
             'mvasc3': mvasc3,
+            'phases': phases,
             'element': _elem,
+            'typ': typ,
         }
     return None
 
@@ -347,10 +451,10 @@ def _new_circuit_command(ext_scan):
     if not ext_scan:
         return 'New Circuit.OpenDSS_Circuit'
     parts = [
-        f"New Circuit.OpenDSS_Circuit bus1={ext_scan['bus']}",
+        f"New Circuit.OpenDSS_Circuit bus1={ext_scan.get('bus_terminal', ext_scan['bus'])}",
         f"basekv={ext_scan['basekv']}",
         f"pu={ext_scan['pu']}",
-        'phases=3',
+        f"phases={ext_scan.get('phases', 3)}",
         f"angle={ext_scan['angle']}",
     ]
     if ext_scan['mode'] == 'mvasc3' and ext_scan['mvasc3']:
@@ -518,7 +622,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
 
 
     
-    # First pass: create External Grid (Vsource) so the slack bus and base voltage are defined before other elements
+    # First pass: create External Grid / Source 1ph (Vsource) so the slack bus is defined before other elements
     for x in in_data:
         try:
             element_data = in_data[x]
@@ -526,6 +630,13 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
+                continue
+            if element_type.startswith("Source 1ph"):
+                if 'bus' not in element_data or element_data['bus'] not in BusbarsDictConnectionToName:
+                    continue
+                create_source_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, created_elements, execute_dss_command)
+                ExternalGridsDict[element_name] = element_name
+                ExternalGridsDictId[element_name] = element_id
                 continue
             if not element_type.startswith("External Grid"):
                 continue
@@ -553,7 +664,9 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_type = element_data.get('typ', '')
             element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
-            if "Line" in element_type:
+            if element_type.startswith("Line 1ph"):
+                create_line_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
+            elif "Line" in element_type:
                 create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Impedance"):
                 create_impedance_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command)
@@ -569,7 +682,9 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_type = element_data.get('typ', '')
             element_name = _sanitize_opendss_name(element_data.get('name', ''))
             element_id = element_data.get('id', '')
-            if (element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer")) and not element_type.startswith("Three Winding Transformer"):
+            if element_type.startswith("Transformer 1ph"):
+                create_transformer_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
+            elif (element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer")) and not element_type.startswith("Three Winding Transformer"):
                 create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command)
         except ValueError as ve:
             raise
@@ -615,9 +730,11 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             element_id = element_data.get('id', '')
             if "Bus" in element_type or element_type == "PowerFlowOpenDss Parameters":
                 continue
-            if element_type.startswith("External Grid") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer") or element_type.startswith("Three Winding") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
+            if element_type.startswith("External Grid") or element_type.startswith("Source 1ph") or "Line" in element_type or element_type.startswith("Transformer") or element_type.startswith("Two Winding Transformer") or element_type.startswith("Three Winding") or element_type.startswith("Shunt Reactor") or element_type.startswith("Capacitor"):
                 continue
-            if element_type.startswith("Load"):
+            if element_type.startswith("Load 1ph"):
+                create_load_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
+            elif element_type.startswith("Load"):
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Motor"):
                 # Motors are modeled as Loads in OpenDSS
@@ -626,6 +743,8 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Asymmetric Static Generator"):
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
+            elif element_type.startswith("Generator 1ph"):
+                create_generator_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Generator"):
                 create_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Storage"):
@@ -666,6 +785,231 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
             StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
             circuit_source_element_name)
+
+# Individual element creation functions — OpenDSS single-phase elements
+def create_load_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
+    if element_name in created_elements:
+        return
+    bus_connection = element_data.get('bus')
+    if not bus_connection:
+        return
+    bus_name = BusbarsDictConnectionToName.get(bus_connection) or _sanitize_opendss_name(bus_connection)
+    bus_voltage = BusbarsDictVoltage.get(bus_name)
+    if bus_voltage is None:
+        return
+    phase, conn = _element_phase_conn(element_data)
+    # Delta 1ph loads need two energized nodes; radial Line 1ph (wye) only energizes one.
+    if conn == 'delta':
+        _opendss_warn(
+            f"Load '{element_name}' conn=delta on single-phase radial feeder; using wye (L-N) on phase {phase}"
+        )
+        conn = 'wye'
+    bus_terminal = _format_opendss_bus_terminal(bus_name, phase, conn)
+    kv = _resolve_load_1ph_kv(bus_voltage, conn, element_data.get('kv'))
+    if element_data.get('p_kw') not in (None, ''):
+        p_kw = float(element_data.get('p_kw') or 0)
+    else:
+        p_kw = float(element_data.get('p_mw', 0) or 0) * 1000
+    if element_data.get('q_kvar') not in (None, ''):
+        q_kvar = float(element_data.get('q_kvar') or 0)
+    else:
+        q_kvar = float(element_data.get('q_mvar', 0) or 0) * 1000
+    load_name = element_name.replace(' ', '_')
+    try:
+        load_cmd = f"New Load.{load_name} phases=1 Bus1={bus_terminal} kV={kv} kW={p_kw} kvar={abs(q_kvar)} conn={conn}"
+        spectrum = element_data.get('spectrum', 'defaultload')
+        if spectrum and str(spectrum).lower() != 'none':
+            load_cmd += f" spectrum={spectrum}"
+        pct_series_rl = element_data.get('pctSeriesRL', '')
+        if pct_series_rl not in ('', None):
+            load_cmd += f" %SeriesRL={float(pct_series_rl)}"
+        execute_dss_command(load_cmd)
+        in_service = element_data.get('in_service', True)
+        is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ['false', 'no', '0']
+        if not is_in_service:
+            execute_dss_command(f'Load.{load_name}.enabled=no')
+        LoadsDict[element_name] = load_name
+        LoadsDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception:
+        pass
+
+
+def create_generator_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
+    if element_name in created_elements:
+        return
+    bus_connection = element_data.get('bus')
+    if not bus_connection:
+        return
+    bus_name = BusbarsDictConnectionToName.get(bus_connection) or _sanitize_opendss_name(bus_connection)
+    bus_voltage = BusbarsDictVoltage.get(bus_name)
+    if bus_voltage is None:
+        return
+    phase, conn = _element_phase_conn(element_data)
+    if conn == 'delta':
+        _opendss_warn(
+            f"Generator '{element_name}' conn=delta on single-phase radial feeder; using wye (L-N) on phase {phase}"
+        )
+        conn = 'wye'
+    bus_terminal = _format_opendss_bus_terminal(bus_name, phase, conn)
+    kv = _resolve_load_1ph_kv(bus_voltage, conn, element_data.get('kv'))
+    if element_data.get('p_kw') not in (None, ''):
+        p_kw = float(element_data.get('p_kw') or 0)
+    else:
+        p_kw = float(element_data.get('p_mw', 0) or 0) * 1000
+    if element_data.get('q_kvar') not in (None, ''):
+        q_kvar = float(element_data.get('q_kvar') or 0)
+    else:
+        q_kvar = float(element_data.get('q_mvar', 0) or 0) * 1000
+    try:
+        model = int(element_data.get('model', 1) or 1)
+    except (TypeError, ValueError):
+        model = 1
+    gen_name = element_name.replace(' ', '_')
+    try:
+        gen_cmd = (
+            f"New Generator.{gen_name} phases=1 Bus1={bus_terminal} kV={kv} "
+            f"kW={p_kw} kvar={q_kvar} Model={model} conn={conn}"
+        )
+        sn_kva = element_data.get('sn_kva')
+        if sn_kva not in (None, '', '0', 0):
+            gen_cmd += f" kVA={float(sn_kva)}"
+        spectrum = element_data.get('spectrum', 'defaultgen')
+        if spectrum and str(spectrum).lower() != 'none':
+            gen_cmd += f" spectrum={spectrum}"
+        execute_dss_command(gen_cmd)
+        in_service = element_data.get('in_service', True)
+        is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ['false', 'no', '0']
+        if not is_in_service:
+            execute_dss_command(f'Generator.{gen_name}.enabled=no')
+        GeneratorsDict[element_name] = gen_name
+        GeneratorsDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception:
+        pass
+
+
+def create_line_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command=None):
+    if element_name in created_elements:
+        return
+    bus_from_ref = element_data.get('busFrom')
+    bus_to_ref = element_data.get('busTo')
+    if not bus_from_ref or not bus_to_ref:
+        return
+    bus_from_name = BusbarsDictConnectionToName.get(bus_from_ref) or _sanitize_opendss_name(bus_from_ref)
+    bus_to_name = BusbarsDictConnectionToName.get(bus_to_ref) or _sanitize_opendss_name(bus_to_ref)
+    phase, conn = _element_phase_conn(element_data)
+    t1 = _format_opendss_bus_terminal(bus_from_name, phase, conn)
+    t2 = _format_opendss_bus_terminal(bus_to_name, phase, conn)
+    r_ohm_per_km = float(element_data.get('r_ohm_per_km', 0.122) or 0.122)
+    x_ohm_per_km = float(element_data.get('x_ohm_per_km', 0.112) or 0.112)
+    length_km = float(element_data.get('length_km', 1) or 1)
+    c_nf_per_km = element_data.get('c_nf_per_km')
+    try:
+        line_cmd = f'New Line.{element_name} phases=1 Bus1={t1} Bus2={t2} R1={r_ohm_per_km} X1={x_ohm_per_km} Length={length_km} units=km'
+        if c_nf_per_km not in (None, '', '0', 0):
+            line_cmd += f' C1={float(c_nf_per_km)}'
+        execute_dss_command(line_cmd)
+        in_service = element_data.get('in_service', True)
+        is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ['false', 'no', '0']
+        if not is_in_service:
+            execute_dss_command(f'Line.{element_name}.enabled=no')
+        LinesDict[element_name] = element_name
+        LinesDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception:
+        pass
+
+
+def create_source_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, created_elements, execute_dss_command=None):
+    if element_name in created_elements:
+        return
+    bus_connection = element_data.get('bus')
+    if not bus_connection:
+        return
+    bus_name = BusbarsDictConnectionToName.get(bus_connection) or _sanitize_opendss_name(bus_connection)
+    bus_voltage = BusbarsDictVoltage.get(bus_name)
+    if bus_voltage is None:
+        raise ValueError(f"Missing voltage for bus '{bus_name}' connected to Source 1ph '{element_name}'.")
+    phase, conn = _element_phase_conn(element_data)
+    bus_terminal = _format_opendss_bus_terminal(bus_name, phase, conn)
+    basekv = _resolve_1ph_kv(bus_voltage, conn, element_data.get('kv'))
+    vm_pu = float(element_data.get('vm_pu', 1.0) or 1.0)
+    if vm_pu == 0:
+        vm_pu = 1.0
+    try:
+        angle = float(element_data.get('va_degree', 0) or 0)
+    except (TypeError, ValueError):
+        angle = 0.0
+    mode, imp_suffix, mvasc3 = _ext_grid_vsource_impedance(element_data, bus_voltage)
+    imp_part = imp_suffix if mode == 'thevenin' else f" mvasc3={mvasc3}"
+    if 'circuit_source_configured' not in created_elements:
+        edit_cmd = (f"Edit Vsource.source Bus1={bus_terminal} basekv={basekv} "
+                    f"pu={vm_pu} Phases=1 angle={angle}{imp_part}")
+        execute_dss_command(edit_cmd)
+        created_elements.add('circuit_source_configured')
+        created_elements.add(f'circuit_source_element:{element_name}')
+    else:
+        execute_dss_command(
+            f"New Vsource.{element_name} Bus1={bus_terminal} basekv={basekv} "
+            f"pu={vm_pu} Phases=1 angle={angle}{imp_part}"
+        )
+    in_service = element_data.get('in_service', True)
+    is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ['false', 'no', '0']
+    if not is_in_service:
+        target = 'Vsource.source' if f'circuit_source_element:{element_name}' in created_elements else f'Vsource.{element_name}'
+        execute_dss_command(f'{target}.enabled=no')
+    created_elements.add(element_name)
+
+
+def create_transformer_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command=None):
+    if element_name in created_elements:
+        return
+    bus_from_ref = element_data.get('busFrom') or element_data.get('hv_bus')
+    bus_to_ref = element_data.get('busTo') or element_data.get('lv_bus')
+    if not bus_from_ref or not bus_to_ref:
+        return
+    bus_from_name = BusbarsDictConnectionToName.get(bus_from_ref) or _sanitize_opendss_name(bus_from_ref)
+    bus_to_name = BusbarsDictConnectionToName.get(bus_to_ref) or _sanitize_opendss_name(bus_to_ref)
+    phase, conn = _element_phase_conn(element_data)
+    try:
+        sn_kva = float(element_data.get('sn_kva', 25) or 25)
+        vk_percent = float(element_data.get('vk_percent', 2.0) or 2.0)
+        vkr_percent = float(element_data.get('vkr_percent', 0.6) or 0.6)
+        kv_hv = float(element_data.get('vn_hv_kv', BusbarsDictVoltage.get(bus_from_name) or 7.2) or 7.2)
+        kv_lv = float(element_data.get('vn_lv_kv', BusbarsDictVoltage.get(bus_to_name) or 0.12) or 0.12)
+        tap_pos = float(element_data.get('tap_pos', 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if float(BusbarsDictVoltage.get(bus_from_name) or 0) >= float(BusbarsDictVoltage.get(bus_to_name) or 0):
+        hv_name, lv_name = bus_from_name, bus_to_name
+    else:
+        hv_name, lv_name = bus_to_name, bus_from_name
+        kv_hv, kv_lv = kv_lv, kv_hv
+    hv_term = _format_opendss_bus_terminal(hv_name, phase, conn)
+    lv_term = _format_opendss_bus_terminal(lv_name, phase, 'wye')
+    pri_conn = 'delta' if conn == 'delta' else 'wye'
+    xhl = vk_percent
+    rs_hv = vkr_percent / 2.0
+    rs_lv = vkr_percent / 2.0
+    try:
+        cmd = (
+            f"New Transformer.{element_name} phases=1 Windings=2 "
+            f"Buses=[{hv_term} {lv_term}] Conns=[{pri_conn} wye] "
+            f"kVs=[{kv_hv} {kv_lv}] kVAs=[{sn_kva} {sn_kva}] "
+            f"XHL={xhl} %Rs=[{rs_hv} {rs_lv}] Taps=[{1 + tap_pos * 0.00625} 1]"
+        )
+        execute_dss_command(cmd)
+        in_service = element_data.get('in_service', True)
+        is_in_service = in_service if isinstance(in_service, bool) else str(in_service).lower() not in ['false', 'no', '0']
+        if not is_in_service:
+            execute_dss_command(f'Transformer.{element_name}.enabled=no')
+        TransformersDict[element_name] = element_name
+        TransformersDictId[element_name] = element_id
+        created_elements.add(element_name)
+    except Exception:
+        pass
+
 
 # Individual element creation functions
 def create_line_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LinesDict, LinesDictId, created_elements, execute_dss_command=None):
@@ -2811,6 +3155,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
     # Initialize list to collect OpenDSS commands if export is requested
     opendss_commands = []
+    _reset_opendss_warnings()
     
     def execute_dss_command(command):
         """Execute DSS command and optionally collect it for export"""
@@ -3148,24 +3493,26 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             is_enabled = dss.CktElement.Enabled()
             
             if is_enabled:
-                # Get powers (in kW and kvar) - sum all three phases
                 powers = dss.CktElement.Powers()
-                if len(powers) >= 12:
-                    # From side: phases 1, 2, 3
-                    p_from_mw = (powers[0] + powers[2] + powers[4]) / 1000.0
-                    q_from_mvar = (powers[1] + powers[3] + powers[5]) / 1000.0
-                    # To side: phases 1, 2, 3
-                    p_to_mw = (powers[6] + powers[8] + powers[10]) / 1000.0
-                    q_to_mvar = (powers[7] + powers[9] + powers[11]) / 1000.0
+                if len(powers) >= 2:
+                    n_conductors = dss.CktElement.NumConductors()
+                    n_phases = dss.CktElement.NumPhases()
+                    p_from_kw, q_from_kvar = _opendss_terminal_pq_kw(powers, 0, n_conductors, n_phases)
+                    p_to_kw, q_to_kvar = _opendss_terminal_pq_kw(powers, 1, n_conductors, n_phases)
+                    p_from_mw = p_from_kw / 1000.0
+                    q_from_mvar = q_from_kvar / 1000.0
+                    p_to_mw = p_to_kw / 1000.0
+                    q_to_mvar = q_to_kvar / 1000.0
                 else:
                     p_from_mw = p_to_mw = q_from_mvar = q_to_mvar = 0.0
 
                 # Get currents (in A) - use magnitude from currents_mag_ang
                 currents = dss.CktElement.CurrentsMagAng()
-                if len(currents) >= 12:
-                    # Current magnitude is at index 0, 6 for from and to sides
-                    i_from_ka = currents[0] / 1000.0  # Convert A to kA
-                    i_to_ka = currents[6] / 1000.0
+                if len(currents) >= 2:
+                    n_conductors = dss.CktElement.NumConductors()
+                    n_phases = dss.CktElement.NumPhases()
+                    i_from_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases)
+                    i_to_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases)
                 else:
                     i_from_ka = i_to_ka = 0.0
             else:
@@ -3240,22 +3587,57 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             
             if is_enabled:
                 powers = dss.CktElement.Powers()
-                if len(powers) >= 6:
-                    p_raw = powers[0] + powers[2] + powers[4]
-                    q_raw = powers[1] + powers[3] + powers[5]
-                    p_mw = p_raw / 1000.0 if not math.isnan(p_raw) else 0.0
-                    q_mvar = q_raw / 1000.0 if not math.isnan(q_raw) else 0.0
-                else:
-                    p_mw = q_mvar = 0.0
+                p_mw, q_mvar = _opendss_ckt_pq_mw(powers, 0)
             else:
                 # Load is disabled - report zero values
                 p_mw = q_mvar = 0.0
 
+            p_set_mw = None
+            vm_pu = None
+            if in_data:
+                for elem in in_data.values():
+                    if not isinstance(elem, dict):
+                        continue
+                    if not elem.get('typ', '').startswith('Load'):
+                        continue
+                    if _sanitize_opendss_name(elem.get('name', '')) != key:
+                        continue
+                    if elem.get('p_kw') not in (None, ''):
+                        p_set_mw = float(elem.get('p_kw') or 0) / 1000.0
+                    else:
+                        p_set_mw = float(elem.get('p_mw', 0) or 0)
+                    break
+            try:
+                bus_names = dss.CktElement.BusNames()
+                load_bus = bus_names[0].split('.')[0] if bus_names else None
+                if load_bus:
+                    for bname in dss.Circuit.AllBusNames():
+                        if bname.lower() == load_bus.lower():
+                            dss.Circuit.SetActiveBus(bname)
+                            bus_pu = dss.Bus.puVmagAngle()
+                            if bus_pu and len(bus_pu) >= 1 and not math.isnan(bus_pu[0]):
+                                vm_pu = float(bus_pu[0])
+                            break
+            except Exception:
+                pass
+            if (
+                p_set_mw is not None and p_set_mw > 0.001
+                and is_enabled and abs(p_mw) < 0.9 * abs(p_set_mw)
+            ):
+                vm_txt = f'{vm_pu:.3f} pu' if vm_pu is not None else 'low'
+                _opendss_warn(
+                    f"Load '{key}' draws {abs(p_mw) * 1000:.1f} kW vs {abs(p_set_mw) * 1000:.1f} kW set — "
+                    f"bus voltage {vm_txt}. Check line length, transformer kVA, or use constant-P load (%SeriesRL=0)."
+                )
+
             # Convert IDs back to hash format
             frontend_name = key
             frontend_id = LoadsDictId[key]
-            
-            load = LoadOut(name=frontend_name, id=frontend_id, p_mw=p_mw, q_mvar=q_mvar)
+
+            load = LoadOut(
+                name=frontend_name, id=frontend_id, p_mw=p_mw, q_mvar=q_mvar,
+                p_set_mw=p_set_mw, vm_pu=vm_pu,
+            )
             loadsList.append(load)
                             
         except Exception as e:
@@ -3286,12 +3668,14 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     # Sum all three phases (powers come in pairs: P1,Q1,P2,Q2,P3,Q3)
                     p_raw = powers[0] + powers[2] + powers[4]
                     q_raw = powers[1] + powers[3] + powers[5]
-                    # Generator reports power flowing OUT as NEGATIVE (generation into grid)
-                    # Negate to show positive generation in results
-                    p_mw = -(p_raw / 1000.0) if not math.isnan(p_raw) else 0.0
-                    q_mvar = -(q_raw / 1000.0) if not math.isnan(q_raw) else 0.0
                 else:
-                    p_mw = q_mvar = 0.0
+                    p_mw_raw, q_mvar_raw = _opendss_ckt_pq_mw(powers, 0)
+                    p_raw = p_mw_raw * 1000.0
+                    q_raw = q_mvar_raw * 1000.0
+                # Generator reports power flowing OUT as NEGATIVE (generation into grid)
+                # Negate to show positive generation in results
+                p_mw = -(p_raw / 1000.0) if not math.isnan(p_raw) else 0.0
+                q_mvar = -(q_raw / 1000.0) if not math.isnan(q_raw) else 0.0
 
                 # Get voltage from bus (use CktElement so it works for Generator)
                 vm_pu = 1.0
@@ -3370,7 +3754,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Initialize power values
                 p_hv_mw = q_hv_mvar = p_lv_mw = q_lv_mvar = pl_mw = ql_mvar = 0.0
                 
-                if len(powers) >= 6:
+                if len(powers) >= 2:
                     n_conductors = dss.CktElement.NumConductors()
                     n_phases = dss.CktElement.NumPhases()
                     p_hv_kw, q_hv_kvar = _opendss_terminal_pq_kw(powers, 0, n_conductors, n_phases)
@@ -3407,7 +3791,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 # Get complex currents [I1_real, I1_imag, I2_real, I2_imag, I3_real, I3_imag, ...] in Amperes
                 currents = dss.CktElement.Currents()
                 
-                if len(currents) >= 6:
+                if len(currents) >= 2:
                     n_conductors = dss.CktElement.NumConductors()
                     n_phases = dss.CktElement.NumPhases()
                     i_hv_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases)
@@ -3446,7 +3830,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             if sn_mva_raw is not None:
                                 sn_mva = float(sn_mva_raw)
                             else:
-                                pass
+                                sn_kva_raw = element_data.get('sn_kva')
+                                if sn_kva_raw is not None:
+                                    sn_mva = float(sn_kva_raw) / 1000.0
                         else:
                             # Debug: show what transformers ARE in in_data
                             transformer_keys_found = []
@@ -3876,17 +4262,12 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 if matched_key and matched_key not in added_external_grid_keys:
                     added_external_grid_keys.add(matched_key)
                     try:
+                        dss.Circuit.SetActiveElement(f"Vsource.{vsource_name}")
                         powers = dss.CktElement.Powers()
-                        if len(powers) >= 6:
-                            p_raw = powers[0] + powers[2] + powers[4]
-                            q_raw = powers[1] + powers[3] + powers[5]
-                            # OpenDSS uses Passive Sign Convention: positive = power INTO component (consumption)
-                            # Frontend convention: positive = power FROM source (generation/supply)
-                            # Therefore, we need to negate the values to match frontend convention
-                            p_mw = -(p_raw / 1000.0) if not math.isnan(p_raw) else 0.0
-                            q_mvar = -(q_raw / 1000.0) if not math.isnan(q_raw) else 0.0
-                        else:
-                            p_mw = q_mvar = 0.0
+                        p_raw, q_raw = _opendss_ckt_pq_mw(powers, 0)
+                        # OpenDSS: positive = power INTO source; frontend: positive = supply FROM source
+                        p_mw = -p_raw if not math.isnan(p_raw) else 0.0
+                        q_mvar = -q_raw if not math.isnan(q_raw) else 0.0
 
                         # Calculate power factor (use absolute values for magnitude)
                         pf = 1.0
@@ -3944,7 +4325,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         result['pvsystems'] = pvsystemsList
     if externalGridsList:
         result['externalgrids'] = externalGridsList
-    
+    if _opendss_warnings:
+        result['warnings'] = list(_opendss_warnings)
 
     # Add OpenDSS commands to result if export was requested
     if export_commands and opendss_commands:
