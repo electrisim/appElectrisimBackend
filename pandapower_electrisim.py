@@ -8997,6 +8997,264 @@ def _rpc_masked_q_interp_clip(p_target, p_list, q_list):
     return float(np.interp(pt, px, qy, left=float(qy[0]), right=float(qy[-1])))
 
 
+def _rpc_clean_pf_val(v):
+    if isinstance(v, (float, np.floating)):
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return float(v)
+    return v
+
+
+def _rpc_serialize_solved_net(net):
+    """
+    Build the same load-flow result shape the frontend expects, from an already-solved net
+    (used for RPC PQ point snapshots — no second powerflow run).
+    """
+    if not hasattr(net, 'res_bus') or net.res_bus is None or net.res_bus.empty:
+        return None
+    try:
+        result = {}
+
+        busbar_list = []
+        for index, row in net.res_bus.iterrows():
+            p_mw = float(row['p_mw'])
+            q_mvar = float(row['q_mvar'])
+            denom_pf = math.sqrt(p_mw ** 2 + q_mvar ** 2)
+            pf = (p_mw / denom_pf) if denom_pf > 0 and not math.isnan(denom_pf) else 0.0
+            q_p = (q_mvar / p_mw) if p_mw != 0 and not math.isnan(p_mw) else 0.0
+            if math.isnan(q_p) or math.isinf(q_p):
+                q_p = 0.0
+            p_br, q_br = _electrisim_bus_branch_p_q_sum(net, index)
+            _vm_pu = float(row['vm_pu'])
+            _vn_kv = float(net.bus.at[index, 'vn_kv'])
+            _vm_kv = float(_vm_pu) * _vn_kv if _vn_kv > 0 and _vm_pu == _vm_pu else None
+            busbar_list.append({
+                'name': str(net.bus.at[index, 'name']),
+                'id': str(net.bus.at[index, 'id']) if 'id' in net.bus.columns else str(index),
+                'vm_pu': _rpc_clean_pf_val(_vm_pu),
+                'va_degree': _rpc_clean_pf_val(row['va_degree']),
+                'p_mw': _rpc_clean_pf_val(p_mw),
+                'q_mvar': _rpc_clean_pf_val(q_mvar),
+                'pf': _rpc_clean_pf_val(pf),
+                'q_p': _rpc_clean_pf_val(q_p),
+                'p_branch_mw': _rpc_clean_pf_val(p_br),
+                'q_branch_mvar': _rpc_clean_pf_val(q_br),
+                'vm_kv': _rpc_clean_pf_val(_vm_kv),
+            })
+        result['busbars'] = busbar_list
+
+        if hasattr(net, 'res_line') and not net.res_line.empty:
+            lines_list = []
+            for index, row in net.res_line.iterrows():
+                lines_list.append({
+                    'name': str(net.line.at[index, 'name']),
+                    'id': str(net.line.at[index, 'id']) if 'id' in net.line.columns else str(index),
+                    'p_from_mw': _rpc_clean_pf_val(row['p_from_mw']),
+                    'q_from_mvar': _rpc_clean_pf_val(row['q_from_mvar']),
+                    'p_to_mw': _rpc_clean_pf_val(row['p_to_mw']),
+                    'q_to_mvar': _rpc_clean_pf_val(row['q_to_mvar']),
+                    'i_from_ka': _rpc_clean_pf_val(row['i_from_ka']),
+                    'i_to_ka': _rpc_clean_pf_val(row['i_to_ka']),
+                    'loading_percent': _rpc_clean_pf_val(row['loading_percent']),
+                })
+            result['lines'] = lines_list
+
+        if hasattr(net, 'res_ext_grid') and not net.res_ext_grid.empty:
+            ext_list = []
+            for index, row in net.res_ext_grid.iterrows():
+                p_mw = float(row['p_mw'])
+                q_mvar = float(row['q_mvar'])
+                denom = math.sqrt(p_mw ** 2 + q_mvar ** 2)
+                ext_list.append({
+                    'name': str(net.ext_grid.at[index, 'name']),
+                    'id': str(net.ext_grid.at[index, 'id']) if 'id' in net.ext_grid.columns else str(index),
+                    'p_mw': _rpc_clean_pf_val(p_mw),
+                    'q_mvar': _rpc_clean_pf_val(q_mvar),
+                    'pf': _rpc_clean_pf_val(p_mw / denom if denom > 0 else 0.0),
+                    'q_p': _rpc_clean_pf_val(q_mvar / p_mw if p_mw != 0 else 0.0),
+                })
+            result['externalgrids'] = ext_list
+
+        if hasattr(net, 'res_sgen') and not net.res_sgen.empty:
+            sgen_list = []
+            for index, row in net.res_sgen.iterrows():
+                sgen_list.append({
+                    'name': str(net.sgen.at[index, 'name']),
+                    'id': str(net.sgen.at[index, 'id']) if 'id' in net.sgen.columns else str(index),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw']),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar']),
+                })
+            result['staticgenerators'] = sgen_list
+
+        if hasattr(net, 'res_gen') and not net.res_gen.empty:
+            gen_list = []
+            for index, row in net.res_gen.iterrows():
+                gen_list.append({
+                    'name': str(net.gen.at[index, 'name']),
+                    'id': str(net.gen.at[index, 'id']) if 'id' in net.gen.columns else str(index),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw']),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar']),
+                    'va_degree': _rpc_clean_pf_val(row['va_degree']),
+                    'vm_pu': _rpc_clean_pf_val(row['vm_pu']),
+                })
+            result['generators'] = gen_list
+
+        if hasattr(net, 'trafo') and not net.trafo.empty:
+            res_tf = getattr(net, 'res_trafo', None)
+            trafo_list = []
+            for trafo_index in net.trafo.index:
+                t_name = net.trafo.at[trafo_index, 'name']
+                t_raw_id = net.trafo.at[trafo_index, 'id'] if 'id' in net.trafo.columns else trafo_index
+                t_id = _trafo_out_id(t_raw_id, t_name, trafo_index)
+                row = _pf_res_row_for_element(net.trafo, res_tf, trafo_index)
+                if row is None:
+                    row = {k: 0.0 for k in (
+                        'p_hv_mw', 'q_hv_mvar', 'p_lv_mw', 'q_lv_mvar', 'pl_mw', 'ql_mvar',
+                        'i_hv_ka', 'i_lv_ka', 'vm_hv_pu', 'vm_lv_pu', 'va_hv_degree', 'va_lv_degree',
+                        'loading_percent')}
+                trafo_list.append({
+                    'name': str(t_name),
+                    'id': str(t_id),
+                    'p_hv_mw': _rpc_clean_pf_val(row['p_hv_mw']),
+                    'q_hv_mvar': _rpc_clean_pf_val(row['q_hv_mvar']),
+                    'p_lv_mw': _rpc_clean_pf_val(row['p_lv_mw']),
+                    'q_lv_mvar': _rpc_clean_pf_val(row['q_lv_mvar']),
+                    'pl_mw': _rpc_clean_pf_val(row.get('pl_mw', 0.0)),
+                    'ql_mvar': _rpc_clean_pf_val(row.get('ql_mvar', 0.0)),
+                    'i_hv_ka': _rpc_clean_pf_val(row['i_hv_ka']),
+                    'i_lv_ka': _rpc_clean_pf_val(row['i_lv_ka']),
+                    'vm_hv_pu': _rpc_clean_pf_val(row.get('vm_hv_pu', 1.0)),
+                    'vm_lv_pu': _rpc_clean_pf_val(row.get('vm_lv_pu', 1.0)),
+                    'va_hv_degree': _rpc_clean_pf_val(row.get('va_hv_degree', 0.0)),
+                    'va_lv_degree': _rpc_clean_pf_val(row.get('va_lv_degree', 0.0)),
+                    'loading_percent': _rpc_clean_pf_val(row['loading_percent']),
+                })
+            if trafo_list:
+                result['transformers'] = trafo_list
+
+        if hasattr(net, 'trafo3w') and not net.trafo3w.empty:
+            res_t3 = getattr(net, 'res_trafo3w', None)
+            t3_list = []
+            for t3_index in net.trafo3w.index:
+                t_name = net.trafo3w.at[t3_index, 'name']
+                t_raw_id = net.trafo3w.at[t3_index, 'id'] if 'id' in net.trafo3w.columns else t3_index
+                t_id = _trafo_out_id(t_raw_id, t_name, t3_index)
+                row = _pf_res_row_for_element(net.trafo3w, res_t3, t3_index)
+                if row is None:
+                    row = {k: 0.0 for k in (
+                        'p_hv_mw', 'q_hv_mvar', 'p_mv_mw', 'q_mv_mvar', 'p_lv_mw', 'q_lv_mvar',
+                        'pl_mw', 'ql_mvar', 'i_hv_ka', 'i_mv_ka', 'i_lv_ka',
+                        'vm_hv_pu', 'vm_mv_pu', 'vm_lv_pu',
+                        'va_hv_degree', 'va_mv_degree', 'va_lv_degree', 'loading_percent')}
+                t3_list.append({
+                    'name': str(t_name),
+                    'id': str(t_id),
+                    'p_hv_mw': _rpc_clean_pf_val(row['p_hv_mw']),
+                    'q_hv_mvar': _rpc_clean_pf_val(row['q_hv_mvar']),
+                    'p_mv_mw': _rpc_clean_pf_val(row['p_mv_mw']),
+                    'q_mv_mvar': _rpc_clean_pf_val(row['q_mv_mvar']),
+                    'p_lv_mw': _rpc_clean_pf_val(row['p_lv_mw']),
+                    'q_lv_mvar': _rpc_clean_pf_val(row['q_lv_mvar']),
+                    'loading_percent': _rpc_clean_pf_val(row['loading_percent']),
+                    'i_hv_ka': _rpc_clean_pf_val(row.get('i_hv_ka', 0.0)),
+                    'i_mv_ka': _rpc_clean_pf_val(row.get('i_mv_ka', 0.0)),
+                    'i_lv_ka': _rpc_clean_pf_val(row.get('i_lv_ka', 0.0)),
+                })
+            if t3_list:
+                result['transformers3W'] = t3_list
+
+        if hasattr(net, 'res_shunt') and not net.res_shunt.empty:
+            shunts_list = []
+            caps_list = []
+            for index, row in net.res_shunt.iterrows():
+                typ = net.shunt.at[index, 'typ'] if 'typ' in net.shunt.columns else 'shuntreactor'
+                entry = {
+                    'name': str(net.shunt.at[index, 'name']),
+                    'id': str(net.shunt.at[index, 'id']) if 'id' in net.shunt.columns else str(index),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw']),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar']),
+                    'vm_pu': _rpc_clean_pf_val(row['vm_pu']),
+                }
+                if typ == 'capacitor':
+                    caps_list.append(entry)
+                else:
+                    try:
+                        sw = net.shunt.at[index, 'step']
+                        smx = net.shunt.at[index, 'max_step']
+                        entry['step'] = _rpc_clean_pf_val(float(sw) if sw is not None and not pd.isna(sw) else None)
+                        entry['max_step'] = _rpc_clean_pf_val(float(smx) if smx is not None and not pd.isna(smx) else None)
+                    except Exception:
+                        pass
+                    shunts_list.append(entry)
+            if shunts_list:
+                result['shunts'] = shunts_list
+            if caps_list:
+                result['capacitors'] = caps_list
+
+        if hasattr(net, 'res_load') and not net.res_load.empty:
+            loads_list = []
+            for index, row in net.res_load.iterrows():
+                loads_list.append({
+                    'name': str(net.load.at[index, 'name']),
+                    'id': str(net.load.at[index, 'id']) if 'id' in net.load.columns else str(index),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw']),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar']),
+                })
+            result['loads'] = loads_list
+
+        if hasattr(net, 'res_switch') and not net.res_switch.empty:
+            sw_list = []
+            for index, row in net.res_switch.iterrows():
+                sw_list.append({
+                    'name': str(net.switch.at[index, 'name']),
+                    'id': str(net.switch.at[index, 'id']) if 'id' in net.switch.columns else str(index),
+                    'closed': bool(net.switch.at[index, 'closed']) if 'closed' in net.switch.columns else True,
+                    'i_ka': _rpc_clean_pf_val(row.get('i_ka', 0.0)),
+                    'p_from_mw': _rpc_clean_pf_val(row.get('p_from_mw', 0.0)),
+                    'q_from_mvar': _rpc_clean_pf_val(row.get('q_from_mvar', 0.0)),
+                    'p_to_mw': _rpc_clean_pf_val(row.get('p_to_mw', 0.0)),
+                    'q_to_mvar': _rpc_clean_pf_val(row.get('q_to_mvar', 0.0)),
+                    'loading_percent': _rpc_clean_pf_val(row.get('loading_percent', 0.0)),
+                })
+            result['switches'] = sw_list
+
+        return _sanitize_for_strict_json(result)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _rpc_store_point_snapshot(point_loadflows, v_key, side, p_val, net_pf):
+    snap = _rpc_serialize_solved_net(net_pf)
+    if not snap:
+        return
+    if v_key not in point_loadflows:
+        point_loadflows[v_key] = {'q_max': {}, 'q_min': {}}
+    p_key = f"{float(p_val):.4f}"
+    point_loadflows[v_key][side][p_key] = snap
+
+
+def _rpc_build_and_run_point_net(net, ext_grid_idx, v_pu, gen_info, total_installed_mw, p_val,
+                                 q_capability_mode, direction, q_frac, verbose_iwamoto,
+                                 run_control_trafo2w, run_control_trafo3w, run_control_shunt):
+    """Rebuild generator dispatch for one RPC point and run power flow; returns solved net or None."""
+    net_pt = deepcopy(net)
+    net_pt.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
+    for g in gen_info:
+        share = g['p_rated_mw'] / total_installed_mw
+        p_gen = float(p_val) * share
+        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
+        if direction == 'max':
+            net_pt.sgen.at[g['idx'], 'q_mvar'] = q_pos_cap * q_frac
+        else:
+            net_pt.sgen.at[g['idx'], 'q_mvar'] = -q_neg_cap * q_frac
+        net_pt.sgen.at[g['idx'], 'p_mw'] = p_gen
+    if not _rpc_run_pf_robust(
+            net_pt, verbose_iwamoto, run_control_trafo2w, run_control_trafo3w, run_control_shunt):
+        return None
+    return net_pt
+
+
 def reactive_power_capability(net, rpc_params):
     """
     Perform Reactive Power Capability (RPC) analysis for a wind farm.
@@ -9116,6 +9374,7 @@ def reactive_power_capability(net, rpc_params):
         p_points = np.linspace(p_min_mw, p_max_mw, max(p_steps + 1, 2))
 
         curves = {}
+        point_loadflows = {}
         warnings_list = []
         try:
             eg_bus = int(net.ext_grid.at[ext_grid_idx, 'bus'])
@@ -9173,6 +9432,7 @@ def reactive_power_capability(net, rpc_params):
 
                 # --- Q_max sweep (overexcited, positive Q) ---
                 q_max_pcc = None
+                q_max_frac_used = None
                 for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
                     net_copy = deepcopy(net)
                     net_copy.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
@@ -9186,6 +9446,7 @@ def reactive_power_capability(net, rpc_params):
 
                     if _rpc_run_pf_robust(net_copy, verbose_iwamoto, rc2, rc3, rcs):
                         q_max_pcc = _rpc_pcc_q_for_chart(net_copy, pcc_bus_idx, ext_grid_idx)
+                        q_max_frac_used = q_frac
                         if limit_overloads:
                             overloaded = False
                             if not net_copy.res_trafo.empty and net_copy.res_trafo.loading_percent.max() > max_loading_percent:
@@ -9215,9 +9476,16 @@ def reactive_power_capability(net, rpc_params):
 
                 if q_max_pcc is None:
                     print(f"    Q_max PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
+                elif q_max_frac_used is not None:
+                    net_qmax_snap = _rpc_build_and_run_point_net(
+                        net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
+                        q_capability_mode, 'max', q_max_frac_used, verbose_iwamoto, rc2, rc3, rcs)
+                    if net_qmax_snap is not None:
+                        _rpc_store_point_snapshot(point_loadflows, v_key, 'q_max', p_val, net_qmax_snap)
 
                 # --- Q_min sweep (underexcited, negative Q) ---
                 q_min_pcc = None
+                q_min_frac_used = None
                 for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
                     net_copy2 = deepcopy(net)
                     net_copy2.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
@@ -9231,6 +9499,7 @@ def reactive_power_capability(net, rpc_params):
 
                     if _rpc_run_pf_robust(net_copy2, verbose_iwamoto, rc2, rc3, rcs):
                         q_min_pcc = _rpc_pcc_q_for_chart(net_copy2, pcc_bus_idx, ext_grid_idx)
+                        q_min_frac_used = q_frac
                         if limit_overloads:
                             overloaded = False
                             if not net_copy2.res_trafo.empty and net_copy2.res_trafo.loading_percent.max() > max_loading_percent:
@@ -9260,6 +9529,12 @@ def reactive_power_capability(net, rpc_params):
 
                 if q_min_pcc is None:
                     print(f"    Q_min PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
+                elif q_min_frac_used is not None:
+                    net_qmin_snap = _rpc_build_and_run_point_net(
+                        net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
+                        q_capability_mode, 'min', q_min_frac_used, verbose_iwamoto, rc2, rc3, rcs)
+                    if net_qmin_snap is not None:
+                        _rpc_store_point_snapshot(point_loadflows, v_key, 'q_min', p_val, net_qmin_snap)
 
                 p_result.append(round(p_val, 4))
                 q_max_result.append(round(q_max_pcc, 4) if q_max_pcc is not None else None)
@@ -9327,6 +9602,7 @@ def reactive_power_capability(net, rpc_params):
             'rpc_results': {
                 'voltage_levels': [round(float(v), 4) for v in voltage_levels],
                 'curves': curves,
+                'point_loadflows': point_loadflows,
                 'requirements': requirements if requirements else {},
                 'compliance': compliance,
                 'warnings': warnings_list,
