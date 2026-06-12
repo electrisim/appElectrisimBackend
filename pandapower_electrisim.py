@@ -482,6 +482,142 @@ def _electrisim_bus_branch_p_q_sum(net, bus_idx):
     return -p_out, -q_out_s
 
 
+def _electrisim_bus_linked_aux_buses(net, bus_idx):
+    """
+    ``_electrisim_aux_*`` bus indices joined to ``bus_idx`` by closed, in-service bus–bus
+    switches (Electrisim's Bus–Switch–element export pattern).
+    """
+    aux = []
+    try:
+        if getattr(net, 'switch', None) is None or net.switch.empty:
+            return aux
+        for sw_idx in net.switch.index:
+            sw = net.switch.loc[sw_idx]
+            if str(sw.get('et', '')) != 'b':
+                continue
+            closed = sw['closed'] if 'closed' in sw.index else True
+            if closed is False or (isinstance(closed, (int, float)) and float(closed) == 0):
+                continue
+            in_service = sw['in_service'] if 'in_service' in sw.index else True
+            if in_service is False or (isinstance(in_service, (int, float)) and float(in_service) == 0):
+                continue
+            bus_a = int(sw['bus'])
+            bus_b = int(sw['element'])
+            if bus_a == bus_idx:
+                other = bus_b
+            elif bus_b == bus_idx:
+                other = bus_a
+            else:
+                continue
+            try:
+                nm = str(net.bus.at[other, 'name'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if nm.startswith('_electrisim_aux_'):
+                aux.append(other)
+    except Exception:
+        pass
+    return aux
+
+
+def _electrisim_bus_aux_injection_sum(net, bus_idx):
+    """
+    Sum ``res_bus`` injections on ``_electrisim_aux_*`` buses linked to ``bus_idx`` via closed
+    bus–bus switches (generator / load / shunt / storage behind a diagram switch).
+    """
+    def _f(v, default=0.0):
+        try:
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return default
+            return x
+        except (TypeError, ValueError):
+            return default
+
+    p = 0.0
+    q = 0.0
+    try:
+        if not hasattr(net, 'res_bus') or net.res_bus is None or net.res_bus.empty:
+            return p, q
+        for other in _electrisim_bus_linked_aux_buses(net, bus_idx):
+            if other not in net.res_bus.index:
+                continue
+            p += _f(net.res_bus.at[other, 'p_mw'])
+            q += _f(net.res_bus.at[other, 'q_mvar'])
+    except Exception:
+        pass
+    return p, q
+
+
+def _electrisim_bus_has_slack(net, bus_idx):
+    """
+    True when an in-service external grid (or slack generator) sits on ``bus_idx`` — directly
+    or on a linked ``_electrisim_aux_*`` bus behind a closed bus–bus switch.
+    """
+    buses = {bus_idx}
+    buses.update(_electrisim_bus_linked_aux_buses(net, bus_idx))
+    try:
+        if hasattr(net, 'ext_grid') and net.ext_grid is not None and not net.ext_grid.empty:
+            for i in net.ext_grid.index:
+                if int(net.ext_grid.at[i, 'bus']) not in buses:
+                    continue
+                ins = net.ext_grid.at[i, 'in_service'] if 'in_service' in net.ext_grid.columns else True
+                if ins is False or (isinstance(ins, (int, float)) and float(ins) == 0):
+                    continue
+                return True
+        if hasattr(net, 'gen') and net.gen is not None and not net.gen.empty and 'slack' in net.gen.columns:
+            for i in net.gen.index:
+                if not bool(net.gen.at[i, 'slack']):
+                    continue
+                if int(net.gen.at[i, 'bus']) not in buses:
+                    continue
+                ins = net.gen.at[i, 'in_service'] if 'in_service' in net.gen.columns else True
+                if ins is False or (isinstance(ins, (int, float)) and float(ins) == 0):
+                    continue
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
+    """
+    Net P/Q exchange of ``bus_idx`` with the rest of the network, for the bus result label:
+
+      = local element demand (this bus ``res_bus`` + aux-bus injections behind bus–bus switches)
+      + signed P/Q at the dominant-infeed branch terminals (``_electrisim_bus_branch_p_q_sum``).
+
+    By Kirchhoff this equals what the remaining (upstream) connections supply to the bus, e.g.
+    for Bus 275kV no. 1: shunt 222.321 + cable terminal (−189.955, charging supplied into the
+    bus) = 32.366 MVar drawn from upstream — the cable charging offsets the shunt instead of
+    the bus repeating the shunt-only ``res_bus`` value. P shows the through-power transiting
+    the bus plus local losses, matching the line result boxes.
+
+    Slack buses (external grid / slack gen) are reported as 0/0: the slack balances the node
+    exactly, so its injection mirrors the branch infeed and summing both would double-count
+    (e.g. 431.6 MW ext grid + 431.6 MW cable = 863.2 MW shown for 431.6 MW of real flow).
+    The actual exchange is on the external grid's own result box.
+    """
+    if _electrisim_bus_has_slack(net, bus_idx):
+        return 0.0, 0.0
+
+    def _f(v, default=0.0):
+        try:
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return default
+            return x
+        except (TypeError, ValueError):
+            return default
+
+    p_inj = _f(net.res_bus.at[bus_idx, 'p_mw'])
+    q_inj = _f(net.res_bus.at[bus_idx, 'q_mvar'])
+    p_aux, q_aux = _electrisim_bus_aux_injection_sum(net, bus_idx)
+    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
+
+    return p_inj + p_aux + p_br, q_inj + q_aux + q_br
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
     """Generate Python code to recreate the pandapower network"""
     lines = []
@@ -3623,7 +3759,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 
                 class BusbarOut(object):
                     def __init__(self, name: str, id: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float, pf: float, q_p: float,
-                                 p_branch_mw: float = 0.0, q_branch_mvar: float = 0.0, vm_kv: float = None):
+                                 p_branch_mw: float = 0.0, q_branch_mvar: float = 0.0,
+                                 p_nodal_mw: float = 0.0, q_nodal_mvar: float = 0.0,
+                                 pf_nodal: float = 0.0, q_p_nodal: float = 0.0,
+                                 vm_kv: float = None):
                         self.name = name
                         self.id = id
                         self.vm_pu = vm_pu
@@ -3634,6 +3773,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         self.q_p = q_p
                         self.p_branch_mw = p_branch_mw
                         self.q_branch_mvar = q_branch_mvar
+                        self.p_nodal_mw = p_nodal_mw
+                        self.q_nodal_mvar = q_nodal_mvar
+                        self.pf_nodal = pf_nodal
+                        self.q_p_nodal = q_p_nodal
                         self.vm_kv = vm_kv
                         
                 class BusbarsOut(object):
@@ -4084,6 +4227,20 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     if math.isnan(q_p) or math.isinf(q_p):
                         q_p = 0.0
                     p_br, q_br = _electrisim_bus_branch_p_q_sum(net, index)
+                    p_nodal, q_nodal = _electrisim_bus_nodal_p_q_sum(net, index)
+                    denom_pf_nodal = math.sqrt(math.pow(p_nodal, 2) + math.pow(q_nodal, 2))
+                    if denom_pf_nodal != 0 and not math.isnan(denom_pf_nodal):
+                        pf_nodal = p_nodal / denom_pf_nodal
+                    else:
+                        pf_nodal = 0.0
+                    if math.isnan(pf_nodal):
+                        pf_nodal = 0.0
+                    if p_nodal != 0 and not math.isnan(p_nodal):
+                        q_p_nodal = q_nodal / p_nodal
+                    else:
+                        q_p_nodal = 0.0
+                    if math.isnan(q_p_nodal) or math.isinf(q_p_nodal):
+                        q_p_nodal = 0.0
                     _vm_pu = row['vm_pu']
                     _vn_kv = float(net.bus.at[index, 'vn_kv'])
                     _vm_kv = None
@@ -4094,6 +4251,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         vm_pu=_vm_pu, va_degree=row['va_degree'],
                         p_mw=p_mw, q_mvar=q_mvar, pf=pf, q_p=q_p,
                         p_branch_mw=p_br, q_branch_mvar=q_br,
+                        p_nodal_mw=p_nodal, q_nodal_mvar=q_nodal,
+                        pf_nodal=pf_nodal, q_p_nodal=q_p_nodal,
                         vm_kv=_vm_kv,
                     )
                     busbarList.append(busbar) 
@@ -9025,6 +9184,12 @@ def _rpc_serialize_solved_net(net):
             if math.isnan(q_p) or math.isinf(q_p):
                 q_p = 0.0
             p_br, q_br = _electrisim_bus_branch_p_q_sum(net, index)
+            p_nodal, q_nodal = _electrisim_bus_nodal_p_q_sum(net, index)
+            denom_pf_nodal = math.sqrt(p_nodal ** 2 + q_nodal ** 2)
+            pf_nodal = (p_nodal / denom_pf_nodal) if denom_pf_nodal > 0 and not math.isnan(denom_pf_nodal) else 0.0
+            q_p_nodal = (q_nodal / p_nodal) if p_nodal != 0 and not math.isnan(p_nodal) else 0.0
+            if math.isnan(q_p_nodal) or math.isinf(q_p_nodal):
+                q_p_nodal = 0.0
             _vm_pu = float(row['vm_pu'])
             _vn_kv = float(net.bus.at[index, 'vn_kv'])
             _vm_kv = float(_vm_pu) * _vn_kv if _vn_kv > 0 and _vm_pu == _vm_pu else None
@@ -9039,6 +9204,10 @@ def _rpc_serialize_solved_net(net):
                 'q_p': _rpc_clean_pf_val(q_p),
                 'p_branch_mw': _rpc_clean_pf_val(p_br),
                 'q_branch_mvar': _rpc_clean_pf_val(q_br),
+                'p_nodal_mw': _rpc_clean_pf_val(p_nodal),
+                'q_nodal_mvar': _rpc_clean_pf_val(q_nodal),
+                'pf_nodal': _rpc_clean_pf_val(pf_nodal),
+                'q_p_nodal': _rpc_clean_pf_val(q_p_nodal),
                 'vm_kv': _rpc_clean_pf_val(_vm_kv),
             })
         result['busbars'] = busbar_list
