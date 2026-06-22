@@ -1680,9 +1680,141 @@ def import_opendss():
                         True,
                     ])
 
+            def _detect_single_phase_model():
+                if re.search(r'New\s+Circuit\.[^\n\r]*\bphases\s*=\s*1\b', dss_text_to_use, re.IGNORECASE):
+                    return True
+                line_names_sp = dss.Lines.AllNames() or []
+                if not line_names_sp:
+                    return False
+                for lname in line_names_sp:
+                    try:
+                        dss.Lines.Name(lname)
+                        if int(dss.Lines.Phases()) != 1:
+                            return False
+                    except (TypeError, ValueError, AttributeError):
+                        return False
+                return True
+
+            def _build_opendss_1ph_import_tables():
+                """Build ElectriSim OpenDSS-only 1ph element tables for canvas import."""
+                bus_vn = {buses[i][0]: float(buses[i][1] or 0) for i in range(len(buses))}
+                hv_bus_names = {name for name, vn in bus_vn.items() if vn >= 1.0}
+                lv_bus_names = {name for name, vn in bus_vn.items() if 0 < vn < 1.0}
+
+                start_bus_idx = ext_grids[0][1] if ext_grids else 0
+                adj = {}
+                line_by_pair = {}
+                for row in lines:
+                    lname, _, f_idx, t_idx, length_km, r_ohm, x_ohm, c_nf = row[:8]
+                    adj.setdefault(f_idx, []).append(t_idx)
+                    line_by_pair[(f_idx, t_idx)] = row
+
+                ordered_hv_nodes = [start_bus_idx]
+                ordered_lines = []
+                cur = start_bus_idx
+                while cur in adj and adj[cur]:
+                    nxt = adj[cur][0]
+                    pair_row = line_by_pair.get((cur, nxt))
+                    if not pair_row:
+                        break
+                    ordered_lines.append(pair_row)
+                    ordered_hv_nodes.append(nxt)
+                    cur = nxt
+
+                line_1ph = []
+                for row in ordered_lines:
+                    lname, _, f_idx, t_idx, length_km, r_ohm, x_ohm, c_nf = row[:8]
+                    line_1ph.append([
+                        lname,
+                        bus_names[f_idx],
+                        bus_names[t_idx],
+                        float(length_km),
+                        float(r_ohm),
+                        float(x_ohm),
+                        float(c_nf),
+                        True,
+                    ])
+
+                trafo_by_hv = {}
+                trafo_1ph = []
+                for row in trafos:
+                    tname = row[0]
+                    hv_idx, lv_idx = row[2], row[3]
+                    sn_kva = float(row[4]) * 1000.0
+                    vn_hv_kv = float(row[5])
+                    vn_lv_kv = float(row[6])
+                    vk_percent = float(row[7])
+                    vkr_percent = float(row[8])
+                    hv_name = bus_names[hv_idx]
+                    lv_name = bus_names[lv_idx]
+                    if hv_name not in hv_bus_names or lv_name not in lv_bus_names:
+                        continue
+                    trafo_by_hv[hv_name] = lv_name
+                    trafo_1ph.append([
+                        tname, hv_name, lv_name, sn_kva, vn_hv_kv, vn_lv_kv,
+                        vk_percent, vkr_percent, True,
+                    ])
+
+                load_1ph = []
+                for row in loads:
+                    lname, bus_idx, p_mw, q_mvar = row[0], row[1], row[2], row[3]
+                    bus_name = bus_names[bus_idx]
+                    if bus_name not in lv_bus_names:
+                        continue
+                    pf = 1.0
+                    if p_mw and abs(float(p_mw)) > 1e-12:
+                        s = math.hypot(float(p_mw), float(q_mvar or 0))
+                        if s > 0:
+                            pf = abs(float(p_mw)) / s
+                    load_1ph.append([
+                        lname,
+                        bus_name,
+                        float(p_mw) * 1000.0,
+                        float(q_mvar or 0) * 1000.0,
+                        bus_vn.get(bus_name, 0.110),
+                        pf,
+                        'wye',
+                        True,
+                    ])
+
+                source_1ph = []
+                for row in ext_grids:
+                    vname, bus_idx, vm_pu, va_degree = row[0], row[1], row[2], row[3]
+                    s_sc_max = row[6] if len(row) > 6 else 1000000.0
+                    source_1ph.append([
+                        vname,
+                        bus_names[bus_idx],
+                        float(vm_pu),
+                        float(va_degree),
+                        float(s_sc_max),
+                        True,
+                    ])
+
+                node_labels = []
+                for idx, bus_idx in enumerate(ordered_hv_nodes):
+                    node_labels.append([bus_names[bus_idx], idx])
+
+                return {
+                    'line_1ph': line_1ph,
+                    'trafo_1ph': trafo_1ph,
+                    'load_1ph': load_1ph,
+                    'source_1ph': source_1ph,
+                    'feeder_nodes': node_labels,
+                    'trafo_by_hv': trafo_by_hv,
+                }
+
+            single_phase = _detect_single_phase_model()
+            opendss_1ph_bundle = _build_opendss_1ph_import_tables() if single_phase else None
+
             # Compose structure similar to example_simple.json
             model = {
                 "_object": {
+                    "meta": {
+                        "_object": _json.dumps({
+                            "single_phase": single_phase,
+                            "import_mode": "opendss_1ph" if single_phase else "standard",
+                        })
+                    },
                     "bus": {
                         "_object": _json.dumps({
                             "data": buses
@@ -1726,6 +1858,31 @@ def import_opendss():
                     "pvsystems": {
                         "_object": _json.dumps({
                             "data": pvsystems
+                        })
+                    },
+                    "line_1ph": {
+                        "_object": _json.dumps({
+                            "data": opendss_1ph_bundle['line_1ph'] if opendss_1ph_bundle else []
+                        })
+                    },
+                    "trafo_1ph": {
+                        "_object": _json.dumps({
+                            "data": opendss_1ph_bundle['trafo_1ph'] if opendss_1ph_bundle else []
+                        })
+                    },
+                    "load_1ph": {
+                        "_object": _json.dumps({
+                            "data": opendss_1ph_bundle['load_1ph'] if opendss_1ph_bundle else []
+                        })
+                    },
+                    "source_1ph": {
+                        "_object": _json.dumps({
+                            "data": opendss_1ph_bundle['source_1ph'] if opendss_1ph_bundle else []
+                        })
+                    },
+                    "feeder_nodes": {
+                        "_object": _json.dumps({
+                            "data": opendss_1ph_bundle['feeder_nodes'] if opendss_1ph_bundle else []
                         })
                     },
                     # Empty tables for elements not yet extracted

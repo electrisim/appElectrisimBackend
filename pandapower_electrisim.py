@@ -580,23 +580,94 @@ def _electrisim_bus_has_slack(net, bus_idx):
     return False
 
 
+def _electrisim_bus_branch_terminal_count(net, bus_idx):
+    """
+    Number of energized AC branch terminals (line / 2W trafo / 3W trafo / impedance) incident
+    to ``bus_idx``. A line connected to the same bus on both ends counts twice. Only branches
+    present in the matching ``res_*`` table are counted (consistent with the power summation),
+    so de-energized branches do not flip a radial bus into a junction.
+    """
+    n = 0
+    try:
+        if hasattr(net, "line") and net.line is not None and not net.line.empty \
+                and hasattr(net, "res_line") and net.res_line is not None and not net.res_line.empty:
+            for i in net.line.index:
+                if i not in net.res_line.index:
+                    continue
+                if net.line.at[i, "from_bus"] == bus_idx:
+                    n += 1
+                if net.line.at[i, "to_bus"] == bus_idx:
+                    n += 1
+    except Exception:
+        pass
+    try:
+        if hasattr(net, "trafo") and net.trafo is not None and not net.trafo.empty \
+                and hasattr(net, "res_trafo") and net.res_trafo is not None and not net.res_trafo.empty:
+            for i in net.trafo.index:
+                if i not in net.res_trafo.index:
+                    continue
+                if net.trafo.at[i, "hv_bus"] == bus_idx:
+                    n += 1
+                if net.trafo.at[i, "lv_bus"] == bus_idx:
+                    n += 1
+    except Exception:
+        pass
+    try:
+        if hasattr(net, "trafo3w") and net.trafo3w is not None and not net.trafo3w.empty \
+                and hasattr(net, "res_trafo3w") and net.res_trafo3w is not None and not net.res_trafo3w.empty:
+            for i in net.trafo3w.index:
+                if i not in net.res_trafo3w.index:
+                    continue
+                row = net.trafo3w.loc[i]
+                if row["hv_bus"] == bus_idx:
+                    n += 1
+                if row["mv_bus"] == bus_idx:
+                    n += 1
+                if row["lv_bus"] == bus_idx:
+                    n += 1
+    except Exception:
+        pass
+    try:
+        if hasattr(net, "impedance") and net.impedance is not None and not net.impedance.empty \
+                and hasattr(net, "res_impedance") and net.res_impedance is not None and not net.res_impedance.empty:
+            for i in net.impedance.index:
+                if i not in net.res_impedance.index:
+                    continue
+                if net.impedance.at[i, "from_bus"] == bus_idx:
+                    n += 1
+                if net.impedance.at[i, "to_bus"] == bus_idx:
+                    n += 1
+    except Exception:
+        pass
+    return n
+
+
 def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     """
-    Net P/Q exchange of ``bus_idx`` with the rest of the network, for the bus result label:
+    P/Q shown on the bus result label, chosen by the bus topology:
 
-      = local element demand (this bus ``res_bus`` + aux-bus injections behind bus–bus switches)
-      + signed P/Q at the dominant-infeed branch terminals (``_electrisim_bus_branch_p_q_sum``).
+    **Radial bus** (one incident branch terminal, e.g. a generator or load feeding a single
+    transformer/line) → **net local injection**:
 
-    By Kirchhoff this equals what the remaining (upstream) connections supply to the bus, e.g.
-    for Bus 275kV no. 1: shunt 222.321 + cable terminal (−189.955, charging supplied into the
-    bus) = 32.366 MVar drawn from upstream — the cable charging offsets the shunt instead of
-    the bus repeating the shunt-only ``res_bus`` value. P shows the through-power transiting
-    the bus plus local losses, matching the line result boxes.
+        = this bus ``res_bus`` (load − generation of elements on the bus)
+        + injections on ``_electrisim_aux_*`` buses behind closed bus–bus switches.
 
-    Slack buses (external grid / slack gen) are reported as 0/0: the slack balances the node
-    exactly, so its injection mirrors the branch infeed and summing both would double-count
-    (e.g. 431.6 MW ext grid + 431.6 MW cable = 863.2 MW shown for 431.6 MW of real flow).
-    The actual exchange is on the external grid's own result box.
+    The single branch can only carry that injection (Kirchhoff), so the injection fully
+    describes the bus. Adding the branch term would double-count the same power the branch
+    re-exports (e.g. a 15 MW static generator + its transformer LV ⇒ −30 MW for 15 MW of
+    generation). A static generator alone therefore reads −15 MW / −6.5 MVar.
+
+    **Junction bus** (two or more incident branch terminals, e.g. a busbar with a cable plus
+    upstream line and a shunt) → **net local injection + dominant-infeed branch terminal**
+    (``_electrisim_bus_branch_p_q_sum``). Here the bare injection hides the large flows
+    transiting between branches; the dominant-branch term restores the true nodal exchange
+    (e.g. shunt absorption offset by cable charging), matching the line/cable result boxes.
+
+    Pure pass-through nodes (no local injection) fall back to the dominant branch through-power
+    so the label reflects transiting power instead of a bare 0.
+
+    Slack buses (external grid / slack gen) report 0/0: the slack balances the node and its
+    exchange is shown on the external grid's own result box.
     """
     if _electrisim_bus_has_slack(net, bus_idx):
         return 0.0, 0.0
@@ -613,9 +684,25 @@ def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     p_inj = _f(net.res_bus.at[bus_idx, 'p_mw'])
     q_inj = _f(net.res_bus.at[bus_idx, 'q_mvar'])
     p_aux, q_aux = _electrisim_bus_aux_injection_sum(net, bus_idx)
-    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
 
-    return p_inj + p_aux + p_br, q_inj + q_aux + q_br
+    p_local = p_inj + p_aux
+    q_local = q_inj + q_aux
+
+    n_branches = _electrisim_bus_branch_terminal_count(net, bus_idx)
+
+    # Junction bus: injection + dominant branch terminal (true nodal exchange / transit-aware).
+    if n_branches >= 2:
+        p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
+        return p_local + p_br, q_local + q_br
+
+    # Radial bus with local generation/load: report its net injection only (the lone branch
+    # re-exports that same power, so adding it would double-count).
+    if math.hypot(p_local, q_local) >= 1e-6:
+        return p_local, q_local
+
+    # Stub / pass-through with no local injection: show the dominant branch through-power.
+    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
+    return p_br, q_br
 
 
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
@@ -1485,6 +1572,139 @@ def _electrisim_shunt_nominals_for_step(rows, step_val, p_fallback, q_fallback):
         return 0.0, 0.0
 
 
+def _electrisim_shunt_uses_zero_based(electrisim_step, characteristic_rows, lf_bands):
+    """
+    Electrisim tap indices are 0..max_step; pandapower uses 1..max_step and treats step=0 as off.
+    When step 0 appears in the diagram payload, shift +1 for pandapower and map back on export.
+    """
+    try:
+        if int(round(float(electrisim_step))) == 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    for r in characteristic_rows or []:
+        try:
+            if int(r.get("step", -1)) == 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    for b in lf_bands or []:
+        try:
+            if int(b.get("step", -1)) == 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _electrisim_shunt_step_to_pp(step_val, zero_based):
+    try:
+        s = int(round(float(step_val)))
+    except (TypeError, ValueError):
+        s = 1
+    if zero_based:
+        return max(1, s + 1)
+    return max(1, s)
+
+
+def _electrisim_shunt_step_from_pp(step_val, zero_based):
+    try:
+        s = float(step_val)
+        if math.isnan(s) or math.isinf(s):
+            return None
+        s = int(round(s))
+    except (TypeError, ValueError):
+        return None
+    if zero_based:
+        return max(0, s - 1)
+    return s
+
+
+def _electrisim_shunt_max_step_to_pp(max_step, zero_based):
+    try:
+        m = int(round(float(max_step)))
+    except (TypeError, ValueError):
+        m = 1
+    return max(1, m + 1) if zero_based else max(1, m)
+
+
+def _electrisim_shift_shunt_characteristic_rows_pp(rows, zero_based):
+    if not zero_based or not rows:
+        return rows
+    return [{"step": int(r["step"]) + 1, "p_mw": r["p_mw"], "q_mvar": r["q_mvar"]} for r in rows]
+
+
+def _electrisim_shunt_is_zero_based(net, shunt_index):
+    zb = getattr(net, "_electrisim_shunt_zero_based", None) or {}
+    return bool(zb.get(int(shunt_index)))
+
+
+def _electrisim_shunt_res_for_output(net, shunt_index, row):
+    """Repair NaN p_mw/q_mvar from pandapower when step=0 with step_dependency_table (divide-by-zero)."""
+    def _is_nan(v):
+        try:
+            v = float(v)
+            return not (v == v)
+        except (TypeError, ValueError):
+            return True
+
+    def _as_float(v, default=float("nan")):
+        try:
+            x = float(v)
+            if math.isnan(x) or math.isinf(x):
+                return default
+            return x
+        except (TypeError, ValueError):
+            return default
+
+    p_mw = _as_float(row.get("p_mw"))
+    q_mvar = _as_float(row.get("q_mvar"))
+    vm_pu = _as_float(row.get("vm_pu"), 1.0)
+    if not _is_nan(p_mw) and not _is_nan(q_mvar):
+        return p_mw, q_mvar, vm_pu
+
+    if getattr(net, "shunt", None) is None or net.shunt.empty or shunt_index not in net.shunt.index:
+        return (0.0 if _is_nan(p_mw) else p_mw), (0.0 if _is_nan(q_mvar) else q_mvar), vm_pu
+
+    sh = net.shunt.loc[shunt_index]
+    use_table = bool(sh.get("step_dependency_table", False))
+    if not use_table:
+        return (0.0 if _is_nan(p_mw) else p_mw), (0.0 if _is_nan(q_mvar) else q_mvar), vm_pu
+
+    try:
+        step_pp = float(sh["step"])
+        id_char = sh.get("id_characteristic_table")
+        bus_i = int(sh["bus"])
+        vn_sh = float(sh["vn_kv"])
+        vn_bus = float(net.bus.at[bus_i, "vn_kv"])
+        vm = float(vm_pu) if not _is_nan(vm_pu) else float(net.res_bus.at[bus_i, "vm_pu"])
+        v_ratio = (vn_bus / vn_sh) ** 2 if vn_sh > 0 else 1.0
+        char_df = getattr(net, "shunt_characteristic_table", None)
+        if char_df is None or char_df.empty or id_char is None or pd.isna(id_char):
+            return (0.0 if _is_nan(p_mw) else p_mw), (0.0 if _is_nan(q_mvar) else q_mvar), vm
+
+        sel = (char_df["id_characteristic"] == id_char) & (char_df["step"] == step_pp)
+        if not sel.any():
+            return (0.0 if _is_nan(p_mw) else p_mw), (0.0 if _is_nan(q_mvar) else q_mvar), vm
+
+        crow = char_df.loc[sel].iloc[0]
+        p_char = float(crow["p_mw"])
+        q_char = float(crow["q_mvar"])
+        if step_pp == 0:
+            p_out = 0.0
+            q_out = 0.0
+        else:
+            p_out = (vm ** 2) * p_char * v_ratio
+            q_out = (vm ** 2) * q_char * v_ratio
+        return (
+            p_out if _is_nan(p_mw) else p_mw,
+            q_out if _is_nan(q_mvar) else q_mvar,
+            vm if not _is_nan(vm_pu) else vm,
+        )
+    except Exception:
+        return (0.0 if _is_nan(p_mw) else p_mw), (0.0 if _is_nan(q_mvar) else q_mvar), vm_pu
+
+
 def _electrisim_find_line_index_by_cell_id(net, cell_id):
     """Resolve diagram line cell id → pandapower net.line row index.
 
@@ -1559,6 +1779,7 @@ def _electrisim_finalize_pending_line_flow_shunts(net):
             "p_col": item.get("p_col") or "p_from_mw",
             "use_abs": bool(item.get("use_abs", True)),
             "bands": lf_rows,
+            "zero_based_steps": bool(item.get("zero_based_steps", False)),
         })
     try:
         del net._electrisim_pending_line_flow_shunts
@@ -1671,6 +1892,8 @@ def _electrisim_attach_line_flow_shunt_controllers(net):
                 lo_span = int(max(abs(lo_min) + 500.0, 512.0)) if lo_min < 0 else 0
                 xs = [float(k) for k in range(-lo_span, span + 1)]
             ys = [_interp_y(float(x)) for x in xs]
+            if bool(spec.get("zero_based_steps")):
+                ys = [float(y) + 1.0 for y in ys]
 
             ch = Characteristic(net, x_values=xs, y_values=ys)
             control.CharacteristicControl(
@@ -2447,17 +2670,21 @@ def create_other_elements(in_data,net,x, Busbars):
             use_characteristic = sdt in (True, 'true', 'True', '1')
             raw_char_json = in_data[x].get('shunt_characteristic_table_json')
             characteristic_rows = _electrisim_parse_shunt_characteristic_table_json(raw_char_json)
+            lf_rows_preview = _electrisim_parse_line_flow_step_table_json(in_data[x].get('line_flow_step_table_json'))
+            st_raw = safe_float(in_data[x].get('step', 1))
+            step_electrisim = st_raw if st_raw is not None else in_data[x].get('step', 1)
+            max_step_electrisim = safe_float(in_data[x].get('max_step', 1)) or 1
+            zero_based_steps = _electrisim_shunt_uses_zero_based(step_electrisim, characteristic_rows, lf_rows_preview)
             id_characteristic_table = None
             step_dependency_table = False
             if use_characteristic and characteristic_rows:
-                id_characteristic_table = _electrisim_append_shunt_characteristic_table(net, characteristic_rows)
+                char_rows_pp = _electrisim_shift_shunt_characteristic_rows_pp(characteristic_rows, zero_based_steps)
+                id_characteristic_table = _electrisim_append_shunt_characteristic_table(net, char_rows_pp)
                 step_dependency_table = id_characteristic_table is not None
                 if step_dependency_table:
-                    st_raw = safe_float(in_data[x].get('step', 1))
-                    step_for_nom = st_raw if st_raw is not None else in_data[x].get('step', 1)
                     p_mw_use, q_mvar_use = _electrisim_shunt_nominals_for_step(
                         characteristic_rows,
-                        step_for_nom,
+                        step_electrisim,
                         p_mw_use,
                         q_mvar_use,
                     )
@@ -2465,7 +2692,14 @@ def create_other_elements(in_data,net,x, Busbars):
                 print(f"Warning: Shunt reactor '{in_data[x].get('name', '?')}': step_dependency_table is enabled "
                       f"but shunt_characteristic_table_json is missing or invalid; using nominal p_mw/q_mvar only.")
 
-            shunt_idx = pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=p_mw_use, q_mvar=q_mvar_use, vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service, step_dependency_table=step_dependency_table, id_characteristic_table=id_characteristic_table if step_dependency_table else None)
+            step_pp = _electrisim_shunt_step_to_pp(step_electrisim, zero_based_steps)
+            max_step_pp = _electrisim_shunt_max_step_to_pp(max_step_electrisim, zero_based_steps)
+
+            shunt_idx = pp.create_shunt(net, typ="shuntreactor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=p_mw_use, q_mvar=q_mvar_use, vn_kv=safe_float(in_data[x]['vn_kv']), step=float(step_pp), max_step=float(max_step_pp), in_service=in_service, step_dependency_table=step_dependency_table, id_characteristic_table=id_characteristic_table if step_dependency_table else None)
+            if zero_based_steps:
+                if not hasattr(net, "_electrisim_shunt_zero_based"):
+                    net._electrisim_shunt_zero_based = {}
+                net._electrisim_shunt_zero_based[int(shunt_idx)] = True
             # DiscreteShuntController (pandapower): step shunt to regulate vm at shunt bus toward vm_set_pu
             dsc = in_data[x].get('discrete_shunt_control')
             if dsc in (True, 'true', 'True', '1'):
@@ -2509,6 +2743,7 @@ def create_other_elements(in_data,net,x, Busbars):
                     'p_col': pref,
                     'use_abs': lf_abs,
                     'name': in_data[x].get('name', '?'),
+                    'zero_based_steps': bool(zero_based_steps),
                 })
         
         if (in_data[x]['typ'].startswith("Capacitor")):
@@ -3491,15 +3726,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 except Exception:
                                     cell_id = None
                             s0 = float(initial_shunt_steps[si]) if si in initial_shunt_steps else step_f
+                            zb = _electrisim_shunt_is_zero_based(net, si)
                             shunt_control_results.append({
                                 'element': 'shunt',
                                 'control_type': 'discrete_voltage',
                                 'name': str(user_friendly_name),
                                 'id': str(name),
                                 'cell_id': cell_id,
-                                'step_initial': s0,
-                                'step': step_f,
-                                'max_step': max_st,
+                                'step_initial': _electrisim_shunt_step_from_pp(s0, zb),
+                                'step': _electrisim_shunt_step_from_pp(step_f, zb),
+                                'max_step': _electrisim_shunt_step_from_pp(max_st, zb) if zb else max_st,
                                 'vm_set_pu': float(spec.get('vm_set_pu', 1.0)),
                                 'vm_pu': round(vm_pu, 4),
                                 'tol': float(spec.get('tol', 1e-3)),
@@ -3532,15 +3768,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 raw_p = float('nan')
                             use_abs_pf = bool(spec.get('use_abs', True))
                             display_p = abs(raw_p) if use_abs_pf and raw_p == raw_p else raw_p
+                            zb = _electrisim_shunt_is_zero_based(net, si)
                             shunt_control_results.append({
                                 'element': 'shunt',
                                 'control_type': 'line_flow',
                                 'name': str(user_friendly_name),
                                 'id': str(name),
                                 'cell_id': cell_id,
-                                'step_initial': s0,
-                                'step': step_f,
-                                'max_step': max_st,
+                                'step_initial': _electrisim_shunt_step_from_pp(s0, zb),
+                                'step': _electrisim_shunt_step_from_pp(step_f, zb),
+                                'max_step': _electrisim_shunt_step_from_pp(max_st, zb) if zb else max_st,
                                 'vm_pu': round(vm_pu, 4),
                                 'line_p_mw_used': round(float(display_p), 6) if display_p == display_p else None,
                                 'line_p_column': str(pcol),
@@ -4512,13 +4749,15 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 try:
                                     sw = net.shunt._get_value(index, 'step')
                                     smx = net.shunt._get_value(index, 'max_step')
-                                    step_pf = float(sw) if sw is not None and not pd.isna(sw) else None
-                                    max_pf = float(smx) if smx is not None and not pd.isna(smx) else None
+                                    zb = _electrisim_shunt_is_zero_based(net, index)
+                                    step_pf = _electrisim_shunt_step_from_pp(sw, zb) if sw is not None and not pd.isna(sw) else None
+                                    max_pf = _electrisim_shunt_step_from_pp(smx, zb) if zb and smx is not None and not pd.isna(smx) else (float(smx) if smx is not None and not pd.isna(smx) else None)
                                 except Exception:
                                     step_pf = max_pf = None
+                                p_out, q_out, vm_out = _electrisim_shunt_res_for_output(net, index, row)
                                 shunt = ShuntOut(
                                     name=net.shunt._get_value(index, 'name'), id = net.shunt._get_value(index, 'id'),
-                                    p_mw=row['p_mw'], q_mvar=row['q_mvar'], vm_pu = row['vm_pu'],
+                                    p_mw=p_out, q_mvar=q_out, vm_pu = vm_out,
                                     step=step_pf, max_step=max_pf,
                                 )
                                 shuntsList.append(shunt)
@@ -9337,12 +9576,13 @@ def _rpc_serialize_solved_net(net):
             caps_list = []
             for index, row in net.res_shunt.iterrows():
                 typ = net.shunt.at[index, 'typ'] if 'typ' in net.shunt.columns else 'shuntreactor'
+                p_out, q_out, vm_out = _electrisim_shunt_res_for_output(net, index, row)
                 entry = {
                     'name': str(net.shunt.at[index, 'name']),
                     'id': str(net.shunt.at[index, 'id']) if 'id' in net.shunt.columns else str(index),
-                    'p_mw': _rpc_clean_pf_val(row['p_mw']),
-                    'q_mvar': _rpc_clean_pf_val(row['q_mvar']),
-                    'vm_pu': _rpc_clean_pf_val(row['vm_pu']),
+                    'p_mw': _rpc_clean_pf_val(p_out),
+                    'q_mvar': _rpc_clean_pf_val(q_out),
+                    'vm_pu': _rpc_clean_pf_val(vm_out),
                 }
                 if typ == 'capacitor':
                     caps_list.append(entry)
@@ -9350,8 +9590,9 @@ def _rpc_serialize_solved_net(net):
                     try:
                         sw = net.shunt.at[index, 'step']
                         smx = net.shunt.at[index, 'max_step']
-                        entry['step'] = _rpc_clean_pf_val(float(sw) if sw is not None and not pd.isna(sw) else None)
-                        entry['max_step'] = _rpc_clean_pf_val(float(smx) if smx is not None and not pd.isna(smx) else None)
+                        zb = _electrisim_shunt_is_zero_based(net, index)
+                        entry['step'] = _rpc_clean_pf_val(_electrisim_shunt_step_from_pp(sw, zb) if sw is not None and not pd.isna(sw) else None)
+                        entry['max_step'] = _rpc_clean_pf_val(_electrisim_shunt_step_from_pp(smx, zb) if zb and smx is not None and not pd.isna(smx) else (float(smx) if smx is not None and not pd.isna(smx) else None))
                     except Exception:
                         pass
                     shunts_list.append(entry)
