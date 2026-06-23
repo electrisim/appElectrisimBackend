@@ -1680,6 +1680,65 @@ def import_opendss():
                         True,
                     ])
 
+            # Storage (BESS) — OpenDSS-only; mapped to Electrisim Storage cells on import
+            storages = []
+            try:
+                storage_names = dss.Storages.AllNames() if hasattr(dss, 'Storages') else []
+            except (TypeError, AttributeError):
+                storage_names = []
+            if storage_names:
+                def _storage_float(sname, prop, default=0.0):
+                    try:
+                        dss.Circuit.SetActiveClass('Storage')
+                        dss.ActiveClass.Name(sname)
+                        raw = dss.Properties.Value(prop)
+                        if raw in (None, ''):
+                            return default
+                        return float(raw)
+                    except (TypeError, ValueError, AttributeError):
+                        return default
+
+                for sname in storage_names:
+                    dss.Circuit.SetActiveElement(f"Storage.{sname}")
+                    bus_names_st = dss.CktElement.BusNames()
+                    if not bus_names_st:
+                        continue
+                    bus = bus_names_st[0].split('.')[0]
+                    try:
+                        bus_idx = bus_names.index(bus)
+                    except ValueError:
+                        # OpenDSS may lowercase bus names; match case-insensitively
+                        bus_lower = bus.lower()
+                        matches = [i for i, bn in enumerate(bus_names) if bn.lower() == bus_lower]
+                        if not matches:
+                            continue
+                        bus_idx = matches[0]
+                    kw = _storage_float(sname, 'kW', 0.0)
+                    kvar = _storage_float(sname, 'kvar', 0.0)
+                    kva = _storage_float(sname, 'kVA', 0.0)
+                    # OpenDSS: +kW discharge, +kvar supply; Electrisim: -p_mw export, +q_mvar absorb
+                    p_mw = -kw / 1000.0
+                    q_mvar = -kvar / 1000.0
+                    sn_mva = kva / 1000.0 if kva > 0 else abs(p_mw)
+                    kwh = _storage_float(sname, 'kWhrated', 0.0)
+                    max_e_mwh = kwh / 1000.0 if kwh > 0 else 0.0
+                    soc_percent = _storage_float(sname, '%stored', 50.0)
+                    pct_reserve = _storage_float(sname, '%reserve', 0.0)
+                    min_e_mwh = (pct_reserve / 100.0) * max_e_mwh if max_e_mwh > 0 else 0.0
+                    in_service = True
+                    try:
+                        dss.Circuit.SetActiveClass('Storage')
+                        dss.ActiveClass.Name(sname)
+                        en = dss.Properties.Value('enabled')
+                        if en is not None and str(en).lower() in ('no', 'false', '0'):
+                            in_service = False
+                    except (TypeError, AttributeError):
+                        pass
+                    storages.append([
+                        sname, bus_idx, p_mw, q_mvar, sn_mva,
+                        soc_percent, min_e_mwh, max_e_mwh, 1.0, in_service, 'BESS',
+                    ])
+
             def _detect_single_phase_model():
                 if re.search(r'New\s+Circuit\.[^\n\r]*\bphases\s*=\s*1\b', dss_text_to_use, re.IGNORECASE):
                     return True
@@ -1893,7 +1952,11 @@ def import_opendss():
                     "ward": {"_object": _json.dumps({"data": []})},
                     "xward": {"_object": _json.dumps({"data": []})},
                     "motor": {"_object": _json.dumps({"data": []})},
-                    "storage": {"_object": _json.dumps({"data": []})},
+                    "storage": {
+                        "_object": _json.dumps({
+                            "data": storages
+                        })
+                    },
                     "svc": {"_object": _json.dumps({"data": []})},
                     "tcsc": {"_object": _json.dumps({"data": []})},
                     "dcline": {"_object": _json.dumps({"data": []})}

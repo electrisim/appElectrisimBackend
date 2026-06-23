@@ -168,11 +168,14 @@ class CapacitorsOut(object):
         self.capacitors = capacitors              
 
 class StorageOut(object):
-    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float):          
+    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float,
+                 inv_control_mode: str = '', vm_pu: float = None):
         self.name = name
         self.id = id
-        self.p_mw = p_mw 
-        self.q_mvar = q_mvar                       
+        self.p_mw = p_mw
+        self.q_mvar = q_mvar
+        self.inv_control_mode = inv_control_mode
+        self.vm_pu = vm_pu                       
                        
 class StoragesOut(object):
     def __init__(self, storages: List[StorageOut]):
@@ -2382,6 +2385,125 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
             pass
     else:
         pass
+
+
+# --- Inverter control helpers (OpenDSS InvControl + XYCurve) ---
+# Reference: https://opendss.epri.com/InvControl.html
+
+_IEEE_1547_VV_X = [0.92, 0.98, 1.02, 1.08]
+_IEEE_1547_VV_Y = [0.44, 0.0, -0.44, -0.44]
+
+
+def _parse_float_array(value, default=None):
+    """Parse space- or comma-separated floats from frontend string."""
+    if default is None:
+        default = []
+    if value is None or value == '':
+        return list(default)
+    if isinstance(value, (list, tuple)):
+        try:
+            return [float(v) for v in value]
+        except (TypeError, ValueError):
+            return list(default)
+    try:
+        parts = str(value).replace(',', ' ').split()
+        return [float(p) for p in parts if p.strip()]
+    except (TypeError, ValueError):
+        return list(default)
+
+
+def _in_data_needs_time_control(in_data):
+    """Return True if any Storage uses voltage-dependent InvControl modes."""
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            if not str(element_data.get('typ', '')).startswith('Storage'):
+                continue
+            mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
+            if mode in ('VOLTVAR', 'VOLTWATT', 'WATTPF', 'WATTVAR', 'DYNAMICREACCURR'):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_voltvar_curve(element_data):
+    """Return (xarray, yarray) for Volt-VAR curve from storage parameters."""
+    preset = str(element_data.get('vv_curve_preset', 'IEEE_1547')).upper()
+    if preset == 'IEEE_1547':
+        return list(_IEEE_1547_VV_X), list(_IEEE_1547_VV_Y)
+    x_vals = _parse_float_array(element_data.get('vv_xarray'), _IEEE_1547_VV_X)
+    y_vals = _parse_float_array(element_data.get('vv_yarray'), _IEEE_1547_VV_Y)
+    if len(x_vals) < 2 or len(y_vals) < 2 or len(x_vals) != len(y_vals):
+        return list(_IEEE_1547_VV_X), list(_IEEE_1547_VV_Y)
+    return x_vals, y_vals
+
+
+def _resolve_wattpf_curve(element_data):
+    """Return (xarray, yarray) for Watt-PF curve from storage parameters."""
+    x_vals = _parse_float_array(element_data.get('wattpf_xarray'), [0.0, 0.5, 1.0])
+    y_vals = _parse_float_array(element_data.get('wattpf_yarray'), [1.0, 0.98, 0.95])
+    if len(x_vals) < 2 or len(y_vals) < 2 or len(x_vals) != len(y_vals):
+        return [0.0, 0.5, 1.0], [1.0, 0.98, 0.95]
+    return x_vals, y_vals
+
+
+def create_xycurve_element(dss, curve_name, xarray, yarray, execute_dss_command=None):
+    """Create an OpenDSS XYCurve for InvControl volt-var or watt-pf functions."""
+    if execute_dss_command is None:
+        execute_dss_command = dss.Text.Command
+    safe_name = _sanitize_opendss_name(curve_name)
+    npts = len(xarray)
+    if npts < 2 or npts != len(yarray):
+        return None
+    x_str = ' '.join(str(v) for v in xarray)
+    y_str = ' '.join(str(v) for v in yarray)
+    cmd = f"New XYCurve.{safe_name} npts={npts} xarray=[{x_str}] yarray=[{y_str}]"
+    execute_dss_command(cmd)
+    return safe_name
+
+
+def create_invcontrol_for_storage(dss, element_name, element_data, execute_dss_command=None):
+    """Create InvControl linked to a Storage element. Returns True if created."""
+    if execute_dss_command is None:
+        execute_dss_command = dss.Text.Command
+    mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
+    if mode in ('NONE', '', 'OFF', 'FIXED_Q', 'FIXED_PF'):
+        return False
+
+    der_name = _sanitize_opendss_name(element_name)
+    ctrl_name = _sanitize_opendss_name(f"{element_name}_InvCtrl")
+    der_list = f"Storage.{der_name}"
+
+    if mode == 'VOLTVAR':
+        x_vals, y_vals = _resolve_voltvar_curve(element_data)
+        curve_name = create_xycurve_element(
+            dss, f"{element_name}_VV", x_vals, y_vals, execute_dss_command)
+        if not curve_name:
+            return False
+        cmd = (
+            f"New InvControl.{ctrl_name} Mode=VOLTVAR DERList=[{der_list}] "
+            f"VVC_Curve1={curve_name} RefReactivePower=VARMAX"
+        )
+        execute_dss_command(cmd)
+        return True
+
+    if mode == 'WATTPF':
+        x_vals, y_vals = _resolve_wattpf_curve(element_data)
+        curve_name = create_xycurve_element(
+            dss, f"{element_name}_WattPF", x_vals, y_vals, execute_dss_command)
+        if not curve_name:
+            return False
+        cmd = (
+            f"New InvControl.{ctrl_name} Mode=WATTPF DERList=[{der_list}] "
+            f"WattPF_Curve={curve_name}"
+        )
+        execute_dss_command(cmd)
+        return True
+
+    return False
+
+
 def create_storage_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, StoragesDict, StoragesDictId, created_elements, execute_dss_command=None):
     """Create a storage element in OpenDSS with full BESS/Battery storage support.
     Maps pandapower parameters to OpenDSS and supports OpenDSS-specific properties.
@@ -2458,11 +2580,31 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 conn_raw = str(element_data.get('conn', 'wye')).lower()
                 conn = 'delta' if conn_raw == 'delta' else 'wye'
 
+                inv_mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
+                pf_suffix = ''
+                if inv_mode == 'FIXED_PF':
+                    try:
+                        pf_val = float(element_data.get('pf', 1.0) or 1.0)
+                        pf_mag = abs(pf_val)
+                        if 0.5 <= pf_mag <= 1.0:
+                            # Electrisim Q sign (+ = absorb vars, same as FIXED_Q / pandapower).
+                            # OpenDSS Storage while DISCHARGING: +pf => vars out (same dir as kW);
+                            # -pf => vars in (absorb). Map UI lagging PF magnitude to -pf when exporting.
+                            if storage_state == 'DISCHARGING':
+                                pf_opendss = -pf_mag
+                            elif storage_state == 'CHARGING':
+                                pf_opendss = pf_mag
+                            else:
+                                pf_opendss = pf_val
+                            pf_suffix = f" pf={pf_opendss}"
+                    except (TypeError, ValueError):
+                        pass
+
                 simple_cmd = (
                     f"New Storage.{element_name} phases={phases} Bus1={bus_name} kV={bus_voltage} "
                     f"conn={conn} "
                     f"kWRated={kw_rated} kW={kw_dispatch} kVA={kva_rated} kvar={kvar_opendss} "
-                    f"State={storage_state}"
+                    f"State={storage_state}{pf_suffix}"
                 )
                 
                 # Append energy parameters (pandapower max_e_mwh -> OpenDSS kWhrated)
@@ -2602,6 +2744,13 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 
                 for cmd in follow_up_cmds:
                     dss.Text.Command(cmd)
+                
+                # InvControl for voltage-dependent inverter modes (Q-V droop, Watt-PF)
+                try:
+                    create_invcontrol_for_storage(
+                        dss, element_name, element_data, execute_dss_command)
+                except Exception as inv_err:
+                    print(f"[OpenDSS] InvControl for {element_name} failed: {inv_err}")
                 
                 # Handle in_service status AFTER creating the element
                 in_service = element_data.get('in_service', True)
@@ -3173,6 +3322,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     # Set OpenDSS circuit parameters
     f = frequency
     
+    # Auto-enable Time control when Storage uses InvControl (Volt-VAR, Watt-PF, etc.)
+    effective_controlmode = controlmode
+    if _in_data_needs_time_control(in_data):
+        if str(controlmode).lower() == 'static':
+            effective_controlmode = 'Time'
+            print("[OpenDSS] InvControl detected — upgrading ControlMode Static → Time")
+    
     # Pre-scan in_data for the first External Grid to embed its Vsource parameters
     # directly into "New Circuit". This avoids relying on "Edit Vsource.source" which
     # can silently fail in some opendssdirect versions, leaving zero voltage everywhere.
@@ -3189,7 +3345,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         execute_dss_command(f'set Mode={mode}')
         execute_dss_command(f'set Algorithm={algorithm}')
         execute_dss_command(f'set LoadModel={loadmodel}')
-        execute_dss_command(f'set ControlMode={controlmode}')
+        execute_dss_command(f'set ControlMode={effective_controlmode}')
         execute_dss_command(f'set MaxIterations={max_iterations}')
         execute_dss_command(f'set Tolerance={tolerance}')
 
@@ -3272,8 +3428,18 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     storagesList = []
     pvsystemsList = []
     externalGridsList = []
+
+    # Lookup inv_control_mode per storage id from input data
+    storage_inv_mode_by_id = {}
+    for _k, _elem in in_data.items():
+        try:
+            if str(_elem.get('typ', '')).startswith('Storage') and _elem.get('id'):
+                storage_inv_mode_by_id[str(_elem['id'])] = str(
+                    _elem.get('inv_control_mode', 'NONE')).upper()
+        except Exception:
+            pass
     
-    # Aggregate P and Q per bus from CktElement powers (for bus result boxes: P[MW], Q[MVAr], PF, Q/P)
+    # Aggregate P and Q per bus from CktElement powers
     bus_pq_kw = {}  # bus_name_lower -> (p_kw, q_kvar)
     try:
         for is_pc in [False, True]:  # PDElements then PCElements
@@ -4148,11 +4314,26 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             frontend_name = key
                             frontend_id = StoragesDictId[key]
                             
+                            inv_mode = storage_inv_mode_by_id.get(str(frontend_id), '')
+                            vm_pu_val = None
+                            try:
+                                dss.Circuit.SetActiveElement(f'Storage.{storage_name}')
+                                bus_names = dss.CktElement.BusNames()
+                                if bus_names:
+                                    dss.Circuit.SetActiveBus(bus_names[0].split('.')[0])
+                                    v_mag = dss.Bus.puVmagAngle()
+                                    if v_mag and len(v_mag) >= 1:
+                                        vm_pu_val = float(v_mag[0])
+                            except Exception:
+                                pass
+
                             storage = StorageOut(
                                 name=frontend_name, 
                                 id=frontend_id, 
                                 p_mw=p_mw, 
-                                q_mvar=q_mvar
+                                q_mvar=q_mvar,
+                                inv_control_mode=inv_mode,
+                                vm_pu=vm_pu_val
                             )
                             storagesList.append(storage)
                             break
