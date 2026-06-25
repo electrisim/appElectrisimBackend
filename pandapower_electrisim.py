@@ -666,12 +666,13 @@ def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     Pure pass-through nodes (no local injection) fall back to the dominant branch through-power
     so the label reflects transiting power instead of a bare 0.
 
-    Slack buses (external grid / slack gen) report 0/0: the slack balances the node and its
-    exchange is shown on the external grid's own result box.
+    Slack buses (external grid / slack gen) report their **net local injection** (pandapower
+    ``res_bus.p_mw`` / ``q_mvar``, which already nets every element on the bus, including the
+    slack infeed). This matches what standard power-flow tools show at the reference bus and
+    keeps the bus box consistent with the External Grid box (same quantity, opposite sign
+    convention). We deliberately do NOT add the dominant branch term here: at the slack the
+    branch simply re-exports the slack infeed, so injection + branch would double-count it.
     """
-    if _electrisim_bus_has_slack(net, bus_idx):
-        return 0.0, 0.0
-
     def _f(v, default=0.0):
         try:
             x = float(v)
@@ -687,6 +688,11 @@ def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
 
     p_local = p_inj + p_aux
     q_local = q_inj + q_aux
+
+    # Slack / reference bus: show the net local injection only (the branch re-exports that same
+    # power, so adding the branch term would double-count). res_bus already nets all elements.
+    if _electrisim_bus_has_slack(net, bus_idx):
+        return p_local, q_local
 
     n_branches = _electrisim_bus_branch_terminal_count(net, bus_idx)
 
