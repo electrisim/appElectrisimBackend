@@ -11484,6 +11484,18 @@ def protection_coordination(net, prot_params, in_data):
             for line_id in line_ids:
                 scenarios.append(_prot_run_scenario(net, line_id, sc_fraction, fault_type, case, attach_summaries))
 
+        scenario_warning = None
+        if not scenarios:
+            if fault_location_mode == 'line' and (not hasattr(net, 'line') or net.line.empty):
+                scenario_warning = (
+                    'No fault scenarios were run: fault location is "line" but the model has no in-service lines. '
+                    'Use "At selected busbar" in the Fault tab, or add lines to the diagram.'
+                )
+            elif fault_location_mode == 'line':
+                scenario_warning = 'No fault scenarios were run: no matching in-service lines for the selected line fault.'
+            else:
+                scenario_warning = 'No fault scenarios were run.'
+
         # Sample characteristics on the unmodified net so curves do not include the sc_bus.
         devices = _prot_extract_devices_for_ui(net, attach_summaries)
 
@@ -11507,9 +11519,12 @@ def protection_coordination(net, prot_params, in_data):
                 'case': case,
                 'fault_location_mode': fault_location_mode,
                 't_diff_s': t_diff,
+                **({'scenario_warning': scenario_warning} if scenario_warning else {}),
             },
             'miscoordination': miscoord,
         }
+        if scenario_warning:
+            response['warning'] = scenario_warning
         return json.dumps(response, default=_json_serialize_default, separators=(',', ':'))
     except Exception as e:
         import traceback
