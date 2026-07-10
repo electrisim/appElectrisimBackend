@@ -9401,6 +9401,88 @@ def _rpc_masked_q_interp_clip(p_target, p_list, q_list):
     return float(np.interp(pt, px, qy, left=float(qy[0]), right=float(qy[-1])))
 
 
+def _rpc_build_uq_curve(voltage_levels, curves, p_target_mw):
+    """
+    Extract Q_min/Q_max at P ≈ p_target from per-voltage P-Q curves for U-Q/Pmax chart.
+    """
+    u_pu = []
+    q_max_mvar = []
+    q_min_mvar = []
+    p_target = float(p_target_mw)
+
+    for v in voltage_levels:
+        v_key = f"{float(v):.4f}"
+        curve = curves.get(v_key, {})
+        p_arr = curve.get('p_mw', [])
+        q_max_arr = curve.get('q_max_mvar', [])
+        q_min_arr = curve.get('q_min_mvar', [])
+
+        q_max_v = _rpc_masked_q_interp_clip(p_target, p_arr, q_max_arr)
+        q_min_v = _rpc_masked_q_interp_clip(p_target, p_arr, q_min_arr)
+
+        u_pu.append(round(float(v), 4))
+        q_max_mvar.append(round(q_max_v, 4) if q_max_v is not None else None)
+        q_min_mvar.append(round(q_min_v, 4) if q_min_v is not None else None)
+
+    return {
+        'u_pu': u_pu,
+        'q_max_mvar': q_max_mvar,
+        'q_min_mvar': q_min_mvar,
+        'p_mw': round(p_target, 4),
+    }
+
+
+def _rpc_check_uq_compliance(uq_curve, uq_requirements, tol_mvar=1e-4):
+    """
+    Compare achieved Q at Pmax vs U-Q requirement envelope over voltage.
+    Returns True, False, or None if requirements missing / insufficient data.
+    """
+    if not uq_requirements or not uq_curve:
+        return None
+
+    req_u = uq_requirements.get('u_pu', [])
+    req_q_max = uq_requirements.get('q_req_max_mvar', [])
+    req_q_min = uq_requirements.get('q_req_min_mvar', [])
+    n = min(len(req_u), len(req_q_max), len(req_q_min))
+    if n < 1:
+        return None
+
+    try:
+        order = np.argsort([float(req_u[i]) for i in range(n)])
+        ru = np.array([float(req_u[i]) for i in order], dtype=float)
+        rmax = np.array([float(req_q_max[i]) for i in order], dtype=float)
+        rmin = np.array([float(req_q_min[i]) for i in order], dtype=float)
+    except (TypeError, ValueError):
+        return None
+
+    cap_u = uq_curve.get('u_pu', [])
+    cap_q_max = uq_curve.get('q_max_mvar', [])
+    cap_q_min = uq_curve.get('q_min_mvar', [])
+
+    u_lo = float(ru[0])
+    u_hi = float(ru[-1])
+    u_check = set(float(x) for x in ru.tolist())
+    for u in cap_u:
+        try:
+            uf = float(u)
+        except (TypeError, ValueError):
+            continue
+        if u_lo <= uf <= u_hi:
+            u_check.add(uf)
+
+    for u_s in sorted(u_check):
+        req_max_v = float(np.interp(u_s, ru, rmax, left=float(rmax[0]), right=float(rmax[-1])))
+        req_min_v = float(np.interp(u_s, ru, rmin, left=float(rmin[0]), right=float(rmin[-1])))
+        cap_max_v = _rpc_masked_q_interp_clip(u_s, cap_u, cap_q_max)
+        cap_min_v = _rpc_masked_q_interp_clip(u_s, cap_u, cap_q_min)
+        if cap_max_v is None or cap_min_v is None:
+            return False
+        if cap_max_v < req_max_v - tol_mvar or cap_min_v > req_min_v + tol_mvar:
+            return False
+
+    return True
+
+
 def _rpc_clean_pf_val(v):
     if isinstance(v, (float, np.floating)):
         if math.isnan(v) or math.isinf(v):
@@ -9671,6 +9753,99 @@ def _rpc_build_and_run_point_net(net, ext_grid_idx, v_pu, gen_info, total_instal
     return net_pt
 
 
+def _rpc_eval_q_frac(net, ext_grid_idx, v_pu, gen_info, total_installed_mw, p_val,
+                     q_capability_mode, direction, frac, limit_overloads, max_loading_percent,
+                     pcc_bus_idx, verbose_iwamoto, rc2, rc3, rcs):
+    """
+    Dispatch every selected static generator at `frac` of its Q-capability in the given
+    direction ('max' = overexcited/+Q, 'min' = underexcited/-Q), run power flow, and report
+    feasibility. Returns dict with keys: converged (bool), overloaded (bool), q_pcc (float|None).
+    """
+    net_try = deepcopy(net)
+    net_try.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
+    sign = 1.0 if direction == 'max' else -1.0
+    for g in gen_info:
+        share = g['p_rated_mw'] / total_installed_mw
+        p_gen = float(p_val) * share
+        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
+        q_full = q_pos_cap if direction == 'max' else q_neg_cap
+        net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
+        net_try.sgen.at[g['idx'], 'q_mvar'] = sign * q_full * float(frac)
+
+    if not _rpc_run_pf_robust(net_try, verbose_iwamoto, rc2, rc3, rcs):
+        return {'converged': False, 'overloaded': False, 'q_pcc': None}
+
+    overloaded = False
+    if limit_overloads:
+        if not net_try.res_trafo.empty and net_try.res_trafo.loading_percent.max() > max_loading_percent:
+            overloaded = True
+        if not net_try.res_line.empty and net_try.res_line.loading_percent.max() > max_loading_percent:
+            overloaded = True
+
+    return {
+        'converged': True,
+        'overloaded': overloaded,
+        'q_pcc': _rpc_pcc_q_for_chart(net_try, pcc_bus_idx, ext_grid_idx),
+    }
+
+
+def _rpc_max_feasible_q(net, ext_grid_idx, v_pu, gen_info, total_installed_mw, p_val,
+                        q_capability_mode, direction, limit_overloads, max_loading_percent,
+                        pcc_bus_idx, verbose_iwamoto, rc2, rc3, rcs,
+                        max_iterations=16, frac_tol=2.5e-3):
+    """
+    Resolve the reactive-power boundary in one direction by finding the maximum fraction
+    (0..1) of each unit's Q-capability whose power flow converges and, when
+    limit_overloads=True, stays within max_loading_percent.
+
+    Instead of snapping to a coarse fraction ladder (which under-reports the boundary when
+    full capability fails to converge), this bisects the feasible fraction so the reported
+    Q at the PCC is the true feasible edge.
+
+    Feasibility is assumed monotonic in the fraction (larger |Q| -> harder to converge and
+    higher branch loading), consistent with the physical voltage-collapse / loading trend.
+
+    Returns (q_pcc, frac_used, limit_reason):
+      - limit_reason is None when full capability (frac=1.0) is feasible,
+        'overload' when the binding limit is branch loading, or
+        'divergence' when the binding limit is power-flow non-convergence.
+      - Returns (None, None, None) if even unity-Q (frac=0.0) fails to converge.
+    """
+    def feas(frac):
+        return _rpc_eval_q_frac(
+            net, ext_grid_idx, v_pu, gen_info, total_installed_mw, p_val,
+            q_capability_mode, direction, frac, limit_overloads, max_loading_percent,
+            pcc_bus_idx, verbose_iwamoto, rc2, rc3, rcs)
+
+    top = feas(1.0)
+    if top['converged'] and not top['overloaded']:
+        return top['q_pcc'], 1.0, None
+
+    base = feas(0.0)
+    if not base['converged']:
+        return None, None, None
+
+    best_q = base['q_pcc']
+    best_frac = 0.0
+    limit_reason = 'overload' if (top['converged'] and top['overloaded']) else 'divergence'
+
+    lo, hi = 0.0, 1.0
+    for _ in range(max_iterations):
+        if (hi - lo) < frac_tol:
+            break
+        mid = 0.5 * (lo + hi)
+        r = feas(mid)
+        if r['converged'] and not r['overloaded']:
+            lo = mid
+            best_q = r['q_pcc']
+            best_frac = mid
+        else:
+            hi = mid
+            limit_reason = 'overload' if (r['converged'] and r['overloaded']) else 'divergence'
+
+    return best_q, best_frac, limit_reason
+
+
 def reactive_power_capability(net, rpc_params):
     """
     Perform Reactive Power Capability (RPC) analysis for a wind farm.
@@ -9700,7 +9875,9 @@ def reactive_power_capability(net, rpc_params):
         limit_overloads = rpc_params.get('limit_overloads', False)
         max_loading_percent = float(rpc_params.get('max_loading_percent', 100))
         requirements = rpc_params.get('requirements', None)
+        uq_requirements = rpc_params.get('uq_requirements', None)
         grid_code_template_name = rpc_params.get('grid_code_template_name')
+        uq_grid_code_template_name = rpc_params.get('uq_grid_code_template_name')
         verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
         progress_cb = rpc_params.get('_progress_callback')
         rc2, rc3, rcs = _resolve_controller_family_flags(rpc_params)
@@ -9846,111 +10023,62 @@ def reactive_power_capability(net, rpc_params):
             for p_total in p_points:
                 p_val = float(p_total)
 
-                # --- Q_max sweep (overexcited, positive Q) ---
-                q_max_pcc = None
-                q_max_frac_used = None
-                for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
-                    net_copy = deepcopy(net)
-                    net_copy.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
-                    for g in gen_info:
-                        share = g['p_rated_mw'] / total_installed_mw
-                        p_gen = p_val * share
-                        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
-                            net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
-                        net_copy.sgen.at[g['idx'], 'p_mw'] = p_gen
-                        net_copy.sgen.at[g['idx'], 'q_mvar'] = q_pos_cap * q_frac
+                # Emit progress per P step so the NDJSON stream keeps producing bytes during the
+                # (per-point) convergence bisection; long silent gaps otherwise let proxies/dev
+                # tunnels drop the HTTP/2 connection mid-computation.
+                if progress_cb:
+                    progress_cb(f"    P = {p_val:.1f} MW: resolving Q_max / Q_min boundary ...")
 
-                    if _rpc_run_pf_robust(net_copy, verbose_iwamoto, rc2, rc3, rcs):
-                        q_max_pcc = _rpc_pcc_q_for_chart(net_copy, pcc_bus_idx, ext_grid_idx)
-                        q_max_frac_used = q_frac
-                        if limit_overloads:
-                            overloaded = False
-                            if not net_copy.res_trafo.empty and net_copy.res_trafo.loading_percent.max() > max_loading_percent:
-                                overloaded = True
-                            if not net_copy.res_line.empty and net_copy.res_line.loading_percent.max() > max_loading_percent:
-                                overloaded = True
-                            if overloaded:
-                                q_max_pcc = _rpc_binary_search_q(
-                                    net, ext_grid_idx, float(v_pu), gen_info,
-                                    total_installed_mw, p_val, q_capability_mode,
-                                    'max', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto,
-                                    run_control_trafo2w=rc2,
-                                    run_control_trafo3w=rc3,
-                                    run_control_shunt=rcs,
-                                )
-                                warnings_list.append(
-                                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited due to overload"
-                                )
-                        if q_frac < 1.0:
-                            warnings_list.append(
-                                f"V={v_pu}pu, P={p_val:.1f}MW: Q_max converged at {q_frac*100:.0f}% capability"
-                            )
-                        break
-                    else:
-                        continue
+                # --- Q_max (overexcited, +Q) & Q_min (underexcited, -Q) ---
+                # Resolve each boundary via convergence-based bisection so the reported limit
+                # is the true feasible fraction of unit capability, instead of snapping to a
+                # coarse ladder step when full capability fails to converge.
+                q_max_pcc, q_max_frac_used, q_max_reason = _rpc_max_feasible_q(
+                    net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
+                    q_capability_mode, 'max', limit_overloads, max_loading_percent, pcc_bus_idx,
+                    verbose_iwamoto, rc2, rc3, rcs)
 
                 if q_max_pcc is None:
                     print(f"    Q_max PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
-                elif q_max_frac_used is not None:
+                else:
+                    if q_max_frac_used is not None and q_max_frac_used < 0.999:
+                        _reason = ('overload' if q_max_reason == 'overload'
+                                   else 'power flow non-convergence at higher Q')
+                        warnings_list.append(
+                            f"V={v_pu}pu, P={p_val:.1f}MW: Q_max limited to "
+                            f"{q_max_frac_used*100:.0f}% capability ({_reason})"
+                        )
                     net_qmax_snap = _rpc_build_and_run_point_net(
                         net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
                         q_capability_mode, 'max', q_max_frac_used, verbose_iwamoto, rc2, rc3, rcs)
                     if net_qmax_snap is not None:
                         _rpc_store_point_snapshot(point_loadflows, v_key, 'q_max', p_val, net_qmax_snap)
 
-                # --- Q_min sweep (underexcited, negative Q) ---
-                q_min_pcc = None
-                q_min_frac_used = None
-                for q_frac in [1.0, 0.9, 0.8, 0.7, 0.5, 0.3, 0.0]:
-                    net_copy2 = deepcopy(net)
-                    net_copy2.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(v_pu)
-                    for g in gen_info:
-                        share = g['p_rated_mw'] / total_installed_mw
-                        p_gen = p_val * share
-                        q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(
-                            net, g['idx'], p_gen, g['sn_mva'], q_capability_mode)
-                        net_copy2.sgen.at[g['idx'], 'p_mw'] = p_gen
-                        net_copy2.sgen.at[g['idx'], 'q_mvar'] = -q_neg_cap * q_frac
-
-                    if _rpc_run_pf_robust(net_copy2, verbose_iwamoto, rc2, rc3, rcs):
-                        q_min_pcc = _rpc_pcc_q_for_chart(net_copy2, pcc_bus_idx, ext_grid_idx)
-                        q_min_frac_used = q_frac
-                        if limit_overloads:
-                            overloaded = False
-                            if not net_copy2.res_trafo.empty and net_copy2.res_trafo.loading_percent.max() > max_loading_percent:
-                                overloaded = True
-                            if not net_copy2.res_line.empty and net_copy2.res_line.loading_percent.max() > max_loading_percent:
-                                overloaded = True
-                            if overloaded:
-                                q_min_pcc = _rpc_binary_search_q(
-                                    net, ext_grid_idx, float(v_pu), gen_info,
-                                    total_installed_mw, p_val, q_capability_mode,
-                                    'min', max_loading_percent, pcc_bus_idx,
-                                    verbose_iwamoto=verbose_iwamoto,
-                                    run_control_trafo2w=rc2,
-                                    run_control_trafo3w=rc3,
-                                    run_control_shunt=rcs,
-                                )
-                                warnings_list.append(
-                                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited due to overload"
-                                )
-                        if q_frac < 1.0:
-                            warnings_list.append(
-                                f"V={v_pu}pu, P={p_val:.1f}MW: Q_min converged at {q_frac*100:.0f}% capability"
-                            )
-                        break
-                    else:
-                        continue
+                q_min_pcc, q_min_frac_used, q_min_reason = _rpc_max_feasible_q(
+                    net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
+                    q_capability_mode, 'min', limit_overloads, max_loading_percent, pcc_bus_idx,
+                    verbose_iwamoto, rc2, rc3, rcs)
 
                 if q_min_pcc is None:
                     print(f"    Q_min PF failed at P={p_val:.1f}MW, V={v_pu}pu (all strategies)")
-                elif q_min_frac_used is not None:
+                else:
+                    if q_min_frac_used is not None and q_min_frac_used < 0.999:
+                        _reason = ('overload' if q_min_reason == 'overload'
+                                   else 'power flow non-convergence at higher Q')
+                        warnings_list.append(
+                            f"V={v_pu}pu, P={p_val:.1f}MW: Q_min limited to "
+                            f"{q_min_frac_used*100:.0f}% capability ({_reason})"
+                        )
                     net_qmin_snap = _rpc_build_and_run_point_net(
                         net, ext_grid_idx, float(v_pu), gen_info, total_installed_mw, p_val,
                         q_capability_mode, 'min', q_min_frac_used, verbose_iwamoto, rc2, rc3, rcs)
                     if net_qmin_snap is not None:
                         _rpc_store_point_snapshot(point_loadflows, v_key, 'q_min', p_val, net_qmin_snap)
+
+                if progress_cb:
+                    _qmx = f"{q_max_pcc:.1f}" if q_max_pcc is not None else "n/a"
+                    _qmn = f"{q_min_pcc:.1f}" if q_min_pcc is not None else "n/a"
+                    progress_cb(f"    P = {p_val:.1f} MW: Q_max={_qmx} Mvar, Q_min={_qmn} Mvar")
 
                 p_result.append(round(p_val, 4))
                 q_max_result.append(round(q_max_pcc, 4) if q_max_pcc is not None else None)
@@ -10014,18 +10142,26 @@ def reactive_power_capability(net, rpc_params):
             else:
                 compliance[v_key] = None
 
+        p_target_uq = float(p_max_mw)
+        uq_curve = _rpc_build_uq_curve(voltage_levels, curves, p_target_uq)
+        uq_compliance = _rpc_check_uq_compliance(uq_curve, uq_requirements)
+
         result = {
             'rpc_results': {
                 'voltage_levels': [round(float(v), 4) for v in voltage_levels],
                 'curves': curves,
+                'uq_curve': uq_curve,
                 'point_loadflows': point_loadflows,
                 'requirements': requirements if requirements else {},
+                'uq_requirements': uq_requirements if uq_requirements else {},
                 'compliance': compliance,
+                'uq_compliance': uq_compliance,
                 'warnings': warnings_list,
                 'total_installed_mw': round(total_installed_mw, 4),
                 'pcc_bus_name': pcc_bus_friendly,
                 'generator_count': len(gen_info),
                 'grid_code_template_name': grid_code_template_name,
+                'uq_grid_code_template_name': uq_grid_code_template_name,
                 'q_capability_mode': q_capability_mode,
                 'tap_changer_control': {
                     'run_control_requested': run_control_any,
@@ -10229,56 +10365,9 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
     return False
 
 
-def _rpc_binary_search_q(net, ext_grid_idx, v_pu, gen_info,
-                          total_installed_mw, p_val, q_capability_mode,
-                          direction, max_loading_percent, pcc_bus_idx,
-                          iterations=12, verbose_iwamoto=False,
-                          run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
-    """
-    Binary search to find the maximum (or minimum) Q at PCC that keeps
-    all branch loadings within max_loading_percent.
-    direction: 'max' for overexcited, 'min' for underexcited.
-    """
-    lo, hi = 0.0, 1.0
-
-    best_q_pcc = 0.0
-
-    for _ in range(iterations):
-        mid = (lo + hi) / 2.0
-        net_try = deepcopy(net)
-        net_try.ext_grid.at[ext_grid_idx, 'vm_pu'] = v_pu
-
-        for g in gen_info:
-            share = g['p_rated_mw'] / total_installed_mw
-            p_gen = p_val * share
-            sn = g['sn_mva']
-            q_pos_cap, q_neg_cap = _rpc_sgen_q_caps(net, g['idx'], p_gen, sn, q_capability_mode)
-            q_full = q_pos_cap if direction == 'max' else q_neg_cap
-            q_gen = q_full * mid * (1 if direction == 'max' else -1)
-            net_try.sgen.at[g['idx'], 'p_mw'] = p_gen
-            net_try.sgen.at[g['idx'], 'q_mvar'] = q_gen
-
-        converged = _rpc_run_pf_robust(
-            net_try, verbose_iwamoto,
-            run_control_trafo2w, run_control_trafo3w, run_control_shunt)
-
-        if not converged:
-            hi = mid
-            continue
-
-        overloaded = False
-        if not net_try.res_trafo.empty and net_try.res_trafo.loading_percent.max() > max_loading_percent:
-            overloaded = True
-        if not net_try.res_line.empty and net_try.res_line.loading_percent.max() > max_loading_percent:
-            overloaded = True
-
-        if overloaded:
-            hi = mid
-        else:
-            lo = mid
-            best_q_pcc = _rpc_pcc_q_for_chart(net_try, pcc_bus_idx, ext_grid_idx)
-
-    return best_q_pcc
+# NOTE: The former _rpc_binary_search_q (overload-only bisection, invoked from a coarse
+# fraction ladder) has been superseded by _rpc_max_feasible_q, which bisects the feasible
+# Q fraction on both convergence and (optionally) branch loading for every RPC point.
 
 
 # ============================================================================

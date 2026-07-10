@@ -285,7 +285,13 @@ def simulation():
                         threading.Thread(target=_worker, daemon=True).start()
 
                         while True:
-                            kind, payload = q.get()
+                            try:
+                                kind, payload = q.get(timeout=10)
+                            except queue.Empty:
+                                # Heartbeat: keep the HTTP/2 stream from going idle (dev tunnels /
+                                # proxies drop long-silent connections). Frontend ignores this type.
+                                yield json.dumps({'type': 'heartbeat'}, ensure_ascii=False) + '\n'
+                                continue
                             if kind == 'p':
                                 yield json.dumps({'type': 'progress', 'message': payload}, ensure_ascii=False) + '\n'
                             elif kind == 'e':
