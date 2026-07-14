@@ -3290,7 +3290,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     
     Args:
         in_data: Network element data
-        frequency: Base frequency (50 or 60 Hz)
+        frequency: Base frequency in Hz (e.g. 50, 60, 75)
         mode: Solution mode (Snapshot, Daily, Dutycycle, Yearly, etc.)
         algorithm: Solution algorithm (Normal, Newton, NCIM)
         loadmodel: Load model (Powerflow=iterative with power injections, Admittance=direct solution)

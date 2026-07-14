@@ -388,7 +388,7 @@ def simulation():
                 
                 # Extract OpenDSS parameters based on OpenDSS documentation
                 # Reference: https://opendss.epri.com/PowerFlow.html
-                frequency = eval(in_data[x]['frequency'])  # Base frequency (50 or 60 Hz)
+                frequency = float(in_data[x]['frequency'])  # Base frequency (Hz)
                 analysis_type = in_data[x].get('analysisType', 'loadflow')
                 mode = in_data[x].get('mode', 'Snapshot')  # Solution mode (Snapshot, Daily, Dutycycle, Yearly)
                 algorithm = in_data[x].get('algorithm', 'Normal')  # Solution algorithm (Normal, Newton)
