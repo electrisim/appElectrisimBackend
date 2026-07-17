@@ -1487,6 +1487,131 @@ def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
     print(f"Applied {len(updates)} static generator Q capability curve(s); power flow will use enforce_q_lims=True.")
 
 
+def _interp_q_capability_at_p(p_vals, q_vals, p_target, curve_style='straightLineYValues'):
+    """
+    Interpolate Q at p_target from sorted knot arrays. Matches pandapower curve styles:
+    straightLineYValues (linear segments) and constantYValue (Q holds until next P).
+    """
+    if p_vals is None or q_vals is None or len(p_vals) < 2 or len(q_vals) < 2:
+        return None
+    p = np.asarray(p_vals, dtype=float)
+    q = np.asarray(q_vals, dtype=float)
+    p_m = float(p_target)
+    if p_m <= p[0]:
+        return float(q[0])
+    if p_m >= p[-1]:
+        return float(q[-1])
+    style = curve_style if curve_style in ('straightLineYValues', 'constantYValue') else 'straightLineYValues'
+    if style == 'constantYValue':
+        for i in range(len(p) - 1):
+            if p[i] <= p_m < p[i + 1]:
+                return float(q[i])
+        return float(q[-1])
+    return float(np.interp(p_m, p, q))
+
+
+def _interp_sgen_pq_limits(net, sgen_idx, p_mw):
+    """
+    Interpolate (q_min_mvar, q_max_mvar) at p_mw from net.q_capability_curve_table for the
+    characteristic linked to net.sgen row sgen_idx. Returns None if unavailable.
+    """
+    try:
+        if not hasattr(net, 'sgen') or net.sgen.empty:
+            return None
+        if 'id_q_capability_characteristic' not in net.sgen.columns:
+            return None
+        cid = net.sgen.at[sgen_idx, 'id_q_capability_characteristic']
+        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+            return None
+        qtbl = net.get('q_capability_curve_table', None)
+        if qtbl is None or (hasattr(qtbl, 'empty') and qtbl.empty):
+            return None
+        if 'id_q_capability_curve' not in qtbl.columns:
+            return None
+        sub = _rpc_q_curve_table_subset(qtbl, cid)
+        if len(sub) < 2:
+            return None
+        sub = sub.sort_values('p_mw')
+        p = sub['p_mw'].astype(float).values
+        qmin = sub['q_min_mvar'].astype(float).values
+        qmax = sub['q_max_mvar'].astype(float).values
+        style = net.sgen.at[sgen_idx, 'curve_style'] if 'curve_style' in net.sgen.columns else 'straightLineYValues'
+        if style is None or (isinstance(style, float) and pd.isna(style)):
+            style = 'straightLineYValues'
+        q_mi = _interp_q_capability_at_p(p, qmin, p_mw, style)
+        q_ma = _interp_q_capability_at_p(p, qmax, p_mw, style)
+        if q_mi is None or q_ma is None:
+            return None
+        return (q_mi, q_ma)
+    except Exception:
+        return None
+
+
+def _electrisim_truthy(val):
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    return s in ('true', '1', 'yes', 'on')
+
+
+def apply_sgen_q_setpoint_from_curve(net, in_data):
+    """
+    Set net.sgen.q_mvar from the Q capability curve when reactive_capability_curve is enabled
+    and q_setpoint_mode is capacitive_max or inductive_max. Manual mode keeps diagram q_mvar.
+    """
+    if in_data is None or not hasattr(net, 'sgen') or net.sgen.empty:
+        return
+    if 'id' not in net.sgen.columns:
+        return
+
+    applied = 0
+
+    for key, elem in in_data.items():
+        if not isinstance(elem, dict):
+            continue
+        typ = elem.get('typ') or ''
+        if not typ.startswith('Static Generator'):
+            continue
+        if not _electrisim_truthy(elem.get('reactive_capability_curve')):
+            continue
+        mode = str(elem.get('q_setpoint_mode') or 'manual').strip().lower()
+        if mode not in ('capacitive_max', 'inductive_max'):
+            continue
+        cell_id = elem.get('id')
+        try:
+            mask = net.sgen['id'] == cell_id
+            if not mask.any():
+                continue
+            sgen_idx = net.sgen.index[mask][0]
+        except Exception:
+            continue
+
+        p_mw = float(net.sgen.at[sgen_idx, 'p_mw'])
+
+        lim = _interp_sgen_pq_limits(net, sgen_idx, p_mw)
+        if lim is None:
+            print(f"Warning: Static Generator '{elem.get('name', key)}': Q setpoint from curve skipped (no valid curve).")
+            continue
+        q_mi, q_ma = lim
+
+        if mode == 'capacitive_max':
+            q_effective = q_ma
+        else:
+            q_effective = q_mi
+
+        net.sgen.at[sgen_idx, 'q_mvar'] = float(q_effective)
+        applied += 1
+        print(
+            f"Static Generator '{elem.get('name', key)}': Q setpoint {q_effective:.4f} MVar "
+            f"(mode={mode}, P={p_mw:.4f} MW, curve q_min={q_mi:.4f}, q_max={q_ma:.4f})"
+        )
+
+    if applied:
+        print(f"Applied Q setpoint from capability curve for {applied} static generator(s).")
+
+
 def _electrisim_enforce_q_lims_kw(net):
     """Keyword args for pp.runpp when static generator Q capability curves are present."""
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
@@ -3318,6 +3443,7 @@ def create_other_elements(in_data,net,x, Busbars):
 
     _electrisim_finalize_pending_line_flow_shunts(net)
     apply_sgen_q_capability_curves(net, in_data)
+    apply_sgen_q_setpoint_from_curve(net, in_data)
 
 
 def _electrisim_boolish(v, default=False):
@@ -9298,36 +9424,8 @@ def _rpc_q_curve_table_subset(qtbl, cid):
 
 
 def _rpc_interp_sgen_pq_limits(net, sgen_idx, p_mw):
-    """
-    Interpolate (q_min_mvar, q_max_mvar) at p_mw from net.q_capability_curve_table for the
-    characteristic linked to net.sgen row sgen_idx. Returns None if unavailable.
-    """
-    try:
-        if not hasattr(net, 'sgen') or net.sgen.empty:
-            return None
-        if 'id_q_capability_characteristic' not in net.sgen.columns:
-            return None
-        cid = net.sgen.at[sgen_idx, 'id_q_capability_characteristic']
-        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
-            return None
-        qtbl = net.get('q_capability_curve_table', None)
-        if qtbl is None or (hasattr(qtbl, 'empty') and qtbl.empty):
-            return None
-        if 'id_q_capability_curve' not in qtbl.columns:
-            return None
-        sub = _rpc_q_curve_table_subset(qtbl, cid)
-        if len(sub) < 2:
-            return None
-        sub = sub.sort_values('p_mw')
-        p = sub['p_mw'].astype(float).values
-        qmin = sub['q_min_mvar'].astype(float).values
-        qmax = sub['q_max_mvar'].astype(float).values
-        p_m = float(p_mw)
-        q_mi = float(np.interp(p_m, p, qmin))
-        q_ma = float(np.interp(p_m, p, qmax))
-        return (q_mi, q_ma)
-    except Exception:
-        return None
+    """RPC alias for shared P–Q limit interpolation."""
+    return _interp_sgen_pq_limits(net, sgen_idx, p_mw)
 
 
 def _rpc_sgen_has_q_curve(net, sgen_idx):
