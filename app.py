@@ -5,6 +5,9 @@ sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 import pandapower_electrisim
 import opendss_electrisim
+import arcflash_electrisim
+import andes_electrisim
+import motor_starting_electrisim
 import os
 import json
 
@@ -356,6 +359,78 @@ def simulation():
                     return response
                 else:
                     return response_data
+
+            if "ArcFlashPandaPower" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== ARC FLASH REQUESTED BY USER: {user_email} ===")
+
+                net = pp.create_empty_network()
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                response_data = arcflash_electrisim.arcflash(net, in_data[x], in_data)
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
+            if "MotorStartingPandaPower" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== MOTOR STARTING REQUESTED BY USER: {user_email} ===")
+
+                mode = str(in_data[x].get('mode', 'steady')).lower()
+                if mode in ('dynamic', 'transient', 'tds', 'andes'):
+                    response_data = motor_starting_electrisim.motor_starting(None, in_data[x], in_data)
+                else:
+                    net = pp.create_empty_network()
+                    Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                    pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                    response_data = motor_starting_electrisim.motor_starting(net, in_data[x], in_data)
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
+            if "TransientStabilityAndes" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== TRANSIENT STABILITY (ANDES) REQUESTED BY USER: {user_email} ===")
+                response_data = andes_electrisim.run_tds(in_data, in_data[x])
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
+
+            if "EigenvalueAndes" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== EIGENVALUE ANALYSIS (ANDES) REQUESTED BY USER: {user_email} ===")
+                response_data = andes_electrisim.run_eig(in_data, in_data[x])
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
 
             if "ShortCircuitOpenDss" in in_data[x]['typ']:
                 # Extract user email for logging
