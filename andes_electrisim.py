@@ -41,7 +41,8 @@ _DEFAULT_GENROU = {
     "Tq20": 0.05,
 }
 
-_DEFAULT_EXDC2 = {
+_EXCITER_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "EXDC2": {
     "TR": 0.01,
     "TA": 0.2,
     "TC": 1.0,
@@ -57,9 +58,19 @@ _DEFAULT_EXDC2 = {
     "SE1": 0.33,
     "E2": 2.3,
     "SE2": 0.1,
+    },
+    "SEXS": {"TATB": 0.1, "TB": 10.0, "K": 100.0, "TE": 0.05, "EMIN": -4.0, "EMAX": 4.0},
+    # The remaining parameters deliberately use ANDES model defaults. These common
+    # parameters provide useful, conservative starting values when supplied by UI.
+    "IEEEX1": {"TR": 0.01, "KA": 50.0, "TA": 0.05, "VRMAX": 5.0, "VRMIN": -5.0},
+    "ESDC2A": {"TR": 0.01, "KA": 20.0, "TA": 0.2, "VRMAX": 5.0, "VRMIN": -5.0},
+    "EXST1": {"TR": 0.01, "KA": 100.0, "TA": 0.05, "VRMAX": 5.0, "VRMIN": -5.0},
+    "ESST1A": {"TR": 0.01, "KA": 100.0, "TA": 0.05, "VRMAX": 5.0, "VRMIN": -5.0},
+    "AC8B": {"TR": 0.01, "KA": 40.0, "TA": 0.05, "VRMAX": 5.0, "VRMIN": -5.0},
 }
 
-_DEFAULT_TGOV1 = {
+_GOVERNOR_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "TGOV1": {
     "R": 0.05,
     "T1": 0.5,
     "T2": 1.0,
@@ -67,15 +78,25 @@ _DEFAULT_TGOV1 = {
     "VMAX": 1.2,
     "VMIN": 0.0,
     "Dt": 0.0,
+    },
+    "IEEEG1": {"R": 0.05, "T1": 0.5, "T2": 1.0, "T3": 1.0, "VMAX": 1.2, "VMIN": 0.0},
+    "IEESGO": {"T1": 0.1, "T2": 0.1, "T3": 0.1, "T4": 0.1, "T5": 0.1, "T6": 0.1},
+    "GAST": {"R": 0.05, "T1": 0.4, "T2": 0.1, "T3": 0.1, "VMAX": 1.2, "VMIN": 0.0},
+    "HYGOV": {"R": 0.05, "T1": 0.5, "T2": 1.0, "T3": 1.0, "VMAX": 1.2, "VMIN": 0.0},
 }
 
-_DEFAULT_SEXS = {
-    "TATB": 0.1,
-    "TB": 10.0,
-    "K": 100.0,
-    "TE": 0.05,
-    "EMIN": -4.0,
-    "EMAX": 4.0,
+_PSS_DEFAULTS = {"IEEEST": {"A1": 0.1, "A2": 0.1, "A3": 0.1, "A4": 0.1, "A5": 0.1, "A6": 0.1}}
+
+_RENEWABLE_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "REGCA1": {"Tg": 0.02, "Lvplsw": 1.0, "Volim": 1.2, "Lvpnt0": 0.4, "Iolim": -1.5},
+    "REECA1": {"Vref0": 1.0, "dbd1": -0.02, "dbd2": 0.02},
+    "REPCA1": {"dbd1": -0.02, "dbd2": 0.02},
+    "WTDTA1": {"H": 3.0, "DAMP": 0.0, "Htfrac": 0.5, "Freq1": 1.0, "Dshaft": 1.0},
+    "WTARA1": {},
+    "WTPTA1": {},
+    "WTTQA1": {},
+    "PVD1": {},
+    "ESD1": {},
 }
 
 
@@ -97,6 +118,41 @@ def _sb(value: Any, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in ("true", "1", "yes")
+
+
+def _dyn_value(el: Dict[str, Any], key: str, default: float) -> float:
+    """Read a Dynamics attribute while preserving blank → model default behavior."""
+    value = el.get(key)
+    if value is None or str(value).strip().lower() in ("", "none", "null"):
+        return default
+    return _sf(value, default)
+
+
+def _add_model_safe(ss: Any, model: str, defaults_applied: List[str], label: str, **kwargs: Any) -> Optional[str]:
+    """
+    Add an optional ANDES model without making a diagram unusable on another ANDES
+    release. ANDES validates both model availability and parameter names in ss.add().
+    """
+    try:
+        ss.add(model, **kwargs)
+        return str(kwargs["idx"])
+    except Exception as exc:
+        defaults_applied.append(
+            f"{label}: could not add {model} ({exc}); continuing without that optional dynamic model."
+        )
+        return None
+
+
+def _model_kwargs(
+    el: Dict[str, Any],
+    attr_prefix: str,
+    defaults: Dict[str, float],
+) -> Dict[str, float]:
+    """Build only the documented key parameters; unset fields use per-model defaults."""
+    return {
+        key: _dyn_value(el, f"{attr_prefix}{key}", default)
+        for key, default in defaults.items()
+    }
 
 
 def _clean_num(v: Any) -> Any:
@@ -420,7 +476,7 @@ def build_system(
     # --- Generators → PV/Slack + SynGen + Exciter + Governor ---
     gen_count = 0
     for _, el, typ in _iter_elements(in_data):
-        if not typ.startswith("Generator") or typ.startswith("Static Generator"):
+        if not typ.startswith("Generator") or typ.startswith("Static Generator") or typ.startswith("Wind Turbine"):
             continue
         if "Asymmetric" in typ or "1ph" in typ:
             continue
@@ -553,51 +609,22 @@ def build_system(
         if used_defaults:
             defaults_applied.append(f"Generator '{ufname}': applied default {machine} parameters.")
 
-        # Exciter
+        # Exciter. The model-specific dictionaries intentionally expose only key
+        # parameters; all other ANDES parameters retain their library defaults.
         exc_model = (el.get("dyn_exciter_model") or "EXDC2").strip().upper()
         if exc_model in ("", "NONE", "OFF"):
             defaults_applied.append(f"Generator '{ufname}': no exciter.")
             exc_idx = None
         else:
-            if exc_model not in ("EXDC2", "SEXS"):
+            if exc_model not in _EXCITER_DEFAULTS:
                 exc_model = "EXDC2"
                 defaults_applied.append(f"Generator '{ufname}': unknown exciter, used EXDC2.")
             exc_idx = f"{exc_model}_{gen_count}"
-            if exc_model == "SEXS":
-                ss.add(
-                    "SEXS",
-                    idx=exc_idx,
-                    name=f"SEXS_{ufname}",
-                    syn=syn_idx,
-                    TATB=_dyn("dyn_exc_TATB", _DEFAULT_SEXS["TATB"]),
-                    TB=_dyn("dyn_exc_TB", _DEFAULT_SEXS["TB"]),
-                    K=_dyn("dyn_exc_K", _DEFAULT_SEXS["K"]),
-                    TE=_dyn("dyn_exc_TE", _DEFAULT_SEXS["TE"]),
-                    EMIN=_dyn("dyn_exc_EMIN", _DEFAULT_SEXS["EMIN"]),
-                    EMAX=_dyn("dyn_exc_EMAX", _DEFAULT_SEXS["EMAX"]),
-                )
-            else:
-                ss.add(
-                    "EXDC2",
-                    idx=exc_idx,
-                    name=f"EXDC2_{ufname}",
-                    syn=syn_idx,
-                    TR=_dyn("dyn_exc_TR", _DEFAULT_EXDC2["TR"]),
-                    TA=_dyn("dyn_exc_TA", _DEFAULT_EXDC2["TA"]),
-                    TC=_dyn("dyn_exc_TC", _DEFAULT_EXDC2["TC"]),
-                    TB=_dyn("dyn_exc_TB", _DEFAULT_EXDC2["TB"]),
-                    TE=_dyn("dyn_exc_TE", _DEFAULT_EXDC2["TE"]),
-                    TF1=_dyn("dyn_exc_TF1", _DEFAULT_EXDC2["TF1"]),
-                    KF1=_dyn("dyn_exc_KF1", _DEFAULT_EXDC2["KF1"]),
-                    KA=_dyn("dyn_exc_KA", _DEFAULT_EXDC2["KA"]),
-                    KE=_dyn("dyn_exc_KE", _DEFAULT_EXDC2["KE"]),
-                    VRMAX=_dyn("dyn_exc_VRMAX", _DEFAULT_EXDC2["VRMAX"]),
-                    VRMIN=_dyn("dyn_exc_VRMIN", _DEFAULT_EXDC2["VRMIN"]),
-                    E1=_dyn("dyn_exc_E1", _DEFAULT_EXDC2["E1"]),
-                    SE1=_dyn("dyn_exc_SE1", _DEFAULT_EXDC2["SE1"]),
-                    E2=_dyn("dyn_exc_E2", _DEFAULT_EXDC2["E2"]),
-                    SE2=_dyn("dyn_exc_SE2", _DEFAULT_EXDC2["SE2"]),
-                )
+            exc_idx = _add_model_safe(
+                ss, exc_model, defaults_applied, f"Generator '{ufname}'",
+                idx=exc_idx, name=f"{exc_model}_{ufname}", syn=syn_idx,
+                **_model_kwargs(el, "dyn_exc_", _EXCITER_DEFAULTS[exc_model]),
+            )
             if all(el.get(k) in (None, "", "null") for k in ("dyn_exciter_model", "dyn_exc_KA", "dyn_exc_K")):
                 defaults_applied.append(f"Generator '{ufname}': applied default {exc_model} exciter.")
 
@@ -607,25 +634,27 @@ def build_system(
             gov_idx = None
             defaults_applied.append(f"Generator '{ufname}': no governor.")
         else:
-            if gov_model != "TGOV1":
+            if gov_model not in _GOVERNOR_DEFAULTS:
                 gov_model = "TGOV1"
                 defaults_applied.append(f"Generator '{ufname}': unknown governor, used TGOV1.")
-            gov_idx = f"TGOV1_{gen_count}"
-            ss.add(
-                "TGOV1",
-                idx=gov_idx,
-                name=f"TGOV1_{ufname}",
-                syn=syn_idx,
-                R=_dyn("dyn_gov_R", _DEFAULT_TGOV1["R"]),
-                T1=_dyn("dyn_gov_T1", _DEFAULT_TGOV1["T1"]),
-                T2=_dyn("dyn_gov_T2", _DEFAULT_TGOV1["T2"]),
-                T3=_dyn("dyn_gov_T3", _DEFAULT_TGOV1["T3"]),
-                VMAX=_dyn("dyn_gov_VMAX", _DEFAULT_TGOV1["VMAX"]),
-                VMIN=_dyn("dyn_gov_VMIN", _DEFAULT_TGOV1["VMIN"]),
-                Dt=_dyn("dyn_gov_Dt", _DEFAULT_TGOV1["Dt"]),
+            gov_idx = _add_model_safe(
+                ss, gov_model, defaults_applied, f"Generator '{ufname}'",
+                idx=f"{gov_model}_{gen_count}", name=f"{gov_model}_{ufname}", syn=syn_idx,
+                **_model_kwargs(el, "dyn_gov_", _GOVERNOR_DEFAULTS[gov_model]),
             )
             if all(el.get(k) in (None, "", "null") for k in ("dyn_governor_model", "dyn_gov_R")):
-                defaults_applied.append(f"Generator '{ufname}': applied default TGOV1 governor.")
+                defaults_applied.append(f"Generator '{ufname}': applied default {gov_model} governor.")
+
+        pss_model = (el.get("dyn_pss_model") or "NONE").strip().upper()
+        pss_idx = None
+        if pss_model == "IEEEST":
+            pss_idx = _add_model_safe(
+                ss, "IEEEST", defaults_applied, f"Generator '{ufname}'",
+                idx=f"IEEEST_{gen_count}", name=f"IEEEST_{ufname}", syn=syn_idx,
+                **_model_kwargs(el, "dyn_pss_", _PSS_DEFAULTS["IEEEST"]),
+            )
+        elif pss_model not in ("", "NONE", "OFF"):
+            defaults_applied.append(f"Generator '{ufname}': unknown PSS '{pss_model}', omitted.")
 
         gen_map[name] = {
             "static_idx": static_idx,
@@ -633,22 +662,143 @@ def build_system(
             "machine": machine,
             "exc_idx": exc_idx,
             "gov_idx": gov_idx,
+            "pss_idx": pss_idx,
             "name": ufname,
             "bus": bus,
         }
 
-    # Static generators — skip SynGen in MVP
+    # Static generators can supply renewable / inverter dynamics. They remain
+    # ANDES PV devices: unlike synchronous machines they deliberately have no SynGen.
+    renewable_count = 0
+    static_count = 0
     for _, el, typ in _iter_elements(in_data):
-        if typ.startswith("Static Generator"):
+        if not (typ.startswith("Static Generator") or typ.startswith("Wind Turbine")):
+            continue
+        bus = bus_map.get(el.get("bus"))
+        if bus is None or not _sb(el.get("in_service"), True):
+            continue
+        # Wind Turbine: derive p_mw from power curve when present
+        if typ.startswith("Wind Turbine"):
+            raw = el.get("wind_power_curve_json")
+            if raw is not None and (not isinstance(raw, str) or str(raw).strip()):
+                try:
+                    points = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(points, list) and len(points) >= 2:
+                        v = float(el.get("wind_speed_ms"))
+                        knots = sorted(
+                            ((float(pt["v_ms"]), float(pt["p_mw"])) for pt in points if isinstance(pt, dict)),
+                            key=lambda x: x[0],
+                        )
+                        if len(knots) >= 2:
+                            if v <= knots[0][0]:
+                                el["p_mw"] = knots[0][1]
+                            elif v >= knots[-1][0]:
+                                el["p_mw"] = knots[-1][1]
+                            else:
+                                for i in range(len(knots) - 1):
+                                    v0, p0 = knots[i]
+                                    v1, p1 = knots[i + 1]
+                                    if v0 <= v <= v1:
+                                        span = v1 - v0
+                                        el["p_mw"] = p0 if abs(span) < 1e-12 else p0 + (v - v0) / span * (p1 - p0)
+                                        break
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+                    pass
+        plant_kind = (el.get("dyn_plant_kind") or "NONE").strip().upper()
+        if plant_kind in ("", "NONE", "OFF"):
             warnings.append(
                 f"Static Generator '{el.get('userFriendlyName', el.get('name'))}' "
-                "has no SynGen dynamics in MVP (treated as omitted from dynamic models)."
+                "has no ANDES dynamic plant model (omitted from dynamic models)."
+            )
+            continue
+        if plant_kind not in ("IBR", "WIND", "PVD1", "ESD1"):
+            defaults_applied.append(
+                f"Static Generator '{el.get('userFriendlyName', el.get('name'))}': "
+                f"unknown plant kind '{plant_kind}', omitted."
+            )
+            continue
+
+        static_count += 1
+        name = el.get("name") or f"SGen_{static_count}"
+        ufname = str(el.get("userFriendlyName") or name)
+        sn_mva = _sf(el.get("dyn_Sn", el.get("sn_mva")), 0.0)
+        if sn_mva <= 0:
+            sn_mva = max(abs(_sf(el.get("p_mw")) * _sf(el.get("scaling"), 1.0)) * 1.25, 100.0)
+            defaults_applied.append(f"Static Generator '{ufname}': dyn_Sn/sn_mva missing, used {sn_mva:.3g} MVA.")
+        static_idx = f"PV_SG_{static_count}"
+        ss.add(
+            "PV", idx=static_idx, name=ufname, bus=bus, Vn=bus_vn.get(bus, 110.0),
+            Sn=sn_mva, p0=_sf(el.get("p_mw")) * _sf(el.get("scaling"), 1.0) / sn_base,
+            q0=_sf(el.get("q_mvar")) * _sf(el.get("scaling"), 1.0) / sn_base, v0=1.0,
+        )
+
+        model_ids: Dict[str, Optional[str]] = {}
+        if plant_kind in ("IBR", "WIND"):
+            reg_idx = _add_model_safe(
+                ss, "REGCA1", defaults_applied, f"Static Generator '{ufname}'",
+                idx=f"REGCA1_{static_count}", name=f"REGCA1_{ufname}", bus=bus, gen=static_idx, Sn=sn_mva,
+                **_model_kwargs(el, "dyn_reg_", _RENEWABLE_DEFAULTS["REGCA1"]),
+            )
+            model_ids["reg_idx"] = reg_idx
+            if reg_idx:
+                ree_idx = _add_model_safe(
+                    ss, "REECA1", defaults_applied, f"Static Generator '{ufname}'",
+                    idx=f"REECA1_{static_count}", name=f"REECA1_{ufname}", reg=reg_idx,
+                    **_model_kwargs(el, "dyn_ree_", _RENEWABLE_DEFAULTS["REECA1"]),
+                )
+                model_ids["ree_idx"] = ree_idx
+                if ree_idx:
+                    model_ids["repca_idx"] = _add_model_safe(
+                        ss, "REPCA1", defaults_applied, f"Static Generator '{ufname}'",
+                        idx=f"REPCA1_{static_count}", name=f"REPCA1_{ufname}", ree=ree_idx,
+                        **_model_kwargs(el, "dyn_repca_", _RENEWABLE_DEFAULTS["REPCA1"]),
+                    )
+                    if plant_kind == "WIND":
+                        wt_idx = _add_model_safe(
+                            ss, "WTDTA1", defaults_applied, f"Static Generator '{ufname}'",
+                            idx=f"WTDTA1_{static_count}", name=f"WTDTA1_{ufname}", ree=ree_idx,
+                            **_model_kwargs(el, "dyn_wt_", _RENEWABLE_DEFAULTS["WTDTA1"]),
+                        )
+                        model_ids["wtdta_idx"] = wt_idx
+                        if wt_idx:
+                            rea_idx = _add_model_safe(
+                                ss, "WTARA1", defaults_applied, f"Static Generator '{ufname}'",
+                                idx=f"WTARA1_{static_count}", name=f"WTARA1_{ufname}", rego=wt_idx,
+                                **_model_kwargs(el, "dyn_wta_", _RENEWABLE_DEFAULTS["WTARA1"]),
+                            )
+                            model_ids["wtara_idx"] = rea_idx
+                            if rea_idx:
+                                pitch_idx = _add_model_safe(
+                                    ss, "WTPTA1", defaults_applied, f"Static Generator '{ufname}'",
+                                    idx=f"WTPTA1_{static_count}", name=f"WTPTA1_{ufname}", rea=rea_idx,
+                                    **_model_kwargs(el, "dyn_wtp_", _RENEWABLE_DEFAULTS["WTPTA1"]),
+                                )
+                                model_ids["wtpta_idx"] = pitch_idx
+                                if pitch_idx:
+                                    model_ids["wttqa_idx"] = _add_model_safe(
+                                        ss, "WTTQA1", defaults_applied, f"Static Generator '{ufname}'",
+                                        idx=f"WTTQA1_{static_count}", name=f"WTTQA1_{ufname}", rep=pitch_idx,
+                                        **_model_kwargs(el, "dyn_wtt_", _RENEWABLE_DEFAULTS["WTTQA1"]),
+                                    )
+        else:
+            dg_model = plant_kind
+            model_ids["dg_idx"] = _add_model_safe(
+                ss, dg_model, defaults_applied, f"Static Generator '{ufname}'",
+                idx=f"{dg_model}_{static_count}", name=f"{dg_model}_{ufname}", bus=bus, gen=static_idx, Sn=sn_mva,
+                **_model_kwargs(el, "dyn_dg_", _RENEWABLE_DEFAULTS[dg_model]),
             )
 
-    if gen_count == 0:
+        if any(model_ids.values()):
+            renewable_count += 1
+        gen_map[name] = {
+            "static_idx": static_idx, "syn_idx": None, "plant_kind": plant_kind,
+            "name": ufname, "bus": bus, **model_ids,
+        }
+
+    if gen_count + renewable_count == 0:
         raise ValueError(
             "Transient / eigenvalue analysis requires at least one synchronous Generator "
-            "with dynamic models. External Grid alone is not sufficient."
+            "or renewable dynamic plant. External Grid alone is not sufficient."
         )
 
     if slack_count == 0:
@@ -710,6 +860,7 @@ def build_system(
         "frequency": freq,
         "sn_mva": sn_base,
         "n_generators": gen_count,
+        "n_renewable_plants": renewable_count,
         "n_buses": len(bus_name_by_idx),
     }
     return ss, meta

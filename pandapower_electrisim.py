@@ -711,6 +711,115 @@ def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     return p_br, q_br
 
 
+def _export_py_literal(obj):
+    """Render a Python literal for generated export scripts (no numpy import required)."""
+    try:
+        import numpy as np
+        if isinstance(obj, (np.bool_, bool)):
+            return 'True' if bool(obj) else 'False'
+        if isinstance(obj, np.integer):
+            return str(int(obj))
+        if isinstance(obj, np.floating):
+            v = float(obj)
+            return 'None' if v != v else repr(v)
+    except ImportError:
+        if isinstance(obj, bool):
+            return 'True' if obj else 'False'
+    if obj is None:
+        return 'None'
+    if isinstance(obj, bool):
+        return 'True' if obj else 'False'
+    if isinstance(obj, int):
+        return str(obj)
+    if isinstance(obj, float):
+        return 'None' if obj != obj else repr(obj)
+    if isinstance(obj, str):
+        return repr(obj)
+    if isinstance(obj, (list, tuple)):
+        return '[' + ', '.join(_export_py_literal(x) for x in obj) + ']'
+    return repr(obj)
+
+
+def _normalize_tap_side(val):
+    """Normalize tap_side for pandapower (diagram may send 'null')."""
+    if val is None:
+        return 'hv'
+    s = str(val).strip().lower()
+    if s in ('', 'null', 'none', 'nan'):
+        return 'hv'
+    return str(val)
+
+
+def _append_electrisim_sgen_setup_python(lines, net):
+    """Export Q capability curves, sgen ids, and initial Q setpoints (post curve, pre park)."""
+    import pandas as pd
+
+    q_init = getattr(net, '_electrisim_export_sgen_q_init', None) or {}
+    ufn = getattr(net, 'user_friendly_names', None) or {}
+    qtbl = net.get('q_capability_curve_table')
+    has_qtbl = qtbl is not None and hasattr(qtbl, 'empty') and not qtbl.empty
+    has_q_init = bool(q_init)
+    has_minmax = 'min_q_mvar' in net.sgen.columns and 'max_q_mvar' in net.sgen.columns
+    has_ids = 'id' in net.sgen.columns
+    has_sn = 'sn_mva' in net.sgen.columns
+
+    if not (has_qtbl or has_q_init or ufn or has_ids or has_sn or has_minmax):
+        return False
+
+    lines.append("# --- Electrisim sgen setup (Q capability + initial Q setpoints) ---")
+    if ufn:
+        lines.append(f"net.user_friendly_names = {_export_py_literal(dict(ufn))}")
+
+    if has_ids or has_sn:
+        for idx, row in net.sgen.iterrows():
+            if has_ids:
+                sid = row.get('id')
+                if sid is not None and str(sid).strip():
+                    lines.append(f"net.sgen.at[{idx}, 'id'] = {sid!r}")
+            if has_sn:
+                sn = row.get('sn_mva')
+                if sn is not None and sn == sn:
+                    lines.append(f"net.sgen.at[{idx}, 'sn_mva'] = {float(sn)}")
+
+    if has_qtbl:
+        lines.append("import pandas as pd")
+        lines.append("from pandapower.control.util.auxiliary import create_q_capability_characteristics_object")
+        records = []
+        for _, r in qtbl.iterrows():
+            records.append({
+                'id_q_capability_curve': int(r['id_q_capability_curve']),
+                'p_mw': float(r['p_mw']),
+                'q_min_mvar': float(r['q_min_mvar']),
+                'q_max_mvar': float(r['q_max_mvar']),
+            })
+        lines.append(f"net['q_capability_curve_table'] = pd.DataFrame({_export_py_literal(records)})")
+        if 'id_q_capability_characteristic' in net.sgen.columns:
+            for idx, row in net.sgen.iterrows():
+                cid = row.get('id_q_capability_characteristic')
+                if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+                    continue
+                lines.append(f"net.sgen.at[{idx}, 'id_q_capability_characteristic'] = {int(cid)}")
+                if 'curve_style' in net.sgen.columns:
+                    cs = net.sgen.at[idx, 'curve_style']
+                    if cs is not None and not (isinstance(cs, float) and pd.isna(cs)):
+                        lines.append(f"net.sgen.at[{idx}, 'curve_style'] = {str(cs)!r}")
+        lines.append("create_q_capability_characteristics_object(net)")
+
+    if has_minmax:
+        for idx, row in net.sgen.iterrows():
+            for col in ('min_q_mvar', 'max_q_mvar'):
+                v = net.sgen.at[idx, col]
+                if v is not None and v == v:
+                    lines.append(f"net.sgen.at[{idx}, '{col}'] = {float(v)}")
+
+    if has_q_init:
+        lines.append("# Q setpoints from capability curve (capacitive_max / inductive_max / manual)")
+        for idx, q in sorted(q_init.items(), key=lambda x: int(x[0])):
+            lines.append(f"net.sgen.at[{int(idx)}, 'q_mvar'] = {float(q)}")
+    lines.append("")
+    return True
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
     """Generate Python code to recreate the pandapower network"""
     lines = []
@@ -802,7 +911,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             # Get optional parameters
             parallel = row.get('parallel', 1)
             shift_degree = row.get('shift_degree', 0.0)
-            tap_side = row.get('tap_side', 'hv')
+            tap_side = _export_tap_side(row.get('tap_side', 'hv'))
             tap_pos = row.get('tap_pos', 0)
             tap_neutral = row.get('tap_neutral', 0)
             tap_max = row.get('tap_max', 0)
@@ -870,7 +979,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             # Get optional parameters
             shift_mv_degree = row.get('shift_mv_degree', 0.0)
             shift_lv_degree = row.get('shift_lv_degree', 0.0)
-            tap_side = row.get('tap_side', 'hv')
+            tap_side = _export_tap_side(row.get('tap_side', 'hv'))
             tap_pos = row.get('tap_pos', 0)
             tap_neutral = row.get('tap_neutral', 0)
             tap_min = row.get('tap_min', 0)
@@ -928,7 +1037,33 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             p_mw = row['p_mw']
             q_mvar = row['q_mvar']
             name = row['name'] if 'name' in row else f"SGen_{idx}"
-            lines.append(f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}')")
+            sgen_id = row.get('id', None) if hasattr(row, 'get') else (row['id'] if 'id' in row.index else None)
+            src = _electrisim_find_in_data_by_sgen(in_data, name, sgen_id)
+            if src is not None and str(src.get('typ') or '').startswith('Wind Turbine'):
+                lines.append(
+                    f"# Wind Turbine '{name}': wind_speed_ms={src.get('wind_speed_ms')}, "
+                    f"p_mw from curve/Pref"
+                    + (f" (controller={src.get('_wind_controller')!r})" if src.get('_wind_controller') else "")
+                )
+            sn_part = ''
+            if 'sn_mva' in row.index:
+                sn = row.get('sn_mva')
+                if sn is not None and sn == sn:
+                    sn_part = f", sn_mva={float(sn)}"
+            scale_part = ''
+            if 'scaling' in row.index:
+                sc = row.get('scaling')
+                if sc is not None and sc == sc:
+                    scale_part = f", scaling={float(sc)}"
+            type_part = ''
+            if 'type' in row.index:
+                st = row.get('type')
+                if st is not None and str(st).strip():
+                    type_part = f", type={str(st)!r}"
+            lines.append(
+                f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}'"
+                f"{sn_part}{scale_part}{type_part})"
+            )
         lines.append("")
     
     # Create generators
@@ -1274,11 +1409,38 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                         f"vm_from_pu={vm_from_pu}, vm_to_pu={vm_to_pu}, in_service={in_service})")
         lines.append("")
     
-    # Run power flow
-    lines.append("# Run power flow")
-    # Format calculate_voltage_angles: string values like 'auto' need quotes in generated code
+    # Electrisim Q capability + initial Q (before controllers)
+    _append_electrisim_sgen_setup_python(lines, net)
+
+    # Electrisim Park / Wind Turbine controllers (must run before runpp)
+    run_control = _append_electrisim_controllers_to_python(
+        lines, net, in_data, algorithm, calculate_voltage_angles, init
+    )
+
+    # Run power flow (seed LF for cosphi(P)/Q(V) parks, then final LF with controllers)
     cva_str = repr(calculate_voltage_angles)
-    lines.append(f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={cva_str}, init='{init}')")
+    need_seed = bool(getattr(net, '_electrisim_export_park_need_seed', False))
+    enforce_q = bool(getattr(net, '_electrisim_enforce_q_lims', False))
+
+    if need_seed:
+        lines.append("# Seed load flow (park cosphi(P)/Q(V) measurements)")
+        lines.append(
+            f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={cva_str}, "
+            f"init='{init}', run_control=False)"
+        )
+        lines.append("")
+
+    lines.append("# Run power flow")
+    run_kwargs = [
+        f"algorithm='{algorithm}'",
+        f"calculate_voltage_angles={cva_str}",
+        f"init='{init}'",
+    ]
+    if run_control:
+        run_kwargs.append("run_control=True")
+    if enforce_q:
+        run_kwargs.append("enforce_q_lims=True")
+    lines.append(f"pp.runpp(net, {', '.join(run_kwargs)})")
     lines.append("")
     
     # Add results printing
@@ -1287,6 +1449,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     lines.append("print(net.res_bus)")
     lines.append("print('\\nLine Results:')")
     lines.append("print(net.res_line)")
+    lines.append("if hasattr(net, 'controller') and net.controller is not None and not net.controller.empty:")
+    lines.append("    print('\\nControllers:')")
+    lines.append("    print(net.controller)")
     
     return '\n'.join(lines)
 
@@ -1377,6 +1542,79 @@ def create_busbars(in_data, net):
     return Busbars
 
 
+def _is_static_generator_like(typ):
+    """True for Static Generator and Wind Turbine (both map to pandapower sgen)."""
+    t = typ or ''
+    return t.startswith('Static Generator') or t.startswith('Wind Turbine')
+
+
+def interp_wind_power_at_v(points, v_ms, approx='linear'):
+    """Linear or constant (step) interpolate P [MW] at wind speed v_ms from [{v_ms, p_mw}, ...]. Clamp to endpoints."""
+    if not isinstance(points, list) or len(points) < 2:
+        return None
+    try:
+        v = float(v_ms)
+    except (TypeError, ValueError):
+        return None
+    knots = []
+    for pt in points:
+        if not isinstance(pt, dict):
+            return None
+        try:
+            knots.append((float(pt['v_ms']), float(pt['p_mw'])))
+        except (KeyError, TypeError, ValueError):
+            return None
+    knots.sort(key=lambda x: x[0])
+    if v <= knots[0][0]:
+        return knots[0][1]
+    if v >= knots[-1][0]:
+        return knots[-1][1]
+    style = 'constant' if str(approx or '').strip().lower() == 'constant' else 'linear'
+    if style == 'constant':
+        for i in range(len(knots) - 1):
+            v0, p0 = knots[i]
+            v1, _p1 = knots[i + 1]
+            if v0 <= v < v1:
+                return p0
+        return knots[-1][1]
+    for i in range(len(knots) - 1):
+        v0, p0 = knots[i]
+        v1, p1 = knots[i + 1]
+        if v0 <= v <= v1:
+            span = v1 - v0
+            if abs(span) < 1e-12:
+                return p0
+            t = (v - v0) / span
+            return p0 + t * (p1 - p0)
+    return knots[-1][1]
+
+
+def apply_wind_turbine_p_from_curve(elem):
+    """
+    For Wind Turbine elements, overwrite p_mw from wind_speed_ms + wind_power_curve_json.
+    Returns the computed p_mw, or None if not applicable / invalid.
+    """
+    if not isinstance(elem, dict):
+        return None
+    typ = elem.get('typ') or ''
+    if not typ.startswith('Wind Turbine'):
+        return None
+    raw = elem.get('wind_power_curve_json')
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        return None
+    try:
+        points = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        print(f"Warning: Wind Turbine '{elem.get('name')}': invalid wind_power_curve_json, keeping p_mw.")
+        return None
+    approx = elem.get('wind_curve_approx') or 'linear'
+    p = interp_wind_power_at_v(points, elem.get('wind_speed_ms'), approx)
+    if p is None:
+        return None
+    elem['p_mw'] = p
+    return p
+
+
 def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
     """
     Build pandapower net.q_capability_curve_table and characteristic objects for static generators
@@ -1387,6 +1625,7 @@ def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
     when valid q_capability_curve_json exists even if reactive_capability_curve is false, so RPC can
     use manufacturer P–Q data without requiring the PF checkbox.
     """
+    store_sgen_q_cap_2d(net, in_data)
     if in_data is None or not hasattr(net, 'sgen') or net.sgen.empty:
         return
     if 'id' not in net.sgen.columns:
@@ -1408,7 +1647,7 @@ def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
         if not isinstance(elem, dict):
             continue
         typ = elem.get('typ') or ''
-        if not typ.startswith('Static Generator'):
+        if not _is_static_generator_like(typ):
             continue
         curve_requested = _truthy(elem.get('reactive_capability_curve'))
         if not curve_requested and rpc_use_diagram_curves:
@@ -1418,23 +1657,38 @@ def apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=False):
         if not curve_requested:
             continue
         raw_json = elem.get('q_capability_curve_json') or elem.get('q_capability_curve_points')
-        if raw_json is None or (isinstance(raw_json, str) and not raw_json.strip()):
-            continue
-        try:
-            if isinstance(raw_json, str):
-                points = json.loads(raw_json)
-            else:
-                points = raw_json
-        except (json.JSONDecodeError, TypeError):
-            print(f"Warning: Static Generator '{elem.get('name', key)}': invalid q_capability_curve_json, skipping Q curve.")
-            continue
+        cell_id = elem.get('id')
+        cap2d = getattr(net, '_electrisim_q_cap_2d', None) or {}
+        rec2d = None
+        if cell_id is not None:
+            rec2d = cap2d.get(cell_id) or cap2d.get(str(cell_id))
+        points = None
+        if rec2d:
+            points = _flatten_q_cap_2d_mvar_points(rec2d, u_pu=1.0)
+        if not points:
+            if raw_json is None or (isinstance(raw_json, str) and not raw_json.strip()):
+                continue
+            try:
+                if isinstance(raw_json, str):
+                    points = json.loads(raw_json)
+                else:
+                    points = raw_json
+            except (json.JSONDecodeError, TypeError):
+                print(f"Warning: Static Generator '{elem.get('name', key)}': invalid q_capability_curve_json, skipping Q curve.")
+                continue
+            if _is_wind_turbine_typ(typ) and _is_legacy_park_scaled_q_curve(points, elem.get('sn_mva')):
+                rec2d = _default_frc_wtg_q_cap_rec(elem)
+                points = _flatten_q_cap_2d_mvar_points(rec2d, u_pu=1.0)
+                if cell_id is not None and rec2d:
+                    cap2d[cell_id] = rec2d
+                    cap2d[str(cell_id)] = rec2d
+                    net._electrisim_q_cap_2d = cap2d
         if not isinstance(points, list) or len(points) < 2:
             print(f"Warning: Static Generator '{elem.get('name', key)}': Q capability curve needs at least 2 points, skipping.")
             continue
         style = elem.get('curve_style') or 'straightLineYValues'
         if style not in ('straightLineYValues', 'constantYValue'):
             style = 'straightLineYValues'
-        cell_id = elem.get('id')
         try:
             mask = net.sgen['id'] == cell_id
             if not mask.any():
@@ -1510,14 +1764,321 @@ def _interp_q_capability_at_p(p_vals, q_vals, p_target, curve_style='straightLin
     return float(np.interp(p_m, p, q))
 
 
-def _interp_sgen_pq_limits(net, sgen_idx, p_mw):
+def _parse_q_cap_float_list(raw, min_len=1):
+    if raw is None:
+        return None
+    try:
+        v = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(v, list) or len(v) < min_len:
+            return None
+        return [float(x) for x in v]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _parse_q_cap_float_matrix(raw, n_u, n_p):
+    if raw is None:
+        return None
+    try:
+        v = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(v, list) or not v:
+        return None
+    try:
+        if isinstance(v[0], list):
+            if len(v) != n_u:
+                return None
+            out = []
+            for row in v:
+                if not isinstance(row, list) or len(row) != n_p:
+                    return None
+                out.append([float(x) for x in row])
+            return out
+        if len(v) != n_u * n_p:
+            return None
+        return [[float(v[i * n_p + j]) for j in range(n_p)] for i in range(n_u)]
+    except (TypeError, ValueError):
+        return None
+
+
+# Default 2.5 MW FRC converter WTG Q(P,U) capability (matches frontend qCapabilityVoltageDependent.js).
+_FRC_WTG_QCAP_U_PU = [0.9, 0.95, 1.0, 1.05, 1.08, 1.09, 1.095]
+_FRC_WTG_QCAP_P_PU = [0, 0.2, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0]
+_FRC_WTG_QCAP_QMAX_PU = [
+    [0.41, 0.41, 0.41, 0.41, 0.41, 0.4, 0.38, 0.33, 0.22, 0.12, 0],
+    [0.43, 0.43, 0.43, 0.43, 0.43, 0.42, 0.4, 0.35, 0.24, 0.13, 0],
+    [0.44, 0.44, 0.44, 0.44, 0.44, 0.43, 0.41, 0.36, 0.25, 0.14, 0],
+    [0.4, 0.4, 0.4, 0.4, 0.4, 0.39, 0.37, 0.32, 0.22, 0.12, 0],
+    [0.28, 0.28, 0.28, 0.28, 0.28, 0.27, 0.25, 0.22, 0.15, 0.08, 0],
+    [0.18, 0.18, 0.18, 0.18, 0.18, 0.17, 0.16, 0.14, 0.09, 0.05, 0],
+    [0.1, 0.1, 0.1, 0.1, 0.1, 0.09, 0.08, 0.07, 0.05, 0.02, 0],
+]
+_FRC_WTG_QCAP_QMIN_PU = [
+    [-0.18, -0.18, -0.18, -0.18, -0.18, -0.17, -0.16, -0.14, -0.09, -0.05, 0],
+    [-0.38, -0.38, -0.38, -0.38, -0.38, -0.37, -0.35, -0.3, -0.2, -0.1, 0],
+    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
+    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
+    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
+    [-0.4, -0.4, -0.4, -0.4, -0.4, -0.39, -0.37, -0.32, -0.22, -0.12, 0],
+    [-0.32, -0.32, -0.32, -0.32, -0.32, -0.31, -0.29, -0.25, -0.16, -0.08, 0],
+]
+
+
+def _is_wind_turbine_typ(typ):
+    return str(typ or '').strip() == 'Wind Turbine'
+
+
+def _parse_q_capability_points(raw_json):
+    if raw_json is None:
+        return None
+    try:
+        pts = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return pts if isinstance(pts, list) else None
+
+
+def _is_legacy_park_scaled_q_curve(points, sn_mva):
+    """Detect old 15 MW park-level 1D curve stored on individual ~2.5 MW WTGs."""
+    if not points or len(points) < 2:
+        return False
+    try:
+        sn = float(sn_mva or 0)
+    except (TypeError, ValueError):
+        sn = 0.0
+    p_vals = []
+    for pt in points:
+        if not isinstance(pt, dict):
+            continue
+        try:
+            p_vals.append(float(pt.get('p_mw')))
+        except (TypeError, ValueError):
+            pass
+    if not p_vals:
+        return False
+    max_p = max(p_vals)
+    if sn > 0 and max_p > sn * 1.5:
+        return True
+    legacy_p = [0, 3.75, 7.5, 11.25, 15]
+    if len(p_vals) == len(legacy_p) and all(abs(p_vals[i] - legacy_p[i]) < 0.01 for i in range(len(legacy_p))):
+        return True
+    return False
+
+
+def _default_frc_wtg_q_cap_rec(elem):
+    try:
+        sn = float(elem.get('sn_mva') or 2.5)
+    except (TypeError, ValueError):
+        sn = 2.5
+    if sn <= 0:
+        sn = 2.5
+    try:
+        smin = float(elem.get('q_cap_scale_min_percent') if elem.get('q_cap_scale_min_percent') not in (None, '') else 100)
+    except (TypeError, ValueError):
+        smin = 100.0
+    try:
+        smax = float(elem.get('q_cap_scale_max_percent') if elem.get('q_cap_scale_max_percent') not in (None, '') else 100)
+    except (TypeError, ValueError):
+        smax = 100.0
+    vd_raw = elem.get('q_cap_voltage_dependent')
+    if vd_raw is None or vd_raw == '':
+        voltage_dependent = True
+    else:
+        voltage_dependent = str(vd_raw).strip().lower() in ('true', '1', 'yes', 'on')
+    return {
+        'u': list(_FRC_WTG_QCAP_U_PU),
+        'p': list(_FRC_WTG_QCAP_P_PU),
+        'qmax': [row[:] for row in _FRC_WTG_QCAP_QMAX_PU],
+        'qmin': [row[:] for row in _FRC_WTG_QCAP_QMIN_PU],
+        'sn_mva': sn,
+        'scale_min': smin,
+        'scale_max': smax,
+        'voltage_dependent': voltage_dependent,
+    }
+
+
+def _flatten_q_cap_2d_mvar_points(rec, u_pu=1.0):
+    """Flatten voltage-dependent Q(P,U) table to pandapower 1D P–Q points at fixed U."""
+    if not rec:
+        return []
+    try:
+        sn = float(rec.get('sn_mva') or 0)
+    except (TypeError, ValueError):
+        sn = 0.0
+    if sn <= 0:
+        return []
+    smin = float(rec.get('scale_min', 100) or 100) / 100.0
+    smax = float(rec.get('scale_max', 100) or 100) / 100.0
+    u = float(u_pu)
+    out = []
+    for p_pu in rec.get('p') or []:
+        qmin_pu = _bilinear_q_cap_pu(rec['u'], rec['p'], rec['qmin'], u, p_pu)
+        qmax_pu = _bilinear_q_cap_pu(rec['u'], rec['p'], rec['qmax'], u, p_pu)
+        if qmin_pu is None or qmax_pu is None:
+            continue
+        out.append({
+            'p_mw': float(p_pu) * sn,
+            'q_min_mvar': qmin_pu * sn * smin,
+            'q_max_mvar': qmax_pu * sn * smax,
+        })
+    return out
+
+
+def store_sgen_q_cap_2d(net, in_data):
+    """Store voltage-dependent Q(P,U) tables (p.u. of Sn) keyed by diagram cell id."""
+    store = {}
+    if in_data is None:
+        net._electrisim_q_cap_2d = store
+        return
+    for _key, elem in in_data.items():
+        if not isinstance(elem, dict):
+            continue
+        typ = (elem.get('typ') or '')
+        if not _is_static_generator_like(typ):
+            continue
+        u_axis = _parse_q_cap_float_list(elem.get('q_cap_u_json'), min_len=1)
+        p_axis = _parse_q_cap_float_list(elem.get('q_cap_p_json'), min_len=2)
+        cell_id = elem.get('id')
+        if not u_axis or not p_axis:
+            use_default = _is_wind_turbine_typ(typ)
+            if not use_default:
+                pts = _parse_q_capability_points(elem.get('q_capability_curve_json'))
+                use_default = _is_legacy_park_scaled_q_curve(pts, elem.get('sn_mva'))
+            if use_default and cell_id is not None:
+                rec = _default_frc_wtg_q_cap_rec(elem)
+                store[cell_id] = rec
+                store[str(cell_id)] = rec
+            continue
+        n_u, n_p = len(u_axis), len(p_axis)
+        qmax = _parse_q_cap_float_matrix(elem.get('q_cap_qmax_json'), n_u, n_p)
+        qmin = _parse_q_cap_float_matrix(elem.get('q_cap_qmin_json'), n_u, n_p)
+        if qmax is None or qmin is None:
+            continue
+        u_order = sorted(range(n_u), key=lambda i: u_axis[i])
+        p_order = sorted(range(n_p), key=lambda j: p_axis[j])
+        u_axis = [u_axis[i] for i in u_order]
+        p_axis = [p_axis[j] for j in p_order]
+        qmax = [[qmax[i][j] for j in p_order] for i in u_order]
+        qmin = [[qmin[i][j] for j in p_order] for i in u_order]
+        try:
+            sn = float(elem.get('sn_mva') or 0)
+        except (TypeError, ValueError):
+            sn = 0.0
+        if sn <= 0:
+            continue
+        try:
+            smin = float(elem.get('q_cap_scale_min_percent') if elem.get('q_cap_scale_min_percent') not in (None, '') else 100)
+        except (TypeError, ValueError):
+            smin = 100.0
+        try:
+            smax = float(elem.get('q_cap_scale_max_percent') if elem.get('q_cap_scale_max_percent') not in (None, '') else 100)
+        except (TypeError, ValueError):
+            smax = 100.0
+        vd_raw = elem.get('q_cap_voltage_dependent')
+        if vd_raw is None or vd_raw == '':
+            voltage_dependent = len(u_axis) > 1
+        else:
+            voltage_dependent = str(vd_raw).strip().lower() in ('true', '1', 'yes', 'on')
+        rec = {
+            'u': u_axis,
+            'p': p_axis,
+            'qmax': qmax,
+            'qmin': qmin,
+            'sn_mva': sn,
+            'scale_min': smin,
+            'scale_max': smax,
+            'voltage_dependent': voltage_dependent,
+        }
+        store[cell_id] = rec
+        if cell_id is not None:
+            store[str(cell_id)] = rec
+    net._electrisim_q_cap_2d = store
+
+
+def _bilinear_q_cap_pu(u_axis, p_axis, qmat, u_pu, p_pu):
+    """Bilinear interpolate Q [p.u.] from voltage rows × P columns. Axes must be sorted."""
+    u = float(u_pu)
+    p = float(p_pu)
+    nu = len(u_axis)
+    np_ = len(p_axis)
+    if nu < 1 or np_ < 1:
+        return None
+    if u <= u_axis[0]:
+        iu0, iu1, tu = 0, 0, 0.0
+    elif u >= u_axis[-1]:
+        iu0, iu1, tu = nu - 1, nu - 1, 0.0
+    else:
+        iu1 = 1
+        while iu1 < nu and u_axis[iu1] < u:
+            iu1 += 1
+        iu0 = iu1 - 1
+        du = u_axis[iu1] - u_axis[iu0]
+        tu = 0.0 if du == 0 else (u - u_axis[iu0]) / du
+    if p <= p_axis[0]:
+        ip0, ip1, tp = 0, 0, 0.0
+    elif p >= p_axis[-1]:
+        ip0, ip1, tp = np_ - 1, np_ - 1, 0.0
+    else:
+        ip1 = 1
+        while ip1 < np_ and p_axis[ip1] < p:
+            ip1 += 1
+        ip0 = ip1 - 1
+        dp = p_axis[ip1] - p_axis[ip0]
+        tp = 0.0 if dp == 0 else (p - p_axis[ip0]) / dp
+    q00 = float(qmat[iu0][ip0])
+    q01 = float(qmat[iu0][ip1])
+    q10 = float(qmat[iu1][ip0])
+    q11 = float(qmat[iu1][ip1])
+    return (1 - tu) * ((1 - tp) * q00 + tp * q01) + tu * ((1 - tp) * q10 + tp * q11)
+
+
+def _sgen_bus_vm_pu(net, sgen_idx):
+    try:
+        bus = int(net.sgen.at[sgen_idx, 'bus'])
+        if hasattr(net, 'res_bus') and bus in net.res_bus.index:
+            vm = net.res_bus.at[bus, 'vm_pu']
+            if vm is not None and not (isinstance(vm, float) and pd.isna(vm)):
+                return float(vm)
+    except Exception:
+        pass
+    return None
+
+
+def _interp_sgen_pq_limits(net, sgen_idx, p_mw, vm_pu=None):
     """
-    Interpolate (q_min_mvar, q_max_mvar) at p_mw from net.q_capability_curve_table for the
-    characteristic linked to net.sgen row sgen_idx. Returns None if unavailable.
+    Interpolate (q_min_mvar, q_max_mvar) at p_mw.
+
+    Prefers Electrisim voltage-dependent Q(P,U) tables when present (bilinear in P and U).
+    Falls back to net.q_capability_curve_table (1D P–Q) for the characteristic linked
+    to net.sgen row sgen_idx. Returns None if unavailable.
     """
     try:
         if not hasattr(net, 'sgen') or net.sgen.empty:
             return None
+        cap2d = getattr(net, '_electrisim_q_cap_2d', None) or {}
+        cell_id = net.sgen.at[sgen_idx, 'id'] if 'id' in net.sgen.columns else None
+        rec = None
+        if cell_id is not None:
+            rec = cap2d.get(cell_id)
+            if rec is None:
+                rec = cap2d.get(str(cell_id))
+        if rec:
+            sn = float(rec.get('sn_mva') or 0)
+            if sn > 0:
+                if rec.get('voltage_dependent'):
+                    u = vm_pu if vm_pu is not None else _sgen_bus_vm_pu(net, sgen_idx)
+                    if u is None:
+                        u = 1.0
+                else:
+                    u = 1.0
+                p_pu = float(p_mw) / sn
+                qmin_pu = _bilinear_q_cap_pu(rec['u'], rec['p'], rec['qmin'], u, p_pu)
+                qmax_pu = _bilinear_q_cap_pu(rec['u'], rec['p'], rec['qmax'], u, p_pu)
+                if qmin_pu is not None and qmax_pu is not None:
+                    smin = float(rec.get('scale_min', 100) or 100) / 100.0
+                    smax = float(rec.get('scale_max', 100) or 100) / 100.0
+                    return (qmin_pu * sn * smin, qmax_pu * sn * smax)
         if 'id_q_capability_characteristic' not in net.sgen.columns:
             return None
         cid = net.sgen.at[sgen_idx, 'id_q_capability_characteristic']
@@ -1572,7 +2133,7 @@ def apply_sgen_q_setpoint_from_curve(net, in_data):
         if not isinstance(elem, dict):
             continue
         typ = elem.get('typ') or ''
-        if not typ.startswith('Static Generator'):
+        if not _is_static_generator_like(typ):
             continue
         if not _electrisim_truthy(elem.get('reactive_capability_curve')):
             continue
@@ -1590,7 +2151,7 @@ def apply_sgen_q_setpoint_from_curve(net, in_data):
 
         p_mw = float(net.sgen.at[sgen_idx, 'p_mw'])
 
-        lim = _interp_sgen_pq_limits(net, sgen_idx, p_mw)
+        lim = _interp_sgen_pq_limits(net, sgen_idx, p_mw, vm_pu=_sgen_bus_vm_pu(net, sgen_idx))
         if lim is None:
             print(f"Warning: Static Generator '{elem.get('name', key)}': Q setpoint from curve skipped (no valid curve).")
             continue
@@ -2478,29 +3039,31 @@ def create_other_elements(in_data,net,x, Busbars):
                 net.user_friendly_names = {}
             net.user_friendly_names[gen_name] = user_friendly_name
         
-        if (in_data[x]['typ'].startswith("Static Generator")):      
+        if _is_static_generator_like(in_data[x]['typ']):
+            apply_wind_turbine_p_from_curve(in_data[x])
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
                 bus_name = in_data[x]['bus']
+                _el_label = 'Wind Turbine' if str(in_data[x]['typ']).startswith('Wind Turbine') else 'Static Generator'
                 
                 # Check if bus is None (not connected) or references non-existent bus
                 if bus_name is None:
                     raise ValueError(
-                        f"CONNECTION ERROR: Static Generator '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
+                        f"CONNECTION ERROR: {_el_label} '{element_name}' (ID: {in_data[x].get('id', 'Unknown')}) is NOT CONNECTED to any bus.\n\n"
                         f"SOLUTION: Please ensure that:\n"
                         f"1. You have placed a Bus/Busbar element in your diagram\n"
-                        f"2. Draw a connection line from the Static Generator to a Bus element\n"
+                        f"2. Draw a connection line from the {_el_label} to a Bus element\n"
                         f"3. Verify the connection line is properly attached at both ends\n\n"
                         f"IMPORTANT: Every electrical component must be connected to at least one Bus element."
                     )
                 else:
                     raise ValueError(
-                        f"CONNECTION ERROR: Static Generator '{element_name}' is trying to connect to bus '{bus_name}', "
+                        f"CONNECTION ERROR: {_el_label} '{element_name}' is trying to connect to bus '{bus_name}', "
                         f"but this bus does not exist in your diagram.\n\n"
                         f"SOLUTION: Please ensure that:\n"
                         f"1. You have placed a Bus/Busbar element in your diagram\n"
-                        f"2. The Static Generator is connected to this Bus element with a connection line\n"
+                        f"2. The {_el_label} is connected to this Bus element with a connection line\n"
                         f"3. All electrical elements must be properly connected to Bus elements"
                     )
            
@@ -2598,7 +3161,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 'i0_percent': safe_float(in_data[x].get('i0_percent', 0.0)),
                 'parallel': float(parallel_value),
                 'shift_degree': safe_float(in_data[x].get('shift_degree', 0)) + phase_shift_from_group,
-                'tap_side': in_data[x].get('tap_side', 'hv'),
+                'tap_side': _normalize_tap_side(in_data[x].get('tap_side', 'hv')),
                 'tap_pos': float(safe_int(in_data[x].get('tap_pos', 0))),
                 'tap_neutral': float(safe_int(in_data[x].get('tap_neutral', 0))),
                 'tap_max': float(safe_int(in_data[x].get('tap_max', 0))),
@@ -2726,7 +3289,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 'shift_lv_degree': safe_float(in_data[x]['shift_lv_degree']) + phase_shift_from_group,
                 'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
                 'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0)),
-                'tap_side': in_data[x]['tap_side'],
+                'tap_side': _normalize_tap_side(in_data[x]['tap_side']),
                 'tap_neutral': float(safe_int(in_data[x].get('tap_neutral', 0))),
                 'tap_min': float(safe_int(in_data[x]['tap_min'])),
                 'tap_max': float(safe_int(in_data[x]['tap_max'])),
@@ -3444,6 +4007,13 @@ def create_other_elements(in_data,net,x, Busbars):
     _electrisim_finalize_pending_line_flow_shunts(net)
     apply_sgen_q_capability_curves(net, in_data)
     apply_sgen_q_setpoint_from_curve(net, in_data)
+    try:
+        net._electrisim_export_sgen_q_init = {
+            int(i): float(net.sgen.at[i, 'q_mvar'])
+            for i in net.sgen.index
+        }
+    except Exception:
+        net._electrisim_export_sgen_q_init = {}
 
 
 def _electrisim_boolish(v, default=False):
@@ -3495,6 +4065,998 @@ def _resolve_controller_family_flags(payload, legacy_key='run_control'):
     return u, u, u
 
 
+def _park_truthy(v, default=True):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _park_parse_json_list(raw):
+    if raw is None or raw == '':
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _park_interp_xy(points, x_key, y_key, x):
+    """Piecewise-linear interpolate y at x from list of dicts; clamp outside range."""
+    pts = []
+    for p in points or []:
+        try:
+            xv = float(p.get(x_key))
+            yv = float(p.get(y_key))
+        except (TypeError, ValueError):
+            continue
+        if xv == xv and yv == yv:
+            pts.append((xv, yv))
+    if not pts or x is None or x != x:
+        return None
+    pts.sort(key=lambda t: t[0])
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if x0 <= x <= x1:
+            if abs(x1 - x0) < 1e-12:
+                return y0
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return pts[-1][1]
+
+
+def _park_find_by_name(df, name, user_friendly_names=None):
+    """Return first index in df whose name or friendly name matches."""
+    if df is None or getattr(df, 'empty', True) or not name:
+        return None
+    target = str(name).strip()
+    friendly = user_friendly_names or {}
+    # reverse friendly map: friendly -> technical
+    rev = {str(v): str(k) for k, v in friendly.items()}
+    tech = rev.get(target, target)
+    if 'name' not in df.columns:
+        return None
+    for idx in df.index:
+        n = df.at[idx, 'name']
+        if n is None or (isinstance(n, float) and np.isnan(n)):
+            continue
+        ns = str(n)
+        if ns == target or ns == tech or friendly.get(ns) == target:
+            return idx
+    return None
+
+
+def _park_q_from_cosphi(p_mw, cos_phi):
+    """Q = P * tan(acos(|cosφ|)); magnitude for OE/UE branch signing."""
+    try:
+        p = float(p_mw)
+        c = float(cos_phi)
+    except (TypeError, ValueError):
+        return 0.0
+    c = max(-1.0, min(1.0, c))
+    if abs(c) < 1e-9:
+        return 0.0
+    import math as _math
+    return p * _math.tan(_math.acos(abs(c)))
+
+
+def _park_pick_cosphi_p_branch(park, q_mvar_meas):
+    """
+    Return 'oe' or 'ue' for cosφ(P) characteristic selection.
+    Auto uses measured Q at the control point (Q >= 0 → overexcited).
+    """
+    mode = str(park.get('cosphi_p_excitation') or 'Overexcited').strip().lower()
+    if mode.startswith('under'):
+        return 'ue'
+    if mode.startswith('auto'):
+        try:
+            q = float(q_mvar_meas) if q_mvar_meas is not None else 0.0
+        except (TypeError, ValueError):
+            q = 0.0
+        return 'oe' if q >= 0.0 else 'ue'
+    return 'oe'
+
+
+def _park_cosphi_p_points(park, branch):
+    """Resolve OE/UE cosφ(P) table; fall back to legacy single curve."""
+    if branch == 'ue':
+        raw = park.get('cosphi_p_ue_characteristic_json')
+    else:
+        raw = park.get('cosphi_p_oe_characteristic_json')
+    pts = _park_parse_json_list(raw)
+    if pts:
+        return pts
+    return _park_parse_json_list(park.get('cosphi_p_characteristic_json'))
+
+
+def _park_measure_p_q_at(net, element_name):
+    """Return (p_mw, q_mvar) at a named bus, line (from-side), or trafo (HV), or (None, None)."""
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+    bi = _park_find_by_name(net.bus, element_name, ufn)
+    if bi is not None and hasattr(net, 'res_bus') and not net.res_bus.empty and bi in net.res_bus.index:
+        return float(net.res_bus.at[bi, 'p_mw']), float(net.res_bus.at[bi, 'q_mvar'])
+    li = _park_find_by_name(net.line, element_name, ufn)
+    if li is not None and hasattr(net, 'res_line') and not net.res_line.empty and li in net.res_line.index:
+        return float(net.res_line.at[li, 'p_from_mw']), float(net.res_line.at[li, 'q_from_mvar'])
+    ti = _park_find_by_name(net.trafo, element_name, ufn)
+    if ti is not None and hasattr(net, 'res_trafo') and not net.res_trafo.empty and ti in net.res_trafo.index:
+        return float(net.res_trafo.at[ti, 'p_hv_mw']), float(net.res_trafo.at[ti, 'q_hv_mvar'])
+    return None, None
+
+
+def _park_resolve_control_q_at(net, boundary):
+    """Resolve Control Q at name to (input_element, input_variable, index) or (None, None, None)."""
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+    bi = _park_find_by_name(net.bus, boundary, ufn)
+    if bi is not None:
+        return 'res_bus', 'q_mvar', bi
+    li = _park_find_by_name(net.line, boundary, ufn)
+    if li is not None:
+        return 'res_line', 'q_from_mvar', li
+    ti = _park_find_by_name(net.trafo, boundary, ufn)
+    if ti is not None:
+        return 'res_trafo', 'q_hv_mvar', ti
+    return None, None, None
+
+
+def _park_machine_q_limits(net, sgen_idx):
+    """
+    (q_min_mvar, q_max_mvar) for a park machine at its current P and terminal voltage.
+    Prefers P–Q / P–U capability (Wind Turbine / SGen Q capability tab); falls back to
+    min_q_mvar / max_q_mvar columns.
+    """
+    try:
+        p_mw = float(net.sgen.at[sgen_idx, 'p_mw']) if 'p_mw' in net.sgen.columns else 0.0
+    except Exception:
+        p_mw = 0.0
+    lim = _interp_sgen_pq_limits(net, sgen_idx, p_mw, vm_pu=_sgen_bus_vm_pu(net, sgen_idx))
+    if lim is not None:
+        return float(lim[0]), float(lim[1])
+    q_min = None
+    q_max = None
+    try:
+        if 'min_q_mvar' in net.sgen.columns:
+            v = net.sgen.at[sgen_idx, 'min_q_mvar']
+            if v == v and v is not None:
+                q_min = float(v)
+        if 'max_q_mvar' in net.sgen.columns:
+            v = net.sgen.at[sgen_idx, 'max_q_mvar']
+            if v == v and v is not None:
+                q_max = float(v)
+    except Exception:
+        pass
+    return q_min, q_max
+
+
+def _park_apply_machine_q_capability_limits(net, sgen_indices):
+    """
+    Write interpolated P–Q capability limits onto net.sgen min/max_q_mvar for park machines
+    and enable enforce_q_lims so BinarySearchControl stays inside the curve.
+    Returns number of machines updated from a curve.
+    """
+    if not sgen_indices:
+        return 0
+    updated = 0
+    for si in sgen_indices:
+        lim = _interp_sgen_pq_limits(
+            net,
+            si,
+            float(net.sgen.at[si, 'p_mw']) if 'p_mw' in net.sgen.columns else 0.0,
+            vm_pu=_sgen_bus_vm_pu(net, si),
+        )
+        if lim is None:
+            continue
+        q_mi, q_ma = float(lim[0]), float(lim[1])
+        if 'min_q_mvar' not in net.sgen.columns:
+            net.sgen['min_q_mvar'] = float('nan')
+        if 'max_q_mvar' not in net.sgen.columns:
+            net.sgen['max_q_mvar'] = float('nan')
+        net.sgen.at[si, 'min_q_mvar'] = q_mi
+        net.sgen.at[si, 'max_q_mvar'] = q_ma
+        updated += 1
+    if updated:
+        net._electrisim_enforce_q_lims = True
+    return updated
+
+
+def _park_resolve_sgen_indices(net, machines, distribution_method=None):
+    """machines: list of {name, connected, q_percent}. Returns (indices, in_service, distribution, gen_Q_response).
+
+    distribution_method (optional) recomputes weights from the live network for non-Individual modes.
+    """
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+    idxs, insvc, user_pct, resp = [], [], [], []
+    for m in machines or []:
+        if not m or not _park_truthy(m.get('connected', True), True):
+            continue
+        name = m.get('name')
+        si = _park_find_by_name(net.sgen, name, ufn)
+        if si is None:
+            # Generators (sync) are net.gen — BinarySearchControl Q supports sgen primarily
+            continue
+        idxs.append(si)
+        insvc.append(bool(net.sgen.at[si, 'in_service']) if 'in_service' in net.sgen.columns else True)
+        user_pct.append(max(0.0, float(m.get('q_percent') or 0.0)))
+        resp.append(1)
+    if not idxs:
+        return [], [], [], []
+
+    method = str(distribution_method or 'Individual Reactive Power')
+    if method == 'Individual Reactive Power':
+        dist = user_pct
+    elif method == 'According to Dispatched Active Power':
+        dist = [abs(float(net.sgen.at[i, 'p_mw'])) for i in idxs]
+    elif method == 'According to Rated Power':
+        dist = []
+        for i in idxs:
+            sn = float(net.sgen.at[i, 'sn_mva']) if 'sn_mva' in net.sgen.columns and net.sgen.at[i, 'sn_mva'] == net.sgen.at[i, 'sn_mva'] else 0.0
+            dist.append(abs(sn) if sn else 0.0)
+    elif method == 'According to Q Capability':
+        # Share proportional to Q band width at current P (from P–Q curve when available)
+        dist = []
+        for i in idxs:
+            q_mi, q_ma = _park_machine_q_limits(net, i)
+            if q_mi is not None and q_ma is not None:
+                dist.append(max(0.0, float(q_ma) - float(q_mi)))
+            else:
+                dist.append(1.0)
+    elif method == 'Maximise Reactive Reserve':
+        dist = []
+        for i in idxs:
+            q = float(net.sgen.at[i, 'q_mvar']) if 'q_mvar' in net.sgen.columns else 0.0
+            q_mi, q_ma = _park_machine_q_limits(net, i)
+            if q_ma is not None and q_mi is not None:
+                # Remaining headroom toward both capacitive and inductive limits
+                dist.append(max(0.0, float(q_ma) - q) + max(0.0, q - float(q_mi)))
+            elif q_ma is not None:
+                dist.append(max(0.0, float(q_ma) - q))
+            else:
+                dist.append(1.0)
+    else:
+        # Voltage Setpoint Adaption / unknown → equal shares
+        dist = [1.0] * len(idxs)
+
+    if sum(dist) <= 0:
+        dist = [1.0] * len(idxs)
+    return idxs, insvc, dist, resp
+
+
+def _electrisim_collect_park_payloads(in_data):
+    parks = []
+    if not isinstance(in_data, dict):
+        return parks
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if typ == 'ParkController' or typ.startswith('ParkController'):
+            if _park_truthy(el.get('enabled', True), True):
+                parks.append(el)
+    return parks
+
+
+def _electrisim_collect_wtc_ss_payloads(in_data):
+    """Steady-state Wind Turbine Controllers from LF payload."""
+    out = []
+    if not isinstance(in_data, dict):
+        return out
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if typ == 'WindTurbineDynamicController':
+            continue
+        if typ == 'WindTurbineController' or typ.startswith('WindTurbineController'):
+            if _park_truthy(el.get('enabled', True), True):
+                out.append(el)
+    return out
+
+
+def _electrisim_collect_wtc_dyn_payloads(in_data):
+    """Dynamic Wind Turbine Controllers from LF payload (documented only for snapshot LF)."""
+    out = []
+    if not isinstance(in_data, dict):
+        return out
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if typ == 'WindTurbineDynamicController' or typ.startswith('WindTurbineDynamicController'):
+            if _park_truthy(el.get('enabled', True), True):
+                out.append(el)
+    return out
+
+
+def _electrisim_find_in_data_by_sgen(in_data, sgen_name, sgen_id=None):
+    if not isinstance(in_data, dict):
+        return None
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if not (typ.startswith('Wind Turbine') or typ.startswith('Static Generator') or typ == 'Static Generator'):
+            continue
+        if sgen_id is not None and el.get('id') is not None and str(el.get('id')) == str(sgen_id):
+            return el
+        if el.get('name') == sgen_name or el.get('userFriendlyName') == sgen_name:
+            return el
+    return None
+
+
+def _electrisim_build_park_controller_results(net, in_data):
+    """Summaries for results .txt / UI after load flow."""
+    results = []
+    parks = _electrisim_collect_park_payloads(in_data)
+    if not parks:
+        return results
+    bsc_by_name = {}
+    if hasattr(net, 'controller') and net.controller is not None and not net.controller.empty:
+        for _ci, row in net.controller.iterrows():
+            obj = row['object']
+            if type(obj).__name__ == 'BinarySearchControl':
+                bsc_by_name[str(getattr(obj, 'name', '') or '')] = obj
+    for park in parks:
+        name = str(park.get('name') or 'ParkController')
+        machines = _park_parse_json_list(park.get('machines_json'))
+        idxs, _insvc, _dist, _resp = _park_resolve_sgen_indices(
+            net, machines, park.get('distribution_method'))
+        sgen_names = []
+        sgen_q = []
+        for i in idxs:
+            try:
+                sgen_names.append(str(net.sgen.at[i, 'name']) if 'name' in net.sgen.columns else str(i))
+            except Exception:
+                sgen_names.append(str(i))
+            try:
+                if hasattr(net, 'res_sgen') and net.res_sgen is not None and not net.res_sgen.empty and i in net.res_sgen.index:
+                    sgen_q.append(float(net.res_sgen.at[i, 'q_mvar']))
+                else:
+                    sgen_q.append(None)
+            except Exception:
+                sgen_q.append(None)
+        bsc = bsc_by_name.get(name)
+        mode = str(park.get('control_mode') or 'Voltage Control')
+        results.append({
+            'name': name,
+            'control_mode': mode,
+            'q_control_type': park.get('q_control_type'),
+            'pf_control_type': park.get('pf_control_type'),
+            'cosphi_p_excitation': park.get('cosphi_p_excitation'),
+            'cosphi_p_oe_characteristic_json': (
+                park.get('cosphi_p_oe_characteristic_json') or park.get('cosphi_p_characteristic_json')
+            ),
+            'cosphi_p_ue_characteristic_json': park.get('cosphi_p_ue_characteristic_json'),
+            'controlled_bus': park.get('controlled_bus') or park.get('target_bus'),
+            'control_q_at': park.get('control_q_at'),
+            'vm_set_pu': park.get('vm_set_pu'),
+            'q_set_mvar': park.get('q_set_mvar'),
+            'cos_phi': park.get('cos_phi'),
+            'tan_phi': park.get('tan_phi'),
+            'enable_droop': _park_truthy(park.get('enable_droop'), False),
+            'droop_percent': park.get('droop_percent'),
+            'q_rated_mvar': park.get('q_rated_mvar'),
+            'distribution_method': park.get('distribution_method'),
+            'machines': sgen_names,
+            'sgen_q_mvar': sgen_q,
+            'set_point': float(bsc.set_point) if bsc is not None else None,
+            'voltage_ctrl': bool(getattr(bsc, 'voltage_ctrl', mode == 'Voltage Control')) if bsc is not None else (mode == 'Voltage Control'),
+            'attached': bsc is not None,
+        })
+    return results
+
+
+def _electrisim_build_wtc_controller_results(in_data):
+    """Steady-state + dynamic Wind Turbine Controller summaries for results export."""
+    ss_out = []
+    dyn_out = []
+    if not isinstance(in_data, dict):
+        return ss_out, dyn_out
+    # Pref applied onto turbines (frontend apply)
+    pref_by_ctrl = {}
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if typ.startswith('Wind Turbine') and el.get('_wind_controller'):
+            cname = str(el.get('_wind_controller'))
+            pref_by_ctrl.setdefault(cname, []).append({
+                'turbine': el.get('userFriendlyName') or el.get('name'),
+                'p_mw': el.get('p_mw'),
+                'wind_speed_ms': el.get('wind_speed_ms'),
+            })
+    for park_like in _electrisim_collect_wtc_ss_payloads(in_data):
+        cname = str(park_like.get('name') or 'WindTurbineController')
+        applied = pref_by_ctrl.get(cname) or []
+        target = park_like.get('wind_turbine') or (applied[0]['turbine'] if applied else '')
+        pref = applied[0]['p_mw'] if applied else None
+        v_ms = applied[0]['wind_speed_ms'] if applied else park_like.get('wind_speed_ms')
+        ss_out.append({
+            'name': cname,
+            'kind': 'steady-state',
+            'wind_turbine': target,
+            'power_curve_type': park_like.get('power_curve_type'),
+            'use_turbine_wind_speed': park_like.get('use_turbine_wind_speed'),
+            'wind_speed_ms': v_ms,
+            'pref_mw': pref,
+            'wind_curve_approx': park_like.get('wind_curve_approx'),
+        })
+    # Orphan Pref notes (controller applied but payload object missing)
+    named_ss = {r['name'] for r in ss_out}
+    for cname, apps in pref_by_ctrl.items():
+        if cname in named_ss:
+            continue
+        for a in apps:
+            ss_out.append({
+                'name': cname,
+                'kind': 'steady-state',
+                'wind_turbine': a.get('turbine'),
+                'power_curve_type': None,
+                'use_turbine_wind_speed': None,
+                'wind_speed_ms': a.get('wind_speed_ms'),
+                'pref_mw': a.get('p_mw'),
+                'wind_curve_approx': None,
+            })
+    for dyn in _electrisim_collect_wtc_dyn_payloads(in_data):
+        dyn_out.append({
+            'name': str(dyn.get('name') or 'WindTurbineController (dynamic)'),
+            'kind': 'dynamic',
+            'wind_turbine': dyn.get('wind_turbine'),
+            'wind_avg_T': dyn.get('wind_avg_T'),
+            'wind_avg_Tavg': dyn.get('wind_avg_Tavg'),
+            'power_avg_T': dyn.get('power_avg_T'),
+            'power_avg_Tavg': dyn.get('power_avg_Tavg'),
+            'gradient_T': dyn.get('gradient_T'),
+            'gradient_max': dyn.get('gradient_max'),
+            'note': 'Not applied to snapshot load flow (time-domain / dynamic studies only).',
+        })
+    return ss_out, dyn_out
+
+
+def _export_tap_side(val):
+    """Normalize tap_side for exported pandapower scripts."""
+    return _normalize_tap_side(val)
+
+
+def _append_electrisim_park_specs_python(lines, net, parks):
+    """Emit BinarySearchControl (+ Droop) from post-LF export snapshot."""
+    park_specs = getattr(net, '_electrisim_export_park_specs', None) or []
+    if not park_specs:
+        return False
+
+    lines.append("from pandapower.control.controller.station_control import BinarySearchControl, DroopControl")
+    lines.append("")
+    for spec in park_specs:
+        cname = str(spec.get('name') or 'ParkController')
+        park_meta = next((p for p in parks if str(p.get('name') or '') == cname), None)
+        if park_meta:
+            lines.append(
+                f"# ParkController '{cname}': mode={spec.get('control_mode')!r}, "
+                f"q_type={park_meta.get('q_control_type')!r}, "
+                f"pf_type={park_meta.get('pf_control_type')!r}, "
+                f"cosphi_p_excitation={spec.get('cosphi_p_excitation')!r}, "
+                f"distribution={spec.get('distribution_method')!r}"
+            )
+            oe = park_meta.get('cosphi_p_oe_characteristic_json') or park_meta.get('cosphi_p_characteristic_json')
+            ue = park_meta.get('cosphi_p_ue_characteristic_json')
+            if oe:
+                lines.append(f"#   cosphi(P) OE characteristic: {oe}")
+            if ue:
+                lines.append(f"#   cosphi(P) UE characteristic: {ue}")
+        else:
+            lines.append(
+                f"# ParkController '{cname}': mode={spec.get('control_mode')!r}, "
+                f"pf_type={spec.get('pf_control_type')!r}, set_point={spec.get('set_point')}"
+            )
+
+        idxs = spec.get('idxs') or []
+        insvc = spec.get('insvc') or []
+        dist = spec.get('dist') or []
+        in_el = spec.get('input_element') or 'res_bus'
+        in_var = spec.get('input_variable') or 'q_mvar'
+        in_idx = spec.get('input_element_index')
+        set_point = float(spec.get('set_point') or 0.0)
+        voltage_ctrl = bool(spec.get('voltage_ctrl', False))
+        gen_q = spec.get('gen_Q_response') or [1] * len(idxs)
+        bus_idx = spec.get('bus_idx')
+        ci = spec.get('controller_idx')
+        if ci is None:
+            ci = 0
+
+        lines.append(
+            f"_park_ctrl_{ci} = BinarySearchControl(\n"
+            f"    net, True, 'sgen', 'q_mvar',\n"
+            f"    {_export_py_literal(idxs)}, {_export_py_literal(insvc)}, {_export_py_literal(dist)},\n"
+            f"    {in_el!r}, {in_var!r}, {_export_py_literal(in_idx)}, {set_point}, {voltage_ctrl},\n"
+            f"    name={cname!r}, gen_Q_response={_export_py_literal(gen_q)},\n"
+            f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0)"
+        )
+        lines.append(f"_park_ctrl_idx_{ci} = net.controller.index[-1]")
+
+        droop = spec.get('droop')
+        if isinstance(droop, dict) and droop.get('q_droop_mvar') is not None:
+            lines.append(
+                f"DroopControl(\n"
+                f"    net, {float(droop['q_droop_mvar'])}, "
+                f"{droop.get('bus_idx')!r}, _park_ctrl_idx_{ci}, True,\n"
+                f"    tol=1e-6, vm_set_pu_bsc={droop.get('vm_set_pu_bsc')!r},\n"
+                f"    name={str(droop.get('name') or cname + '_droop')!r}, "
+                f"in_service=True, order=-1, level=0)"
+            )
+        lines.append("")
+    return True
+
+
+def _append_electrisim_controllers_to_python(lines, net, in_data, algorithm, calculate_voltage_angles, init):
+    """
+    Append ParkController (BinarySearchControl/DroopControl) and Wind Turbine Controller
+    blocks to exported pandapower Python. Returns True if runpp should use run_control=True.
+    """
+    parks = _electrisim_collect_park_payloads(in_data)
+    wtc_ss = _electrisim_collect_wtc_ss_payloads(in_data)
+    wtc_dyn = _electrisim_collect_wtc_dyn_payloads(in_data)
+    run_control = False
+
+    # Annotate Pref applied on wind turbines even without controller payload objects
+    pref_notes = []
+    if isinstance(in_data, dict):
+        for _k, el in in_data.items():
+            if not isinstance(el, dict):
+                continue
+            if str(el.get('typ') or '').startswith('Wind Turbine') and el.get('_wind_controller'):
+                pref_notes.append(el)
+
+    if not parks and not wtc_ss and not wtc_dyn and not pref_notes:
+        return False
+
+    lines.append("# --- Electrisim controllers (Park / Wind Turbine) ---")
+    lines.append("")
+
+    if wtc_ss or pref_notes:
+        lines.append("# Wind Turbine Controller (steady-state): Pref applied to linked turbines before LF")
+        for ctrl in wtc_ss:
+            cname = ctrl.get('name') or 'WindTurbineController'
+            lines.append(
+                f"#   {cname}: turbine={ctrl.get('wind_turbine')!r}, "
+                f"curve={ctrl.get('power_curve_type')!r}, "
+                f"use_turbine_wind_speed={ctrl.get('use_turbine_wind_speed')}, "
+                f"wind_speed_ms={ctrl.get('wind_speed_ms')}, approx={ctrl.get('wind_curve_approx')!r}"
+            )
+        for el in pref_notes:
+            lines.append(
+                f"#   Pref applied: turbine={el.get('userFriendlyName') or el.get('name')!r} "
+                f"p_mw={el.get('p_mw')} wind_speed_ms={el.get('wind_speed_ms')} "
+                f"via controller={el.get('_wind_controller')!r}"
+            )
+        lines.append("")
+
+    if wtc_dyn:
+        lines.append("# Wind Turbine Controller (dynamic) — parameters for time-domain studies (not used in snapshot LF)")
+        for ctrl in wtc_dyn:
+            lines.append(
+                f"#   {ctrl.get('name')}: turbine={ctrl.get('wind_turbine')!r}, "
+                f"wind_avg T={ctrl.get('wind_avg_T')} Tavg={ctrl.get('wind_avg_Tavg')}, "
+                f"gradient T={ctrl.get('gradient_T')} max={ctrl.get('gradient_max')}, "
+                f"power_avg T={ctrl.get('power_avg_T')} Tavg={ctrl.get('power_avg_Tavg')}"
+            )
+        lines.append("")
+
+    if parks:
+        emitted_names = set()
+        if _append_electrisim_park_specs_python(lines, net, parks):
+            run_control = True
+            for spec in (getattr(net, '_electrisim_export_park_specs', None) or []):
+                emitted_names.add(str(spec.get('name') or 'ParkController'))
+        else:
+            lines.append("from pandapower.control.controller.station_control import BinarySearchControl, DroopControl")
+            lines.append("")
+            # Prefer emitting controllers already attached on net (post-LF) so setpoints match Electrisim
+            if hasattr(net, 'controller') and net.controller is not None and not net.controller.empty:
+                for ci, row in net.controller.iterrows():
+                    obj = row['object']
+                    cls = type(obj).__name__
+                    if cls != 'BinarySearchControl':
+                        continue
+                    cname = str(getattr(obj, 'name', '') or f'ParkController_{ci}')
+                    # Match Electrisim park metadata for comments
+                    park_meta = next((p for p in parks if str(p.get('name') or '') == cname), None)
+                    if park_meta:
+                        lines.append(
+                            f"# ParkController '{cname}': mode={park_meta.get('control_mode')!r}, "
+                            f"q_type={park_meta.get('q_control_type')!r}, "
+                            f"pf_type={park_meta.get('pf_control_type')!r}, "
+                            f"cosphi_p_excitation={park_meta.get('cosphi_p_excitation')!r}, "
+                            f"distribution={park_meta.get('distribution_method')!r}"
+                        )
+                        oe = park_meta.get('cosphi_p_oe_characteristic_json') or park_meta.get('cosphi_p_characteristic_json')
+                        ue = park_meta.get('cosphi_p_ue_characteristic_json')
+                        if oe:
+                            lines.append(f"#   cosphi(P) OE characteristic: {oe}")
+                        if ue:
+                            lines.append(f"#   cosphi(P) UE characteristic: {ue}")
+                        if _park_truthy(park_meta.get('enable_droop'), False):
+                            lines.append(
+                                f"#   droop enabled: droop_percent={park_meta.get('droop_percent')}, "
+                                f"q_rated_mvar={park_meta.get('q_rated_mvar')}"
+                            )
+                    out_idx = list(getattr(obj, 'output_element_index', []) or [])
+                    out_insvc = list(getattr(obj, 'output_element_in_service', []) or [])
+                    dist = getattr(obj, 'output_values_distribution', None)
+                    if dist is None:
+                        dist_list = [1.0] * len(out_idx)
+                    else:
+                        dist_list = [float(x) for x in list(dist)]
+                    # pandapower may store normalized weights as zeros in the object; rebuild from diagram
+                    if park_meta and (not dist_list or sum(abs(x) for x in dist_list) <= 0):
+                        machines = _park_parse_json_list(park_meta.get('machines_json'))
+                        _, _, dist_list, _ = _park_resolve_sgen_indices(
+                            net, machines, park_meta.get('distribution_method'))
+                    if not dist_list or sum(abs(x) for x in dist_list) <= 0:
+                        dist_list = [1.0] * len(out_idx)
+                    gen_q = list(getattr(obj, 'gen_Q_response', []) or [])
+                    if park_meta and (not gen_q or len(gen_q) != len(out_idx)):
+                        q_resp = str(park_meta.get('q_change_response') or 'same').lower()
+                        gen_q = [1 if q_resp != 'opposite' else -1] * len(out_idx)
+                    in_el = getattr(obj, 'input_element', 'res_bus')
+                    in_var_list = getattr(obj, 'input_variable', None)
+                    voltage_ctrl = bool(getattr(obj, 'voltage_ctrl', False))
+                    if voltage_ctrl:
+                        in_var = 'vm_pu'
+                    elif isinstance(in_var_list, list) and in_var_list:
+                        v0 = in_var_list[0]
+                        in_var = v0 if isinstance(v0, str) else str(v0)
+                        # Common Q measurements when flag objects stringify poorly
+                        if in_var and ('object' in in_var.lower() or len(in_var) > 40):
+                            if in_el == 'res_bus':
+                                in_var = 'q_mvar'
+                            elif in_el == 'res_line':
+                                in_var = 'q_from_mvar'
+                            elif in_el in ('res_trafo', 'res_trafo3w'):
+                                in_var = 'q_hv_mvar'
+                    else:
+                        in_var = 'q_mvar' if in_el == 'res_bus' else 'q_from_mvar'
+                    in_idx_list = list(getattr(obj, 'input_element_index', []) or [])
+                    in_idx = in_idx_list[0] if len(in_idx_list) == 1 else in_idx_list
+                    set_point = float(getattr(obj, 'set_point', 0.0))
+                    bus_idx = getattr(obj, 'bus_idx', None)
+                    out_var = getattr(obj, 'output_variable', 'q_mvar')
+                    if isinstance(out_var, list):
+                        out_var = out_var[0] if out_var else 'q_mvar'
+                    lines.append(
+                        f"_park_ctrl_{ci} = BinarySearchControl(\n"
+                        f"    net, True, {getattr(obj, 'output_element', 'sgen')!r}, {out_var!r},\n"
+                        f"    {_export_py_literal(out_idx)}, {_export_py_literal(out_insvc)}, {_export_py_literal(dist_list)},\n"
+                        f"    {in_el!r}, {in_var!r}, {_export_py_literal(in_idx)}, {set_point}, {voltage_ctrl},\n"
+                        f"    name={cname!r}, gen_Q_response={_export_py_literal(gen_q)},\n"
+                        f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0)"
+                    )
+                    lines.append(f"_park_ctrl_idx_{ci} = net.controller.index[-1]")
+                    # Droop linked to this BSC
+                    for dj, drow in net.controller.iterrows():
+                        dobj = drow['object']
+                        if type(dobj).__name__ != 'DroopControl':
+                            continue
+                        if getattr(dobj, 'controller_idx', None) != ci:
+                            continue
+                        lines.append(
+                            f"DroopControl(\n"
+                            f"    net, {float(getattr(dobj, 'q_droop_mvar', 0.0))}, "
+                            f"{getattr(dobj, 'bus_idx', None)!r}, _park_ctrl_idx_{ci}, True,\n"
+                            f"    tol=1e-6, vm_set_pu_bsc={getattr(dobj, 'vm_set_pu_bsc', None)!r},\n"
+                            f"    name={str(getattr(dobj, 'name', cname + '_droop'))!r}, "
+                            f"in_service=True, order=-1, level=0)"
+                        )
+                    lines.append("")
+                    emitted_names.add(cname)
+                    run_control = True
+
+        # Parks that failed to attach: still document configuration
+        for park in parks:
+            pname = str(park.get('name') or 'ParkController')
+            if pname in emitted_names:
+                continue
+            lines.append(
+                f"# ParkController '{pname}' was not attached during Electrisim LF "
+                f"(mode={park.get('control_mode')!r}, machines={park.get('machines_json')}). "
+                f"Check machine / Control Q at names."
+            )
+            lines.append(
+                f"#   cosphi_p_excitation={park.get('cosphi_p_excitation')!r}, "
+                f"OE={park.get('cosphi_p_oe_characteristic_json') or park.get('cosphi_p_characteristic_json')}, "
+                f"UE={park.get('cosphi_p_ue_characteristic_json')}"
+            )
+            lines.append("")
+
+    return run_control
+
+
+def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_voltage_angles=True, init='auto'):
+    """
+    Attach pandapower BinarySearchControl (+ optional DroopControl) for Electrisim ParkController
+    payloads (Electrisim ParkController steady-state plant control).
+    Returns number of park controllers successfully attached.
+    """
+    parks = _electrisim_collect_park_payloads(in_data)
+    if not parks:
+        return 0
+
+    try:
+        from pandapower.control.controller.station_control import BinarySearchControl, DroopControl
+    except ImportError:
+        print('[ParkController] pandapower station_control not available; skipping')
+        return 0
+
+    # Ensure Wind Turbine / SGen P–Q capability curves are on the net when parks use them
+    if any(_park_truthy(p.get('use_q_capability', True), True) for p in parks):
+        try:
+            apply_sgen_q_capability_curves(net, in_data, rpc_use_diagram_curves=True)
+        except Exception as ex:
+            print(f'[ParkController] Q capability curve apply skipped: {ex}')
+
+    # One uncontrolled solve so characteristics can use P/V measurements
+    need_seed = any(
+        (p.get('control_mode') in ('Reactive Power Control', 'Power Factor Control') and
+         (str(p.get('q_control_type') or '').startswith('Q(') or
+          str(p.get('pf_control_type') or '').startswith('cosphi(')))
+        or p.get('control_mode') == 'Power Factor Control'
+        or p.get('control_mode') == 'tan(phi) Control'
+        for p in parks
+    )
+    if need_seed:
+        try:
+            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles,
+                     init=init, run_control=False)
+        except Exception as ex:
+            print(f'[ParkController] seed load flow failed (continuing with setpoints only): {ex}')
+    net._electrisim_export_park_need_seed = need_seed
+
+    attached = 0
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+
+    for park in parks:
+        machines = _park_parse_json_list(park.get('machines_json'))
+        idxs, insvc, dist, resp = _park_resolve_sgen_indices(
+            net, machines, park.get('distribution_method'))
+        if not idxs:
+            print(f"[ParkController] '{park.get('name')}': no connected sgen machines resolved; skipped")
+            continue
+
+        use_q_cap = _park_truthy(park.get('use_q_capability', True), True)
+        if use_q_cap:
+            n_lim = _park_apply_machine_q_capability_limits(net, idxs)
+            if n_lim:
+                print(
+                    f"[ParkController] '{park.get('name')}': applied P–Q capability limits "
+                    f"to {n_lim}/{len(idxs)} machines (enforce_q_lims)"
+                )
+            # Recompute distribution after limits are on the sgen table
+            idxs, insvc, dist, resp = _park_resolve_sgen_indices(
+                net, machines, park.get('distribution_method'))
+
+        mode = str(park.get('control_mode') or 'Voltage Control')
+        q_resp_same = str(park.get('q_change_response') or 'same').lower() != 'opposite'
+        gen_Q_response = [1 if q_resp_same else -1] * len(idxs)
+
+        voltage_ctrl = False
+        set_point = 0.0
+        input_element = 'res_bus'
+        input_variable = 'vm_pu'
+        input_element_index = None
+        bus_idx = None
+
+        if mode == 'Voltage Control':
+            voltage_ctrl = True
+            bus_name = park.get('controlled_bus') or park.get('target_bus')
+            bus_idx = _park_find_by_name(net.bus, bus_name, ufn)
+            if bus_idx is None and str(park.get('node_selection') or '') == 'Automatic Selection':
+                # nearest high-voltage bus among machine buses
+                try:
+                    buses = [int(net.sgen.at[i, 'bus']) for i in idxs]
+                    bus_idx = max(buses, key=lambda b: float(net.bus.at[b, 'vn_kv']))
+                except Exception:
+                    bus_idx = idxs and int(net.sgen.at[idxs[0], 'bus'])
+            if bus_idx is None:
+                print(f"[ParkController] '{park.get('name')}': controlled bus not found; skipped")
+                continue
+            input_element = 'res_bus'
+            input_variable = 'vm_pu'
+            input_element_index = bus_idx
+            set_point = safe_float(park.get('vm_set_pu'), 1.0)
+            if str(park.get('uset_mode') or '') == 'bus target voltage':
+                # Prefer bus.vn or existing vm if column present — keep explicit vm_set_pu
+                pass
+
+        elif mode == 'Reactive Power Control':
+            voltage_ctrl = False
+            boundary = park.get('control_q_at') or ''
+            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            if input_element is None:
+                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                continue
+            q_type = str(park.get('q_control_type') or 'Const. Q')
+            if q_type == 'Const. Q':
+                set_point = safe_float(park.get('q_set_mvar'), 0.0)
+            elif q_type.startswith('Q(V)'):
+                vm = 1.0
+                cb = _park_find_by_name(net.bus, park.get('controlled_bus') or park.get('target_bus') or boundary, ufn)
+                if cb is not None and hasattr(net, 'res_bus') and not net.res_bus.empty and cb in net.res_bus.index:
+                    vm = float(net.res_bus.at[cb, 'vm_pu'])
+                set_point = _park_interp_xy(_park_parse_json_list(park.get('qv_characteristic_json')),
+                                           'vm_pu', 'q_mvar', vm)
+                if set_point is None:
+                    set_point = 0.0
+            else:  # Q(P)
+                p_m, _q_m = _park_measure_p_q_at(net, boundary)
+                set_point = _park_interp_xy(_park_parse_json_list(park.get('qp_characteristic_json')),
+                                           'p_mw', 'q_mvar', p_m if p_m is not None else 0.0)
+                if set_point is None:
+                    set_point = 0.0
+
+        elif mode == 'Power Factor Control':
+            voltage_ctrl = False
+            boundary = park.get('control_q_at') or ''
+            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            if input_element is None:
+                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                continue
+            p_m, q_m = _park_measure_p_q_at(net, boundary)
+            p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
+            pf_type = str(park.get('pf_control_type') or 'Const. cosphi')
+            if pf_type == 'Const. cosphi':
+                cos_phi = safe_float(park.get('cos_phi'), 1.0)
+                set_point = _park_q_from_cosphi(p_use, cos_phi)
+            elif pf_type.startswith('cosphi(P)'):
+                branch = _park_pick_cosphi_p_branch(park, q_m)
+                cos_phi = _park_interp_xy(_park_cosphi_p_points(park, branch),
+                                          'p_mw', 'cos_phi', abs(p_use) if p_use is not None else 0.0)
+                if cos_phi is None:
+                    cos_phi = 1.0
+                q_mag = abs(_park_q_from_cosphi(abs(p_use) if p_use is not None else 0.0, cos_phi))
+                set_point = q_mag if branch == 'oe' else -q_mag
+            else:
+                # Prefer V at Control Q bus when boundary is a busbar
+                cb = _park_find_by_name(
+                    net.bus,
+                    park.get('controlled_bus') or park.get('target_bus') or boundary,
+                    ufn,
+                )
+                vm = 1.0
+                if cb is not None and hasattr(net, 'res_bus') and cb in net.res_bus.index:
+                    vm = float(net.res_bus.at[cb, 'vm_pu'])
+                cos_phi = _park_interp_xy(_park_parse_json_list(park.get('cosphi_v_characteristic_json')),
+                                          'vm_pu', 'cos_phi', vm)
+                if cos_phi is None:
+                    cos_phi = 1.0
+                set_point = _park_q_from_cosphi(p_use, cos_phi)
+
+        elif mode == 'tan(phi) Control':
+            voltage_ctrl = False
+            boundary = park.get('control_q_at') or ''
+            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            if input_element is None:
+                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                continue
+            p_m, _q_m = _park_measure_p_q_at(net, boundary)
+            p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
+            set_point = float(p_use) * safe_float(park.get('tan_phi'), 0.0)
+        else:
+            print(f"[ParkController] '{park.get('name')}': unknown mode {mode!r}; skipped")
+            continue
+
+        # Clamp plant Q setpoint to sum of machine P–Q capability at current P
+        if use_q_cap and not voltage_ctrl:
+            qmin_sum = 0.0
+            qmax_sum = 0.0
+            have_lim = False
+            for i in idxs:
+                q_mi, q_ma = _park_machine_q_limits(net, i)
+                if q_mi is None or q_ma is None:
+                    continue
+                have_lim = True
+                qmin_sum += float(q_mi)
+                qmax_sum += float(q_ma)
+            if have_lim:
+                sp0 = float(set_point)
+                set_point = min(max(sp0, qmin_sum), qmax_sum)
+                if abs(set_point - sp0) > 1e-6:
+                    print(
+                        f"[ParkController] '{park.get('name')}': Q set_point {sp0:.4f} → {set_point:.4f} Mvar "
+                        f"(clamped to plant capability [{qmin_sum:.4f}, {qmax_sum:.4f}])"
+                    )
+
+        try:
+            bsc = BinarySearchControl(
+                net,
+                True,
+                'sgen',
+                'q_mvar',
+                idxs,
+                insvc,
+                dist,
+                input_element,
+                input_variable,
+                input_element_index,
+                float(set_point),
+                voltage_ctrl,
+                name=str(park.get('name') or 'ParkController'),
+                gen_Q_response=gen_Q_response,
+                bus_idx=bus_idx if voltage_ctrl else None,
+                tol=0.001,
+                in_service=True,
+                order=0,
+                level=0,
+            )
+            # Locate controller index for droop chaining
+            ctrl_idx = None
+            droop_spec = None
+            if hasattr(net, 'controller') and not net.controller.empty:
+                for ci in net.controller.index:
+                    if net.controller.at[ci, 'object'] is bsc:
+                        ctrl_idx = ci
+                        break
+
+            if voltage_ctrl and _park_truthy(park.get('enable_droop'), False) and ctrl_idx is not None:
+                droop_pct = safe_float(park.get('droop_percent'), 0.0)
+                q_rated = safe_float(park.get('q_rated_mvar'), 0.0)
+                if droop_pct > 1e-9 and q_rated > 1e-9:
+                    q_droop_mvar = q_rated * 100.0 / droop_pct  # Mvar / p.u.
+                    droop_spec = {
+                        'q_droop_mvar': float(q_droop_mvar),
+                        'bus_idx': bus_idx,
+                        'vm_set_pu_bsc': float(set_point),
+                        'name': str(park.get('name') or 'ParkController') + '_droop',
+                    }
+                    DroopControl(
+                        net,
+                        q_droop_mvar,
+                        bus_idx,
+                        ctrl_idx,
+                        True,
+                        tol=1e-6,
+                        vm_set_pu_bsc=float(set_point),
+                        name=str(park.get('name') or 'ParkController') + '_droop',
+                        in_service=True,
+                        order=-1,
+                        level=0,
+                    )
+            if not hasattr(net, '_electrisim_export_park_specs'):
+                net._electrisim_export_park_specs = []
+            net._electrisim_export_park_specs.append({
+                'name': str(park.get('name') or 'ParkController'),
+                'control_mode': mode,
+                'pf_control_type': str(park.get('pf_control_type') or ''),
+                'cosphi_p_excitation': str(park.get('cosphi_p_excitation') or ''),
+                'distribution_method': str(park.get('distribution_method') or ''),
+                'idxs': [int(x) for x in idxs],
+                'insvc': [bool(x) for x in insvc],
+                'dist': [float(x) for x in dist],
+                'input_element': str(input_element),
+                'input_variable': str(input_variable),
+                'input_element_index': input_element_index,
+                'set_point': float(set_point),
+                'voltage_ctrl': bool(voltage_ctrl),
+                'gen_Q_response': [int(x) for x in gen_Q_response],
+                'bus_idx': bus_idx,
+                'controller_idx': int(ctrl_idx) if ctrl_idx is not None else None,
+                'droop': droop_spec,
+            })
+            attached += 1
+            print(f"[ParkController] attached '{park.get('name')}' mode={mode} setpoint={set_point} sgens={idxs}")
+        except Exception as ex:
+            print(f"[ParkController] attach failed for '{park.get('name')}': {ex}")
+
+    return attached
+
+
+
 def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None,
               run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
             #pandapower - rozpływ mocy
@@ -3516,7 +5078,11 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Check for isolated buses before running power flow
                 isolated_buses = pp.topology.unsupplied_buses(net)
                 if len(isolated_buses) > 0:
-                    raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
+                    isolated_refs = resolve_element_refs(net, 'bus', isolated_buses)
+                    isolated_names = [r.get('name') or r.get('id') or str(r.get('index')) for r in isolated_refs]
+                    raise ValueError(
+                        f"Isolated buses found: {', '.join(isolated_names)}. Check your network connectivity."
+                    )
                 
                 # DiscreteTapControl + DiscreteShuntController (per-family flags from UI)
                 rc2 = bool(run_control_trafo2w)
@@ -3533,13 +5099,23 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Do not require run_control_shunt — that flag is for DiscreteShuntController and users often
                 # leave it off while still expecting Line P bands to drive step.
                 attach_lf_sh = bool(lf_shunt_list)
-                run_pp_control = attach_2w or attach_3w or attach_sh_disc or attach_lf_sh
+                park_attached = 0
+                try:
+                    park_attached = _electrisim_attach_park_controllers(
+                        net, in_data, algorithm=algorithm,
+                        calculate_voltage_angles=calculate_voltage_angles, init=init
+                    )
+                except Exception as park_ex:
+                    print(f"[ParkController] attach error: {park_ex}")
+                    park_attached = 0
+                run_pp_control = attach_2w or attach_3w or attach_sh_disc or attach_lf_sh or bool(park_attached)
                 if run_pp_control:
                     print(
                         f"Controllers active: 2w_tap={attach_2w} ({len(tc2_list)} configured), "
                         f"3w_tap={attach_3w} ({len(tc3_list)} configured), "
                         f"shunt_DiscreteShunt={attach_sh_disc} ({len(shunt_ctrl_list)} configured), "
-                        f"shunt_line_P={attach_lf_sh} ({len(lf_shunt_list)} configured)"
+                        f"shunt_line_P={attach_lf_sh} ({len(lf_shunt_list)} configured), "
+                        f"park={park_attached}"
                     )
                     if attach_2w:
                         for (trafo_idx, control_side, vm_lower_pu, vm_upper_pu) in tc2_list:
@@ -3943,51 +5519,66 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             unsupplied_buses_list = [int(x) for x in unsupplied_buses_set.tolist()]
                         else:
                             unsupplied_buses_list = [int(x) for x in list(unsupplied_buses_set)]
-                        
-                        # Find elements connected to unsupplied buses
-                        disconnected_elements = {
-                            "buses": unsupplied_buses_list,
-                            "trafos": [],
-                            "sgens": [],
-                            "loads": [],
-                            "generators": []
-                        }
-                        
+
+                        trafo_idxs = []
+                        line_idxs = []
+                        sgen_idxs = []
+                        load_idxs = []
+                        gen_idxs = []
+
                         # Find transformers connected to unsupplied buses
                         if hasattr(net, 'trafo') and not net.trafo.empty:
                             for trafo_idx in net.trafo.index:
                                 hv_bus = net.trafo.loc[trafo_idx, 'hv_bus']
                                 lv_bus = net.trafo.loc[trafo_idx, 'lv_bus']
                                 if hv_bus in unsupplied_buses_set or lv_bus in unsupplied_buses_set:
-                                    disconnected_elements["trafos"].append(int(trafo_idx))
-                        
+                                    trafo_idxs.append(int(trafo_idx))
+
+                        # Find lines connected to unsupplied buses
+                        if hasattr(net, 'line') and not net.line.empty:
+                            for line_idx in net.line.index:
+                                from_bus = net.line.loc[line_idx, 'from_bus']
+                                to_bus = net.line.loc[line_idx, 'to_bus']
+                                if from_bus in unsupplied_buses_set or to_bus in unsupplied_buses_set:
+                                    line_idxs.append(int(line_idx))
+
                         # Find static generators connected to unsupplied buses
                         if hasattr(net, 'sgen') and not net.sgen.empty:
                             for sgen_idx in net.sgen.index:
                                 if net.sgen.loc[sgen_idx, 'bus'] in unsupplied_buses_set:
-                                    disconnected_elements["sgens"].append(int(sgen_idx))
-                        
+                                    sgen_idxs.append(int(sgen_idx))
+
                         # Find loads connected to unsupplied buses
                         if hasattr(net, 'load') and not net.load.empty:
                             for load_idx in net.load.index:
                                 if net.load.loc[load_idx, 'bus'] in unsupplied_buses_set:
-                                    disconnected_elements["loads"].append(int(load_idx))
-                        
+                                    load_idxs.append(int(load_idx))
+
                         # Find generators connected to unsupplied buses
                         if hasattr(net, 'gen') and not net.gen.empty:
                             for gen_idx in net.gen.index:
                                 if net.gen.loc[gen_idx, 'bus'] in unsupplied_buses_set:
-                                    disconnected_elements["generators"].append(int(gen_idx))
-                        
-                        # Ensure all bus indices are native Python int (not numpy int64)
-                        disconnected_elements["buses"] = [int(x) for x in disconnected_elements["buses"]]
-                        disconnected_elements["trafos"] = [int(x) for x in disconnected_elements["trafos"]]
-                        disconnected_elements["sgens"] = [int(x) for x in disconnected_elements["sgens"]]
-                        disconnected_elements["loads"] = [int(x) for x in disconnected_elements["loads"]]
-                        disconnected_elements["generators"] = [int(x) for x in disconnected_elements["generators"]]
-                        
-                        total_disconnected = len(disconnected_elements["buses"]) + len(disconnected_elements["trafos"]) + len(disconnected_elements["sgens"]) + len(disconnected_elements["loads"]) + len(disconnected_elements["generators"])
-                        
+                                    gen_idxs.append(int(gen_idx))
+
+                        # Resolve indices to frontend names/ids for dialog + canvas highlight
+                        disconnected_elements = {
+                            "buses": resolve_element_refs(net, 'bus', unsupplied_buses_list),
+                            "lines": resolve_element_refs(net, 'line', line_idxs),
+                            "trafos": resolve_element_refs(net, 'trafo', trafo_idxs),
+                            "sgens": resolve_element_refs(net, 'sgen', sgen_idxs),
+                            "loads": resolve_element_refs(net, 'load', load_idxs),
+                            "generators": resolve_element_refs(net, 'gen', gen_idxs),
+                        }
+
+                        total_disconnected = (
+                            len(disconnected_elements["buses"])
+                            + len(disconnected_elements["lines"])
+                            + len(disconnected_elements["trafos"])
+                            + len(disconnected_elements["sgens"])
+                            + len(disconnected_elements["loads"])
+                            + len(disconnected_elements["generators"])
+                        )
+
                         diagnostic_response["diagnostic"]["disconnected_elements"] = disconnected_elements
                         diagnostic_response["diagnostic"]["total_disconnected_elements"] = int(total_disconnected)
                 except Exception as disconn_error:
@@ -3998,16 +5589,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 try:
                     isolated_buses = pp.topology.unsupplied_buses(net)
                     if len(isolated_buses) > 0:
-                        # Convert set to list and ensure all values are native Python int (not numpy int64)
-                        if isinstance(isolated_buses, set):
-                            isolated_list = [int(x) for x in isolated_buses]
-                        elif hasattr(isolated_buses, 'tolist'):
-                            isolated_list = [int(x) for x in isolated_buses.tolist()]
-                        else:
-                            isolated_list = [int(x) for x in list(isolated_buses)]
-                        
-                        diagnostic_response["diagnostic"]["isolated_buses"] = isolated_list
-                        diagnostic_response["diagnostic"]["num_isolated_buses"] = len(isolated_list)
+                        isolated_refs = resolve_element_refs(net, 'bus', isolated_buses)
+                        diagnostic_response["diagnostic"]["isolated_buses"] = isolated_refs
+                        diagnostic_response["diagnostic"]["num_isolated_buses"] = len(isolated_refs)
                 except Exception as isolated_error:
                     pass
                 
@@ -4075,6 +5659,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     elif "disconnected_elements" in diagnostic_response["diagnostic"]:
                         disconnected = diagnostic_response["diagnostic"]["disconnected_elements"]
                         num_buses = len(disconnected.get("buses", []))
+                        num_lines = len(disconnected.get("lines", []))
                         num_trafos = len(disconnected.get("trafos", []))
                         num_sgens = len(disconnected.get("sgens", []))
                         num_loads = len(disconnected.get("loads", []))
@@ -4083,6 +5668,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         elements_summary = []
                         if num_buses > 0:
                             elements_summary.append(f"{num_buses} bus(es)")
+                        if num_lines > 0:
+                            elements_summary.append(f"{num_lines} line(s)")
                         if num_trafos > 0:
                             elements_summary.append(f"{num_trafos} transformer(s)")
                         if num_sgens > 0:
@@ -5235,6 +6822,19 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result['tap_control_results'] = tap_control_results
                 if shunt_control_results:
                     result['shunt_control_results'] = shunt_control_results
+
+                # Park / Wind Turbine controller summaries for results export
+                try:
+                    park_ctrl_results = _electrisim_build_park_controller_results(net, in_data)
+                    if park_ctrl_results:
+                        result['park_controller_results'] = park_ctrl_results
+                    wtc_ss_results, wtc_dyn_results = _electrisim_build_wtc_controller_results(in_data)
+                    if wtc_ss_results:
+                        result['wind_turbine_controller_results'] = wtc_ss_results
+                    if wtc_dyn_results:
+                        result['wind_turbine_dynamic_controller_results'] = wtc_dyn_results
+                except Exception as ctrl_ex:
+                    print(f"[controllers export] summary build error: {ctrl_ex}")
                 
                 # Add any vm_pu validation warnings to the response
                 if hasattr(net, 'warnings') and net.warnings:
@@ -5299,14 +6899,14 @@ def analyze_shortcircuit_input_data(in_data):
                     'message': 'Set to a positive value. Right-click → Edit data → Short circuit parameters.'
                 })
 
-        # Static Generator with async/async_doubly_fed: sn_mva must be > 0
-        if typ and 'Static Generator' in typ:
+        # Static Generator / Wind Turbine with async/async_doubly_fed: sn_mva must be > 0
+        if typ and ('Static Generator' in typ or typ.startswith('Wind Turbine')):
             gen_type = (elem.get('generator_type') or '').lower()
             if gen_type in ('async', 'async_doubly_fed'):
                 sn_mva = _safe_float(elem.get('sn_mva'))
                 if sn_mva is None or sn_mva <= 0:
                     recommendations.append({
-                        'element_type': 'Static Generator',
+                        'element_type': 'Static Generator' if 'Static Generator' in typ else 'Wind Turbine',
                         'name': name,
                         'param': 'sn_mva',
                         'message': f'Set sn_mva (rated power) to a positive value, or change generator_type to "current_source" for PV inverters. Right-click → Edit data.'
@@ -5351,7 +6951,11 @@ def shortcircuit(net, in_data, in_data_full=None):
     
     isolated_buses = top.unsupplied_buses(net)
     if len(isolated_buses) > 0:
-        raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
+        isolated_refs = resolve_element_refs(net, 'bus', isolated_buses)
+        isolated_names = [r.get('name') or r.get('id') or str(r.get('index')) for r in isolated_refs]
+        raise ValueError(
+            f"Isolated buses found: {', '.join(isolated_names)}. Check your network connectivity."
+        )
     
     pp.diagnostic(net)
     
@@ -7909,104 +9513,95 @@ def process_diagnostic_data(net, diag_result_dict):
     
     return processed_diagnostic
 
+def _pp_element_table(net, element_type):
+    """Return pandapower element DataFrame for a diagnostic element type key."""
+    key = str(element_type or '').lower().rstrip('s')
+    # Normalize plural / alias keys from diagnostics
+    aliases = {
+        'buses': 'bus', 'bus': 'bus',
+        'lines': 'line', 'line': 'line',
+        'trafos': 'trafo', 'trafo': 'trafo',
+        'trafo3w': 'trafo3w', 'trafos3w': 'trafo3w',
+        'sgens': 'sgen', 'sgen': 'sgen',
+        'loads': 'load', 'load': 'load',
+        'generators': 'gen', 'gens': 'gen', 'gen': 'gen',
+        'ext_grid': 'ext_grid', 'ext_grids': 'ext_grid',
+        'storage': 'storage', 'storages': 'storage',
+        'shunt': 'shunt', 'shunts': 'shunt',
+    }
+    table_name = aliases.get(str(element_type or '').lower(), aliases.get(key, key))
+    if not hasattr(net, table_name):
+        return None
+    df = getattr(net, table_name)
+    if df is None or getattr(df, 'empty', True):
+        return None
+    return df
+
+
+def get_element_ref(net, element_type, element_index):
+    """
+    Resolve a pandapower element index to frontend identifiers.
+    Returns {index, id, name} where id is the technical mxCell_* name and
+    name is the user-friendly diagram name used in the UI.
+    """
+    try:
+        idx = int(element_index)
+    except (TypeError, ValueError):
+        return {
+            "index": element_index,
+            "id": str(element_index),
+            "name": str(element_type),
+        }
+
+    technical_id = None
+    try:
+        df = _pp_element_table(net, element_type)
+        if df is not None:
+            if idx in df.index and 'name' in df.columns:
+                technical_id = df.at[idx, 'name']
+            elif 0 <= idx < len(df) and 'name' in df.columns:
+                # Fallback for contiguous positional indices
+                technical_id = df.iloc[idx]['name']
+    except Exception:
+        technical_id = None
+
+    if technical_id is None or (isinstance(technical_id, float) and np.isnan(technical_id)):
+        technical_id = f"{element_type}_{idx}"
+    else:
+        technical_id = str(technical_id)
+
+    ufn_map = getattr(net, 'user_friendly_names', None) or {}
+    friendly = ufn_map.get(technical_id, technical_id)
+    if friendly is None or str(friendly).strip() == '':
+        friendly = technical_id
+
+    return {
+        "index": idx,
+        "id": technical_id,
+        "name": str(friendly),
+    }
+
+
+def resolve_element_refs(net, element_type, indices):
+    """Convert a list of pandapower indices to element ref dicts."""
+    refs = []
+    for raw in list(indices or []):
+        try:
+            refs.append(get_element_ref(net, element_type, raw))
+        except Exception:
+            refs.append({"index": raw, "id": str(raw), "name": str(raw)})
+    return refs
+
+
 def get_element_display_name(net, element_type, element_index):
     """
     Get user-friendly display name for an element based on its type and index
     """
     try:
-        # First, try to get the user-friendly name from net.user_friendly_names
-        if hasattr(net, 'user_friendly_names'):
-            if element_type == 'line':
-                if element_index < len(net.line):
-                    line_name = net.line.iloc[element_index]['name']
-                    if line_name in net.user_friendly_names:
-                        return net.user_friendly_names[line_name]
-            
-            elif element_type == 'bus':
-                if element_index < len(net.bus):
-                    bus_name = net.bus.iloc[element_index]['name']
-                    if bus_name in net.user_friendly_names:
-                        return net.user_friendly_names[bus_name]
-            
-            elif element_type == 'ext_grid':
-                if element_index < len(net.ext_grid):
-                    ext_grid_name = net.ext_grid.iloc[element_index]['name']
-                    if ext_grid_name in net.user_friendly_names:
-                        return net.user_friendly_names[ext_grid_name]
-            
-            elif element_type == 'trafo':
-                if element_index < len(net.trafo):
-                    trafo_name = net.trafo.iloc[element_index]['name']
-                    if trafo_name in net.user_friendly_names:
-                        return net.user_friendly_names[trafo_name]
-            
-            elif element_type == 'trafo3w':
-                if element_index < len(net.trafo3w):
-                    trafo3w_name = net.trafo3w.iloc[element_index]['name']
-                    if trafo3w_name in net.user_friendly_names:
-                        return net.user_friendly_names[trafo3w_name]
-            
-            elif element_type == 'gen':
-                if element_index < len(net.gen):
-                    gen_name = net.gen.iloc[element_index]['name']
-                    if gen_name in net.user_friendly_names:
-                        return net.user_friendly_names[gen_name]
-            
-            elif element_type == 'load':
-                if element_index < len(net.load):
-                    load_name = net.load.iloc[element_index]['name']
-                    if load_name in net.user_friendly_names:
-                        return net.user_friendly_names[load_name]
-        
-        # Fallback to the original name from the network dataframes
-        if element_type == 'line':
-            if element_index < len(net.line):
-                line_name = net.line.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return line_name
-        
-        elif element_type == 'bus':
-            if element_index < len(net.bus):
-                bus_name = net.bus.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return bus_name
-        
-        elif element_type == 'ext_grid':
-            if element_index < len(net.ext_grid):
-                ext_grid_name = net.ext_grid.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return ext_grid_name
-        
-        elif element_type == 'trafo':
-            if element_index < len(net.trafo):
-                trafo_name = net.trafo.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return trafo_name
-        
-        elif element_type == 'trafo3w':
-            if element_index < len(net.trafo3w):
-                trafo3w_name = net.trafo3w.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return trafo3w_name
-        
-        elif element_type == 'gen':
-            if element_index < len(net.gen):
-                gen_name = net.gen.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return gen_name
-        
-        elif element_type == 'load':
-            if element_index < len(net.load):
-                load_name = net.load.iloc[element_index]['name']
-                # Use the name directly (which is the user-provided ID like mxCell_138)
-                return load_name
-        
-        # Fallback for unknown element types
-        return f"{element_type.capitalize()} no. {element_index + 1}"
-        
-    except Exception as e:
-        # Fallback if any error occurs
-        return f"{element_type.capitalize()} no. {element_index + 1}"
+        ref = get_element_ref(net, element_type, element_index)
+        return ref.get('name') or ref.get('id') or f"{element_type} {element_index}"
+    except Exception:
+        return f"{str(element_type).capitalize()} no. {element_index}"
 
 def controller_simulation(net, controller_params):
     """
@@ -10485,6 +12080,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
 # OCR is one logical kind (DTOC/IDMT/IDTOC drives the subtype).
 _PROTECTION_KIND_OCR = "ocr"
 _PROTECTION_KIND_FUSE = "fuse"
+_PROTECTION_KIND_EARTH_FAULT = "earth_fault"
+_PROTECTION_KIND_DIRECTIONAL = "directional"
 _PROTECTION_KIND_DIFF = "differential"
 _PROTECTION_KIND_DIST = "distance"
 _PROTECTION_KIND_NONE = "none"
@@ -10502,6 +12099,15 @@ _VALID_OC_CURVE_TYPES = {
     "very_inverse",
     "extremely_inverse",
     "long_inverse",
+}
+
+# IEEE / ANSI curves are evaluated by Electrisim because pandapower's OCRelay
+# currently implements IEC 60255 curves only. Values use IEEE C37.112:
+# t = TMS * (A / (M ** p - 1) + B).
+_IEEE_OC_CURVES = {
+    "ieee_moderately_inverse": (0.0515, 0.114, 0.02),
+    "ieee_very_inverse": (19.61, 0.491, 2.0),
+    "ieee_extremely_inverse": (28.2, 0.1217, 2.0),
 }
 
 
@@ -10551,12 +12157,12 @@ def _prot_collect_switch_protection_specs(in_data):
         specs[str(sw_id)] = {
             'protection_type': protection_type,
             'oc_relay_type': str(row.get('oc_relay_type', 'DTOC') or 'DTOC').upper(),
-            'curve_type': str(row.get('curve_type', 'standard_inverse') or 'standard_inverse').lower(),
-            'tms': _prot_safe_float(row.get('tms'), 1.0),
-            't_grade': _prot_safe_float(row.get('t_grade'), 0.5),
-            't_gg': _prot_safe_float(row.get('t_gg'), 0.07),
-            't_g': _prot_safe_float(row.get('t_g'), 0.5),
-            't_diff': _prot_safe_float(row.get('t_diff'), 0.3),
+            'curve_type': str(row.get('curve_type') or '').lower(),
+            'tms': _prot_safe_float(row.get('tms')),
+            't_grade': _prot_safe_float(row.get('t_grade')),
+            't_gg': _prot_safe_float(row.get('t_gg')),
+            't_g': _prot_safe_float(row.get('t_g')),
+            't_diff': _prot_safe_float(row.get('t_diff')),
             'pickup_mode': str(row.get('pickup_mode', 'auto') or 'auto').lower(),
             'I_s_a': _prot_safe_float(row.get('I_s_a')),
             'I_g_a': _prot_safe_float(row.get('I_g_a')),
@@ -10565,13 +12171,47 @@ def _prot_collect_switch_protection_specs(in_data):
             'fuse_mode': str(row.get('fuse_mode', 'library') or 'library').strip().lower(),
             'fuse_custom_std_json': row.get('fuse_custom_std_json'),
             'rated_i_a': _prot_safe_float(row.get('rated_i_a')),
-            'overload_factor': _prot_safe_float(row.get('overload_factor'), 1.25),
-            'ct_current_factor': _prot_safe_float(row.get('ct_current_factor'), 1.2),
-            'safety_factor': _prot_safe_float(row.get('safety_factor'), 1.0),
+            'overload_factor': _prot_safe_float(row.get('overload_factor')),
+            'ct_current_factor': _prot_safe_float(row.get('ct_current_factor')),
+            'safety_factor': _prot_safe_float(row.get('safety_factor')),
+            'I_e_a': _prot_safe_float(row.get('I_e_a')),
+            't_e': _prot_safe_float(row.get('t_e')),
+            'directional_mode': str(row.get('directional_mode', 'forward') or 'forward').lower(),
+            'I_diff_a': _prot_safe_float(row.get('I_diff_a')),
+            'diff_slope': _prot_safe_float(row.get('diff_slope')),
+            'z1_r_ohm': _prot_safe_float(row.get('z1_r_ohm')),
+            'z1_x_ohm': _prot_safe_float(row.get('z1_x_ohm')),
+            'z2_r_ohm': _prot_safe_float(row.get('z2_r_ohm')),
+            'z2_x_ohm': _prot_safe_float(row.get('z2_x_ohm')),
+            'z3_r_ohm': _prot_safe_float(row.get('z3_r_ohm')),
+            'z3_x_ohm': _prot_safe_float(row.get('z3_x_ohm')),
+            't_z1': _prot_safe_float(row.get('t_z1')),
+            't_z2': _prot_safe_float(row.get('t_z2')),
+            't_z3': _prot_safe_float(row.get('t_z3')),
             'sw_id': str(sw_id),
             'sw_name': str(row.get('name', sw_id)),
             'user_friendly_name': str(row.get('userFriendlyName', row.get('name', sw_id))),
         }
+    return specs
+
+
+def _prot_merge_study_defaults(specs, prot_params):
+    """Fill omitted / blank switch settings from the study Grading tab."""
+    defaults = {
+        'curve_type': str(prot_params.get('curve_type', 'standard_inverse') or 'standard_inverse').lower(),
+        'tms': _prot_safe_float(prot_params.get('tms'), 1.0),
+        't_grade': _prot_safe_float(prot_params.get('t_grade'), 0.5),
+        't_gg': _prot_safe_float(prot_params.get('t_gg'), 0.07),
+        't_g': _prot_safe_float(prot_params.get('t_g'), 0.5),
+        't_diff': _prot_safe_float(prot_params.get('t_diff'), 0.3),
+        'overload_factor': _prot_safe_float(prot_params.get('overload_factor'), 1.25),
+        'ct_current_factor': _prot_safe_float(prot_params.get('ct_current_factor'), 1.2),
+        'safety_factor': _prot_safe_float(prot_params.get('safety_factor'), 1.0),
+    }
+    for spec in specs.values():
+        for key, value in defaults.items():
+            if spec.get(key) is None or spec.get(key) == '':
+                spec[key] = value
     return specs
 
 
@@ -10613,7 +12253,7 @@ def _prot_build_pickup_current_manual_df(spec):
     return pd.DataFrame(cols)
 
 
-def _prot_build_oc_relay_time_settings(spec):
+def _prot_build_oc_relay_time_settings(spec, grading_mode='auto', manual_time_settings=None):
     """Build the `time_settings` list expected by OCRelay for the chosen subtype."""
     subtype = spec.get('oc_relay_type', 'DTOC')
     t_gg = spec.get('t_gg', 0.07)
@@ -10621,6 +12261,8 @@ def _prot_build_oc_relay_time_settings(spec):
     t_diff = spec.get('t_diff', 0.3)
     tms = spec.get('tms', 1.0)
     t_grade = spec.get('t_grade', 0.5)
+    if grading_mode == 'manual' and manual_time_settings is not None:
+        return manual_time_settings
     if subtype == 'DTOC':
         return [t_gg, t_g, t_diff]
     if subtype == 'IDMT':
@@ -10628,6 +12270,27 @@ def _prot_build_oc_relay_time_settings(spec):
     if subtype == 'IDTOC':
         return [t_gg, t_g, t_diff, tms, t_grade]
     return [t_gg, t_g, t_diff]
+
+
+def _prot_build_manual_time_settings(net, specs, subtype):
+    """Return the per-switch DataFrame format expected by pandapower time_grading."""
+    rows = []
+    for sw_idx in net.switch.index:
+        matching = next(
+            (s for s in specs.values()
+             if _prot_resolve_sw_idx_for_id(net, s.get('sw_id')) == int(sw_idx)
+             and s.get('protection_type') == _PROTECTION_KIND_OCR
+             and s.get('oc_relay_type') == subtype),
+            None
+        )
+        matching = matching or {}
+        if subtype == 'IDMT':
+            rows.append({'switch_id': int(sw_idx), 'tms': matching.get('tms', 1.0),
+                         't_grade': matching.get('t_grade', 0.5)})
+        else:
+            rows.append({'switch_id': int(sw_idx), 't_gg': matching.get('t_gg', 0.07),
+                         't_g': matching.get('t_g', 0.5)})
+    return pd.DataFrame(rows)
 
 
 def _prot_ensure_bus_geodata(net):
@@ -10749,7 +12412,7 @@ def _prot_register_custom_fuse_std_types(net, specs):
     return errors
 
 
-def _attach_protection_devices(net, specs):
+def _attach_protection_devices(net, specs, grading_mode='auto'):
     """
     Instantiate pandapower protection devices for every collected spec. Returns a list of
     summaries (one per device) describing what was attached (or why it was skipped).
@@ -10779,6 +12442,11 @@ def _attach_protection_devices(net, specs):
         Fuse = _Fuse
     except ImportError:
         Fuse = None
+
+    manual_times = {
+        subtype: _prot_build_manual_time_settings(net, specs, subtype)
+        for subtype in _OC_SUBTYPE_TO_SWITCH_TYPE
+    } if grading_mode == 'manual' else {}
 
     for sw_id, spec in specs.items():
         sw_idx = _prot_resolve_sw_idx_for_id(net, sw_id)
@@ -10826,9 +12494,22 @@ def _attach_protection_devices(net, specs):
             except Exception:
                 pass
             curve_type = spec.get('curve_type', 'standard_inverse')
+            # IEEE curves use the Electrisim evaluator below, sharing the SC result
+            # and output pipeline with native relay / fuse devices.
+            if curve_type in _IEEE_OC_CURVES or (grading_mode == 'manual' and subtype == 'IDTOC'):
+                summaries.append({
+                    'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
+                    'user_friendly_name': spec.get('user_friendly_name'), 'sw_idx': int(sw_idx),
+                    'kind': 'OCR', 'subtype': subtype, 'curve_type': curve_type,
+                    'attached': True, 'custom_evaluator': 'ieee_oc' if curve_type in _IEEE_OC_CURVES else 'manual_idtoc',
+                    'not_computed': False, 'settings': dict(spec),
+                })
+                continue
             if curve_type not in _VALID_OC_CURVE_TYPES:
                 curve_type = 'standard_inverse'
-            time_settings = _prot_build_oc_relay_time_settings(spec)
+            time_settings = _prot_build_oc_relay_time_settings(
+                spec, grading_mode, manual_times.get(subtype)
+            )
             pickup_df = _prot_build_pickup_current_manual_df(spec)
             try:
                 kwargs = dict(
@@ -10844,9 +12525,11 @@ def _attach_protection_devices(net, specs):
                 if spec.get('safety_factor') is not None:
                     kwargs['safety_factor'] = float(spec['safety_factor'])
                 if pickup_df is not None:
-                    # OCRelay expects switch_id column to match the actual sw_idx.
-                    pickup_df = pickup_df.copy()
-                    pickup_df['switch_id'] = int(sw_idx)
+                    # OCRelay reads manual values using ``iloc[switch_index]``.
+                    # Supply every switch row (with this relay's settings) so a
+                    # relay on a non-zero switch index is addressed correctly.
+                    pickup_df = pd.concat([pickup_df] * len(net.switch), ignore_index=True)
+                    pickup_df['switch_id'] = list(net.switch.index)
                     kwargs['pickup_current_manual'] = pickup_df
                 OCRelay(net, **kwargs)
                 summaries.append({
@@ -10914,17 +12597,24 @@ def _attach_protection_devices(net, specs):
                     'reason': f'Fuse instantiation failed: {e}',
                 })
 
-        # --- Differential / Distance (stubs) ----------------------------------------
-        elif kind in (_PROTECTION_KIND_DIFF, _PROTECTION_KIND_DIST):
+        # --- Electrisim-side devices -----------------------------------------------
+        elif kind in (_PROTECTION_KIND_EARTH_FAULT, _PROTECTION_KIND_DIRECTIONAL,
+                      _PROTECTION_KIND_DIFF, _PROTECTION_KIND_DIST):
             summaries.append({
                 'switch_id': sw_id,
                 'switch_name': spec.get('sw_name'),
                 'user_friendly_name': spec.get('user_friendly_name'),
                 'sw_idx': int(sw_idx),
-                'kind': 'Differential' if kind == _PROTECTION_KIND_DIFF else 'Distance',
-                'attached': False,
-                'not_computed': True,
-                'reason': 'Differential (87) / Distance (21) is not modeled in pandapower. UI placeholder only.',
+                'kind': {
+                    _PROTECTION_KIND_EARTH_FAULT: 'Earth-fault OCR',
+                    _PROTECTION_KIND_DIRECTIONAL: 'Directional OCR',
+                    _PROTECTION_KIND_DIFF: 'Differential (87)',
+                    _PROTECTION_KIND_DIST: 'Distance (21)',
+                }[kind],
+                'attached': True,
+                'custom_evaluator': kind,
+                'not_computed': False,
+                'settings': dict(spec),
             })
         else:
             summaries.append({
@@ -11371,6 +13061,140 @@ def _prot_extract_short_circuit_at_bus(net_sc, bus_idx):
     return out
 
 
+def _prot_switch_current_ka(net_sc, sw_idx, fault_bus_idx=None):
+    """Best available branch current at a switch for Electrisim-side relays."""
+    try:
+        sw = net_sc.switch.loc[int(sw_idx)]
+        et, element = str(sw.get('et')), int(sw.get('element'))
+        table = {'l': 'res_line_sc', 't': 'res_trafo_sc', 't3': 'res_trafo3w_sc'}.get(et)
+        if table and hasattr(net_sc, table):
+            result = getattr(net_sc, table)
+            if element in result.index:
+                row = result.loc[element]
+                for col in ('ikss_ka', 'ikss_from_ka', 'ikss_to_ka',
+                            'ikss_hv_ka', 'ikss_lv_ka', 'ikss_mv_ka'):
+                    if col in row.index and pd.notna(row[col]):
+                        return abs(float(row[col]))
+    except Exception:
+        pass
+    if fault_bus_idx is not None:
+        return _prot_extract_short_circuit_at_bus(net_sc, fault_bus_idx).get('ikss_ka')
+    return None
+
+
+def _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx=None):
+    """Evaluate IEEE, earth-fault, directional, 87 and 21 devices from SC results."""
+    rows = []
+    for summary in attach_summaries:
+        evaluator = summary.get('custom_evaluator')
+        if not evaluator:
+            continue
+        spec = summary.get('settings', {})
+        current_ka = _prot_switch_current_ka(net_sc, summary.get('sw_idx'), fault_bus_idx)
+        current_a = (float(current_ka) * 1000.0) if current_ka is not None else None
+        tripped, t_trip, detail = False, None, {}
+
+        if evaluator in ('ieee_oc', 'manual_idtoc'):
+            pickup = spec.get('I_s_a') or spec.get('I_g_a')
+            if pickup is None or pickup <= 0:
+                pickup = max(1.0, (current_a or 0.0) / max(spec.get('overload_factor', 1.25), 1.0))
+            multiple = (current_a / pickup) if current_a and pickup else 0.0
+            if evaluator == 'ieee_oc':
+                a, b, p = _IEEE_OC_CURVES.get(spec.get('curve_type'), _IEEE_OC_CURVES['ieee_moderately_inverse'])
+                if multiple > 1.0:
+                    t_trip = float(spec.get('tms', 1.0)) * (a / (multiple ** p - 1.0) + b)
+                    tripped = math.isfinite(t_trip) and t_trip >= 0
+                detail = {'pickup_a': pickup, 'multiple': multiple}
+            else:
+                # pandapower cannot consume an IDTOC manual DataFrame; apply the
+                # same definite/inverse terms explicitly for this device.
+                if current_a and spec.get('I_gg_a') and current_a >= spec['I_gg_a']:
+                    t_trip, tripped = spec.get('t_gg', 0.07), True
+                elif current_a and spec.get('I_g_a') and current_a >= spec['I_g_a']:
+                    t_trip, tripped = spec.get('t_g', 0.5), True
+                elif multiple > 1.0:
+                    t_trip = spec.get('tms', 1.0) * 0.14 / (multiple ** 0.02 - 1.0) + spec.get('t_grade', 0.5)
+                    tripped = True
+                detail = {'pickup_a': pickup, 'multiple': multiple}
+        elif evaluator == _PROTECTION_KIND_EARTH_FAULT:
+            pickup = spec.get('I_e_a') or 1.0
+            # For a 1ph SC, Ikss is the fault-loop current and is the available
+            # residual-current estimate. Other fault types have no residual trip.
+            residual_a = current_a if fault_type == '1ph' else 0.0
+            tripped = residual_a >= pickup
+            t_trip = spec.get('t_e', 0.2) if tripped else None
+            detail = {'residual_current_a': residual_a, 'pickup_a': pickup}
+        elif evaluator == _PROTECTION_KIND_DIRECTIONAL:
+            # SC branch results contain magnitude but no reliable phasor angle in
+            # every pandapower version. Relay orientation is therefore the switch
+            # bus → protected element direction; it is reported with every trip.
+            pickup = spec.get('I_g_a') or spec.get('I_s_a') or 1.0
+            forward = True
+            requested = spec.get('directional_mode', 'forward')
+            tripped = current_a is not None and current_a >= pickup and (requested == 'forward') == forward
+            t_trip = spec.get('t_g', 0.5) if tripped else None
+            detail = {'orientation': 'switch bus -> protected element', 'direction': 'forward',
+                      'pickup_a': pickup}
+        elif evaluator == _PROTECTION_KIND_DIFF:
+            pickup = spec.get('I_diff_a') or 1.0
+            slope = spec.get('diff_slope') or 0.0
+            # A switch defines the protected boundary. Branch fault current is the
+            # operating current; half is a conservative restraint-current proxy.
+            operate = current_a or 0.0
+            restraint = operate / 2.0
+            tripped = operate >= pickup + slope * restraint
+            t_trip = spec.get('t_g', 0.03) if tripped else None
+            detail = {'i_operate_a': operate, 'i_restraint_a': restraint,
+                      'pickup_a': pickup, 'slope': slope}
+        elif evaluator == _PROTECTION_KIND_DIST:
+            z_base = None
+            try:
+                sw = net_sc.switch.loc[int(summary.get('sw_idx'))]
+                vn_kv = float(net_sc.bus.at[int(sw['bus']), 'vn_kv'])
+                z_base = (vn_kv / math.sqrt(3.0)) / current_ka if current_ka and current_ka > 0 else None
+            except Exception:
+                pass
+            zones = [
+                (1, spec.get('z1_r_ohm'), spec.get('z1_x_ohm'), spec.get('t_z1', 0.0)),
+                (2, spec.get('z2_r_ohm'), spec.get('z2_x_ohm'), spec.get('t_z2', 0.3)),
+                (3, spec.get('z3_r_ohm'), spec.get('z3_x_ohm'), spec.get('t_z3', 0.6)),
+            ]
+            reached = next(((n, r, x, delay) for n, r, x, delay in zones
+                            if z_base is not None and r is not None and x is not None
+                            and z_base <= math.hypot(r, x)), None)
+            tripped = reached is not None
+            t_trip = reached[3] if reached else None
+            detail = {'z_apparent_ohm': z_base, 'zone': reached[0] if reached else None}
+
+        rows.append({
+            'switch_idx': summary.get('sw_idx'), 'switch_id': summary.get('switch_id'),
+            'switch_name': summary.get('switch_name'),
+            'user_friendly_name': summary.get('user_friendly_name'),
+            'device': summary.get('kind'), 'device_kind': summary.get('kind'),
+            'is_fuse': False, 'tripped': bool(tripped), 't_trip_s': _prot_clean_scalar(t_trip),
+            't_melt_s': None, 'trip_melt_time_s': None, 'ikss_ka': _prot_clean_scalar(current_ka),
+            'activation_parameter_value': _prot_clean_scalar(current_ka),
+            'evaluation': detail,
+        })
+    return rows
+
+
+def _prot_append_custom_devices(devices, attach_summaries):
+    for summary in attach_summaries:
+        if not summary.get('custom_evaluator'):
+            continue
+        spec = summary.get('settings', {})
+        devices.append({
+            'switch_idx': summary.get('sw_idx'), 'switch_id': summary.get('switch_id'),
+            'switch_name': summary.get('switch_name'),
+            'user_friendly_name': summary.get('user_friendly_name'),
+            'type': summary.get('kind'), 'subtype': summary.get('subtype'),
+            'curve_type': summary.get('curve_type'), 'settings': spec,
+            'characteristic': {'i_a': [], 't_s': []},
+        })
+    return devices
+
+
 def _prot_resolve_fault_bus_idx(in_data, net, fault_bus_cell_id):
     """Map frontend bus cell id (diagram id) to pandapower bus index."""
     if fault_bus_cell_id in (None, ''):
@@ -11453,7 +13277,7 @@ def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_sum
             'fault_type': fault_type,
             'case': case,
             'short_circuit': sc_info,
-            'trip': [],
+            'trip': _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, int(fault_bus_idx)),
         }
 
     return {
@@ -11465,7 +13289,8 @@ def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_sum
         'fault_type': fault_type,
         'case': case,
         'short_circuit': sc_info,
-        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx),
+        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx)
+                + _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, int(fault_bus_idx)),
     }
 
 
@@ -11525,7 +13350,7 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
             'error': f'calculate_protection_times failed: {e}',
             'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
             'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
-            'trip': [],
+            'trip': _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus),
         }
 
     return {
@@ -11537,22 +13362,77 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
         'fault_type': fault_type,
         'case': case,
         'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
-        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx),
+        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx)
+                + _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus),
     }
 
 
-def _prot_check_miscoordination(scenarios, t_diff):
-    """
-    Identify primary/backup pairs whose `t_backup - t_primary < t_diff`.
-    For each scenario, sort tripped devices by t_trip_s and flag adjacent pairs.
-    """
+def _prot_bus_distances(net, starts):
+    """Unweighted bus distances through in-service lines and transformers."""
+    adjacency = {}
+    def connect(a, b):
+        adjacency.setdefault(int(a), set()).add(int(b))
+        adjacency.setdefault(int(b), set()).add(int(a))
+    for table, cols in (('line', ('from_bus', 'to_bus')), ('trafo', ('hv_bus', 'lv_bus'))):
+        data = getattr(net, table, None)
+        if data is None:
+            continue
+        for _, row in data.iterrows():
+            if bool(row.get('in_service', True)):
+                connect(row[cols[0]], row[cols[1]])
+    distance, queue = {}, [int(x) for x in starts if x is not None]
+    for x in queue:
+        distance[x] = 0
+    for bus in queue:
+        for adjacent in adjacency.get(bus, ()):
+            if adjacent not in distance:
+                distance[adjacent] = distance[bus] + 1
+                queue.append(adjacent)
+    return distance
+
+
+def _prot_scenario_fault_buses(net, scenario):
+    if scenario.get('fault_bus_idx') in net.bus.index:
+        return [scenario['fault_bus_idx']]
+    line_id = scenario.get('sc_line_id')
+    if line_id in getattr(net, 'line', pd.DataFrame()).index:
+        row = net.line.loc[line_id]
+        return [int(row['from_bus']), int(row['to_bus'])]
+    return []
+
+
+def _prot_check_miscoordination(net, scenarios, t_diff):
+    """Check only primary/backup devices that lie on a source-to-fault path."""
     miscoord = []
+    sources = list(getattr(net, 'ext_grid', pd.DataFrame()).get('bus', []))
+    source_distance = _prot_bus_distances(net, sources)
     for scenario in scenarios:
+        fault_buses = _prot_scenario_fault_buses(net, scenario)
+        fault_distance = _prot_bus_distances(net, fault_buses)
         trips = [t for t in scenario.get('trip', []) if t.get('tripped') and t.get('t_trip_s') is not None]
-        trips.sort(key=lambda r: r['t_trip_s'])
+        on_path = []
+        source_to_fault = min((source_distance.get(b, float('inf')) for b in fault_buses), default=float('inf'))
+        for trip in trips:
+            try:
+                sw = net.switch.loc[int(trip['switch_idx'])]
+                bus = int(sw['bus'])
+                ds, df = source_distance.get(bus), fault_distance.get(bus)
+                # A protection point is on a shortest supplied path when its
+                # source/fault distances add up to the path length (allow one
+                # hop because a switch is attached to a line terminal).
+                if ds is not None and df is not None and ds + df <= source_to_fault + 1:
+                    trip['_fault_distance'] = df
+                    on_path.append(trip)
+            except Exception:
+                continue
+        # Closer-to-fault relay is primary; only its immediate upstream relay is
+        # a valid backup. Devices on other feeders are deliberately excluded.
+        trips = sorted(on_path, key=lambda r: (r['_fault_distance'], r['t_trip_s']))
         for i in range(len(trips) - 1):
             primary = trips[i]
             backup = trips[i + 1]
+            if primary['_fault_distance'] == backup['_fault_distance']:
+                continue
             delta_t = float(backup['t_trip_s']) - float(primary['t_trip_s'])
             if delta_t < t_diff:
                 miscoord.append({
@@ -11567,6 +13447,7 @@ def _prot_check_miscoordination(scenarios, t_diff):
                     'backup_t_s': backup.get('t_trip_s'),
                     'delta_t_s': delta_t,
                     'required_t_diff_s': float(t_diff),
+                    'topology_path': True,
                 })
     return miscoord
 
@@ -11592,6 +13473,9 @@ def protection_coordination(net, prot_params, in_data):
         if not (0.0 < sc_fraction < 1.0):
             sc_fraction = 0.5
         t_diff = float(prot_params.get('t_diff', 0.3))
+        grading_mode = str(prot_params.get('grading_mode', 'auto') or 'auto').lower()
+        if grading_mode not in ('auto', 'manual'):
+            grading_mode = 'auto'
 
         # Validate connectivity early so we surface a clear message before sc.calc_sc.
         isolated_buses = top.unsupplied_buses(net)
@@ -11615,6 +13499,7 @@ def protection_coordination(net, prot_params, in_data):
 
         # Attach protection devices based on the frontend Switch attributes.
         specs = _prot_collect_switch_protection_specs(in_data)
+        _prot_merge_study_defaults(specs, prot_params)
         if not specs:
             return json.dumps({
                 'error': True,
@@ -11628,7 +13513,7 @@ def protection_coordination(net, prot_params, in_data):
         # create_sc_bus and time_grading do not raise on missing coordinates.
         _prot_ensure_bus_geodata(net)
 
-        attach_summaries = _attach_protection_devices(net, specs)
+        attach_summaries = _attach_protection_devices(net, specs, grading_mode)
         attached_count = sum(1 for s in attach_summaries if s.get('attached'))
         not_computed_count = sum(1 for s in attach_summaries if s.get('not_computed'))
 
@@ -11685,8 +13570,9 @@ def protection_coordination(net, prot_params, in_data):
 
         # Sample characteristics on the unmodified net so curves do not include the sc_bus.
         devices = _prot_extract_devices_for_ui(net, attach_summaries)
+        _prot_append_custom_devices(devices, attach_summaries)
 
-        miscoord = _prot_check_miscoordination(scenarios, t_diff)
+        miscoord = _prot_check_miscoordination(net, scenarios, t_diff)
 
         n_tripped = sum(1 for sc_res in scenarios for trip in sc_res.get('trip', []) if trip.get('tripped'))
         response = {
@@ -11704,11 +13590,17 @@ def protection_coordination(net, prot_params, in_data):
                 'n_miscoordination': len(miscoord),
                 'fault_type': fault_type,
                 'case': case,
+                'grading_mode': grading_mode,
                 'fault_location_mode': fault_location_mode,
                 't_diff_s': t_diff,
                 **({'scenario_warning': scenario_warning} if scenario_warning else {}),
             },
             'miscoordination': miscoord,
+            'output': {
+                'show_curves': bool(prot_params.get('show_curves', True)),
+                'show_table': bool(prot_params.get('show_table', True)),
+                'show_miscoordination': bool(prot_params.get('show_miscoordination', True)),
+            },
         }
         if scenario_warning:
             response['warning'] = scenario_warning

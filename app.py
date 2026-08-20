@@ -71,6 +71,23 @@ def simulation():
        
         Busbars = {}
         
+        # DG Interconnection Screening (OpenDSS)
+        if 'dg_interconnection_params' in in_data and 'DgInterconnectionOpenDss' in str(
+                in_data.get('dg_interconnection_params', {}).get('typ', '')):
+            user_email = in_data.get('dg_interconnection_params', {}).get('user_email', 'unknown@user.com')
+            print(f"=== DG INTERCONNECTION SCREENING REQUESTED BY USER: {user_email} ===")
+            dg_params = in_data.get('dg_interconnection_params', {})
+            response_data = opendss_electrisim.dg_interconnection_screening(in_data, dg_params)
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                return response
+            return response_data
+
         # Check for BESS sizing request first (it's in a nested structure)
         if 'bess_sizing_params' in in_data and in_data.get('bess_sizing_params', {}).get('typ') == 'BessSizingPandaPower':
             # Extract user email for logging
@@ -457,6 +474,20 @@ def simulation():
                 else:
                     return response_data
            
+            if "DgInterconnectionOpenDss" in in_data[x]['typ']:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== DG INTERCONNECTION SCREENING REQUESTED BY USER: {user_email} ===")
+                response_data = opendss_electrisim.dg_interconnection_screening(in_data, in_data[x])
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
+
             if "PowerFlowOpenDss" in in_data[x]['typ']:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
@@ -474,6 +505,9 @@ def simulation():
                 tolerance = float(in_data[x].get('tolerance', 0.0001))  # Convergence tolerance
                 controlmode = in_data[x].get('controlmode', 'Static')  # Control mode (Static, Event, Time)
                 export_commands = in_data[x].get('exportCommands', False)  # Export OpenDSS commands flag
+                monte_carlo_number = in_data[x].get('monteCarloNumber', 100)
+                monte_carlo_random = in_data[x].get('monteCarloRandom', 'Uniform')
+                monte_carlo_hour = in_data[x].get('monteCarloHour')
                 
                 # For backwards compatibility, default to standard power flow when analysisType is missing
                 if str(analysis_type).lower() == 'harmonic':
@@ -500,7 +534,10 @@ def simulation():
                         max_iterations, 
                         tolerance, 
                         controlmode,
-                        export_commands
+                        export_commands,
+                        monte_carlo_number,
+                        monte_carlo_random,
+                        monte_carlo_hour
                     )
                 
                 # Check if client accepts gzip compression
@@ -1946,6 +1983,34 @@ def import_opendss():
             single_phase = _detect_single_phase_model()
             opendss_1ph_bundle = _build_opendss_1ph_import_tables() if single_phase else None
 
+            # Control classes are not exposed consistently by all OpenDSSDirect
+            # bindings, so retain their authored properties from the DSS source.
+            def _import_control_rows(class_name, properties):
+                rows = []
+                pattern = rf'^\s*(?:new|edit)\s+{class_name}\.([^\s]+)\s+([^\r\n!]*)'
+                for match in re.finditer(pattern, dss_text_to_use, re.IGNORECASE | re.MULTILINE):
+                    values = []
+                    text = match.group(2)
+                    for prop, default in properties:
+                        value_match = re.search(rf'(?<!\w){re.escape(prop)}\s*=\s*(?:\[([^\]]*)\]|([^\s]+))', text, re.IGNORECASE)
+                        values.append((value_match.group(1) or value_match.group(2)) if value_match else default)
+                    rows.append([match.group(1)] + values)
+                return rows
+
+            regcontrols = _import_control_rows('RegControl', [
+                ('Transformer', ''), ('Winding', '2'), ('VReg', '120'), ('Band', '3'),
+                ('PTRatio', '60'), ('CTPrim', '300'), ('Delay', '15'), ('Enabled', 'yes')
+            ])
+            capcontrols = _import_control_rows('CapControl', [
+                ('Capacitor', ''), ('Type', 'Voltage'), ('ONSetting', '115'),
+                ('OFFSetting', '125'), ('CTRatio', '1'), ('PTRatio', '1'),
+                ('Delay', '15'), ('Enabled', 'yes')
+            ])
+            storagecontrollers = _import_control_rows('StorageController', [
+                ('ElementList', ''), ('Element', ''), ('Mode', 'PeakShave'),
+                ('kWTarget', '0'), ('%Reserve', '20'), ('Enabled', 'yes')
+            ])
+
             # Compose structure similar to example_simple.json
             model = {
                 "_object": {
@@ -2000,6 +2065,9 @@ def import_opendss():
                             "data": pvsystems
                         })
                     },
+                    "regcontrol": {"_object": _json.dumps({"data": regcontrols})},
+                    "capcontrol": {"_object": _json.dumps({"data": capcontrols})},
+                    "storagecontroller": {"_object": _json.dumps({"data": storagecontrollers})},
                     "line_1ph": {
                         "_object": _json.dumps({
                             "data": opendss_1ph_bundle['line_1ph'] if opendss_1ph_bundle else []

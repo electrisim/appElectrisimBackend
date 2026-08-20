@@ -182,7 +182,7 @@ class StoragesOut(object):
         self.storages = storages
 
 class PVSystemOut(object):
-    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, vm_pu: float, va_degree: float, irradiance: float, temperature: float):
+    def __init__(self, name: str, id: str, p_mw: float, q_mvar: float, vm_pu: float, va_degree: float, irradiance: float, temperature: float, inv_control_mode: str = ''):
         self.name = name
         self.id = id
         self.p_mw = p_mw
@@ -191,6 +191,7 @@ class PVSystemOut(object):
         self.va_degree = va_degree
         self.irradiance = irradiance
         self.temperature = temperature
+        self.inv_control_mode = inv_control_mode
 
 class PVSystemsOut(object):
     def __init__(self, pvsystems: List[PVSystemOut]):
@@ -742,7 +743,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             elif element_type.startswith("Motor"):
                 # Motors are modeled as Loads in OpenDSS
                 create_load_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command)
-            elif element_type.startswith("Static Generator"):
+            elif element_type.startswith("Static Generator") or element_type.startswith("Wind Turbine"):
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
             elif element_type.startswith("Asymmetric Static Generator"):
                 create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command)
@@ -772,6 +773,36 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
         except Exception as e:
             continue
 
+    # Seventh pass: create OpenDSS control elements after their controlled equipment exists.
+    # These are not electrical terminals, so their canvas attachment is a reference rather
+    # than a bus connection.
+    for x in in_data:
+        try:
+            element_data = in_data[x]
+            element_type = element_data.get('typ', '')
+            element_name = _sanitize_opendss_name(element_data.get('name', ''))
+            element_id = element_data.get('id', '')
+            if element_type.startswith('RegControl'):
+                create_regcontrol_element(
+                    dss, element_data, element_name, element_id, TransformersDict,
+                    TransformersDictId, BusbarsDictConnectionToName, execute_dss_command, in_data)
+            elif element_type.startswith('CapControl'):
+                create_capcontrol_element(
+                    dss, element_data, element_name, element_id, CapacitorsDict,
+                    CapacitorsDictId, BusbarsDictConnectionToName, execute_dss_command, in_data)
+            elif element_type.startswith('StorageController'):
+                create_storagecontroller_element(
+                    dss, element_data, element_name, element_id, StoragesDict,
+                    StoragesDictId, execute_dss_command)
+            elif element_type.startswith('WindTurbineController'):
+                # Pref applied to linked Wind Turbine on the frontend for snapshot studies.
+                pass
+        except ValueError:
+            raise
+        except Exception as e:
+            print(f'[OpenDSS] Control element creation failed: {e}')
+            continue
+
     # After all elements: set voltage bases and run calcv so OpenDSS assigns correct base kV
     # to every bus (including those with PVSystems/Loads). Running calcv before power
     # injection elements can leave the first solve at zero power until the circuit is rebuilt.
@@ -789,7 +820,7 @@ def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectio
             StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
             circuit_source_element_name)
 
-# Individual element creation functions — OpenDSS single-phase elements
+# Individual element creation functions - OpenDSS single-phase elements
 def create_load_1ph_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, LoadsDict, LoadsDictId, created_elements, execute_dss_command=None):
     if element_name in created_elements:
         return
@@ -1539,6 +1570,43 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         pass
 def create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
     """Create a static generator element in OpenDSS"""
+
+    # Wind Turbine: derive p_mw from wind speed + power curve when present
+    typ = str(element_data.get('typ') or '')
+    if typ.startswith('Wind Turbine'):
+        raw = element_data.get('wind_power_curve_json')
+        if raw is not None and (not isinstance(raw, str) or str(raw).strip()):
+            try:
+                points = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(points, list) and len(points) >= 2:
+                    v = float(element_data.get('wind_speed_ms'))
+                    approx = str(element_data.get('wind_curve_approx') or 'linear').strip().lower()
+                    knots = sorted(
+                        ((float(pt['v_ms']), float(pt['p_mw'])) for pt in points if isinstance(pt, dict)),
+                        key=lambda x: x[0]
+                    )
+                    if len(knots) >= 2:
+                        if v <= knots[0][0]:
+                            element_data['p_mw'] = knots[0][1]
+                        elif v >= knots[-1][0]:
+                            element_data['p_mw'] = knots[-1][1]
+                        elif approx == 'constant':
+                            for i in range(len(knots) - 1):
+                                v0, p0 = knots[i]
+                                v1, _p1 = knots[i + 1]
+                                if v0 <= v < v1:
+                                    element_data['p_mw'] = p0
+                                    break
+                        else:
+                            for i in range(len(knots) - 1):
+                                v0, p0 = knots[i]
+                                v1, p1 = knots[i + 1]
+                                if v0 <= v <= v1:
+                                    span = v1 - v0
+                                    element_data['p_mw'] = p0 if abs(span) < 1e-12 else p0 + (v - v0) / span * (p1 - p0)
+                                    break
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+                pass
     
     # Check for duplicates - skip if already created
     if element_name in created_elements:
@@ -1626,7 +1694,7 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                     cmd = f'Generator.{gen_name}.enabled=no'
                     print(f"[OpenDSS] {cmd}")
                     dss.Text.Command(cmd)
-                # print(f"✓ Command: {gen_cmd}")  # Reduced logging
+                # print(f"? Command: {gen_cmd}")  # Reduced logging
                 
                 # Store in GeneratorsDict
                 GeneratorsDict[element_name] = gen_name
@@ -1658,7 +1726,7 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
         bus_voltage = BusbarsDictVoltage.get(bus_name)
         
         if bus_voltage is None:
-             #  ✗ Generator {element_name} cannot be created - no voltage information for bus {bus_name})
+             #  ? Generator {element_name} cannot be created - no voltage information for bus {bus_name})
             return         
         # Get generator parameters with proper null handling
         p_mw_raw = element_data.get('p_mw')
@@ -1900,7 +1968,7 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
         i0_percent = float(element_data.get('i0_percent', 0))
         vector_group = element_data.get('vector_group', 'YNdd')
 
-        # Base conversion — this is the subtle one.
+        # Base conversion - this is the subtle one.
         #
         # Pandapower trafo3w (https://pandapower.readthedocs.io/en/latest/elements/trafo3w.html)
         # defines each per-pair short-circuit voltage on the MIN apparent power of the pair:
@@ -1952,7 +2020,7 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
 
         conns = vector_group_to_opendss_conns_3w(vector_group)
 
-        # OLTC taps — must match create_transformer_element (2w) and pandapower_electrisim 3w branch.
+        # OLTC taps - must match create_transformer_element (2w) and pandapower_electrisim 3w branch.
         # Previously 3w transformers were always exported at Taps=1, which skewed voltages and slack Q.
         tap_pos_raw = element_data.get('tap_pos', '0')
         tap_step_percent_raw = element_data.get('tap_step_percent', '1.5')
@@ -2251,7 +2319,7 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         
         
         # OpenDSS Reactor element: constant impedance (kV + kvar), matches pandapower shunt.
-        # Optional Rp = V_LL² / P_total for no-load losses when p_mw > 0.
+        # Optional Rp = V_LL^2 / P_total for no-load losses when p_mw > 0.
         # Sign convention (aligned with pandapower create_shunt):
         #   q_mvar > 0  -> inductive (absorbs Q)  -> OpenDSS Reactor with kvar > 0
         #   q_mvar < 0  -> capacitive (delivers Q) -> model as OpenDSS Capacitor
@@ -2342,7 +2410,7 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
             
             # Check if required parameter is present
             if q_mvar_raw is None:
-               # ✗ Capacitor {element_name} cannot be created - missing q_mvar parameter")
+               # ? Capacitor {element_name} cannot be created - missing q_mvar parameter")
                 return
             
             # Convert to float
@@ -2392,6 +2460,12 @@ def create_capacitor_element(dss, element_data, element_name, element_id, Busbar
 
 _IEEE_1547_VV_X = [0.92, 0.98, 1.02, 1.08]
 _IEEE_1547_VV_Y = [0.44, 0.0, -0.44, -0.44]
+_IEEE_1547_VW_X = [1.06, 1.1]
+_IEEE_1547_VW_Y = [1.0, 0.0]
+_DEFAULT_WATTVAR_X = [0.2, 0.5, 1.0]
+_DEFAULT_WATTVAR_Y = [0.44, 0.22, 0.0]
+_INVCONTROL_TIME_MODES = ('VOLTVAR', 'VOLTWATT', 'WATTPF', 'WATTVAR', 'DYNAMICREACCURR')
+_DER_TYP_PREFIXES = ('Storage', 'PVSystem')
 
 
 def _parse_float_array(value, default=None):
@@ -2412,23 +2486,150 @@ def _parse_float_array(value, default=None):
         return list(default)
 
 
+def _element_typ_is_der(typ):
+    t = str(typ or '')
+    return any(t.startswith(p) for p in _DER_TYP_PREFIXES)
+
+
 def _in_data_needs_time_control(in_data):
-    """Return True if any Storage uses voltage-dependent InvControl modes."""
+    """Return True if the model contains controls that need queued control actions."""
     for x in in_data:
         try:
             element_data = in_data[x]
-            if not str(element_data.get('typ', '')).startswith('Storage'):
+            typ = str(element_data.get('typ', ''))
+            if typ.startswith(('RegControl', 'CapControl', 'StorageController')):
+                return True
+            if not _element_typ_is_der(element_data.get('typ', '')):
                 continue
             mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
-            if mode in ('VOLTVAR', 'VOLTWATT', 'WATTPF', 'WATTVAR', 'DYNAMICREACCURR'):
+            if mode in _INVCONTROL_TIME_MODES:
                 return True
         except Exception:
             continue
     return False
 
 
+def _resolve_controlled_element(reference, elements, buses=None):
+    """Resolve a canvas name/id (or a bus reference) to an OpenDSS element name."""
+    reference = str(reference or '').strip()
+    if not reference:
+        return None
+    resolved = _resolve_in_dict(reference, elements)
+    if resolved:
+        return resolved
+    safe_reference = _sanitize_opendss_name(reference)
+    if safe_reference in elements:
+        return elements[safe_reference]
+    if buses:
+        for element_name in elements:
+            if str(element_name).lower() == reference.lower():
+                return element_name
+    return None
+
+
+def _dss_bool(value, default=True):
+    if value is None or value == '':
+        return default
+    return str(value).strip().lower() not in ('false', 'no', '0', 'off')
+
+
+def create_regcontrol_element(dss, element_data, element_name, element_id, TransformersDict,
+                              TransformersDictId, BusbarsDictConnectionToName,
+                              execute_dss_command=None, all_elements=None):
+    """Create an OpenDSS RegControl attached to an existing Transformer."""
+    if execute_dss_command is None:
+        execute_dss_command = dss.Text.Command
+    transformer_ref = element_data.get('transformer') or element_data.get('element') or element_data.get('bus')
+    transformer = _resolve_controlled_element(
+        transformer_ref, TransformersDict, BusbarsDictConnectionToName)
+    if not transformer and all_elements:
+        for candidate in (all_elements.values() if hasattr(all_elements, 'values') else all_elements):
+            if str(candidate.get('typ', '')).startswith(('Transformer', 'Two Winding')) and str(transformer_ref) in (
+                str(candidate.get('busFrom', '')), str(candidate.get('busTo', '')), str(candidate.get('bus', ''))
+            ):
+                transformer = _resolve_controlled_element(candidate.get('name'), TransformersDict)
+                break
+    if not transformer:
+        print(f'[OpenDSS] RegControl {element_name} skipped: transformer not found ({transformer_ref})')
+        return
+    winding = int(float(element_data.get('winding', 2) or 2))
+    vreg = float(element_data.get('vreg', 120) or 120)
+    band = float(element_data.get('band', 3) or 3)
+    ptratio = float(element_data.get('ptratio', 60) or 60)
+    ctprim = float(element_data.get('ctprim', 300) or 300)
+    delay = float(element_data.get('delaying', element_data.get('delay', 15)) or 0)
+    enabled = 'yes' if _dss_bool(element_data.get('enabled'), True) else 'no'
+    execute_dss_command(
+        f'New RegControl.{element_name} Transformer={transformer} Winding={winding} '
+        f'VReg={vreg} Band={band} PTRatio={ptratio} CTPrim={ctprim} Delay={delay} Enabled={enabled}')
+
+
+def create_capcontrol_element(dss, element_data, element_name, element_id, CapacitorsDict,
+                              CapacitorsDictId, BusbarsDictConnectionToName,
+                              execute_dss_command=None, all_elements=None):
+    """Create an OpenDSS CapControl attached to an existing Capacitor."""
+    if execute_dss_command is None:
+        execute_dss_command = dss.Text.Command
+    capacitor_ref = element_data.get('capacitor') or element_data.get('element') or element_data.get('bus')
+    capacitor = _resolve_controlled_element(
+        capacitor_ref, CapacitorsDict, BusbarsDictConnectionToName)
+    if not capacitor and all_elements:
+        for candidate in (all_elements.values() if hasattr(all_elements, 'values') else all_elements):
+            if str(candidate.get('typ', '')).startswith('Capacitor') and str(capacitor_ref) == str(candidate.get('bus', '')):
+                capacitor = _resolve_controlled_element(candidate.get('name'), CapacitorsDict)
+                break
+    if not capacitor:
+        print(f'[OpenDSS] CapControl {element_name} skipped: capacitor not found ({capacitor_ref})')
+        return
+    control_type = str(element_data.get('control_type', element_data.get('type', 'Voltage')) or 'Voltage').capitalize()
+    if control_type.lower() == 'kvar':
+        control_type = 'kvar'
+    on_setting = float(element_data.get('on_setting', element_data.get('onsetting', 115)) or 0)
+    off_setting = float(element_data.get('off_setting', element_data.get('offsetting', 125)) or 0)
+    ct_ratio = float(element_data.get('ctratio', 1) or 1)
+    pt_ratio = float(element_data.get('ptratio', 1) or 1)
+    delay = float(element_data.get('delay', 15) or 0)
+    enabled = 'yes' if _dss_bool(element_data.get('enabled'), True) else 'no'
+    execute_dss_command(
+        f'New CapControl.{element_name} Capacitor={capacitor} Type={control_type} '
+        f'ONSetting={on_setting} OFFSetting={off_setting} CTRatio={ct_ratio} '
+        f'PTRatio={pt_ratio} Delay={delay} Enabled={enabled}')
+
+
+def create_storagecontroller_element(dss, element_data, element_name, element_id, StoragesDict,
+                                     StoragesDictId, execute_dss_command=None):
+    """Create an OpenDSS StorageController and put controlled storage in EXTERNAL mode."""
+    if execute_dss_command is None:
+        execute_dss_command = dss.Text.Command
+    storage_ref = element_data.get('element') or element_data.get('storage') or ''
+    references = storage_ref if isinstance(storage_ref, (list, tuple)) else str(storage_ref).replace(';', ',').split(',')
+    storage_names = [
+        _resolve_controlled_element(reference, StoragesDict)
+        for reference in references
+        if str(reference).strip()
+    ]
+    storage_names = [name for name in storage_names if name]
+    if not storage_names:
+        print(f'[OpenDSS] StorageController {element_name} skipped: storage not found ({storage_ref})')
+        return
+    mode = str(element_data.get('mode', 'PeakShave') or 'PeakShave')
+    kw_target = float(element_data.get('kwtarget', element_data.get('kWTarget', 0)) or 0)
+    reserve = float(element_data.get('pct_reserve', element_data.get('reserve', 20)) or 0)
+    enabled = 'yes' if _dss_bool(element_data.get('enabled'), True) else 'no'
+    storage_target = (
+        f'Element=Storage.{storage_names[0]}'
+        if len(storage_names) == 1
+        else f'ElementList=[{" ".join("Storage." + name for name in storage_names)}]'
+    )
+    execute_dss_command(
+        f'New StorageController.{element_name} {storage_target} Mode={mode} '
+        f'kWTarget={kw_target} %Reserve={reserve} Enabled={enabled}')
+    for storage_name in storage_names:
+        execute_dss_command(f'Storage.{storage_name}.DispMode=EXTERNAL')
+
+
 def _resolve_voltvar_curve(element_data):
-    """Return (xarray, yarray) for Volt-VAR curve from storage parameters."""
+    """Return (xarray, yarray) for Volt-VAR curve from DER parameters."""
     preset = str(element_data.get('vv_curve_preset', 'IEEE_1547')).upper()
     if preset == 'IEEE_1547':
         return list(_IEEE_1547_VV_X), list(_IEEE_1547_VV_Y)
@@ -2439,12 +2640,33 @@ def _resolve_voltvar_curve(element_data):
     return x_vals, y_vals
 
 
+def _resolve_voltwatt_curve(element_data):
+    """Return (xarray, yarray) for Volt-Watt curve from DER parameters."""
+    preset = str(element_data.get('vw_curve_preset', 'IEEE_1547')).upper()
+    if preset == 'IEEE_1547':
+        return list(_IEEE_1547_VW_X), list(_IEEE_1547_VW_Y)
+    x_vals = _parse_float_array(element_data.get('vw_xarray'), _IEEE_1547_VW_X)
+    y_vals = _parse_float_array(element_data.get('vw_yarray'), _IEEE_1547_VW_Y)
+    if len(x_vals) < 2 or len(y_vals) < 2 or len(x_vals) != len(y_vals):
+        return list(_IEEE_1547_VW_X), list(_IEEE_1547_VW_Y)
+    return x_vals, y_vals
+
+
 def _resolve_wattpf_curve(element_data):
-    """Return (xarray, yarray) for Watt-PF curve from storage parameters."""
+    """Return (xarray, yarray) for Watt-PF curve from DER parameters."""
     x_vals = _parse_float_array(element_data.get('wattpf_xarray'), [0.0, 0.5, 1.0])
     y_vals = _parse_float_array(element_data.get('wattpf_yarray'), [1.0, 0.98, 0.95])
     if len(x_vals) < 2 or len(y_vals) < 2 or len(x_vals) != len(y_vals):
         return [0.0, 0.5, 1.0], [1.0, 0.98, 0.95]
+    return x_vals, y_vals
+
+
+def _resolve_wattvar_curve(element_data):
+    """Return (xarray, yarray) for Watt-VAR curve from DER parameters."""
+    x_vals = _parse_float_array(element_data.get('wattvar_xarray'), _DEFAULT_WATTVAR_X)
+    y_vals = _parse_float_array(element_data.get('wattvar_yarray'), _DEFAULT_WATTVAR_Y)
+    if len(x_vals) < 2 or len(y_vals) < 2 or len(x_vals) != len(y_vals):
+        return list(_DEFAULT_WATTVAR_X), list(_DEFAULT_WATTVAR_Y)
     return x_vals, y_vals
 
 
@@ -2463,17 +2685,21 @@ def create_xycurve_element(dss, curve_name, xarray, yarray, execute_dss_command=
     return safe_name
 
 
-def create_invcontrol_for_storage(dss, element_name, element_data, execute_dss_command=None):
-    """Create InvControl linked to a Storage element. Returns True if created."""
+def create_invcontrol_for_der(dss, der_class, element_name, element_data, execute_dss_command=None):
+    """Create InvControl linked to a Storage or PVSystem. Returns True if created."""
     if execute_dss_command is None:
         execute_dss_command = dss.Text.Command
     mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
     if mode in ('NONE', '', 'OFF', 'FIXED_Q', 'FIXED_PF'):
         return False
 
+    der_class = str(der_class or 'Storage').strip()
+    if der_class not in ('Storage', 'PVSystem'):
+        der_class = 'Storage'
+
     der_name = _sanitize_opendss_name(element_name)
     ctrl_name = _sanitize_opendss_name(f"{element_name}_InvCtrl")
-    der_list = f"Storage.{der_name}"
+    der_list = f"{der_class}.{der_name}"
 
     if mode == 'VOLTVAR':
         x_vals, y_vals = _resolve_voltvar_curve(element_data)
@@ -2484,6 +2710,19 @@ def create_invcontrol_for_storage(dss, element_name, element_data, execute_dss_c
         cmd = (
             f"New InvControl.{ctrl_name} Mode=VOLTVAR DERList=[{der_list}] "
             f"VVC_Curve1={curve_name} RefReactivePower=VARMAX"
+        )
+        execute_dss_command(cmd)
+        return True
+
+    if mode == 'VOLTWATT':
+        x_vals, y_vals = _resolve_voltwatt_curve(element_data)
+        curve_name = create_xycurve_element(
+            dss, f"{element_name}_VW", x_vals, y_vals, execute_dss_command)
+        if not curve_name:
+            return False
+        cmd = (
+            f"New InvControl.{ctrl_name} Mode=VOLTWATT DERList=[{der_list}] "
+            f"voltwatt_curve={curve_name}"
         )
         execute_dss_command(cmd)
         return True
@@ -2501,7 +2740,33 @@ def create_invcontrol_for_storage(dss, element_name, element_data, execute_dss_c
         execute_dss_command(cmd)
         return True
 
+    if mode == 'WATTVAR':
+        x_vals, y_vals = _resolve_wattvar_curve(element_data)
+        curve_name = create_xycurve_element(
+            dss, f"{element_name}_WattVar", x_vals, y_vals, execute_dss_command)
+        if not curve_name:
+            return False
+        cmd = (
+            f"New InvControl.{ctrl_name} Mode=WATTVAR DERList=[{der_list}] "
+            f"WattVar_Curve={curve_name}"
+        )
+        execute_dss_command(cmd)
+        return True
+
+    if mode == 'DYNAMICREACCURR':
+        cmd = (
+            f"New InvControl.{ctrl_name} Mode=DYNAMICREACCURR DERList=[{der_list}]"
+        )
+        execute_dss_command(cmd)
+        return True
+
     return False
+
+
+def create_invcontrol_for_storage(dss, element_name, element_data, execute_dss_command=None):
+    """Backward-compatible wrapper: InvControl for Storage."""
+    return create_invcontrol_for_der(
+        dss, 'Storage', element_name, element_data, execute_dss_command)
 
 
 def create_storage_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, StoragesDict, StoragesDictId, created_elements, execute_dss_command=None):
@@ -2546,9 +2811,9 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             q_kvar = q_mvar * 1000
 
             # Determine OpenDSS State from dispatch power:
-            #   pandapower p_mw < 0 → discharging/generating → State=DISCHARGING
-            #   pandapower p_mw > 0 → charging/consuming    → State=CHARGING
-            #   pandapower p_mw == 0 → idling                → State=IDLING
+            #   pandapower p_mw < 0 ? discharging/generating ? State=DISCHARGING
+            #   pandapower p_mw > 0 ? charging/consuming    ? State=CHARGING
+            #   pandapower p_mw == 0 ? idling                ? State=IDLING
             if p_kw < 0:
                 storage_state = 'DISCHARGING'
                 kw_rated = abs(p_kw)
@@ -2745,10 +3010,10 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 for cmd in follow_up_cmds:
                     dss.Text.Command(cmd)
                 
-                # InvControl for voltage-dependent inverter modes (Q-V droop, Watt-PF)
+                # InvControl for voltage-dependent inverter modes (Q-V droop, Watt-PF, ...)
                 try:
-                    create_invcontrol_for_storage(
-                        dss, element_name, element_data, execute_dss_command)
+                    create_invcontrol_for_der(
+                        dss, 'Storage', element_name, element_data, execute_dss_command)
                 except Exception as inv_err:
                     print(f"[OpenDSS] InvControl for {element_name} failed: {inv_err}")
                 
@@ -2858,26 +3123,46 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
                 if cutout_raw is not None:
                     cutout_percent = float(cutout_raw) * 100  # Convert 0.1 to 10%
                     pv_cmd += f" %Cutout={cutout_percent}"
-                
-                # ONLY ADD PARAMETERS THAT ARE CONFIRMED TO WORK IN OpenDSS
-                # The following parameters caused "Unknown parameter" errors and are commented out:
-                # - PminKvarMax (not supported)
-                # - PminNoVars (not supported)
-                # - %PmppGain (not supported)
-                # - Many other advanced parameters are not in standard OpenDSS
-                
+
+                # Safe advanced OpenDSS PVSystem parameters
+                kvarmax_raw = element_data.get('kvarmax')
+                kvarmaxabs_raw = element_data.get('kvarmaxabs')
+                pct_pmpp_raw = element_data.get('pmpp_percent')
+                if kvarmax_raw is not None:
+                    try:
+                        pv_cmd += f" kvarMax={float(kvarmax_raw)}"
+                    except (TypeError, ValueError):
+                        pass
+                if kvarmaxabs_raw is not None:
+                    try:
+                        pv_cmd += f" kvarMaxAbs={float(kvarmaxabs_raw)}"
+                    except (TypeError, ValueError):
+                        pass
+                if pct_pmpp_raw is not None:
+                    try:
+                        pct_pmpp = float(pct_pmpp_raw)
+                        # Frontend may send 0-1 or 0-100
+                        if pct_pmpp <= 1.0:
+                            pct_pmpp *= 100.0
+                        pv_cmd += f" %Pmpp={pct_pmpp}"
+                    except (TypeError, ValueError):
+                        pass
+
                 # Harmonic analysis property
                 spec_name = _sanitize_opendss_name(f"harm_pv_{element_name}")
                 spectrum_resolved = _resolve_named_spectrum_for_element(
                     dss, element_data, 'default', spec_name, execute_dss_command)
                 if spectrum_resolved:
                     pv_cmd += f" spectrum={spectrum_resolved}"
-                
-                # If you need additional parameters, verify them in OpenDSS documentation first:
-                # https://opendss.epri.com/PVSystem.html
 
                 execute_dss_command(pv_cmd)
-              
+
+                # InvControl for PVSystem (Volt-VAR / Volt-Watt / Watt-PF / ...)
+                try:
+                    create_invcontrol_for_der(
+                        dss, 'PVSystem', element_name, element_data, execute_dss_command)
+                except Exception as inv_err:
+                    print(f"[OpenDSS] InvControl for PVSystem {element_name} failed: {inv_err}")
 
                 # Handle in_service status AFTER creating the element
                 in_service = element_data.get('in_service', True)
@@ -3179,7 +3464,7 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
 
                 # Peak short-circuit current: ip = kappa * sqrt(2) * ikss
                 ip_ka = kappa * math.sqrt(2) * ikss_ka if ikss_ka else 0.0
-                # Thermal short-circuit current (short duration): ith ≈ ikss
+                # Thermal short-circuit current (short duration): ith ? ikss
                 ith_ka = ikss_ka
 
                 # Zsc1() returns complex positive-sequence short-circuit impedance at bus (ohms)
@@ -3283,7 +3568,101 @@ def _opendss_total_power_is_zero(total_power, threshold_kw=0.01):
     return abs(p_kw) < threshold_kw and abs(q_kvar) < threshold_kw
 
 
-def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode, export_commands=False):
+def _monte_carlo_percentile(values, percentile):
+    """Return a linear-interpolated percentile without adding a NumPy dependency."""
+    values = sorted(float(value) for value in values if value is not None and math.isfinite(float(value)))
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * percentile / 100.0
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return values[lower]
+    return values[lower] + (values[upper] - values[lower]) * (position - lower)
+
+
+def _capture_monte_carlo_sample(BusbarsDictConnectionToName, LinesDict, LinesDictId, in_data):
+    """Capture one native OpenDSS Monte Carlo solve result."""
+    buses = {}
+    lines = {}
+    try:
+        for bus_name in dss.Circuit.AllBusNames():
+            dss.Circuit.SetActiveBus(bus_name)
+            actual_name = dss.Bus.Name()
+            bus_id = next((key for key in BusbarsDictConnectionToName
+                           if key.lower() == actual_name.lower()), None)
+            if not bus_id:
+                continue
+            pu_values = dss.Bus.puVmagAngle()
+            magnitudes = [float(pu_values[index]) for index in range(0, len(pu_values), 2)
+                          if math.isfinite(float(pu_values[index]))]
+            if magnitudes:
+                buses[bus_id] = {
+                    'id': bus_id,
+                    'name': BusbarsDictConnectionToName[bus_id],
+                    'vm_pu': sum(magnitudes) / len(magnitudes),
+                }
+    except Exception as error:
+        print(f"[OpenDSS] Monte Carlo bus capture failed: {error}")
+
+    line_ratings = {}
+    for element in in_data.values():
+        if isinstance(element, dict) and 'Line' in str(element.get('typ', '')):
+            line_ratings[_sanitize_opendss_name(element.get('name', ''))] = element.get('max_i_ka')
+    for key, line_name in LinesDict.items():
+        try:
+            dss.Circuit.SetActiveElement(f"Line.{line_name}")
+            currents = dss.CktElement.CurrentsMagAng()
+            n_conductors = dss.CktElement.NumConductors()
+            n_phases = dss.CktElement.NumPhases()
+            current_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases) if currents else 0.0
+            rating_ka = float(line_ratings.get(key) or 0)
+            lines[key] = {
+                'id': LinesDictId.get(key, key),
+                'name': key,
+                'loading_percent': (current_ka / rating_ka * 100.0) if rating_ka > 0 else 0.0,
+                'current_ka': current_ka,
+            }
+        except Exception:
+            continue
+    return buses, lines
+
+
+def _build_monte_carlo_result(mode, number, random_distribution, bus_samples, line_samples, converged_count):
+    """Aggregate captured Monte Carlo samples into the frontend response schema."""
+    bus_stats = []
+    for bus_id, entry in bus_samples.items():
+        values = entry['values']
+        bus_stats.append({
+            'id': bus_id, 'name': entry['name'], 'vmin': min(values), 'vmean': sum(values) / len(values),
+            'vmax': max(values), 'p5': _monte_carlo_percentile(values, 5),
+            'p50': _monte_carlo_percentile(values, 50), 'p95': _monte_carlo_percentile(values, 95),
+        })
+    line_stats = []
+    for line_id, entry in line_samples.items():
+        values = entry['values']
+        line_stats.append({
+            'id': entry['id'], 'name': entry['name'], 'loading_mean': sum(values) / len(values),
+            'loading_max': max(values), 'p95': _monte_carlo_percentile(values, 95),
+        })
+    histogram_buses = [
+        {'id': bus_id, 'name': entry['name'], 'values': entry['values']}
+        for bus_id, entry in list(bus_samples.items())[:20]
+    ]
+    return {
+        'mode': mode, 'number': number, 'random': random_distribution,
+        'bus_stats': bus_stats, 'line_stats': line_stats,
+        'samples': {'bus_voltage_pu': histogram_buses},
+        'summary': {'n_samples': number, 'converged_count': converged_count,
+                    'failed_count': number - converged_count},
+    }
+
+
+def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode,
+              export_commands=False, monte_carlo_number=100, monte_carlo_random='Uniform',
+              monte_carlo_hour=None):
     """Main powerflow function for OpenDSS
     
     Parameters based on OpenDSS documentation: https://opendss.epri.com/PowerFlow.html
@@ -3319,6 +3698,22 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         if export_commands:
             opendss_commands.append(command)
     
+    # Native OpenDSS Monte Carlo modes.  The individual Solve calls below are
+    # intentional: OpenDSS exposes only the last solution after `Solve Number=N`,
+    # so collecting sample-level statistics requires one native M1/M2/M3 solve per sample.
+    mode = str(mode or 'Snapshot')
+    monte_carlo_mode = mode.upper() in ('M1', 'M2', 'M3')
+    try:
+        monte_carlo_number = max(1, int(monte_carlo_number or 100))
+    except (TypeError, ValueError):
+        monte_carlo_number = 100
+    monte_carlo_random = str(monte_carlo_random or 'Uniform').capitalize()
+    if monte_carlo_random not in ('Uniform', 'Gaussian'):
+        monte_carlo_random = 'Uniform'
+    monte_carlo_bus_samples = {}
+    monte_carlo_line_samples = {}
+    monte_carlo_converged_count = 0
+
     # Set OpenDSS circuit parameters
     f = frequency
     
@@ -3327,7 +3722,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     if _in_data_needs_time_control(in_data):
         if str(controlmode).lower() == 'static':
             effective_controlmode = 'Time'
-            print("[OpenDSS] InvControl detected — upgrading ControlMode Static → Time")
+            print("[OpenDSS] InvControl detected - upgrading ControlMode Static -> Time")
     
     # Pre-scan in_data for the first External Grid to embed its Vsource parameters
     # directly into "New Circuit". This avoids relying on "Edit Vsource.source" which
@@ -3338,6 +3733,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     for build_attempt in range(2):
         if build_attempt > 0:
             print("[OpenDSS] Zero-power first solve with active injections; rebuilding circuit and solving again")
+            if monte_carlo_mode:
+                monte_carlo_bus_samples.clear()
+                monte_carlo_line_samples.clear()
+                monte_carlo_converged_count = 0
 
         execute_dss_command('clear')
         execute_dss_command(_new_circuit_command(ext_scan))
@@ -3348,6 +3747,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         execute_dss_command(f'set ControlMode={effective_controlmode}')
         execute_dss_command(f'set MaxIterations={max_iterations}')
         execute_dss_command(f'set Tolerance={tolerance}')
+        if monte_carlo_mode:
+            execute_dss_command(f'set Number={monte_carlo_number}')
+            execute_dss_command(f'set Random={monte_carlo_random}')
+            if mode.upper() == 'M3' and monte_carlo_hour not in (None, ''):
+                execute_dss_command(f'set Hour={monte_carlo_hour}')
 
         # Create busbars and other elements using helper functions
         # Wrap in try-except to catch validation errors and return them to frontend
@@ -3368,7 +3772,28 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         try:
             print("[OpenDSS] solve")
             execute_dss_command('init')
-            dss.Text.Command('solve')
+            if monte_carlo_mode:
+                # Retain the requested Number setting in the exported model, then
+                # use one solve at a time to preserve each random realization.
+                execute_dss_command('set Number=1')
+                for sample_index in range(monte_carlo_number):
+                    dss.Text.Command('solve')
+                    if not dss.Solution.Converged():
+                        print(f"[OpenDSS] Monte Carlo sample {sample_index + 1} did not converge")
+                        continue
+                    monte_carlo_converged_count += 1
+                    sample_buses, sample_lines = _capture_monte_carlo_sample(
+                        BusbarsDictConnectionToName, element_dicts[0], element_dicts[1], in_data)
+                    for bus_id, sample in sample_buses.items():
+                        entry = monte_carlo_bus_samples.setdefault(
+                            bus_id, {'name': sample['name'], 'values': []})
+                        entry['values'].append(sample['vm_pu'])
+                    for line_key, sample in sample_lines.items():
+                        entry = monte_carlo_line_samples.setdefault(
+                            line_key, {'id': sample['id'], 'name': sample['name'], 'values': []})
+                        entry['values'].append(sample['loading_percent'])
+            else:
+                dss.Text.Command('solve')
         except Exception as e:
             print(f"[OpenDSS] Solve EXCEPTION: {e}")
 
@@ -3429,13 +3854,20 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     pvsystemsList = []
     externalGridsList = []
 
-    # Lookup inv_control_mode per storage id from input data
+    # Lookup inv_control_mode per Storage / PVSystem id from input data
     storage_inv_mode_by_id = {}
+    pv_inv_mode_by_id = {}
     for _k, _elem in in_data.items():
         try:
-            if str(_elem.get('typ', '')).startswith('Storage') and _elem.get('id'):
-                storage_inv_mode_by_id[str(_elem['id'])] = str(
-                    _elem.get('inv_control_mode', 'NONE')).upper()
+            typ = str(_elem.get('typ', ''))
+            eid = _elem.get('id')
+            if not eid:
+                continue
+            mode = str(_elem.get('inv_control_mode', 'NONE')).upper()
+            if typ.startswith('Storage'):
+                storage_inv_mode_by_id[str(eid)] = mode
+            elif typ.startswith('PVSystem'):
+                pv_inv_mode_by_id[str(eid)] = mode
         except Exception:
             pass
     
@@ -3524,7 +3956,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     matched_bus_id = key
                     matched_bus_name = BusbarsDictConnectionToName[key]
                     bus_number = value
-                    # print(f"    ✓ Matched to user bus: {matched_bus_name}")  # Reduced logging
+                    # print(f"    ? Matched to user bus: {matched_bus_name}")  # Reduced logging
                     break
             
             if not matched_bus_id:
@@ -3546,11 +3978,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 Vb = complex(voltages[2]/1000, voltages[3]/1000)
                 Vc = complex(voltages[4]/1000, voltages[5]/1000)
                 
-                # Symmetrical component operator: a = e^(j*2π/3)
+                # Symmetrical component operator: a = e^(j*2?/3)
                 a = complex(-0.5, math.sqrt(3)/2)
-                a2 = complex(-0.5, -math.sqrt(3)/2)  # a² = e^(j*4π/3)
+                a2 = complex(-0.5, -math.sqrt(3)/2)  # a^2 = e^(j*4*pi/3)
                 
-                # Positive sequence voltage: V1 = (Va + a*Vb + a²*Vc) / 3
+                # Positive sequence voltage: V1 = (Va + a*Vb + a^2*Vc) / 3
                 V1 = (Va + a * Vb + a2 * Vc) / 3
                 V1_mag_ln_kv = abs(V1)  # Magnitude in kV (line-to-neutral)
                 
@@ -3592,7 +4024,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     vm_kv=V1_mag_ll_kv if V1_mag_ll_kv == V1_mag_ll_kv else None,
                 )
                 busbarList.append(busbar)
-                # print(f"    ✓ Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")  # Reduced logging
+                # print(f"    ? Added to results: {frontend_bus_name} (vm_pu={vm_pu:.6f}, va_degree={va_degree:.6f})")  # Reduced logging
                 
             except Exception as e:
                 # Add with default values - use name/id as stored
@@ -3792,7 +4224,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             ):
                 vm_txt = f'{vm_pu:.3f} pu' if vm_pu is not None else 'low'
                 _opendss_warn(
-                    f"Load '{key}' draws {abs(p_mw) * 1000:.1f} kW vs {abs(p_set_mw) * 1000:.1f} kW set — "
+                    f"Load '{key}' draws {abs(p_mw) * 1000:.1f} kW vs {abs(p_set_mw) * 1000:.1f} kW set - "
                     f"bus voltage {vm_txt}. Check line length, transformer kVA, or use constant-P load (%SeriesRL=0)."
                 )
 
@@ -3883,7 +4315,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 vm_pu=vm_pu
             )
             generatorsList.append(generator)
-            # print(f"    ✓ Added Generator (static generator): {frontend_name}, P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr, V={vm_pu:.3f} pu")  # Reduced logging
+            # print(f"    ? Added Generator (static generator): {frontend_name}, P={p_mw:.3f} MW, Q={q_mvar:.3f} MVAr, V={vm_pu:.3f} pu")  # Reduced logging
                         
         except Exception as e:
             # Still add the generator to results with zero values
@@ -4393,7 +4825,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 # Convert IDs back to hash format for frontend
                                 frontend_name = key
                                 frontend_id = PVSystemsDictId[key]
-                                
+                                inv_mode = pv_inv_mode_by_id.get(str(frontend_id), '')
+
                                 pvsystem = PVSystemOut(
                                     name=frontend_name,
                                     id=frontend_id,
@@ -4402,7 +4835,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                     vm_pu=vm_pu,
                                     va_degree=va_degree,
                                     irradiance=irradiance,
-                                    temperature=temperature
+                                    temperature=temperature,
+                                    inv_control_mode=inv_mode
                                 )
                                 pvsystemsList.append(pvsystem)
                                 break
@@ -4508,6 +4942,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         result['externalgrids'] = externalGridsList
     if _opendss_warnings:
         result['warnings'] = list(_opendss_warnings)
+    if monte_carlo_mode:
+        result['monte_carlo'] = _build_monte_carlo_result(
+            mode.upper(), monte_carlo_number, monte_carlo_random, monte_carlo_bus_samples,
+            monte_carlo_line_samples, monte_carlo_converged_count)
 
     # Add OpenDSS commands to result if export was requested
     if export_commands and opendss_commands:
@@ -4978,3 +5416,418 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
             },
             separators=(',', ':'),
         )
+
+
+# --- DG Interconnection Screening (OpenDSS) ---------------------------------
+
+def _dg_collect_metrics(dss, BusbarsDictConnectionToName, LinesDict, LinesDictId, ExternalGridsDict):
+    """Collect bus voltages (pu), line loadings (%), and source P after a solve."""
+    bus_metrics = []
+    try:
+        for bus_name in dss.Circuit.AllBusNames():
+            try:
+                dss.Circuit.SetActiveBus(bus_name)
+                vmag = dss.Bus.VMagAngle()
+                if not vmag:
+                    continue
+                kv_base = dss.Bus.kVBase()
+                if not kv_base or kv_base <= 0:
+                    continue
+                phases = max(1, int(len(vmag) / 2))
+                mags = [vmag[i * 2] for i in range(phases) if i * 2 < len(vmag)]
+                if not mags:
+                    continue
+                v_pu = (sum(mags) / len(mags)) / (kv_base * 1000.0)
+                bus_metrics.append({'name': bus_name, 'vm_pu': float(v_pu)})
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    line_metrics = []
+    try:
+        for line_name, line_id in (LinesDictId or {}).items():
+            try:
+                dss.Circuit.SetActiveElement(f'Line.{line_name}')
+                norms = dss.CktElement.NormalAmps()
+                currents = dss.CktElement.CurrentsMagAng()
+                if not currents:
+                    continue
+                i_mags = [currents[i] for i in range(0, len(currents), 2)]
+                i_max = max(i_mags) if i_mags else 0.0
+                norm = float(norms) if norms not in (None, 0, 0.0) else 0.0
+                if isinstance(norms, (list, tuple)) and norms:
+                    norm = float(norms[0] or 0.0)
+                loading = (i_max / norm * 100.0) if norm > 0 else 0.0
+                line_metrics.append({
+                    'name': line_name,
+                    'id': line_id,
+                    'loading_percent': float(loading),
+                    'i_a': float(i_max),
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    source_p_kw = 0.0
+    try:
+        for src_name in (ExternalGridsDict or {}):
+            try:
+                dss.Circuit.SetActiveElement(f'Vsource.{src_name}')
+                powers = dss.CktElement.Powers()
+                if powers:
+                    # Sum P across phases at terminal 1
+                    n = max(1, int(len(powers) / 2))
+                    source_p_kw += sum(powers[i * 2] for i in range(min(n, 3)))
+            except Exception:
+                continue
+        if not ExternalGridsDict:
+            total = dss.Circuit.TotalPower()
+            if total:
+                source_p_kw = float(total[0])
+    except Exception:
+        pass
+
+    return bus_metrics, line_metrics, float(source_p_kw)
+
+
+def _dg_evaluate_checks(bus_metrics, line_metrics, source_p_kw, vmin_pu, vmax_pu, max_loading_percent):
+    """Return pass/fail checks and limiting constraint description."""
+    checks = []
+    limiting = None
+
+    vmax_bus = max(bus_metrics, key=lambda b: b['vm_pu']) if bus_metrics else None
+    vmin_bus = min(bus_metrics, key=lambda b: b['vm_pu']) if bus_metrics else None
+    if vmax_bus is not None:
+        ok = vmax_bus['vm_pu'] <= vmax_pu + 1e-9
+        checks.append({
+            'id': 'voltage_max',
+            'name': 'Maximum voltage',
+            'status': 'pass' if ok else 'fail',
+            'value': round(vmax_bus['vm_pu'], 4),
+            'limit': vmax_pu,
+            'location': vmax_bus['name'],
+            'unit': 'pu',
+        })
+        if not ok and limiting is None:
+            limiting = f"Voltage rise at {vmax_bus['name']} ({vmax_bus['vm_pu']:.3f} pu > {vmax_pu} pu)"
+    if vmin_bus is not None:
+        ok = vmin_bus['vm_pu'] >= vmin_pu - 1e-9
+        checks.append({
+            'id': 'voltage_min',
+            'name': 'Minimum voltage',
+            'status': 'pass' if ok else 'fail',
+            'value': round(vmin_bus['vm_pu'], 4),
+            'limit': vmin_pu,
+            'location': vmin_bus['name'],
+            'unit': 'pu',
+        })
+        if not ok and limiting is None:
+            limiting = f"Low voltage at {vmin_bus['name']} ({vmin_bus['vm_pu']:.3f} pu < {vmin_pu} pu)"
+
+    worst_line = max(line_metrics, key=lambda L: L['loading_percent']) if line_metrics else None
+    if worst_line is not None:
+        ok = worst_line['loading_percent'] <= max_loading_percent + 1e-9
+        checks.append({
+            'id': 'thermal',
+            'name': 'Thermal loading',
+            'status': 'pass' if ok else 'fail',
+            'value': round(worst_line['loading_percent'], 2),
+            'limit': max_loading_percent,
+            'location': worst_line['name'],
+            'unit': '%',
+        })
+        if not ok and limiting is None:
+            limiting = (
+                f"Thermal overload on {worst_line['name']} "
+                f"({worst_line['loading_percent']:.1f}% > {max_loading_percent}%)"
+            )
+
+    # Reverse power at source: OpenDSS Vsource P > 0 means power into the grid from the circuit
+    # Convention varies; treat large negative circuit TotalPower export as reverse through source.
+    reverse = source_p_kw < -1.0  # kW into grid / reverse through POC source
+    checks.append({
+        'id': 'reverse_power',
+        'name': 'Reverse power at source',
+        'status': 'fail' if reverse else 'pass',
+        'value': round(source_p_kw, 3),
+        'limit': 0.0,
+        'location': 'source',
+        'unit': 'kW',
+        'note': 'Negative source P indicates export / reverse power through the grid source',
+    })
+    if reverse and limiting is None:
+        limiting = f"Reverse power at source ({source_p_kw:.1f} kW)"
+
+    overall = 'pass' if all(c['status'] == 'pass' for c in checks if c['id'] != 'reverse_power') else 'fail'
+    # Reverse power is informational for DG interconnection unless strict mode - flag but do not alone fail hosting
+    hard_fail = any(c['status'] == 'fail' and c['id'] != 'reverse_power' for c in checks)
+    overall = 'fail' if hard_fail else 'pass'
+    return checks, overall, limiting
+
+
+def _dg_find_der_element(in_data, der_id, der_type):
+    """Locate DER element dict by id or name."""
+    der_type = str(der_type or '').lower()
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ', ''))
+        eid = str(el.get('id', ''))
+        ename = str(el.get('name', ''))
+        if der_id and eid != str(der_id) and ename != str(der_id) and _sanitize_opendss_name(ename) != _sanitize_opendss_name(der_id):
+            continue
+        if der_type in ('pvsystem', 'pv') and typ.startswith('PVSystem'):
+            return el
+        if der_type in ('storage', 'bess') and typ.startswith('Storage'):
+            return el
+        if der_type in ('generator', 'static', 'staticgenerator', 'wind', 'windturbine') and (
+            typ.startswith('Generator') or typ.startswith('Static Generator') or typ.startswith('Wind Turbine')
+        ):
+            return el
+        if not der_type and der_id and (eid == str(der_id) or ename == str(der_id)):
+            return el
+    return None
+
+
+def _dg_scale_der(el, kw, kva=None):
+    """Scale a DER element's power rating in-place for screening."""
+    typ = str(el.get('typ', ''))
+    kw = float(kw)
+    if typ.startswith('PVSystem'):
+        el['pmpp'] = kw
+        el['kva'] = float(kva) if kva is not None else max(kw * 1.1, kw)
+    elif typ.startswith('Storage'):
+        # Electrisim Storage uses MW; negative = discharging/export
+        el['p_mw'] = -abs(kw) / 1000.0
+        if kva is not None:
+            el['sn_mva'] = abs(float(kva)) / 1000.0
+    elif typ.startswith('Generator') or typ.startswith('Static Generator') or typ.startswith('Wind Turbine'):
+        el['p_mw'] = abs(kw) / 1000.0
+        if kva is not None:
+            el['sn_mva'] = abs(float(kva)) / 1000.0
+    return el
+
+
+def _dg_build_and_solve(in_data, frequency, controlmode='Time'):
+    """Build OpenDSS circuit from in_data and solve Snapshot. Returns metrics tuple or error dict."""
+    import copy
+    work = copy.deepcopy(in_data)
+    opendss_commands = []
+    _reset_opendss_warnings()
+
+    def execute_dss_command(command):
+        print(f"[OpenDSS DG] {command}")
+        dss.Text.Command(command)
+        opendss_commands.append(command)
+
+    try:
+        dss.Basic.ClearAll()
+    except Exception:
+        pass
+
+    f = float(frequency or 50)
+    ext_scan = None
+    for _k, el in work.items():
+        if isinstance(el, dict) and str(el.get('typ', '')).startswith('External Grid'):
+            ext_scan = el
+            break
+    try:
+        execute_dss_command(_new_circuit_command(ext_scan) if ext_scan else 'New Circuit.ElectrisimDG basefreq={}'.format(f))
+        execute_dss_command(f'set DefaultBaseFrequency={f}')
+        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(work, dss, False, opendss_commands)
+        element_dicts = create_other_elements(
+            work, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)
+        (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+         Transformers3WDict, Transformers3WDictId,
+         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+         circuit_source_element_name) = element_dicts
+        execute_dss_command('set Mode=Snapshot')
+        execute_dss_command('set Algorithm=Normal')
+        ctrl = 'Time' if (_in_data_needs_time_control(work) or str(controlmode).lower() == 'time') else str(controlmode or 'Static')
+        execute_dss_command(f'set ControlMode={ctrl}')
+        execute_dss_command('set MaxIterations=100')
+        execute_dss_command('set tolerance=0.0001')
+        execute_dss_command('solve')
+        converged = bool(dss.Solution.Converged())
+        bus_metrics, line_metrics, source_p_kw = _dg_collect_metrics(
+            dss, BusbarsDictConnectionToName, LinesDict, LinesDictId, ExternalGridsDict)
+        return {
+            'ok': True,
+            'converged': converged,
+            'bus_metrics': bus_metrics,
+            'line_metrics': line_metrics,
+            'source_p_kw': source_p_kw,
+            'work': work,
+        }
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def dg_interconnection_screening(in_data, params):
+    """OpenDSS DG interconnection screening + optional hosting-capacity binary search.
+
+    params keys:
+      poc_bus_id, der_id, der_type (PVSystem|Storage|Generator),
+      proposed_kw, proposed_kva, frequency,
+      vmin_pu, vmax_pu, max_loading_percent,
+      run_hosting_capacity (bool), hc_max_kw, hc_tol_kw,
+      compare_invcontrol (bool)
+    """
+    import copy
+
+    poc_bus_id = params.get('poc_bus_id') or params.get('pocBusId') or ''
+    der_id = params.get('der_id') or params.get('derId') or ''
+    der_type = params.get('der_type') or params.get('derType') or 'PVSystem'
+    try:
+        proposed_kw = float(params.get('proposed_kw') or params.get('proposedKw') or 100.0)
+    except (TypeError, ValueError):
+        proposed_kw = 100.0
+    proposed_kva = params.get('proposed_kva') or params.get('proposedKva')
+    try:
+        proposed_kva = float(proposed_kva) if proposed_kva not in (None, '') else None
+    except (TypeError, ValueError):
+        proposed_kva = None
+    frequency = float(params.get('frequency') or 50)
+    vmin_pu = float(params.get('vmin_pu') or params.get('vminPu') or 0.95)
+    vmax_pu = float(params.get('vmax_pu') or params.get('vmaxPu') or 1.05)
+    max_loading = float(params.get('max_loading_percent') or params.get('maxLoadingPercent') or 100.0)
+    run_hc = str(params.get('run_hosting_capacity', params.get('runHostingCapacity', False))).lower() in ('1', 'true', 'yes')
+    compare_inv = str(params.get('compare_invcontrol', params.get('compareInvControl', True))).lower() in ('1', 'true', 'yes')
+    try:
+        hc_max_kw = float(params.get('hc_max_kw') or params.get('hcMaxKw') or max(proposed_kw * 5, 1000.0))
+    except (TypeError, ValueError):
+        hc_max_kw = max(proposed_kw * 5, 1000.0)
+    try:
+        hc_tol_kw = float(params.get('hc_tol_kw') or params.get('hcTolKw') or max(proposed_kw * 0.02, 1.0))
+    except (TypeError, ValueError):
+        hc_tol_kw = max(proposed_kw * 0.02, 1.0)
+
+    base_data = copy.deepcopy(in_data)
+    # Strip study param entries from network payload
+    clean = {}
+    for k, v in base_data.items():
+        if isinstance(v, dict) and 'DgInterconnection' in str(v.get('typ', '')):
+            continue
+        clean[k] = v
+
+    der = _dg_find_der_element(clean, der_id, der_type)
+    if der is None:
+        return json.dumps({
+            'error': True,
+            'message': f'DER element not found (id={der_id}, type={der_type}). Select an existing PVSystem, Storage, or Generator on the canvas.',
+        })
+
+    # Baseline proposed size
+    _dg_scale_der(der, proposed_kw, proposed_kva)
+    # Optionally disable InvControl for baseline
+    original_inv = der.get('inv_control_mode', 'NONE')
+    der['inv_control_mode'] = 'NONE'
+
+    result_base = _dg_build_and_solve(clean, frequency, controlmode='Static')
+    if not result_base.get('ok'):
+        return json.dumps({'error': True, 'message': result_base.get('error', 'Circuit build failed')})
+
+    checks, overall, limiting = _dg_evaluate_checks(
+        result_base['bus_metrics'], result_base['line_metrics'], result_base['source_p_kw'],
+        vmin_pu, vmax_pu, max_loading)
+
+    mitigations = []
+    inv_compare = None
+    if compare_inv:
+        clean_inv = copy.deepcopy(clean)
+        der_inv = _dg_find_der_element(clean_inv, der_id, der_type)
+        if der_inv is not None:
+            _dg_scale_der(der_inv, proposed_kw, proposed_kva)
+            der_inv['inv_control_mode'] = 'VOLTVAR'
+            der_inv['vv_curve_preset'] = der_inv.get('vv_curve_preset') or 'IEEE_1547'
+            res_inv = _dg_build_and_solve(clean_inv, frequency, controlmode='Time')
+            if res_inv.get('ok'):
+                c2, o2, lim2 = _dg_evaluate_checks(
+                    res_inv['bus_metrics'], res_inv['line_metrics'], res_inv['source_p_kw'],
+                    vmin_pu, vmax_pu, max_loading)
+                inv_compare = {
+                    'overall': o2,
+                    'checks': c2,
+                    'limiting_constraint': lim2,
+                    'inv_control_mode': 'VOLTVAR',
+                }
+                if overall == 'fail' and o2 == 'pass':
+                    mitigations.append('Enable Volt-VAR InvControl on the DER (IEEE 1547-style Q-V droop).')
+                elif overall == 'fail' and o2 == 'fail':
+                    mitigations.append('Volt-VAR alone may be insufficient; reduce DER size or add RegControl/CapControl.')
+
+    if overall == 'fail':
+        mitigations.append('Reduce proposed DER kW until voltage/thermal limits are satisfied (use hosting capacity search).')
+        mitigations.append('Consider feeder RegControl or CapControl near the POC.')
+    if not mitigations and overall == 'pass':
+        mitigations.append('Proposed interconnection passes screening limits at the selected size.')
+
+    hosting = None
+    if run_hc:
+        lo, hi = 0.0, max(hc_max_kw, proposed_kw)
+        best = 0.0
+        iters = 0
+        last_lim = None
+        while (hi - lo) > hc_tol_kw and iters < 24:
+            mid = 0.5 * (lo + hi)
+            clean_hc = copy.deepcopy(clean)
+            der_hc = _dg_find_der_element(clean_hc, der_id, der_type)
+            if der_hc is None:
+                break
+            _dg_scale_der(der_hc, mid, proposed_kva)
+            # Prefer InvControl if it helped
+            if inv_compare and inv_compare.get('overall') == 'pass':
+                der_hc['inv_control_mode'] = 'VOLTVAR'
+                ctrl = 'Time'
+            else:
+                der_hc['inv_control_mode'] = 'NONE'
+                ctrl = 'Static'
+            res_hc = _dg_build_and_solve(clean_hc, frequency, controlmode=ctrl)
+            iters += 1
+            if not res_hc.get('ok') or not res_hc.get('converged'):
+                hi = mid
+                last_lim = 'Did not converge'
+                continue
+            _c, o_hc, lim_hc = _dg_evaluate_checks(
+                res_hc['bus_metrics'], res_hc['line_metrics'], res_hc['source_p_kw'],
+                vmin_pu, vmax_pu, max_loading)
+            last_lim = lim_hc
+            if o_hc == 'pass':
+                best = mid
+                lo = mid
+            else:
+                hi = mid
+        hosting = {
+            'hosting_capacity_kw': round(best, 2),
+            'iterations': iters,
+            'search_max_kw': hc_max_kw,
+            'tolerance_kw': hc_tol_kw,
+            'limiting_constraint_at_upper': last_lim,
+        }
+
+    # Restore note about original inv mode
+    out = {
+        'error': False,
+        'summary': {
+            'overall': overall,
+            'proposed_kw': proposed_kw,
+            'der_id': der_id,
+            'der_type': der_type,
+            'poc_bus_id': poc_bus_id,
+            'converged': result_base.get('converged'),
+            'limiting_constraint': limiting,
+            'original_inv_control_mode': original_inv,
+        },
+        'checks': checks,
+        'invcontrol_compare': inv_compare,
+        'mitigations': mitigations,
+        'hosting_capacity': hosting,
+        'related': {
+            'bess_sizing': 'Pandapower BESS sizing study can size storage to POC P/Q targets.',
+            'rpc': 'Pandapower Grid Code Compliance (P-Q & U-Q) checks reactive capability envelopes.',
+        },
+    }
+    return json.dumps(out, default=str, separators=(',', ':'))
