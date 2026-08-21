@@ -1472,6 +1472,8 @@ def create_busbars(in_data, net):
         print("   Upgrade to pandapower 3.1+ for full DC grid support.")
     
     for x in in_data:
+        if not isinstance(in_data[x], dict) or not isinstance(in_data[x].get('typ'), str):
+            continue
         if "DC Bus" in in_data[x]['typ']:
             # Handle DC Bus separately - requires pandapower 3.1+
             if not has_dc_bus_support:
@@ -2656,6 +2658,8 @@ def create_other_elements(in_data,net,x, Busbars):
         globals()[name] = value    
        
     for x in _ordered_keys:
+        if not isinstance(in_data[x], dict) or not isinstance(in_data[x].get('typ'), str):
+            continue
       
         #eval - rozwiazuje problem z wartosciami NaN
         if (in_data[x]['typ'].startswith("Line")):

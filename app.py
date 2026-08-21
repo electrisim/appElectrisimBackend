@@ -57,26 +57,36 @@ app.config['CORS_HEADERS'] = 'Content-Type'
  #@cross_origin()
 #@cross_origin(origins=['http://127.0.0.1:5500'],allow_headers=['Content-Type, access-control-allow-origin'])#supports_credentials=True #nie było tego
 
+def _element_typ(item):
+    """Return the element type string, or '' if this payload entry is not an element dict."""
+    if not isinstance(item, dict):
+        return ''
+    typ = item.get('typ')
+    return typ if isinstance(typ, str) else ''
+
+
 #pobieranie danych z frontend
-@app.route('/')
+@app.route('/', methods=['GET'])
 def index():
         return 'Please send data to backend'
 
-@app.route('/', methods=['GET','POST'])
+@app.route('/', methods=['POST'])
 def simulation():
     try:
-        #in_data = request.get_json()
-        in_data = request.get_json(force=True) #force – if set to True the mimetype is ignored.
+        in_data = request.get_json(force=True, silent=True)
+        if not isinstance(in_data, dict):
+            return jsonify({
+                'error': 'Request body must be a JSON object with simulation elements.'
+            }), 400
         print(in_data) 
        
         Busbars = {}
         
         # DG Interconnection Screening (OpenDSS)
-        if 'dg_interconnection_params' in in_data and 'DgInterconnectionOpenDss' in str(
-                in_data.get('dg_interconnection_params', {}).get('typ', '')):
-            user_email = in_data.get('dg_interconnection_params', {}).get('user_email', 'unknown@user.com')
+        dg_params = in_data.get('dg_interconnection_params')
+        if isinstance(dg_params, dict) and 'DgInterconnectionOpenDss' in str(dg_params.get('typ', '')):
+            user_email = dg_params.get('user_email', 'unknown@user.com')
             print(f"=== DG INTERCONNECTION SCREENING REQUESTED BY USER: {user_email} ===")
-            dg_params = in_data.get('dg_interconnection_params', {})
             response_data = opendss_electrisim.dg_interconnection_screening(in_data, dg_params)
             accept_encoding = request.headers.get('Accept-Encoding', '')
             if 'gzip' in accept_encoding and len(response_data) > 1024:
@@ -89,13 +99,13 @@ def simulation():
             return response_data
 
         # Check for BESS sizing request first (it's in a nested structure)
-        if 'bess_sizing_params' in in_data and in_data.get('bess_sizing_params', {}).get('typ') == 'BessSizingPandaPower':
+        bess_params = in_data.get('bess_sizing_params')
+        if isinstance(bess_params, dict) and bess_params.get('typ') == 'BessSizingPandaPower':
             # Extract user email for logging
-            user_email = in_data.get('bess_sizing_params', {}).get('user_email', 'unknown@user.com')
+            user_email = bess_params.get('user_email', 'unknown@user.com')
             print(f"=== BESS SIZING REQUESTED BY USER: {user_email} ===")
             
             # Extract BESS sizing parameters
-            bess_params = in_data.get('bess_sizing_params', {})
             frequency = float(bess_params.get('frequency', 50))
             algorithm = bess_params.get('algorithm', 'nr')
             calculation_mode = bess_params.get('calculationMode', 'single')
@@ -166,14 +176,16 @@ def simulation():
               
         #utworzenie sieci - w pierwszej petli sczytujemy parametry symulacji i tworzymy szyny
         for x in in_data:    
-            #print(x)
-            if "FuseCharacteristicPreviewPandaPower" in in_data[x].get('typ', ''):
+            typ = _element_typ(in_data[x])
+            if not typ:
+                continue
+            if "FuseCharacteristicPreviewPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== FUSE CHARACTERISTIC PREVIEW: {user_email} ===")
                 body = pandapower_electrisim.fuse_characteristic_preview(in_data[x])
                 return Response(body, mimetype='application/json')
 
-            if "OptimalPowerFlowPandaPower" in in_data[x]['typ']:
+            if "OptimalPowerFlowPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 
@@ -216,7 +228,7 @@ def simulation():
                 response = pandapower_electrisim.optimalPowerFlow(net, opf_params)
                 return jsonify(response) # Changed to jsonify for direct dict return
             
-            if "PowerFlowPandaPower" in in_data[x]['typ']:
+            if "PowerFlowPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
@@ -252,7 +264,7 @@ def simulation():
                     return response_data
             
             
-            if "RPCAnalysisPandaPower" in in_data[x]['typ']:
+            if "RPCAnalysisPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== RPC ANALYSIS REQUESTED BY USER: {user_email} ===")
 
@@ -355,7 +367,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "ShortCircuitPandaPower" in in_data[x]['typ']:
+            if "ShortCircuitPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
 
@@ -377,7 +389,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "ArcFlashPandaPower" in in_data[x]['typ']:
+            if "ArcFlashPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== ARC FLASH REQUESTED BY USER: {user_email} ===")
 
@@ -397,7 +409,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "MotorStartingPandaPower" in in_data[x]['typ']:
+            if "MotorStartingPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== MOTOR STARTING REQUESTED BY USER: {user_email} ===")
 
@@ -421,7 +433,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "TransientStabilityAndes" in in_data[x]['typ']:
+            if "TransientStabilityAndes" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== TRANSIENT STABILITY (ANDES) REQUESTED BY USER: {user_email} ===")
                 response_data = andes_electrisim.run_tds(in_data, in_data[x])
@@ -435,7 +447,7 @@ def simulation():
                     return response
                 return response_data
 
-            if "EigenvalueAndes" in in_data[x]['typ']:
+            if "EigenvalueAndes" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== EIGENVALUE ANALYSIS (ANDES) REQUESTED BY USER: {user_email} ===")
                 response_data = andes_electrisim.run_eig(in_data, in_data[x])
@@ -449,7 +461,7 @@ def simulation():
                     return response
                 return response_data
 
-            if "ShortCircuitOpenDss" in in_data[x]['typ']:
+            if "ShortCircuitOpenDss" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 frequency = int(in_data[x].get('frequency', 50))
@@ -474,7 +486,7 @@ def simulation():
                 else:
                     return response_data
            
-            if "DgInterconnectionOpenDss" in in_data[x]['typ']:
+            if "DgInterconnectionOpenDss" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== DG INTERCONNECTION SCREENING REQUESTED BY USER: {user_email} ===")
                 response_data = opendss_electrisim.dg_interconnection_screening(in_data, in_data[x])
@@ -488,7 +500,7 @@ def simulation():
                     return response
                 return response_data
 
-            if "PowerFlowOpenDss" in in_data[x]['typ']:
+            if "PowerFlowOpenDss" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 
@@ -553,7 +565,7 @@ def simulation():
                 else:
                     return response_data
             
-            if "ContingencyAnalysisPandaPower" in in_data[x]['typ']:
+            if "ContingencyAnalysisPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 
@@ -588,7 +600,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "ProtectionCoordinationPandaPower" in in_data[x]['typ']:
+            if "ProtectionCoordinationPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== PROTECTION COORDINATION REQUESTED BY USER: {user_email} ===")
 
@@ -629,7 +641,7 @@ def simulation():
                 else:
                     return response_data
 
-            if "EconomicAnalysisPandaPower" in in_data[x]['typ']:
+            if "EconomicAnalysisPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== ECONOMIC ANALYSIS REQUESTED BY USER: {user_email} ===")
@@ -661,7 +673,7 @@ def simulation():
                 print(f"=== ECONOMIC ANALYSIS RESPONSE: total_capex={response.get('total_capex')}, total_power_losses_mw={response.get('total_power_losses_mw')}, error={response.get('error')} ===")
                 return jsonify(response)
                 
-            if "ControllerSimulationPandaPower Parameters" in in_data[x]['typ']:
+            if "ControllerSimulationPandaPower Parameters" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 
@@ -686,7 +698,7 @@ def simulation():
                 response = pandapower_electrisim.controller_simulation(net, controller_params)
                 return jsonify(response)
                 
-            if "TimeSeriesSimulationPandaPower Parameters" in in_data[x]['typ']:
+            if "TimeSeriesSimulationPandaPower Parameters" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 
