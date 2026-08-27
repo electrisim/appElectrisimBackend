@@ -5067,6 +5067,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
             # Initialize tap_control_results before try block so it's accessible in else block
             tap_control_results = []
             shunt_control_results = []
+            controller_fallback_warning = None
 
             # Redirect stdout/stderr to a safe UTF-8 buffer during power flow
             # to prevent UnicodeEncodeError on Windows (cp1252 can't handle emoji/Unicode
@@ -5099,10 +5100,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 attach_2w = rc2 and bool(tc2_list)
                 attach_3w = rc3 and bool(tc3_list)
                 attach_sh_disc = rcs and bool(shunt_ctrl_list)
-                # Line P → shunt step is configured on the shunt (line_flow_step_control + table + ref line).
-                # Do not require run_control_shunt — that flag is for DiscreteShuntController and users often
-                # leave it off while still expecting Line P bands to drive step.
-                attach_lf_sh = bool(lf_shunt_list)
+                attach_lf_sh = rcs and bool(lf_shunt_list)
+                # ParkController is an explicit diagram element with its own enable toggle, so it is
+                # not gated on the run_control_* checkboxes (those cover tap/shunt control only).
                 park_attached = 0
                 try:
                     park_attached = _electrisim_attach_park_controllers(
@@ -5236,8 +5236,83 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 else:
                     print(f"Running power flow WITHOUT controllers (run_pp_control={run_pp_control})")
                 
-                pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
-                         run_control=run_pp_control, **_electrisim_enforce_q_lims_kw(net))
+                def _restore_controller_setpoints():
+                    for idx, pos in initial_tap_positions.items():
+                        try:
+                            net.trafo.at[idx, 'tap_pos'] = pos
+                        except Exception:
+                            pass
+                    for idx, pos in initial_tap3w_positions.items():
+                        try:
+                            net.trafo3w.at[idx, 'tap_pos'] = pos
+                        except Exception:
+                            pass
+                    for si, s0 in initial_shunt_steps.items():
+                        try:
+                            net.shunt.at[si, 'step'] = s0
+                        except Exception:
+                            pass
+
+                pf_kwargs = _electrisim_enforce_q_lims_kw(net)
+
+                # A heavily compensated cable network needs more than the 10 Newton iterations
+                # pandapower allows by default, so work through progressively more robust solver
+                # settings rather than reporting failure after the first divergence. Later plans
+                # drop the controllers: DiscreteTapControl on this farm often cannot reach 0.99 pu
+                # on 0.69 kV buses (tap range too small) and then Newton-Raphson diverges.
+                requested_label = f"{algorithm}, init={init}"
+                solve_plans = [(requested_label, {'algorithm': algorithm, 'init': init}, run_pp_control)]
+                if run_pp_control:
+                    solve_plans.append(
+                        (f"{requested_label}, no controllers", {'algorithm': algorithm, 'init': init}, False)
+                    )
+                solve_plans.append(
+                    (f"{algorithm}, init={init}, max_iteration=50",
+                     {'algorithm': algorithm, 'init': init, 'max_iteration': 50}, False)
+                )
+                solve_plans.append(
+                    (f"{algorithm}, init=flat, max_iteration=100",
+                     {'algorithm': algorithm, 'init': 'flat', 'max_iteration': 100}, False)
+                )
+                # Iwamoto's step-size multiplier is built for ill-conditioned cases that plain
+                # Newton-Raphson overshoots.
+                solve_plans.append(
+                    ("iwamoto_nr, init=flat, max_iteration=100",
+                     {'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 100}, False)
+                )
+
+                pf_plan_used = None
+                pf_last_error = None
+                pf_attempt_log = []
+                for plan_label, plan_kwargs, plan_run_control in solve_plans:
+                    if not plan_run_control and run_pp_control:
+                        _restore_controller_setpoints()
+                        if hasattr(net, 'controller') and not net.controller.empty:
+                            try:
+                                net.controller['in_service'] = False
+                            except Exception:
+                                pass
+                    try:
+                        pp.runpp(net, calculate_voltage_angles=calculate_voltage_angles,
+                                 run_control=plan_run_control, **plan_kwargs, **pf_kwargs)
+                        pf_plan_used = plan_label
+                        break
+                    except Exception as plan_err:
+                        pf_last_error = plan_err
+                        detail = f"{plan_label}: {type(plan_err).__name__}: {plan_err}"
+                        pf_attempt_log.append(detail)
+                        print(f"Power flow attempt failed [{detail}]")
+
+                if pf_plan_used is None:
+                    raise pf_last_error
+
+                if pf_plan_used != solve_plans[0][0]:
+                    print(f"Power flow converged with fallback settings [{pf_plan_used}]")
+                    controller_fallback_warning = (
+                        f"Load flow did not converge with the requested settings ({requested_label}) "
+                        f"and succeeded with [{pf_plan_used}]. Failed attempts: "
+                        + " | ".join(pf_attempt_log)
+                    )
                 
                 # Check if tap positions changed
                 if run_pp_control and (initial_tap_positions or initial_tap3w_positions):
@@ -5501,7 +5576,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Restore stdout/stderr before handling error
                 sys.stdout = _orig_stdout
                 sys.stderr = _orig_stderr
-                
+
+                # stdout was captured during the solve, so without this the server log shows only
+                # the diagnostic dump and the real cause is visible in the HTTP response alone.
+                import traceback
+                print(f"[pandapower] Power flow failed: {type(e).__name__}: {e}")
+                traceback.print_exc()
+
                 # Initialize diagnostic response
                 diagnostic_response = {
                     "error": True,
@@ -6826,6 +6907,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     result['tap_control_results'] = tap_control_results
                 if shunt_control_results:
                     result['shunt_control_results'] = shunt_control_results
+                if controller_fallback_warning:
+                    result['controller_fallback_warning'] = controller_fallback_warning
+                    print(f"[WARN] {controller_fallback_warning}")
 
                 # Park / Wind Turbine controller summaries for results export
                 try:
@@ -11098,6 +11182,44 @@ def _rpc_masked_q_interp_clip(p_target, p_list, q_list):
     return float(np.interp(pt, px, qy, left=float(qy[0]), right=float(qy[-1])))
 
 
+def _rpc_merge_uq_voltages(voltage_levels, uq_requirements, requirements=None):
+    """
+    U-Q/Pmax needs a voltage sweep. If the client sent U-Q requirement voltages
+    (or only one P-Q voltage such as 1.0 pu), union those U points into voltage_levels
+    so the U-Q chart is a curve rather than two dots at a single U.
+    Replicates the P-Q requirement envelope onto any newly added voltage keys.
+    """
+    extra = []
+    if isinstance(uq_requirements, dict):
+        extra = uq_requirements.get('u_pu') or []
+    merged = []
+    seen = set()
+    for v in list(voltage_levels or []) + list(extra or []):
+        try:
+            fv = round(float(v), 4)
+        except (TypeError, ValueError):
+            continue
+        if fv in seen:
+            continue
+        seen.add(fv)
+        merged.append(fv)
+    merged.sort()
+    if not merged:
+        merged = [1.0]
+    if isinstance(requirements, dict) and requirements:
+        proto = None
+        for val in requirements.values():
+            if isinstance(val, dict) and val.get('p_mw'):
+                proto = val
+                break
+        if proto:
+            for v in merged:
+                vk = f"{float(v):.4f}"
+                if vk not in requirements:
+                    requirements[vk] = proto
+    return merged
+
+
 def _rpc_build_uq_curve(voltage_levels, curves, p_target_mw):
     """
     Extract Q_min/Q_max at P ≈ p_target from per-voltage P-Q curves for U-Q/Pmax chart.
@@ -11545,7 +11667,8 @@ def _rpc_max_feasible_q(net, ext_grid_idx, v_pu, gen_info, total_installed_mw, p
 
 def reactive_power_capability(net, rpc_params):
     """
-    Perform Reactive Power Capability (RPC) analysis for a wind farm.
+    Perform Reactive Power Capability (RPC) analysis for a plant
+    (static generators and/or wind turbines; both map to pandapower sgen).
     Sweeps active power and determines Q_min/Q_max at the PCC bus for
     each requested voltage level. Compares against grid code requirements.
 
@@ -11564,7 +11687,7 @@ def reactive_power_capability(net, rpc_params):
         pcc_bus_name = rpc_params.get('pcc_bus_name')
         ext_grid_name = rpc_params.get('ext_grid_name')
         generator_names = rpc_params.get('generator_names', [])
-        voltage_levels = rpc_params.get('voltage_levels', [1.0])
+        voltage_levels = list(rpc_params.get('voltage_levels', [1.0]) or [1.0])
         p_min_mw = float(rpc_params.get('p_min_mw', 0))
         p_max_mw = float(rpc_params.get('p_max_mw', 0))
         p_steps = int(rpc_params.get('p_steps', 10))
@@ -11575,6 +11698,7 @@ def reactive_power_capability(net, rpc_params):
         uq_requirements = rpc_params.get('uq_requirements', None)
         grid_code_template_name = rpc_params.get('grid_code_template_name')
         uq_grid_code_template_name = rpc_params.get('uq_grid_code_template_name')
+        voltage_levels = _rpc_merge_uq_voltages(voltage_levels, uq_requirements, requirements)
         verbose_iwamoto = bool(rpc_params.get('verbose_iwamoto', False))
         progress_cb = rpc_params.get('_progress_callback')
         rc2, rc3, rcs = _resolve_controller_family_flags(rpc_params)
@@ -11656,7 +11780,7 @@ def reactive_power_capability(net, rpc_params):
 
         total_installed_mw = sum(g['p_rated_mw'] for g in gen_info)
         if total_installed_mw <= 0:
-            return json.dumps({'error': 'Total installed capacity is zero. Set p_mw on static generators.'}, separators=(',', ':'))
+            return json.dumps({'error': 'Total installed capacity is zero. Set p_mw on static generators or wind turbines.'}, separators=(',', ':'))
 
         if p_max_mw <= 0:
             p_max_mw = total_installed_mw
@@ -11678,7 +11802,7 @@ def reactive_power_capability(net, rpc_params):
         if q_capability_mode == 'from_sgen_curve':
             if not any(_rpc_sgen_has_q_curve(net, g['idx']) for g in gen_info):
                 warnings_list.append(
-                    'Q mode "from_sgen_curve": no selected static generator has an active P–Q curve '
+                    'Q mode "from_sgen_curve": no selected static generator or wind turbine has an active P–Q curve '
                     '(enable reactive capability on the unit). Using circular √(S_n²−P²) fallback for all.'
                 )
         tc2_list = getattr(net, 'trafo_discrete_tap_controllers', None) or []
@@ -11858,7 +11982,9 @@ def reactive_power_capability(net, rpc_params):
                 'pcc_bus_name': pcc_bus_friendly,
                 'generator_count': len(gen_info),
                 'grid_code_template_name': grid_code_template_name,
+                'grid_code_template_key': rpc_params.get('grid_code_template_key'),
                 'uq_grid_code_template_name': uq_grid_code_template_name,
+                'uq_grid_code_template_key': rpc_params.get('uq_grid_code_template_key'),
                 'q_capability_mode': q_capability_mode,
                 'tap_changer_control': {
                     'run_control_requested': run_control_any,
@@ -11998,8 +12124,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
     pass verbose_iwamoto=True to forward them to stdout (for debugging).
 
     When any of run_control_trafo2w / run_control_trafo3w / run_control_shunt is True and the net
-    lists matching controller specs, registers DiscreteTapControl / DiscreteShuntController / line-P
-    CharacteristicControl for shunt step and runs pp.runpp(..., run_control=True) with a single NR
+    lists matching controller specs, registers DiscreteTapControl / DiscreteShuntController /
+    line-P CharacteristicControl for shunt step and runs pp.runpp(..., run_control=True) with a single NR
     strategy (controller state is not reliable across solver fallbacks on the same net).
     """
     import io
@@ -12012,8 +12138,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
     attach_2w = bool(run_control_trafo2w) and bool(tc2)
     attach_3w = bool(run_control_trafo3w) and bool(tc3)
     attach_sh = bool(run_control_shunt) and bool(shc)
-    # Same as powerflow(): line-flow shunt specs imply control run; do not gate on run_control_shunt.
-    attach_lf = bool(lfc)
+    attach_lf = bool(run_control_shunt) and bool(lfc)
     rc = attach_2w or attach_3w or attach_sh or attach_lf
     if rc:
         if attach_2w or attach_3w:

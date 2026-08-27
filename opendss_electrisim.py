@@ -224,6 +224,439 @@ def _opendss_warn(message):
     _opendss_warnings.append(message)
 
 
+# Per-shunt metadata (step table, discrete voltage control) filled while creating reactors.
+_opendss_shunt_meta = {}
+
+
+def _opendss_is_true(val):
+    return val in (True, 'true', 'True', '1', 1)
+
+
+def _opendss_float(val, default=0.0):
+    try:
+        if val is None or val == '':
+            return default
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _opendss_parse_shunt_characteristic_rows(raw_json):
+    """Parse Electrisim [{'step','p_mw','q_mvar'}, ...] JSON the same way as pandapower."""
+    if raw_json is None:
+        return []
+    try:
+        if isinstance(raw_json, list):
+            data = raw_json
+        elif isinstance(raw_json, str):
+            data = json.loads(raw_json.strip() or '[]')
+        else:
+            return []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    by_step = {}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            st = int(round(float(row.get('step', 0))))
+            pm = float(row.get('p_mw', 0.0))
+            qv = float(row.get('q_mvar', 0.0))
+        except (TypeError, ValueError):
+            continue
+        by_step[st] = {'step': st, 'p_mw': pm, 'q_mvar': qv}
+    return sorted(by_step.values(), key=lambda r: r['step'])
+
+
+def _opendss_shunt_uses_zero_based(electrisim_step, characteristic_rows, line_flow_bands=None):
+    """Mirrors pandapower's _electrisim_shunt_uses_zero_based so both solvers pick the same step."""
+    try:
+        if int(round(float(electrisim_step))) == 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    for r in characteristic_rows or []:
+        try:
+            if int(r.get('step', -1)) == 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    for b in line_flow_bands or []:
+        try:
+            if int(b.get('step', -1)) == 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _opendss_shunt_step_to_pp(step_val, zero_based):
+    try:
+        s = int(round(float(step_val)))
+    except (TypeError, ValueError):
+        s = 1
+    if zero_based:
+        return max(1, s + 1)
+    return max(1, s)
+
+
+def _opendss_shunt_max_step_to_pp(max_step, zero_based):
+    try:
+        m = int(round(float(max_step)))
+    except (TypeError, ValueError):
+        m = 1
+    return max(1, m + 1) if zero_based else max(1, m)
+
+
+def _opendss_shunt_nominals_for_step(rows, step_val, p_fallback, q_fallback):
+    try:
+        si = int(round(float(step_val)))
+    except (TypeError, ValueError):
+        si = 1
+    for r in rows or []:
+        if int(r['step']) == si:
+            return float(r['p_mw']), float(r['q_mvar'])
+    return p_fallback, q_fallback
+
+
+def _opendss_shunt_pq_at_pp_step(spec, step_pp):
+    """Nominal P [MW], Q [MVAr] at 1.0 pu for a pandapower-style step index."""
+    p_fb = spec.get('p_fallback', 0.0)
+    q_fb = spec.get('q_fallback', 0.0)
+    rows = spec.get('characteristic_rows') or []
+    if spec.get('use_characteristic') and rows:
+        el_step = (step_pp - 1) if spec.get('zero_based') else step_pp
+        return _opendss_shunt_nominals_for_step(rows, el_step, p_fb, q_fb)
+    return p_fb * float(step_pp), q_fb * float(step_pp)
+
+
+def _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name):
+    if not bus_name or not BusbarsDictVoltage:
+        return None
+    if bus_name in BusbarsDictVoltage:
+        return BusbarsDictVoltage[bus_name]
+    lower = str(bus_name).lower()
+    for key, val in BusbarsDictVoltage.items():
+        if str(key).lower() == lower:
+            return val
+    return None
+
+
+def _opendss_read_bus_vm_pu(dss_mod, bus_name, BusbarsDictVoltage):
+    """Positive-sequence L-L voltage in pu after a solve."""
+    if not bus_name:
+        return None
+    try:
+        dss_mod.Circuit.SetActiveBus(str(bus_name))
+        voltages = dss_mod.Bus.Voltages()
+        if voltages is None or len(voltages) < 6:
+            return None
+        va = complex(voltages[0] / 1000.0, voltages[1] / 1000.0)
+        vb = complex(voltages[2] / 1000.0, voltages[3] / 1000.0)
+        vc = complex(voltages[4] / 1000.0, voltages[5] / 1000.0)
+        a = complex(-0.5, math.sqrt(3) / 2.0)
+        a2 = complex(-0.5, -math.sqrt(3) / 2.0)
+        v1 = (va + a * vb + a2 * vc) / 3.0
+        v1_ll_kv = abs(v1) * math.sqrt(3)
+        try:
+            base_ln = float(dss_mod.Bus.kVBase())
+            if base_ln > 0:
+                return v1_ll_kv / (base_ln * math.sqrt(3))
+        except (TypeError, ValueError):
+            pass
+        base_kv = _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name)
+        if base_kv and float(base_kv) > 0:
+            return v1_ll_kv / float(base_kv)
+    except Exception:
+        return None
+    return None
+
+
+def _opendss_shunt_rp_ohms(bus_voltage_kv, p_mw):
+    if bus_voltage_kv is None or p_mw is None or p_mw <= 0:
+        return None
+    v_volts = float(bus_voltage_kv) * 1000.0
+    p_watts = float(p_mw) * 1e6
+    if p_watts <= 0:
+        return None
+    return (v_volts ** 2) / p_watts
+
+
+def _opendss_apply_shunt_rating(execute_dss_command, spec, p_mw, q_mvar):
+    """Update an existing Reactor/Capacitor to the nominal P/Q at 1.0 pu."""
+    reactor_name = spec.get('reactor_name')
+    bus_voltage = spec.get('bus_voltage')
+    if not reactor_name:
+        return
+    q_kvar = float(q_mvar) * 1000.0
+    prefix = spec.get('dss_class', 'Reactor')
+    if abs(q_kvar) < 1.0:
+        execute_dss_command(f'{prefix}.{reactor_name}.enabled=no')
+        return
+    execute_dss_command(f'{prefix}.{reactor_name}.enabled=yes')
+    rp = _opendss_shunt_rp_ohms(bus_voltage, p_mw)
+    if q_kvar >= 0:
+        cmd = f'Edit Reactor.{reactor_name} kvar={q_kvar:.0f}'
+        if rp is not None:
+            cmd += f' Rp={rp:.2f}'
+        execute_dss_command(cmd)
+    else:
+        execute_dss_command(f'Edit Capacitor.{reactor_name} kvar={abs(q_kvar):.0f}')
+
+
+def _opendss_apply_discrete_shunt_control(dss_mod, execute_dss_command, BusbarsDictVoltage, max_iters=20):
+    """
+    Approximate pandapower DiscreteShuntController: step shunt Q to drive bus voltage
+    toward vm_set_pu. Positive q_mvar is inductive (higher step lowers voltage).
+    """
+    specs = [m for m in _opendss_shunt_meta.values() if m.get('discrete_shunt_control')]
+    if not specs:
+        return
+    for _ in range(max_iters):
+        changed = False
+        for spec in specs:
+            vm = _opendss_read_bus_vm_pu(dss_mod, spec.get('bus_name'), BusbarsDictVoltage)
+            if vm is None:
+                continue
+            vm_set = float(spec.get('vm_set_pu', 1.0))
+            tol = float(spec.get('tol', 1e-3))
+            increment = int(spec.get('increment', 1) or 1)
+            if increment < 1:
+                increment = 1
+            step = int(spec.get('step', 1))
+            max_step = int(spec.get('max_step', 1) or 1)
+            min_step = 1
+            p_now, q_now = _opendss_shunt_pq_at_pp_step(spec, step)
+            q_sign = 1.0 if q_now >= 0 else -1.0
+            if vm > vm_set + tol:
+                new_step = step + increment if q_sign >= 0 else step - increment
+            elif vm < vm_set - tol:
+                new_step = step - increment if q_sign >= 0 else step + increment
+            else:
+                continue
+            new_step = max(min_step, min(max_step, new_step))
+            if new_step == step:
+                continue
+            spec['step'] = new_step
+            p_mw, q_mvar = _opendss_shunt_pq_at_pp_step(spec, new_step)
+            _opendss_apply_shunt_rating(execute_dss_command, spec, p_mw, q_mvar)
+            changed = True
+        if not changed:
+            break
+        execute_dss_command('solve')
+
+
+def _opendss_circuit_has_usable_solution(dss_mod):
+    """Finite slack power and finite voltages (Newton can miss Converged() at MaxIterations)."""
+    try:
+        total = dss_mod.Circuit.TotalPower()
+        if not total or not math.isfinite(float(total[0])):
+            return False
+        buses = dss_mod.Circuit.AllBusNames() or []
+        for bname in buses[:3]:
+            dss_mod.Circuit.SetActiveBus(bname)
+            v = dss_mod.Bus.Voltages()
+            if not v:
+                return False
+            if not math.isfinite(float(v[0])):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _opendss_circuit_converged(dss_mod):
+    """
+    Whether the snapshot result can be reported. OpenDSS can stop at MaxIterations with
+    Converged()=False on an operating point that is already valid, so finite voltages and
+    slack power decide here; a diverged solve leaves NaN behind and is rejected.
+    """
+    return _opendss_circuit_has_usable_solution(dss_mod)
+
+
+def _opendss_set_all_generator_vminpu(execute_dss_command, generators_dict, vminpu):
+    for gen_name in (generators_dict or {}):
+        if not gen_name:
+            continue
+        execute_dss_command(f'Edit Generator.{gen_name} Vminpu={float(vminpu):.3f}')
+
+
+def _opendss_snapshot_solve_plans(algorithm, max_iterations):
+    """
+    Ordered snapshot attempts. A diverged solve leaves NaN in the node voltages and
+    OpenDSS has no executive command to clear them, so every fallback here is applied
+    to a freshly rebuilt circuit rather than to the failed one.
+    """
+    try:
+        requested_iters = int(float(max_iterations))
+    except (TypeError, ValueError):
+        requested_iters = 100
+    retry_iters = max(200, requested_iters)
+    requested = str(algorithm or 'Normal')
+    candidates = [
+        (requested, requested_iters, None),
+        # Newton at the requested iteration count first: a longer run can walk a
+        # marginal case away from the finite iterate this one stops at.
+        ('Newton', requested_iters, None),
+        ('Newton', retry_iters, None),
+        ('Newton', retry_iters, 0.90),
+    ]
+    plans = []
+    seen = set()
+    for algo, iters, vminpu in candidates:
+        key = (algo.lower(), iters, vminpu)
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f'{algo}, MaxIterations={iters}'
+        if vminpu is not None:
+            label += f', generator Vminpu={vminpu:.2f}'
+        plans.append({'label': label, 'algorithm': algo,
+                      'max_iterations': iters, 'gen_vminpu': vminpu})
+    return plans
+
+
+def _opendss_solve_snapshot_plan(dss_mod, execute_dss_command, plan, generators_dict=None):
+    """Solve a freshly built circuit for one plan; Vminpu plans relax then restore PQ behaviour."""
+    vminpu = plan.get('gen_vminpu')
+    if vminpu is not None and generators_dict:
+        _opendss_set_all_generator_vminpu(execute_dss_command, generators_dict, vminpu)
+    execute_dss_command('solve')
+    if vminpu is not None and generators_dict and _opendss_circuit_has_usable_solution(dss_mod):
+        _opendss_set_all_generator_vminpu(execute_dss_command, generators_dict, 0.50)
+        execute_dss_command('solve')
+    return _opendss_circuit_converged(dss_mod)
+
+
+def _opendss_parse_line_flow_step_table(raw_json):
+    """[{p_mw_min, p_mw_max, step}, ...] — same rules as pandapower line-flow bands."""
+    if raw_json is None:
+        return []
+    try:
+        if isinstance(raw_json, list):
+            data = raw_json
+        elif isinstance(raw_json, str):
+            data = json.loads(raw_json.strip() or '[]')
+        else:
+            return []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            out.append({
+                'p_mw_min': float(row.get('p_mw_min', 0)),
+                'p_mw_max': float(row.get('p_mw_max', 0)),
+                'step': int(row.get('step', 0)),
+            })
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda r: (r['p_mw_min'], r['p_mw_max']))
+    return out
+
+
+def _opendss_line_flow_pick_step(bands, p_mw):
+    if not bands:
+        return 0
+    try:
+        pv = float(p_mw)
+    except (TypeError, ValueError):
+        pv = 0.0
+    if pv < float(bands[0]['p_mw_min']):
+        return int(bands[0]['step'])
+    if pv > float(bands[-1]['p_mw_max']):
+        return int(bands[-1]['step'])
+    n = len(bands)
+    for i, b in enumerate(bands):
+        lo = float(b['p_mw_min'])
+        hi = float(b['p_mw_max'])
+        st = int(b['step'])
+        if i == n - 1:
+            if lo <= pv <= hi:
+                return st
+        elif lo <= pv < hi:
+            return st
+    return int(bands[-1]['step'])
+
+
+def _opendss_find_line_name(ref, LinesDict, LinesDictId):
+    if not ref:
+        return None
+    ref_s = str(ref).strip()
+    if not ref_s:
+        return None
+    if LinesDict and ref_s in LinesDict:
+        return LinesDict[ref_s]
+    san = _sanitize_opendss_name(ref_s)
+    if LinesDict and san in LinesDict:
+        return LinesDict[san]
+    for name, lid in (LinesDictId or {}).items():
+        if str(lid) == ref_s or _sanitize_opendss_name(str(lid)) == san:
+            return (LinesDict or {}).get(name, name)
+    return None
+
+
+def _opendss_line_p_mw(dss_mod, line_name, p_reference='p_from_mw', use_abs=True):
+    dss_mod.Circuit.SetActiveElement(f'Line.{line_name}')
+    powers = dss_mod.CktElement.Powers() or []
+    n_cond = dss_mod.CktElement.NumConductors()
+    n_ph = dss_mod.CktElement.NumPhases()
+    term = 1 if str(p_reference or '').lower() == 'p_to_mw' else 0
+    p_kw, _q = _opendss_terminal_pq_kw(powers, term, n_cond, n_ph)
+    p_mw = p_kw / 1000.0
+    if use_abs:
+        p_mw = abs(p_mw)
+    return p_mw
+
+
+def _opendss_apply_line_flow_shunt_control(dss_mod, execute_dss_command, LinesDict, LinesDictId, max_iters=3):
+    """
+    Match pandapower line_flow_step_control: map monitored line P to shunt step.
+    Pandapower attaches this even when DiscreteShuntController is off.
+    """
+    specs = [m for m in _opendss_shunt_meta.values() if m.get('line_flow_step_control')]
+    if not specs:
+        return
+    for _ in range(max_iters):
+        changed = False
+        for spec in specs:
+            line_name = _opendss_find_line_name(
+                spec.get('line_flow_reference_line_id'), LinesDict, LinesDictId)
+            bands = spec.get('line_flow_bands') or []
+            if not line_name or not bands:
+                continue
+            try:
+                p_mw = _opendss_line_p_mw(
+                    dss_mod, line_name,
+                    spec.get('line_flow_p_reference') or 'p_from_mw',
+                    spec.get('line_flow_p_use_abs', True),
+                )
+            except Exception as ex:
+                print(f"[OpenDSS] Line-flow shunt: could not read line '{line_name}': {ex}")
+                continue
+            el_step = _opendss_line_flow_pick_step(bands, p_mw)
+            step_pp = _opendss_shunt_step_to_pp(el_step, spec.get('zero_based'))
+            if int(step_pp) == int(spec.get('step') or 0):
+                continue
+            spec['step'] = int(step_pp)
+            p_now, q_now = _opendss_shunt_pq_at_pp_step(spec, step_pp)
+            print(
+                f"[OpenDSS] Line-flow shunt {spec.get('reactor_name')}: "
+                f"|P|={p_mw:.2f} MW -> step {el_step} (Q={q_now} MVAr)"
+            )
+            _opendss_apply_shunt_rating(execute_dss_command, spec, p_now, q_now)
+            changed = True
+        if not changed:
+            break
+        execute_dss_command('solve')
+
+
 def _format_opendss_bus_terminal(bus_name, phase=1, conn='wye'):
     """Return OpenDSS bus string with node notation, e.g. 'Bus5.1' or 'Bus5.1.2'."""
     try:
@@ -587,6 +1020,8 @@ def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
 
 def create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, export_commands=False, opendss_commands=None, execute_dss_command=None):
     """Create other elements in OpenDSS circuit"""
+    global _opendss_shunt_meta
+    _opendss_shunt_meta = {}
     if opendss_commands is None:
         opendss_commands = []
     
@@ -1653,9 +2088,16 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
             gen_name = element_name.replace(' ', '_')
             
             try:
-                # Use Generator element for static generator. Model=1 for constant P and Q
-                # (exact match for pandapower sgen which is a constant P,Q source).
-                gen_cmd = f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kW={p_kw:.3f} kvar={q_kvar:.3f} Model=1"
+                # Model=1 = constant kW and kvar, the PQ injection a pandapower sgen represents.
+                # Model=3 is constant kW / constant kV, which pins the terminal at 1.0 pu and lets
+                # Q float, so it must not be used here. Maxkvar/Minkvar only apply to Model=3.
+                # Vminpu default 0.90 converts the generator to constant-Z when collector
+                # voltage is low, so P collapses (e.g. 15 MW → ~8 MW). Keep PQ over a wide band.
+                gen_cmd = (
+                    f"New Generator.{gen_name} Bus1={bus_name} Phases=3 kV={bus_voltage} "
+                    f"kW={p_kw:.3f} kvar={q_kvar:.3f} Model=1 "
+                    f"Vminpu=0.5 Vmaxpu=2.0"
+                )
                 
                 # Append harmonic analysis properties if provided
                 spec_name = _sanitize_opendss_name(f"harm_sgen_{gen_name}")
@@ -1751,8 +2193,14 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             q_kvar = q_mvar * 1000
 
         try:
-            # Create generator command string with Model=3 for constant kW and kvar
-            gen_cmd = f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar} Model=3 PF={cos_phi}"
+            # Model=3 = constant kW / constant kV, matching pandapower gen (a PV bus).
+            q_abs_sync = abs(float(q_kvar))
+            maxkvar_sync = max(q_abs_sync * 2.0, 10000.0)
+            gen_cmd = (
+                f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} "
+                f"kW={p_kw} kvar={q_kvar} Model=3 PF={cos_phi} "
+                f"Vminpu=0.5 Vmaxpu=2.0 Maxkvar={maxkvar_sync:.3f} Minkvar={-maxkvar_sync:.3f}"
+            )
             
             # Add fault study parameters if provided (sub-transient reactance/resistance)
             xdss_pu_raw = element_data.get('xdss_pu')
@@ -2302,22 +2750,29 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
             )
             raise ValueError(error_msg)
         
-        # Get shunt reactor parameters with proper null handling
-        q_mvar_raw = element_data.get('q_mvar')
-        p_mw_raw = element_data.get('p_mw')  # Active power from frontend
-        
-        # Debug: Print what we received
-    
-        
-        # Convert to float
-        q_mvar = float(q_mvar_raw)
-        p_mw = float(p_mw_raw) if p_mw_raw is not None else 0.0
-        
-        # Convert to kVar and kW
-        q_kvar = q_mvar * 1000
-        p_kw = p_mw * 1000
-        
-        
+        # Nominal P/Q at 1.0 pu — same step / characteristic-table rules as pandapower.
+        q_fallback = _opendss_float(element_data.get('q_mvar'), 0.0)
+        p_fallback = _opendss_float(element_data.get('p_mw'), 0.0)
+        characteristic_rows = _opendss_parse_shunt_characteristic_rows(
+            element_data.get('shunt_characteristic_table_json'))
+        line_flow_bands = _opendss_parse_line_flow_step_table(
+            element_data.get('line_flow_step_table_json'))
+        use_characteristic = _opendss_is_true(element_data.get('step_dependency_table')) and bool(characteristic_rows)
+        step_electrisim = _opendss_float(element_data.get('step', 1), 1.0)
+        max_step_electrisim = _opendss_float(element_data.get('max_step', 1), 1.0)
+        zero_based = _opendss_shunt_uses_zero_based(
+            step_electrisim, characteristic_rows, line_flow_bands)
+        step_pp = _opendss_shunt_step_to_pp(step_electrisim, zero_based)
+        max_step_pp = _opendss_shunt_max_step_to_pp(max_step_electrisim, zero_based)
+        if use_characteristic:
+            p_mw, q_mvar = _opendss_shunt_nominals_for_step(
+                characteristic_rows, step_electrisim, p_fallback, q_fallback)
+        else:
+            p_mw = p_fallback * float(step_pp)
+            q_mvar = q_fallback * float(step_pp)
+
+        q_kvar = q_mvar * 1000.0
+
         # OpenDSS Reactor element: constant impedance (kV + kvar), matches pandapower shunt.
         # Optional Rp = V_LL^2 / P_total for no-load losses when p_mw > 0.
         # Sign convention (aligned with pandapower create_shunt):
@@ -2325,6 +2780,7 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         #   q_mvar < 0  -> capacitive (delivers Q) -> model as OpenDSS Capacitor
         try:
             reactor_name = f"ShuntReactor_{element_name}"
+            dss_class = 'Reactor' if q_kvar >= 0 else 'Capacitor'
 
             if abs(q_kvar) < 1.0:
                 print(f"[OpenDSS] Skipping Reactor {reactor_name}: kvar={q_kvar:.6f} is too small (would produce NaN impedance)")
@@ -2334,29 +2790,17 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
                 return
 
             if q_kvar >= 0:
-                # Inductive shunt (reactor)
                 cmd_parts = [f"New Reactor.{reactor_name} Bus1={bus_name} Phases=3 kV={bus_voltage} kvar={q_kvar:.0f}"]
-                if p_kw > 0 and bus_voltage is not None:
-                    voltage_kv = float(bus_voltage)
-                    p_watts = p_kw * 1000
-                    v_volts = voltage_kv * 1000
-                    rp_ohms = (v_volts ** 2) / p_watts
+                rp_ohms = _opendss_shunt_rp_ohms(bus_voltage, p_mw)
+                if rp_ohms is not None:
                     cmd_parts.append(f" Rp={rp_ohms:.2f}")
-                reactor_cmd = "".join(cmd_parts)
-                execute_dss_command(reactor_cmd)
+                execute_dss_command("".join(cmd_parts))
             else:
-                # Capacitive shunt (negative q_mvar in pandapower). OpenDSS Capacitor kvar is
-                # specified as a positive number (capacitor always delivers Q).
-                cap_kvar = abs(q_kvar)
                 cap_cmd = (f"New Capacitor.{reactor_name} Bus1={bus_name} Phases=3 "
-                           f"kV={bus_voltage} kvar={cap_kvar:.0f}")
+                           f"kV={bus_voltage} kvar={abs(q_kvar):.0f}")
                 execute_dss_command(cap_cmd)
-                reactor_cmd = cap_cmd
             
-            # Handle in_service status AFTER creating the element
             in_service = element_data.get('in_service', True)
-            
-            # Convert to boolean for comparison
             is_in_service = True
             if isinstance(in_service, bool):
                 is_in_service = in_service
@@ -2366,14 +2810,49 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
                 is_in_service = False
             
             if not is_in_service:
-                element_type_prefix = 'Reactor' if q_kvar >= 0 else 'Capacitor'
-                cmd = f'{element_type_prefix}.{reactor_name}.enabled=no'
+                cmd = f'{dss_class}.{reactor_name}.enabled=no'
                 print(f"[OpenDSS] {cmd}")
                 dss.Text.Command(cmd)
 
             ShuntsDict[element_name] = reactor_name
             ShuntsDictId[element_name] = element_id
             created_elements.add(element_name)
+
+            vm_set = _opendss_float(element_data.get('vm_set_pu'), 1.0)
+            if vm_set is None:
+                vm_set = 1.0
+            try:
+                increment = int(_opendss_float(element_data.get('shunt_control_increment', 1), 1))
+            except (TypeError, ValueError):
+                increment = 1
+            if increment < 1:
+                increment = 1
+            tol = _opendss_float(element_data.get('shunt_control_tol'), 1e-3)
+            _opendss_shunt_meta[element_name] = {
+                'reactor_name': reactor_name,
+                'dss_class': dss_class,
+                'bus_name': bus_name,
+                'bus_voltage': float(bus_voltage) if bus_voltage is not None else None,
+                'p_fallback': p_fallback,
+                'q_fallback': q_fallback,
+                'step': int(step_pp),
+                'max_step': int(max_step_pp),
+                'zero_based': bool(zero_based),
+                'use_characteristic': bool(use_characteristic),
+                'characteristic_rows': characteristic_rows,
+                'discrete_shunt_control': _opendss_is_true(element_data.get('discrete_shunt_control')) and is_in_service,
+                'vm_set_pu': float(vm_set),
+                'increment': increment,
+                'tol': float(tol) if tol is not None else 1e-3,
+                'line_flow_step_control': (
+                    _opendss_is_true(element_data.get('line_flow_step_control')) and is_in_service
+                ),
+                'line_flow_reference_line_id': element_data.get('line_flow_reference_line_id') or '',
+                'line_flow_bands': line_flow_bands,
+                'line_flow_p_use_abs': _opendss_is_true(
+                    element_data.get('line_flow_p_use_abs', True)),
+                'line_flow_p_reference': element_data.get('line_flow_p_reference') or 'p_from_mw',
+            }
         except Exception as e:
             pass
     else:
@@ -3730,9 +4209,20 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     ext_scan = _prescan_external_grid(in_data)
     
     element_dicts = None
-    for build_attempt in range(2):
+    if monte_carlo_mode:
+        plan_queue = [{'label': str(mode), 'algorithm': algorithm,
+                       'max_iterations': max_iterations, 'gen_vminpu': None}]
+    else:
+        plan_queue = _opendss_snapshot_solve_plans(algorithm, max_iterations)
+    build_attempt = 0
+    zero_power_rebuild_done = False
+    usable_plan = None
+    usable_plan_replayed = False
+
+    while build_attempt < len(plan_queue):
+        plan = plan_queue[build_attempt]
         if build_attempt > 0:
-            print("[OpenDSS] Zero-power first solve with active injections; rebuilding circuit and solving again")
+            print(f"[OpenDSS] Rebuilding circuit and solving again: {plan['label']}")
             if monte_carlo_mode:
                 monte_carlo_bus_samples.clear()
                 monte_carlo_line_samples.clear()
@@ -3742,10 +4232,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         execute_dss_command(_new_circuit_command(ext_scan))
         execute_dss_command(f'set DefaultBaseFrequency={f}')
         execute_dss_command(f'set Mode={mode}')
-        execute_dss_command(f'set Algorithm={algorithm}')
+        execute_dss_command(f"set Algorithm={plan['algorithm']}")
         execute_dss_command(f'set LoadModel={loadmodel}')
         execute_dss_command(f'set ControlMode={effective_controlmode}')
-        execute_dss_command(f'set MaxIterations={max_iterations}')
+        execute_dss_command(f"set MaxIterations={plan['max_iterations']}")
         execute_dss_command(f'set Tolerance={tolerance}')
         if monte_carlo_mode:
             execute_dss_command(f'set Number={monte_carlo_number}')
@@ -3771,7 +4261,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
 
         try:
             print("[OpenDSS] solve")
-            execute_dss_command('init')
+            gens_for_solve = element_dicts[12] if element_dicts and len(element_dicts) > 12 else {}
             if monte_carlo_mode:
                 # Retain the requested Number setting in the exported model, then
                 # use one solve at a time to preserve each random realization.
@@ -3793,7 +4283,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             line_key, {'id': sample['id'], 'name': sample['name'], 'values': []})
                         entry['values'].append(sample['loading_percent'])
             else:
-                dss.Text.Command('solve')
+                _opendss_solve_snapshot_plan(dss, execute_dss_command, plan, gens_for_solve)
         except Exception as e:
             print(f"[OpenDSS] Solve EXCEPTION: {e}")
 
@@ -3816,11 +4306,30 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
              StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
              circuit_source_element_name) = element_dicts
 
-            if (build_attempt == 0
+            if (not zero_power_rebuild_done
                     and _opendss_has_power_injections(LoadsDict, GeneratorsDict, StoragesDict, PVSystemsDict)
                     and _opendss_total_power_is_zero(total_power)):
+                print("[OpenDSS] Zero-power solve with active injections; rebuilding circuit")
+                zero_power_rebuild_done = True
+                plan_queue.insert(build_attempt + 1, dict(plan))
+                build_attempt += 1
                 continue
-            break
+
+            if monte_carlo_mode:
+                break
+
+            solution_usable = _opendss_circuit_has_usable_solution(dss)
+            if converged and solution_usable:
+                break
+            if solution_usable and usable_plan is None:
+                usable_plan = dict(plan)
+
+            build_attempt += 1
+            if (build_attempt >= len(plan_queue) and usable_plan is not None
+                    and not solution_usable and not usable_plan_replayed):
+                # Every later plan diverged; go back to the one that produced real voltages.
+                usable_plan_replayed = True
+                plan_queue.append(usable_plan)
         except Exception as e:
             print(f"[OpenDSS] Post-solve diagnostics EXCEPTION: {e}")
             if element_dicts is not None:
@@ -3838,6 +4347,50 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
      ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
      StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
      circuit_source_element_name) = element_dicts
+
+    if not monte_carlo_mode:
+        if not _opendss_circuit_converged(dss):
+            iters = 0
+            try:
+                iters = dss.Solution.Iterations()
+            except Exception:
+                pass
+            return json.dumps({
+                "error": (
+                    "OpenDSS load flow did not converge "
+                    f"(iterations={iters}). Check generator P/Q, transformer ratings, "
+                    "and slack short-circuit power. Try Algorithm=Newton in the OpenDSS "
+                    "load-flow dialog, or compare with pandapower on the same case."
+                )
+            })
+        try:
+            if not dss.Solution.Converged():
+                print(
+                    f"[OpenDSS] Solution.Converged()=False after {dss.Solution.Iterations()} "
+                    "iteration(s), but voltages and total power are finite; reporting result"
+                )
+        except Exception:
+            pass
+        try:
+            _opendss_apply_discrete_shunt_control(dss, execute_dss_command, BusbarsDictVoltage)
+        except Exception as e:
+            print(f"[OpenDSS] Discrete shunt control failed: {e}")
+        try:
+            _opendss_apply_line_flow_shunt_control(dss, execute_dss_command, LinesDict, LinesDictId)
+        except Exception as e:
+            print(f"[OpenDSS] Line-flow shunt control failed: {e}")
+        if not _opendss_circuit_converged(dss):
+            iters = 0
+            try:
+                iters = dss.Solution.Iterations()
+            except Exception:
+                pass
+            return json.dumps({
+                "error": (
+                    "OpenDSS load flow lost convergence after shunt control "
+                    f"(iterations={iters})."
+                )
+            })
 
     # Process results using the new output classes
     
@@ -4697,10 +5250,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 a2 = complex(-0.5, -math.sqrt(3)/2)
                                 V1 = (Va + a * Vb + a2 * Vc) / 3
                                 V1_ll_kv = abs(V1) * math.sqrt(3)
-                                # Use user-specified base voltage
-                                base_kv = BusbarsDictVoltage.get(bus_name.lower()) or BusbarsDictVoltage.get(bus_name)
-                                if base_kv:
-                                    vm_pu = V1_ll_kv / float(base_kv)
+                                try:
+                                    base_ln = float(dss.Bus.kVBase())
+                                    if base_ln > 0:
+                                        vm_pu = V1_ll_kv / (base_ln * math.sqrt(3))
+                                except (TypeError, ValueError):
+                                    base_ln = 0
+                                if not base_ln:
+                                    base_kv = _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name)
+                                    if base_kv:
+                                        vm_pu = V1_ll_kv / float(base_kv)
                     except Exception as e:
                         pass
 

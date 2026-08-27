@@ -65,6 +65,21 @@ def _element_typ(item):
     return typ if isinstance(typ, str) else ''
 
 
+@app.after_request
+def add_noindex_header(response):
+    """API host is not a website — keep it out of Google Search index."""
+    response.headers.setdefault('X-Robots-Tag', 'noindex, nofollow')
+    return response
+
+
+@app.route('/robots.txt', methods=['GET'])
+def robots_txt():
+    body = 'User-agent: *\nDisallow: /\n'
+    resp = make_response(body)
+    resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+    return resp
+
+
 #pobieranie danych z frontend
 @app.route('/', methods=['GET'])
 def index():
@@ -290,11 +305,17 @@ def simulation():
                     'limit_overloads': in_data[x].get('limit_overloads', False),
                     'max_loading_percent': in_data[x].get('max_loading_percent', 100),
                     'requirements': in_data[x].get('requirements', None),
+                    'uq_requirements': in_data[x].get('uq_requirements', None),
                     'verbose_iwamoto': in_data[x].get('verbose_iwamoto', False),
                     'run_control': in_data[x].get('run_control', False),
                     'grid_code_template_key': in_data[x].get('grid_code_template_key'),
                     'grid_code_template_name': in_data[x].get('grid_code_template_name'),
+                    'uq_grid_code_template_key': in_data[x].get('uq_grid_code_template_key'),
+                    'uq_grid_code_template_name': in_data[x].get('uq_grid_code_template_name'),
                 }
+                for _rpc_flag in ('run_control_trafo2w', 'run_control_trafo3w', 'run_control_shunt'):
+                    if _rpc_flag in in_data[x]:
+                        rpc_params[_rpc_flag] = in_data[x].get(_rpc_flag)
 
                 use_rpc_stream = bool(in_data[x].get('rpc_stream', False))
 
