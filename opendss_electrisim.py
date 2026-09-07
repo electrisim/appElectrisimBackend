@@ -169,13 +169,14 @@ class CapacitorsOut(object):
 
 class StorageOut(object):
     def __init__(self, name: str, id: str, p_mw: float, q_mvar: float,
-                 inv_control_mode: str = '', vm_pu: float = None):
+                 inv_control_mode: str = '', vm_pu: float = None, note: str = ''):
         self.name = name
         self.id = id
         self.p_mw = p_mw
         self.q_mvar = q_mvar
         self.inv_control_mode = inv_control_mode
-        self.vm_pu = vm_pu                       
+        self.vm_pu = vm_pu
+        self.note = note or ''                       
                        
 class StoragesOut(object):
     def __init__(self, storages: List[StorageOut]):
@@ -211,11 +212,14 @@ def _sanitize_opendss_name(name):
 
 
 _opendss_warnings = []
+# Requested storage dispatch (Electrisim / pandapower sign) for post-solve checks.
+_opendss_storage_dispatch = {}
 
 
 def _reset_opendss_warnings():
-    global _opendss_warnings
+    global _opendss_warnings, _opendss_storage_dispatch
     _opendss_warnings = []
+    _opendss_storage_dispatch = {}
 
 
 def _opendss_warn(message):
@@ -3290,27 +3294,28 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             q_kvar = q_mvar * 1000
 
             # Determine OpenDSS State from dispatch power:
-            #   pandapower p_mw < 0 ? discharging/generating ? State=DISCHARGING
-            #   pandapower p_mw > 0 ? charging/consuming    ? State=CHARGING
-            #   pandapower p_mw == 0 ? idling                ? State=IDLING
+            #   pandapower p_mw < 0 → discharging/generating → State=DISCHARGING
+            #   pandapower p_mw > 0 → charging/consuming    → State=CHARGING
+            #   pandapower p_mw == 0 → idling               → State=IDLING
+            # OpenDSS kW is generator convention: positive = discharging, negative = charging.
             if p_kw < 0:
                 storage_state = 'DISCHARGING'
                 kw_rated = abs(p_kw)
+                kw_dispatch = abs(p_kw)
             elif p_kw > 0:
                 storage_state = 'CHARGING'
                 kw_rated = abs(p_kw)
+                kw_dispatch = -abs(p_kw)
             else:
                 storage_state = 'IDLING'
                 kw_rated = float(element_data.get('sn_mva', 1) or 1) * 1000
+                kw_dispatch = 0.0
 
             # Rated apparent power (kVA) from sn_mva
             sn_mva = float(element_data.get('sn_mva', 0) or 0)
             kva_rated = sn_mva * 1000 if sn_mva > 0 else kw_rated
                         
             try:
-                # kWRated = inverter rating (max capacity)
-                # kW = requested dispatch power (positive for both charging/discharging)
-                kw_dispatch = abs(p_kw) if p_kw != 0 else 0
                 # Negate q_kvar: Pandapower uses load convention (positive=absorbing),
                 # OpenDSS Storage uses generator convention (positive=supplying)
                 kvar_opendss = -q_kvar
@@ -3344,22 +3349,38 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                     except (TypeError, ValueError):
                         pass
 
-                simple_cmd = (
-                    f"New Storage.{element_name} phases={phases} Bus1={bus_name} kV={bus_voltage} "
-                    f"conn={conn} "
-                    f"kWRated={kw_rated} kW={kw_dispatch} kVA={kva_rated} kvar={kvar_opendss} "
-                    f"State={storage_state}{pf_suffix}"
-                )
-                
-                # Append energy parameters (pandapower max_e_mwh -> OpenDSS kWhrated)
+                # Energy must be on the New command *before* State. OpenDSS default %stored=100;
+                # applying kWhrated while full immediately forces CHARGING → IDLING
+                # (terminal P = %IdlingkW of kWRated). A later %stored write does not restore charging.
+                energy_suffix = ''
                 max_e_mwh = element_data.get('max_e_mwh')
+                kWhrated = 0.0
                 if max_e_mwh is not None:
                     try:
                         kWhrated = float(max_e_mwh) * 1000  # MWh to kWh
                         if kWhrated > 0:
-                            simple_cmd += f" kWhrated={kWhrated}"
+                            energy_suffix += f" kWhrated={kWhrated}"
                     except (TypeError, ValueError):
-                        pass
+                        kWhrated = 0.0
+                soc_percent = element_data.get('soc_percent')
+                soc_for_new = None
+                if soc_percent is not None:
+                    try:
+                        soc_for_new = float(soc_percent)
+                        if 0 <= soc_for_new <= 100:
+                            energy_suffix += f" %stored={soc_for_new}"
+                        else:
+                            soc_for_new = None
+                    except (TypeError, ValueError):
+                        soc_for_new = None
+
+                simple_cmd = (
+                    f"New Storage.{element_name} phases={phases} Bus1={bus_name} kV={bus_voltage} "
+                    f"conn={conn} "
+                    f"kWRated={kw_rated} kVA={kva_rated}{energy_suffix} "
+                    f"kW={kw_dispatch} kvar={kvar_opendss} "
+                    f"State={storage_state}{pf_suffix}"
+                )
                 
                 # Append harmonic analysis spectrum if provided
                 spectrum = element_data.get('spectrum', 'default')
@@ -3474,8 +3495,9 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                     except (TypeError, ValueError):
                         pass
 
-                # State was already set in the New command based on p_mw sign.
-                # Only override with explicit frontend value if p_mw == 0 (user chose IDLING).
+                # Snapshot dispatch: re-assert State/kW after energy and DispMode writes.
+                # OpenDSS default %stored=100; CHARGING a full battery becomes IDLING at
+                # %IdlingkW (typically 1% of kWRated). A later %stored write does not restore charging.
                 if p_kw == 0:
                     state = element_data.get('state')
                     if state and str(state).upper() in ('IDLING', 'CHARGING', 'DISCHARGING'):
@@ -3485,9 +3507,23 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 disp_mode = element_data.get('disp_mode')
                 if disp_mode and str(disp_mode).upper() in ('DEFAULT', 'FOLLOW', 'EXTERNAL', 'LOADLEVEL', 'PRICE'):
                     follow_up_cmds.append(f'Storage.{element_name}.DispMode={str(disp_mode).upper()}')
+                if p_kw != 0:
+                    follow_up_cmds.append(f'Storage.{element_name}.State={storage_state}')
+                    follow_up_cmds.append(f'Storage.{element_name}.kW={kw_dispatch}')
                 
                 for cmd in follow_up_cmds:
-                    dss.Text.Command(cmd)
+                    if execute_dss_command:
+                        execute_dss_command(cmd)
+                    else:
+                        dss.Text.Command(cmd)
+
+                _opendss_storage_dispatch[element_name] = {
+                    'p_mw': p_mw,
+                    'state': storage_state,
+                    'kw_rated': kw_rated,
+                    'pct_idling_kw': float(element_data.get('pct_idling_kw') or 1),
+                    'user_name': str(element_data.get('userFriendlyName') or element_data.get('name') or element_name),
+                }
                 
                 # InvControl for voltage-dependent inverter modes (Q-V droop, Watt-PF, ...)
                 try:
@@ -3495,6 +3531,16 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                         dss, 'Storage', element_name, element_data, execute_dss_command)
                 except Exception as inv_err:
                     print(f"[OpenDSS] InvControl for {element_name} failed: {inv_err}")
+
+                if p_kw != 0:
+                    _st_cmd = f'Storage.{element_name}.State={storage_state}'
+                    _kw_cmd = f'Storage.{element_name}.kW={kw_dispatch}'
+                    if execute_dss_command:
+                        execute_dss_command(_st_cmd)
+                        execute_dss_command(_kw_cmd)
+                    else:
+                        dss.Text.Command(_st_cmd)
+                        dss.Text.Command(_kw_cmd)
                 
                 # Handle in_service status AFTER creating the element
                 in_service = element_data.get('in_service', True)
@@ -5318,13 +5364,33 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             except Exception:
                                 pass
 
+                            storage_note = ''
+                            req = None
+                            for _dname, _dreq in _opendss_storage_dispatch.items():
+                                if str(_dname).lower() == str(storage_name).lower() or str(_dname).lower() == str(key).lower():
+                                    req = _dreq
+                                    break
+                            if req is not None:
+                                req_p = float(req.get('p_mw') or 0.0)
+                                if abs(req_p) > 0.05 and abs(p_mw) < 0.15 * abs(req_p):
+                                    idling_pct = float(req.get('pct_idling_kw') or 1)
+                                    uf = req.get('user_name') or storage_name
+                                    storage_note = (
+                                        f'Idling at {p_mw:.3f} MW instead of requested '
+                                        f'{"charging" if req_p > 0 else "discharging"} {abs(req_p):g} MW. '
+                                        f'OpenDSS blocks charge at 100% SOC and discharge at reserve; '
+                                        f'idling load is {idling_pct:g}% of kWRated.'
+                                    )
+                                    _opendss_warn(f"Storage '{uf}': {storage_note}")
+
                             storage = StorageOut(
                                 name=frontend_name, 
                                 id=frontend_id, 
                                 p_mw=p_mw, 
                                 q_mvar=q_mvar,
                                 inv_control_mode=inv_mode,
-                                vm_pu=vm_pu_val
+                                vm_pu=vm_pu_val,
+                                note=storage_note
                             )
                             storagesList.append(storage)
                             break

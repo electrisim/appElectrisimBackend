@@ -1804,26 +1804,27 @@ def _parse_q_cap_float_matrix(raw, n_u, n_p):
         return None
 
 
-# Default 2.5 MW FRC converter WTG Q(P,U) capability (matches frontend qCapabilityVoltageDependent.js).
+# Default FRC WTG Q(P,U) — PowerFactory "Fully Rated Converter WTG 2.5MW 50Hz"
+# (matches frontend qCapabilityVoltageDependent.js). Rows = U [pu], columns = P [pu].
 _FRC_WTG_QCAP_U_PU = [0.9, 0.95, 1.0, 1.05, 1.08, 1.09, 1.095]
 _FRC_WTG_QCAP_P_PU = [0, 0.2, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0]
 _FRC_WTG_QCAP_QMAX_PU = [
-    [0.41, 0.41, 0.41, 0.41, 0.41, 0.4, 0.38, 0.33, 0.22, 0.12, 0],
-    [0.43, 0.43, 0.43, 0.43, 0.43, 0.42, 0.4, 0.35, 0.24, 0.13, 0],
-    [0.44, 0.44, 0.44, 0.44, 0.44, 0.43, 0.41, 0.36, 0.25, 0.14, 0],
-    [0.4, 0.4, 0.4, 0.4, 0.4, 0.39, 0.37, 0.32, 0.22, 0.12, 0],
-    [0.28, 0.28, 0.28, 0.28, 0.28, 0.27, 0.25, 0.22, 0.15, 0.08, 0],
-    [0.18, 0.18, 0.18, 0.18, 0.18, 0.17, 0.16, 0.14, 0.09, 0.05, 0],
-    [0.1, 0.1, 0.1, 0.1, 0.1, 0.09, 0.08, 0.07, 0.05, 0.02, 0],
+    [0, 0.41, 0.41, 0.41, 0.41, 0.41, 0.39, 0.3, 0, 0, 0],
+    [0, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44, 0.37, 0.22, 0, 0],
+    [0, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44, 0.31, 0.2, 0],
+    [0, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44, 0.38, 0.3, 0.22],
+    [0, 0.44, 0.44, 0.44, 0.41, 0.38, 0.36, 0.34, 0.32, 0.3, 0.28],
+    [0, 0.4, 0.4, 0.4, 0.37, 0.34, 0.32, 0.3, 0.28, 0.2, 0.17],
+    [0, 0.3, 0.3, 0.3, 0.27, 0.24, 0.22, 0.2, 0.18, 0.12, 0.09],
 ]
 _FRC_WTG_QCAP_QMIN_PU = [
-    [-0.18, -0.18, -0.18, -0.18, -0.18, -0.17, -0.16, -0.14, -0.09, -0.05, 0],
-    [-0.38, -0.38, -0.38, -0.38, -0.38, -0.37, -0.35, -0.3, -0.2, -0.1, 0],
-    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
-    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
-    [-0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.41, -0.36, -0.25, -0.14, 0],
-    [-0.4, -0.4, -0.4, -0.4, -0.4, -0.39, -0.37, -0.32, -0.22, -0.12, 0],
-    [-0.32, -0.32, -0.32, -0.32, -0.32, -0.31, -0.29, -0.25, -0.16, -0.08, 0],
+    [0, -0.41, -0.41, -0.41, -0.41, -0.41, -0.39, -0.3, 0, 0, 0],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.37, -0.22, 0, 0],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.31, -0.2, 0],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.38, -0.3, -0.22],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.42, -0.35, -0.28],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.43, -0.36, -0.3],
+    [0, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.44, -0.37, -0.31],
 ]
 
 
@@ -3035,6 +3036,12 @@ def create_other_elements(in_data,net,x, Busbars):
             if in_data[x].get('max_p_mw') is not None and str(in_data[x].get('max_p_mw')).lower() not in ('null', 'none', ''):
                 gen_kw['max_p_mw'] = safe_float(in_data[x]['max_p_mw'], safe_float(in_data[x]['p_mw']) * 1.2)
             pp.create_gen(net, **gen_kw)
+            gen_idx = net.gen.index[-1]
+            ansi_mt = in_data[x].get('ansi_machine_type')
+            if ansi_mt and str(ansi_mt).strip().lower() not in ('', 'none', 'null'):
+                if 'ansi_machine_type' not in net.gen.columns:
+                    net.gen['ansi_machine_type'] = 'turbo'
+                net.gen.at[gen_idx, 'ansi_machine_type'] = str(ansi_mt).strip().lower()
             
             # Store user-friendly name for generator
             gen_name = in_data[x]['name']
@@ -3752,6 +3759,28 @@ def create_other_elements(in_data,net,x, Busbars):
             if 'id' not in net.switch.columns:
                 net.switch['id'] = None
             net.switch.at[sw_idx, 'id'] = in_data[x].get('id', in_data[x].get('name', str(sw_idx)))
+            for col, key, default in (
+                ('ansi_device_class', 'ansi_device_class', 'auto'),
+                ('interrupting_rating_ka', 'interrupting_rating_ka', float('nan')),
+                ('momentary_rating_ka', 'momentary_rating_ka', float('nan')),
+                ('rated_voltage_kv', 'rated_voltage_kv', float('nan')),
+                ('contact_parting_cycles', 'contact_parting_cycles', float('nan')),
+                ('generator_cb', 'generator_cb', False),
+            ):
+                if col not in net.switch.columns:
+                    net.switch[col] = default
+                raw = in_data[x].get(key)
+                if raw is None or str(raw).strip().lower() in ('', 'none', 'null', 'nan'):
+                    continue
+                if col == 'generator_cb':
+                    net.switch.at[sw_idx, col] = bool(raw) if isinstance(raw, bool) else str(raw).lower() in ('true', '1', 'yes')
+                elif col in ('ansi_device_class',):
+                    net.switch.at[sw_idx, col] = str(raw).strip().lower()
+                else:
+                    try:
+                        net.switch.at[sw_idx, col] = float(raw)
+                    except (TypeError, ValueError):
+                        pass
             
             # Store user-friendly name for switch
             switch_name = in_data[x]['name']
@@ -4782,7 +4811,7 @@ def _append_electrisim_controllers_to_python(lines, net, in_data, algorithm, cal
     return run_control
 
 
-def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_voltage_angles=True, init='auto'):
+def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_voltage_angles=True, init='auto', quiet=False):
     """
     Attach pandapower BinarySearchControl (+ optional DroopControl) for Electrisim ParkController
     payloads (Electrisim ParkController steady-state plant control).
@@ -4791,6 +4820,10 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
     parks = _electrisim_collect_park_payloads(in_data)
     if not parks:
         return 0
+
+    def _plog(msg):
+        if not quiet:
+            print(msg)
 
     try:
         from pandapower.control.controller.station_control import BinarySearchControl, DroopControl
@@ -4837,7 +4870,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
         if use_q_cap:
             n_lim = _park_apply_machine_q_capability_limits(net, idxs)
             if n_lim:
-                print(
+                _plog(
                     f"[ParkController] '{park.get('name')}': applied P–Q capability limits "
                     f"to {n_lim}/{len(idxs)} machines (enforce_q_lims)"
                 )
@@ -5053,7 +5086,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                 'droop': droop_spec,
             })
             attached += 1
-            print(f"[ParkController] attached '{park.get('name')}' mode={mode} setpoint={set_point} sgens={idxs}")
+            _plog(f"[ParkController] attached '{park.get('name')}' mode={mode} setpoint={set_point} sgens={idxs}")
         except Exception as ex:
             print(f"[ParkController] attach failed for '{park.get('name')}': {ex}")
 
@@ -11302,6 +11335,104 @@ def _rpc_check_uq_compliance(uq_curve, uq_requirements, tol_mvar=1e-4):
     return True
 
 
+def _electrisim_tap_control_snapshot(net):
+    """DiscreteTapControl results from a solved net (for diagram overlay / RPC snapshots)."""
+    rows = []
+    if net is None or not hasattr(net, 'res_bus') or net.res_bus is None or net.res_bus.empty:
+        return rows
+    ufn = getattr(net, 'user_friendly_names', None) or {}
+
+    def _side_vm(element, idx, side):
+        try:
+            if element == 'trafo3w':
+                bus_col = {'hv': 'hv_bus', 'mv': 'mv_bus', 'lv': 'lv_bus'}.get(str(side), 'lv_bus')
+                bus = int(net.trafo3w.at[idx, bus_col])
+            else:
+                bus_col = 'lv_bus' if str(side) == 'lv' else 'hv_bus'
+                bus = int(net.trafo.at[idx, bus_col])
+            return float(net.res_bus.at[bus, 'vm_pu'])
+        except Exception:
+            return None
+
+    # The Grid Code Compliance (P-Q) study rewrites the band to bias taps toward a
+    # worst-case setpoint. Report the band the user configured, and keep the pinned
+    # one alongside it so the diagram never shows limits the user did not enter.
+    configured_bands = getattr(net, '_pq_tap_bands_original', None) or {}
+
+    def _one(element, table, idx, side, vm_lo, vm_hi):
+        study_lo, study_hi = float(vm_lo), float(vm_hi)
+        vm_lo, vm_hi = configured_bands.get(f'{element}:{idx}', (study_lo, study_hi))
+        if vm_hi < vm_lo:
+            vm_lo, vm_hi = vm_hi, vm_lo
+        try:
+            name = str(table.at[idx, 'name'])
+            tap_pos = float(table.at[idx, 'tap_pos'])
+            tap_min = float(table.at[idx, 'tap_min'])
+            tap_max = float(table.at[idx, 'tap_max'])
+            tap_step = float(table.at[idx, 'tap_step_percent']) if 'tap_step_percent' in table.columns else 0.0
+            hv_bus = int(table.at[idx, 'hv_bus'])
+            lv_bus = int(table.at[idx, 'lv_bus'])
+            hv_vm = float(net.res_bus.at[hv_bus, 'vm_pu'])
+            lv_vm = float(net.res_bus.at[lv_bus, 'vm_pu'])
+            controlled_vm = _side_vm(element, idx, side)
+            if controlled_vm is None:
+                controlled_vm = lv_vm if str(side) == 'lv' else hv_vm
+            in_limits = float(vm_lo) - 1e-6 <= float(controlled_vm) <= float(vm_hi) + 1e-6
+            at_limit_type = None
+            if tap_pos >= tap_max - 1e-9:
+                at_limit_type = 'max'
+            elif tap_pos <= tap_min + 1e-9:
+                at_limit_type = 'min'
+            cell_id = None
+            if 'id' in table.columns:
+                try:
+                    raw = table.at[idx, 'id']
+                    if raw is not None and not pd.isna(raw):
+                        cell_id = str(raw)
+                except Exception:
+                    cell_id = None
+            rec = {
+                'element': element,
+                'name': str(ufn.get(name, name)),
+                'id': str(name),
+                'cell_id': cell_id,
+                'tap_pos': tap_pos,
+                'tap_min': tap_min,
+                'tap_max': tap_max,
+                'tap_step_percent': tap_step,
+                'control_side': str(side),
+                'controlled_vm_pu': round(float(controlled_vm), 4),
+                'vm_lower_pu': float(vm_lo),
+                'vm_upper_pu': float(vm_hi),
+                'hv_vm_pu': round(hv_vm, 4),
+                'lv_vm_pu': round(lv_vm, 4),
+                'in_limits': bool(in_limits),
+                'at_limit': at_limit_type,
+            }
+            if abs(study_lo - vm_lo) > 1e-9 or abs(study_hi - vm_hi) > 1e-9:
+                rec['study_band_lower_pu'] = study_lo
+                rec['study_band_upper_pu'] = study_hi
+            if element == 'trafo3w' and 'mv_bus' in table.columns:
+                try:
+                    rec['mv_vm_pu'] = round(float(net.res_bus.at[int(table.at[idx, 'mv_bus']), 'vm_pu']), 4)
+                except Exception:
+                    pass
+            rows.append(rec)
+        except Exception:
+            return
+
+    for spec in getattr(net, 'trafo_discrete_tap_controllers', None) or []:
+        if not spec or len(spec) < 4:
+            continue
+        _one('trafo', net.trafo, spec[0], spec[1], spec[2], spec[3])
+    for spec in getattr(net, 'trafo3w_discrete_tap_controllers', None) or []:
+        if not spec or len(spec) < 4:
+            continue
+        if hasattr(net, 'trafo3w') and not net.trafo3w.empty:
+            _one('trafo3w', net.trafo3w, spec[0], spec[1], spec[2], spec[3])
+    return rows
+
+
 def _rpc_clean_pf_val(v):
     if isinstance(v, (float, np.floating)):
         if math.isnan(v) or math.isinf(v):
@@ -11443,6 +11574,8 @@ def _rpc_serialize_solved_net(net):
                     'va_hv_degree': _rpc_clean_pf_val(row.get('va_hv_degree', 0.0)),
                     'va_lv_degree': _rpc_clean_pf_val(row.get('va_lv_degree', 0.0)),
                     'loading_percent': _rpc_clean_pf_val(row['loading_percent']),
+                    'tap_pos': _rpc_clean_pf_val(
+                        net.trafo.at[trafo_index, 'tap_pos'] if 'tap_pos' in net.trafo.columns else None),
                 })
             if trafo_list:
                 result['transformers'] = trafo_list
@@ -11534,6 +11667,10 @@ def _rpc_serialize_solved_net(net):
                     'loading_percent': _rpc_clean_pf_val(row.get('loading_percent', 0.0)),
                 })
             result['switches'] = sw_list
+
+        tap_rows = _electrisim_tap_control_snapshot(net)
+        if tap_rows:
+            result['tap_control_results'] = tap_rows
 
         return _sanitize_for_strict_json(result)
     except Exception:
