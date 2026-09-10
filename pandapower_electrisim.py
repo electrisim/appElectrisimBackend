@@ -12489,6 +12489,72 @@ def _prot_has_native_protection(net):
     return prot is not None and len(prot) > 0
 
 
+def _prot_protection_index(net):
+    """Snapshot of ``net.protection`` row labels before a device is created."""
+    prot = getattr(net, "protection", None)
+    if prot is None:
+        return set()
+    return set(prot.index)
+
+
+def _prot_drop_new_protection_rows(net, existing_index):
+    """Remove protection rows added since ``existing_index`` was taken.
+
+    pandapower protection devices register themselves in ``net.protection``
+    inside ``__init__``, before their pickup currents and trip times are
+    computed. A failure in that computation therefore leaves a half-initialized
+    device behind, which would both duplicate the ElectriSim-evaluated relay in
+    the results and break ``calculate_protection_times``.
+    """
+    prot = getattr(net, "protection", None)
+    if prot is None or len(prot) == 0:
+        return
+    stale = [idx for idx in prot.index if idx not in existing_index]
+    if stale:
+        net.protection.drop(index=stale, inplace=True)
+
+
+# Protection-tab fields that each device actually uses. The raw spec carries
+# every field on the tab, so reporting all of them mixes in settings the chosen
+# device ignores (e.g. an instantaneous pickup on a pure IDMT relay).
+_PROT_OC_SUBTYPE_SETTING_KEYS = {
+    "DTOC": ("oc_relay_type", "I_g_a", "I_gg_a", "t_g", "t_gg", "t_diff"),
+    "IDMT": ("oc_relay_type", "curve_type", "I_s_a", "tms", "t_grade", "t_diff"),
+    "IDTOC": ("oc_relay_type", "curve_type", "I_s_a", "I_g_a", "I_gg_a",
+              "tms", "t_grade", "t_g", "t_gg", "t_diff"),
+}
+
+_PROT_KIND_SETTING_KEYS = {
+    _PROTECTION_KIND_FUSE: ("fuse_type", "rated_i_a"),
+    _PROTECTION_KIND_EARTH_FAULT: ("I_e_a", "t_e"),
+    _PROTECTION_KIND_DIRECTIONAL: ("directional_mode", "I_g_a", "I_s_a", "t_g"),
+    _PROTECTION_KIND_DIFF: ("I_diff_a", "diff_slope", "t_g"),
+    _PROTECTION_KIND_DIST: ("z1_r_ohm", "z1_x_ohm", "t_z1", "z2_r_ohm", "z2_x_ohm",
+                            "t_z2", "z3_r_ohm", "z3_x_ohm", "t_z3"),
+}
+
+
+def _prot_spec_settings_for_ui(spec, subtype=None):
+    """Subtype-aware settings payload for an ElectriSim-evaluated device."""
+    kind = spec.get("protection_type")
+    if kind == _PROTECTION_KIND_OCR:
+        subtype = str(subtype or spec.get("oc_relay_type") or "DTOC").upper()
+        keys = list(_PROT_OC_SUBTYPE_SETTING_KEYS.get(
+            subtype, _PROT_OC_SUBTYPE_SETTING_KEYS["DTOC"]))
+        keys.append("pickup_mode")
+        if spec.get("pickup_mode") != "manual":
+            keys += ["overload_factor", "ct_current_factor", "safety_factor"]
+    else:
+        keys = list(_PROT_KIND_SETTING_KEYS.get(kind, ()))
+    out = {}
+    for key in keys:
+        value = spec.get(key)
+        if value is None or value == "":
+            continue
+        out[key] = value
+    return out
+
+
 def _prot_to_jsonable(obj, _depth=0):
     """Convert a protection-coordination payload to JSON-safe primitives.
 
@@ -12830,7 +12896,12 @@ def _prot_build_oc_relay_time_settings(spec, grading_mode='auto', manual_time_se
 
 
 def _prot_build_manual_time_settings(net, specs, subtype):
-    """Return the per-switch DataFrame format expected by pandapower time_grading."""
+    """Return the per-switch DataFrame format expected by pandapower time_grading.
+
+    The frame is indexed by switch index because OCRelay reads its times with
+    ``time_grading.t_g[switch_index]`` (a label lookup), which would otherwise
+    miss whenever switch indices are not a contiguous 0..n-1 range.
+    """
     rows = []
     for sw_idx in net.switch.index:
         matching = next(
@@ -12847,7 +12918,7 @@ def _prot_build_manual_time_settings(net, specs, subtype):
         else:
             rows.append({'switch_id': int(sw_idx), 't_gg': matching.get('t_gg', 0.07),
                          't_g': matching.get('t_g', 0.5)})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, index=[int(i) for i in net.switch.index])
 
 
 def _prot_ensure_bus_geodata(net):
@@ -13057,6 +13128,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
                     'user_friendly_name': spec.get('user_friendly_name'), 'sw_idx': int(sw_idx),
                     'kind': 'OCR', 'subtype': subtype, 'curve_type': curve_type,
+                    'pickup_mode': spec.get('pickup_mode'), 'engine': 'electrisim',
                     'attached': True, 'custom_evaluator': 'ieee_oc',
                     'not_computed': False, 'settings': dict(spec),
                 })
@@ -13067,6 +13139,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                 spec, grading_mode, manual_times.get(subtype)
             )
             pickup_df = _prot_build_pickup_current_manual_df(spec)
+            protection_index_before = _prot_protection_index(net)
             try:
                 kwargs = dict(
                     switch_index=int(sw_idx),
@@ -13099,13 +13172,16 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'curve_type': curve_type,
                     'time_settings': _prot_to_jsonable(time_settings),
                     'pickup_mode': spec.get('pickup_mode'),
+                    'engine': 'pandapower',
                     'attached': True,
                     'not_computed': False,
                 })
             except Exception as e:
                 import traceback as _tb
                 tb_text = _tb.format_exc(limit=10)
-                # Keep the study usable: evaluate trip times and TCC in ElectriSim.
+                # OCRelay registered itself before it failed; unregister it so the
+                # relay is reported once, by the ElectriSim evaluator below.
+                _prot_drop_new_protection_rows(net, protection_index_before)
                 summaries.append({
                     'switch_id': sw_id,
                     'switch_name': spec.get('sw_name'),
@@ -13114,11 +13190,18 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'kind': 'OCR',
                     'subtype': subtype,
                     'curve_type': curve_type,
+                    'pickup_mode': spec.get('pickup_mode'),
+                    'engine': 'electrisim',
                     'attached': True,
                     'custom_evaluator': 'oc_electrisim',
                     'not_computed': False,
                     'settings': dict(spec),
-                    'reason': f'Native OCRelay failed, using ElectriSim evaluator: {e}',
+                    'reason': (
+                        f'pandapower OCRelay could not be built ({type(e).__name__}: {e}); '
+                        'trip times and the TCC curve were evaluated by ElectriSim from the '
+                        'Switch dialog settings. pandapower topological grading requires every '
+                        'closed switch to sit on a line.'
+                    ),
                     'traceback': tb_text,
                 })
 
@@ -13132,6 +13215,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'reason': 'pandapower.protection.Fuse not available in this pandapower version.',
                 })
                 continue
+            protection_index_before = _prot_protection_index(net)
             try:
                 kwargs = {'switch_index': int(sw_idx)}
                 if spec.get('fuse_type'):
@@ -13147,10 +13231,12 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'kind': 'Fuse',
                     'fuse_type': spec.get('fuse_type'),
                     'rated_i_a': spec.get('rated_i_a'),
+                    'engine': 'pandapower',
                     'attached': True,
                     'not_computed': False,
                 })
             except Exception as e:
+                _prot_drop_new_protection_rows(net, protection_index_before)
                 summaries.append({
                     'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
                     'user_friendly_name': spec.get('user_friendly_name'),
@@ -13172,6 +13258,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     _PROTECTION_KIND_DIFF: 'Differential (87)',
                     _PROTECTION_KIND_DIST: 'Distance (21)',
                 }[kind],
+                'engine': 'electrisim',
                 'attached': True,
                 'custom_evaluator': kind,
                 'not_computed': False,
@@ -13470,6 +13557,10 @@ def _prot_extract_devices_for_ui(net, attach_summaries):
             sw_idx = prow['switch_index']
         sw_idx = int(sw_idx) if sw_idx is not None and not (isinstance(sw_idx, float) and math.isnan(sw_idx)) else None
         summary = summary_by_sw_idx.get(sw_idx, {}) if sw_idx is not None else {}
+        if summary.get('custom_evaluator'):
+            # ElectriSim evaluates this switch (see _prot_append_custom_devices),
+            # so a pandapower object left on it must not be reported as well.
+            continue
 
         device_class = type(device).__name__  # 'OCRelay' / 'Fuse' / ...
         kind = summary.get('kind') or device_class
@@ -13502,6 +13593,7 @@ def _prot_extract_devices_for_ui(net, attach_summaries):
             'type': kind,
             'subtype': subtype,
             'curve_type': curve_type,
+            'engine': 'pandapower',
             'settings': settings,
             'characteristic': {'i_a': i_a, 't_s': t_s},
         })
@@ -13667,7 +13759,7 @@ def _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx=N
         current_a = (float(current_ka) * 1000.0) if current_ka is not None else None
         tripped, t_trip, detail = False, None, {}
 
-        if evaluator in ('ieee_oc', 'manual_idtoc', 'oc_electrisim'):
+        if evaluator in ('ieee_oc', 'oc_electrisim'):
             subtype = summary.get('subtype') or spec.get('oc_relay_type') or 'DTOC'
             tripped, t_trip, detail = _prot_eval_oc_trip(spec, subtype, current_a, evaluator)
             pickup = spec.get('I_s_a') or spec.get('I_g_a')
@@ -13740,24 +13832,30 @@ def _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx=N
 
 
 def _prot_append_custom_devices(devices, attach_summaries):
+    """Add the ElectriSim-evaluated devices, one entry per switch."""
+    already_reported = {d.get('switch_idx') for d in devices if d.get('switch_idx') is not None}
     for summary in attach_summaries:
         if not summary.get('custom_evaluator'):
+            continue
+        if summary.get('sw_idx') in already_reported:
             continue
         spec = summary.get('settings', {}) or {}
         evaluator = summary.get('custom_evaluator')
         subtype = summary.get('subtype') or spec.get('oc_relay_type')
         curve_type = summary.get('curve_type') or spec.get('curve_type')
         i_a, t_s = [], []
-        if evaluator in ('ieee_oc', 'manual_idtoc', 'oc_electrisim') or summary.get('kind') == 'OCR':
+        if evaluator in ('ieee_oc', 'oc_electrisim') or summary.get('kind') == 'OCR':
             i_a, t_s = _prot_sample_spec_oc_characteristic(spec, subtype, curve_type)
         devices.append({
             'switch_idx': summary.get('sw_idx'), 'switch_id': summary.get('switch_id'),
             'switch_name': summary.get('switch_name'),
             'user_friendly_name': summary.get('user_friendly_name'),
             'type': summary.get('kind'), 'subtype': subtype,
-            'curve_type': curve_type, 'settings': spec,
+            'curve_type': curve_type, 'engine': 'electrisim',
+            'settings': _prot_spec_settings_for_ui(spec, subtype),
             'characteristic': {'i_a': i_a, 't_s': t_s},
         })
+        already_reported.add(summary.get('sw_idx'))
     return devices
 
 
@@ -13804,7 +13902,10 @@ def _prot_resolve_fault_bus_idx(in_data, net, fault_bus_cell_id):
 
 
 def _prot_native_and_custom_trips(net_sc, attach_summaries, summary_by_sw_idx, fault_type, fault_bus_idx):
-    """Run pandapower protection times only when net.protection exists."""
+    """Trip rows from pandapower (when net.protection exists) plus ElectriSim devices.
+
+    Rows are keyed by switch so one relay can never appear twice in the table.
+    """
     warning = None
     trip = []
     if _prot_has_native_protection(net_sc):
@@ -13814,7 +13915,12 @@ def _prot_native_and_custom_trips(net_sc, attach_summaries, summary_by_sw_idx, f
             trip.extend(_prot_parse_prot_results(prot_results, summary_by_sw_idx))
         except Exception as e:
             warning = f'calculate_protection_times failed: {e}'
-    trip.extend(_prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx))
+    reported = {row.get('switch_idx') for row in trip if row.get('switch_idx') is not None}
+    for row in _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx):
+        if row.get('switch_idx') in reported:
+            continue
+        trip.append(row)
+        reported.add(row.get('switch_idx'))
     return trip, warning
 
 
