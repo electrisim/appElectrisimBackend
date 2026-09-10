@@ -4,6 +4,12 @@ import math
 import json
 import re
 
+from storage_q_capability import (
+    resolve_storage_pq,
+    interp_storage_pq_limits,
+    _truthy as _storage_qcap_truthy,
+)
+
 # Output classes for OpenDSS results (similar to pandapower_electrisim.py structure)
 class BusbarOut(object):
     def __init__(self, name: str, id: str, vm_pu: float, va_degree: float,
@@ -243,6 +249,41 @@ def _opendss_float(val, default=0.0):
         return float(val)
     except (TypeError, ValueError):
         return default
+
+
+def _opendss_storage_fixed_pf_suffix(element_data, storage_state):
+    """Map Electrisim lagging/leading PF to OpenDSS Storage pf=.
+
+    Electrisim: lagging = absorb Q, leading = inject Q.
+    OpenDSS (generator convention): +pf produces vars, -pf absorbs vars while discharging.
+    While charging, kW is negative so the sign is reversed to keep the same Q direction.
+    """
+    charging = storage_state == 'CHARGING'
+    mag_raw = element_data.get('pf_charge') if charging else element_data.get('pf')
+    if mag_raw is None or str(mag_raw).strip() == '':
+        mag_raw = element_data.get('pf', 1.0)
+    mode = element_data.get('pf_charge_q_mode') if charging else element_data.get('pf_q_mode')
+    if not mode:
+        mode = element_data.get('pf_q_mode') or 'lagging'
+    try:
+        pf_val = float(mag_raw)
+    except (TypeError, ValueError):
+        return ''
+    if pf_val < 0:
+        mode = 'leading'
+        pf_mag = abs(pf_val)
+    else:
+        pf_mag = abs(pf_val)
+    if not (0.5 <= pf_mag <= 1.0):
+        return ''
+    leading = str(mode).lower() == 'leading'
+    if storage_state == 'DISCHARGING':
+        pf_opendss = pf_mag if leading else -pf_mag
+    elif storage_state == 'CHARGING':
+        pf_opendss = -pf_mag if leading else pf_mag
+    else:
+        pf_opendss = pf_val
+    return f' pf={pf_opendss}'
 
 
 def _opendss_parse_shunt_characteristic_rows(raw_json):
@@ -3288,6 +3329,12 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             # Convert to float
             p_mw = float(p_mw_raw) if p_mw_raw is not None else 0.0
             q_mvar = float(q_mvar_raw) if q_mvar_raw is not None else 0.0
+
+            # P–Q capability curve, setpoint mode, and kVA priority (Electrisim convention)
+            try:
+                p_mw, q_mvar, _, _ = resolve_storage_pq(element_data)
+            except Exception:
+                pass
             
             # Convert to kW and kVar (OpenDSS uses kW/kvar)
             p_kw = p_mw * 1000
@@ -3332,22 +3379,7 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 inv_mode = str(element_data.get('inv_control_mode', 'NONE')).upper()
                 pf_suffix = ''
                 if inv_mode == 'FIXED_PF':
-                    try:
-                        pf_val = float(element_data.get('pf', 1.0) or 1.0)
-                        pf_mag = abs(pf_val)
-                        if 0.5 <= pf_mag <= 1.0:
-                            # Electrisim Q sign (+ = absorb vars, same as FIXED_Q / pandapower).
-                            # OpenDSS Storage while DISCHARGING: +pf => vars out (same dir as kW);
-                            # -pf => vars in (absorb). Map UI lagging PF magnitude to -pf when exporting.
-                            if storage_state == 'DISCHARGING':
-                                pf_opendss = -pf_mag
-                            elif storage_state == 'CHARGING':
-                                pf_opendss = pf_mag
-                            else:
-                                pf_opendss = pf_val
-                            pf_suffix = f" pf={pf_opendss}"
-                    except (TypeError, ValueError):
-                        pass
+                    pf_suffix = _opendss_storage_fixed_pf_suffix(element_data, storage_state)
 
                 # Energy must be on the New command *before* State. OpenDSS default %stored=100;
                 # applying kWhrated while full immediately forces CHARGING → IDLING
@@ -3374,11 +3406,24 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                     except (TypeError, ValueError):
                         soc_for_new = None
 
+                qcap_suffix = ''
+                if _storage_qcap_truthy(element_data.get('reactive_capability_curve')):
+                    lim = interp_storage_pq_limits(element_data, p_mw)
+                    if lim is not None:
+                        q_mi, q_ma = lim
+                        # OpenDSS generator convention: kvarMax = max supplying, kvarMaxAbs = max absorbing
+                        kvar_max_gen = max(0.0, -float(q_mi)) * 1000.0
+                        kvar_max_abs = max(0.0, float(q_ma)) * 1000.0
+                        if kvar_max_gen > 0:
+                            qcap_suffix += f" kvarMax={kvar_max_gen}"
+                        if kvar_max_abs > 0:
+                            qcap_suffix += f" kvarMaxAbs={kvar_max_abs}"
+
                 simple_cmd = (
                     f"New Storage.{element_name} phases={phases} Bus1={bus_name} kV={bus_voltage} "
                     f"conn={conn} "
                     f"kWRated={kw_rated} kVA={kva_rated}{energy_suffix} "
-                    f"kW={kw_dispatch} kvar={kvar_opendss} "
+                    f"kW={kw_dispatch} kvar={kvar_opendss}{qcap_suffix} "
                     f"State={storage_state}{pf_suffix}"
                 )
                 
@@ -3507,6 +3552,9 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
                 disp_mode = element_data.get('disp_mode')
                 if disp_mode and str(disp_mode).upper() in ('DEFAULT', 'FOLLOW', 'EXTERNAL', 'LOADLEVEL', 'PRICE'):
                     follow_up_cmds.append(f'Storage.{element_name}.DispMode={str(disp_mode).upper()}')
+                watt_priority_raw = element_data.get('watt_priority')
+                if watt_priority_raw is not None and str(watt_priority_raw).lower() in ('true', '1', 'yes'):
+                    follow_up_cmds.append(f'Storage.{element_name}.WattPriority=yes')
                 if p_kw != 0:
                     follow_up_cmds.append(f'Storage.{element_name}.State={storage_state}')
                     follow_up_cmds.append(f'Storage.{element_name}.kW={kw_dispatch}')

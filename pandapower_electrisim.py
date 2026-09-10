@@ -16,6 +16,9 @@ import pandapower.control as control
 import pandapower.timeseries as ts
 from pandapower.timeseries import DFData
 from copy import deepcopy
+import weakref
+
+from storage_q_capability import resolve_storage_pq
 
 
 Busbars = {}
@@ -52,20 +55,91 @@ def _trafo_out_id(raw_id, name, index_fallback):
 
 
 def _json_serialize_default(obj):
-    """Handle numpy types and custom objects for json.dumps. Works with NumPy 1.x and 2.x."""
+    """Handle numpy/pandas types for json.dumps without walking object internals.
+
+    Dumping ``obj.__dict__`` is unsafe: pandas DataFrames/Flags and pandapower
+    protection devices store ``weakref.ReferenceType``, which raises
+    ``Object of type ReferenceType is not JSON serializable``.
+    """
+    if isinstance(obj, weakref.ReferenceType):
+        return None
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    if isinstance(obj, pd.DataFrame):
+        return obj.replace({np.nan: None}).to_dict(orient='records')
+    if isinstance(obj, pd.Series):
+        return obj.replace({np.nan: None}).tolist()
+    if isinstance(obj, pd.Timestamp):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
     # numpy scalars (bool_, int64, float64, etc.) have .item() -> native Python type
     if hasattr(obj, 'item') and callable(getattr(obj, 'item')):
-        return obj.item()
-    if hasattr(obj, '__dict__'):
-        return obj.__dict__
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    if hasattr(obj, '__dict__') and not isinstance(obj, type):
+        out = {}
+        for k, v in obj.__dict__.items():
+            if str(k).startswith('_') or isinstance(v, weakref.ReferenceType):
+                continue
+            if callable(v):
+                continue
+            out[k] = v
+        return out
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def _jsonify_safe(obj):
     """Deep-convert numpy/pandas scalars and arrays so Flask jsonify succeeds."""
     return json.loads(json.dumps(obj, default=_json_serialize_default))
+
+
+def _blank_numeric(value):
+    """True when a frontend field is missing and should inherit another ratio."""
+    if value is None:
+        return True
+    if isinstance(value, float) and (value != value):  # NaN
+        return True
+    text = str(value).strip().lower()
+    return text in ('', 'null', 'none', 'nan')
+
+
+def _ext_grid_zero_seq_min(data, min_key, max_value):
+    """Return the min zero-sequence ratio, falling back to the matching max ratio."""
+    raw = data.get(min_key) if isinstance(data, dict) else None
+    if _blank_numeric(raw):
+        return max_value
+    return safe_float(raw, max_value)
+
+
+def ensure_ext_grid_zero_sequence_min(net):
+    """
+    pandapower single-phase min short-circuit reads ext_grid['x0x_min'] and
+    ['r0x0_min']. Older ElectriSim models only stored the max ratios, so copy
+    those when the min columns are missing or NaN.
+    """
+    eg = getattr(net, 'ext_grid', None)
+    if eg is None or getattr(eg, 'empty', True):
+        return
+    if 'x0x_max' not in eg.columns:
+        net.ext_grid['x0x_max'] = 1.0
+        eg = net.ext_grid
+    if 'r0x0_max' not in eg.columns:
+        net.ext_grid['r0x0_max'] = 0.1
+        eg = net.ext_grid
+    if 'x0x_min' not in eg.columns:
+        net.ext_grid['x0x_min'] = eg['x0x_max']
+        eg = net.ext_grid
+    else:
+        net.ext_grid['x0x_min'] = eg['x0x_min'].where(eg['x0x_min'].notna(), eg['x0x_max'])
+        eg = net.ext_grid
+    if 'r0x0_min' not in eg.columns:
+        net.ext_grid['r0x0_min'] = eg['r0x0_max']
+    else:
+        net.ext_grid['r0x0_min'] = eg['r0x0_min'].where(eg['r0x0_min'].notna(), eg['r0x0_max'])
 
 
 def _sanitize_for_strict_json(obj):
@@ -88,6 +162,12 @@ def _sanitize_for_strict_json(obj):
         return obj
     if isinstance(obj, np.ndarray):
         return _sanitize_for_strict_json(obj.tolist())
+    if isinstance(obj, weakref.ReferenceType):
+        return None
+    if isinstance(obj, pd.DataFrame):
+        return _sanitize_for_strict_json(obj.replace({np.nan: None}).to_dict(orient='records'))
+    if isinstance(obj, pd.Series):
+        return _sanitize_for_strict_json(obj.replace({np.nan: None}).tolist())
     if isinstance(obj, dict):
         return {k: _sanitize_for_strict_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -98,7 +178,10 @@ def _sanitize_for_strict_json(obj):
         except Exception:
             return None
     if hasattr(obj, '__dict__') and not isinstance(obj, type):
-        return _sanitize_for_strict_json(vars(obj))
+        return _sanitize_for_strict_json({
+            k: v for k, v in vars(obj).items()
+            if not str(k).startswith('_') and not isinstance(v, weakref.ReferenceType) and not callable(v)
+        })
     return obj
 
 
@@ -644,34 +727,30 @@ def _electrisim_bus_branch_terminal_count(net, bus_idx):
 
 def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     """
-    P/Q shown on the bus result label, chosen by the bus topology:
+    P/Q shown on the bus result label.
 
-    **Radial bus** (one incident branch terminal, e.g. a generator or load feeding a single
-    transformer/line) → **net local injection**:
+    **Net local injection**:
 
         = this bus ``res_bus`` (load − generation of elements on the bus)
         + injections on ``_electrisim_aux_*`` buses behind closed bus–bus switches.
 
-    The single branch can only carry that injection (Kirchhoff), so the injection fully
-    describes the bus. Adding the branch term would double-count the same power the branch
-    re-exports (e.g. a 15 MW static generator + its transformer LV ⇒ −30 MW for 15 MW of
-    generation). A static generator alone therefore reads −15 MW / −6.5 MVar.
+    Kirchhoff already sends that injection out through the incident branches, so
+    adding the dominant branch term (``_electrisim_bus_branch_p_q_sum``) double-counts
+    it. Never add the two.
 
-    **Junction bus** (two or more incident branch terminals, e.g. a busbar with a cable plus
-    upstream line and a shunt) → **net local injection + dominant-infeed branch terminal**
-    (``_electrisim_bus_branch_p_q_sum``). Here the bare injection hides the large flows
-    transiting between branches; the dominant-branch term restores the true nodal exchange
-    (e.g. shunt absorption offset by cable charging), matching the line/cable result boxes.
+    Choice when both are non-zero:
 
-    Pure pass-through nodes (no local injection) fall back to the dominant branch through-power
-    so the label reflects transiting power instead of a bare 0.
+    - If local injection accounts for most of the branch magnitude (generation or
+      load collection bus, including a junction LV busbar with BESS plus
+      transformer *and* another feeder) → show **injection**. Two 1.75 MW BESS
+      units must read −3.5 MW, not −7 MW. The solved load flow (transformer /
+      ext. grid) is already ~3.5 MW — only the bus label was wrong.
+    - If through-power dominates a small local leftover (transit hub, shunt vs
+      cable charging) → show **through-power**, not injection + branch.
+    - Pass-through (no local injection) → through-power so the label is not 0.
 
-    Slack buses (external grid / slack gen) report their **net local injection** (pandapower
-    ``res_bus.p_mw`` / ``q_mvar``, which already nets every element on the bus, including the
-    slack infeed). This matches what standard power-flow tools show at the reference bus and
-    keeps the bus box consistent with the External Grid box (same quantity, opposite sign
-    convention). We deliberately do NOT add the dominant branch term here: at the slack the
-    branch simply re-exports the slack infeed, so injection + branch would double-count it.
+    Slack buses report net local injection only (``res_bus`` already nets the
+    slack infeed). Adding the branch would double-count the reference-bus infeed.
     """
     def _f(v, default=0.0):
         try:
@@ -689,25 +768,24 @@ def _electrisim_bus_nodal_p_q_sum(net, bus_idx):
     p_local = p_inj + p_aux
     q_local = q_inj + q_aux
 
-    # Slack / reference bus: show the net local injection only (the branch re-exports that same
-    # power, so adding the branch term would double-count). res_bus already nets all elements.
+    # Slack / reference bus: show the net local injection only (the branch re-exports
+    # that same power). res_bus already nets all elements.
     if _electrisim_bus_has_slack(net, bus_idx):
         return p_local, q_local
 
-    n_branches = _electrisim_bus_branch_terminal_count(net, bus_idx)
+    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
+    mag_local = math.hypot(p_local, q_local)
+    mag_br = math.hypot(p_br, q_br)
 
-    # Junction bus: injection + dominant branch terminal (true nodal exchange / transit-aware).
-    if n_branches >= 2:
-        p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
-        return p_local + p_br, q_local + q_br
+    if mag_local < 1e-6:
+        return p_br, q_br
 
-    # Radial bus with local generation/load: report its net injection only (the lone branch
-    # re-exports that same power, so adding it would double-count).
-    if math.hypot(p_local, q_local) >= 1e-6:
+    # Collection bus: branches merely re-export the local devices (radial sgen,
+    # two BESS on a junction LV busbar, …).
+    if mag_br < 1e-6 or mag_local >= 0.5 * mag_br:
         return p_local, q_local
 
-    # Stub / pass-through with no local injection: show the dominant branch through-power.
-    p_br, q_br = _electrisim_bus_branch_p_q_sum(net, bus_idx)
+    # Transit hub: large through-flow, small local leftover — through-power only.
     return p_br, q_br
 
 
@@ -2863,8 +2941,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 s_sc_min_mva=safe_float(in_data[x]['s_sc_min_mva']),
                 rx_max=safe_float(in_data[x]['rx_max']),
                 rx_min=safe_float(in_data[x]['rx_min']),
-                r0x0_max=safe_float(in_data[x]['r0x0_max']),
-                x0x_max=safe_float(in_data[x]['x0x_max']),
+                r0x0_max=safe_float(in_data[x].get('r0x0_max')),
+                x0x_max=safe_float(in_data[x].get('x0x_max')),
+                r0x0_min=_ext_grid_zero_seq_min(in_data[x], 'r0x0_min', safe_float(in_data[x].get('r0x0_max'))),
+                x0x_min=_ext_grid_zero_seq_min(in_data[x], 'x0x_min', safe_float(in_data[x].get('x0x_max'))),
                 in_service=in_service,
             )
             for fld in ('max_p_mw', 'min_p_mw'):
@@ -3671,6 +3751,20 @@ def create_other_elements(in_data,net,x, Busbars):
                     pass
             pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], **storage_kwargs)
             stor_nm = in_data[x]['name']
+            stor_cell_id = in_data[x]['id']
+            try:
+                stor_mask = net.storage['id'] == stor_cell_id
+                if stor_mask.any():
+                    stor_idx = net.storage.index[stor_mask][0]
+                    p_res, q_res, q_min_lim, q_max_lim = resolve_storage_pq(in_data[x])
+                    net.storage.at[stor_idx, 'p_mw'] = p_res
+                    net.storage.at[stor_idx, 'q_mvar'] = q_res
+                    if q_min_lim is not None:
+                        net.storage.at[stor_idx, 'min_q_mvar'] = q_min_lim
+                    if q_max_lim is not None:
+                        net.storage.at[stor_idx, 'max_q_mvar'] = q_max_lim
+            except Exception as stor_q_err:
+                print(f"Warning: Storage '{stor_nm}' Q capability apply failed: {stor_q_err}")
             uf_storage = in_data[x].get('userFriendlyName', stor_nm)
             if not hasattr(net, 'user_friendly_names'):
                 net.user_friendly_names = {}
@@ -7133,6 +7227,7 @@ def shortcircuit(net, in_data, in_data_full=None):
         # NOTE: return_all_currents=False (default) gives max/min per branch (simple index).
         #       return_all_currents=True gives results per (branch, fault_bus) combination (MultiIndex).
         #       For UI display, we want max/min per branch, so keep return_all_currents=False.
+        ensure_ext_grid_zero_sequence_min(net)
         sc.calc_sc(
             net,
             fault=fault_type,
@@ -12376,6 +12471,185 @@ _IEEE_OC_CURVES = {
     "ieee_extremely_inverse": (28.2, 0.1217, 2.0),
 }
 
+# IEC 60255-151 k / alpha used by pandapower OCRelay._select_k_alpha.
+_IEC_K_ALPHA = {
+    "standard_inverse": (0.14, 0.02),
+    "very_inverse": (13.5, 1.0),
+    "extremely_inverse": (80.0, 2.0),
+    "long_inverse": (120.0, 1.0),
+}
+
+
+def _prot_iec_k_alpha(curve_type):
+    return _IEC_K_ALPHA.get(str(curve_type or "").lower(), _IEC_K_ALPHA["standard_inverse"])
+
+
+def _prot_has_native_protection(net):
+    prot = getattr(net, "protection", None)
+    return prot is not None and len(prot) > 0
+
+
+def _prot_to_jsonable(obj, _depth=0):
+    """Convert a protection-coordination payload to JSON-safe primitives.
+
+    Never serializes pandapower protection device objects or pandas internals
+    (those contain ``weakref.ReferenceType``).
+    """
+    if _depth > 40:
+        return str(obj)
+    if obj is None:
+        return None
+    if isinstance(obj, weakref.ReferenceType):
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, np.ndarray):
+        return _prot_to_jsonable(obj.tolist(), _depth + 1)
+    if isinstance(obj, pd.DataFrame):
+        return _prot_to_jsonable(obj.replace({np.nan: None}).to_dict(orient="records"), _depth + 1)
+    if isinstance(obj, pd.Series):
+        return _prot_to_jsonable(obj.replace({np.nan: None}).tolist(), _depth + 1)
+    if isinstance(obj, pd.Timestamp):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _prot_to_jsonable(v, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_prot_to_jsonable(v, _depth + 1) for v in obj]
+    module = getattr(type(obj), "__module__", "") or ""
+    name = type(obj).__name__
+    if name in ("OCRelay", "Fuse", "ProtectionDevice", "BlockManager", "Flags") or "pandapower" in module:
+        return str(obj)
+    if hasattr(obj, "item") and callable(getattr(obj, "item")):
+        try:
+            return _prot_to_jsonable(obj.item(), _depth + 1)
+        except Exception:
+            return str(obj)
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        return {
+            str(k): _prot_to_jsonable(v, _depth + 1)
+            for k, v in vars(obj).items()
+            if not str(k).startswith("_") and not isinstance(v, weakref.ReferenceType) and not callable(v)
+        }
+    return str(obj)
+
+
+def _prot_apply_ocrelay_overrides(device, spec, grading_mode):
+    """Force Switch-dialog pickups/times onto a native OCRelay.
+
+    pandapower IDTOC indexes ``time_settings`` as a 5-element list (DataFrame
+    manual grading is ignored / mistyped in time_grading). Manual pickup also
+    copies I_g into I_gg. Override after construction so the device matches the
+    dialog and ``net.protection`` still exists for calculate_protection_times.
+    """
+    if device is None:
+        return device
+    subtype = str(getattr(device, "oc_relay_type", None) or spec.get("oc_relay_type") or "").upper()
+    if spec.get("pickup_mode") == "manual":
+        if subtype in ("DTOC", "IDTOC") and spec.get("I_g_a") is not None:
+            device.I_g = float(spec["I_g_a"]) / 1000.0
+        if subtype in ("DTOC", "IDTOC") and spec.get("I_gg_a") is not None:
+            device.I_gg = float(spec["I_gg_a"]) / 1000.0
+        if subtype in ("IDMT", "IDTOC") and spec.get("I_s_a") is not None:
+            device.I_s = float(spec["I_s_a"]) / 1000.0
+    if grading_mode == "manual":
+        if subtype in ("DTOC", "IDTOC"):
+            if spec.get("t_g") is not None:
+                device.t_g = float(spec["t_g"])
+            if spec.get("t_gg") is not None:
+                device.t_gg = float(spec["t_gg"])
+        if subtype in ("IDMT", "IDTOC"):
+            if spec.get("tms") is not None:
+                device.tms = float(spec["tms"])
+            if spec.get("t_grade") is not None:
+                device.t_grade = float(spec["t_grade"])
+    if getattr(device, "k", None) is None or getattr(device, "alpha", None) is None:
+        k, alpha = _prot_iec_k_alpha(spec.get("curve_type") or getattr(device, "curve_type", None))
+        device.k = k
+        device.alpha = alpha
+    return device
+
+
+def _prot_eval_oc_trip(spec, subtype, current_a, evaluator="oc_electrisim"):
+    """Trip time for an ElectriSim-side OCR (IEEE curves or native-OCRelay fallback)."""
+    I_s = spec.get("I_s_a")
+    I_g = spec.get("I_g_a")
+    I_gg = spec.get("I_gg_a")
+    tms = spec.get("tms", 1.0)
+    t_grade = spec.get("t_grade", 0.5)
+    t_g = spec.get("t_g", 0.5)
+    t_gg = spec.get("t_gg", 0.07)
+    curve = str(spec.get("curve_type") or "standard_inverse").lower()
+    subtype = str(subtype or spec.get("oc_relay_type") or "DTOC").upper()
+    if current_a is None:
+        return False, None, {}
+
+    def inverse_time(pickup):
+        if pickup is None or pickup <= 0 or current_a <= pickup:
+            return None
+        multiple = current_a / pickup
+        if evaluator == "ieee_oc" or curve in _IEEE_OC_CURVES:
+            a, b, p = _IEEE_OC_CURVES.get(curve, _IEEE_OC_CURVES["ieee_moderately_inverse"])
+            t = float(tms or 1.0) * (a / (multiple ** p - 1.0) + b)
+        else:
+            k, alpha = _prot_iec_k_alpha(curve)
+            t = float(tms or 1.0) * k / (multiple ** alpha - 1.0) + float(t_grade or 0.0)
+        return t if math.isfinite(t) and t >= 0 else None
+
+    if subtype == "DTOC":
+        if I_gg is not None and current_a >= I_gg:
+            return True, t_gg, {"element": "I>>"}
+        if I_g is not None and current_a >= I_g:
+            return True, t_g, {"element": "I>"}
+        return False, None, {}
+    if subtype == "IDMT":
+        t = inverse_time(I_s if I_s else I_g)
+        return (t is not None), t, {"element": "IDMT"}
+    if I_gg is not None and current_a >= I_gg:
+        return True, t_gg, {"element": "I>>"}
+    if I_g is not None and current_a >= I_g:
+        return True, t_g, {"element": "I>"}
+    t = inverse_time(I_s if I_s else I_g)
+    return (t is not None), t, {"element": "IDMT"}
+
+
+def _prot_sample_spec_oc_characteristic(spec, subtype=None, curve_type=None, n_points=100):
+    """Sample a complete OCR I–t curve from Switch-dialog settings (Amperes, seconds)."""
+    subtype = str(subtype or spec.get("oc_relay_type") or "DTOC").upper()
+    curve_type = str(curve_type or spec.get("curve_type") or "standard_inverse").lower()
+    I_s = spec.get("I_s_a")
+    I_g = spec.get("I_g_a")
+    I_gg = spec.get("I_gg_a")
+    pickups = [p for p in (I_s, I_g, I_gg) if p is not None and p > 0]
+    x_min = max(1.0, min(pickups) * 0.5) if pickups else 10.0
+    x_max = max(pickups) * 50.0 if pickups else 1.0e5
+    x_max = max(x_max, 1.0e4)
+    x = list(np.logspace(math.log10(x_min), math.log10(x_max), int(n_points)))
+    for p in pickups:
+        x.extend([p * 0.999, p, p * 1.001])
+    x = sorted(set(float(v) for v in x if v > 0))
+    currents, times = [], []
+    evaluator = "ieee_oc" if curve_type in _IEEE_OC_CURVES else "oc_electrisim"
+    for i_a in x:
+        tripped, t_trip, _ = _prot_eval_oc_trip(spec, subtype, i_a, evaluator)
+        currents.append(float(i_a))
+        if tripped and t_trip is not None and math.isfinite(float(t_trip)) and float(t_trip) > 0:
+            times.append(float(t_trip))
+        else:
+            times.append(None)
+    return currents, times
+
 
 def _prot_safe_float(value, default=None):
     """safe_float that tolerates None / empty / 'nan' and returns `default` instead of 0.0."""
@@ -12497,7 +12771,10 @@ def _prot_resolve_sw_idx_for_id(net, frontend_id):
 
 
 def _prot_build_pickup_current_manual_df(spec):
-    """Build a manual pickup dataframe for OCRelay when pickup_mode == 'manual'."""
+    """Build a manual pickup dataframe for OCRelay when pickup_mode == 'manual'.
+
+    Switch-dialog pickups are in A; pandapower OCRelay stores and compares kA.
+    """
     if spec.get('pickup_mode') != 'manual':
         return None
     subtype = spec.get('oc_relay_type', 'DTOC')
@@ -12505,36 +12782,50 @@ def _prot_build_pickup_current_manual_df(spec):
     if subtype == 'DTOC':
         if spec.get('I_gg_a') is None or spec.get('I_g_a') is None:
             return None
-        cols = {'switch_id': [0], 'I_gg': [float(spec['I_gg_a'])], 'I_g': [float(spec['I_g_a'])]}
+        cols = {
+            'switch_id': [0],
+            'I_gg': [float(spec['I_gg_a']) / 1000.0],
+            'I_g': [float(spec['I_g_a']) / 1000.0],
+        }
     elif subtype == 'IDMT':
         if spec.get('I_s_a') is None:
             return None
-        cols = {'switch_id': [0], 'I_s': [float(spec['I_s_a'])]}
+        cols = {'switch_id': [0], 'I_s': [float(spec['I_s_a']) / 1000.0]}
     elif subtype == 'IDTOC':
         if spec.get('I_gg_a') is None or spec.get('I_g_a') is None or spec.get('I_s_a') is None:
             return None
-        cols = {'switch_id': [0], 'I_gg': [float(spec['I_gg_a'])], 'I_g': [float(spec['I_g_a'])], 'I_s': [float(spec['I_s_a'])]}
+        cols = {
+            'switch_id': [0],
+            'I_gg': [float(spec['I_gg_a']) / 1000.0],
+            'I_g': [float(spec['I_g_a']) / 1000.0],
+            'I_s': [float(spec['I_s_a']) / 1000.0],
+        }
     if not cols:
         return None
     return pd.DataFrame(cols)
 
 
 def _prot_build_oc_relay_time_settings(spec, grading_mode='auto', manual_time_settings=None):
-    """Build the `time_settings` list expected by OCRelay for the chosen subtype."""
+    """Build the `time_settings` list expected by OCRelay for the chosen subtype.
+
+    IDTOC always uses a 5-element list: pandapower indexes ``time_settings[0:5]``
+    and its DataFrame column check for IDTOC is mistyped (``t_gg`` twice).
+    Manual times are applied afterwards via ``_prot_apply_ocrelay_overrides``.
+    """
     subtype = spec.get('oc_relay_type', 'DTOC')
     t_gg = spec.get('t_gg', 0.07)
     t_g = spec.get('t_g', 0.5)
     t_diff = spec.get('t_diff', 0.3)
     tms = spec.get('tms', 1.0)
     t_grade = spec.get('t_grade', 0.5)
+    if subtype == 'IDTOC':
+        return [t_gg, t_g, t_diff, tms, t_grade]
     if grading_mode == 'manual' and manual_time_settings is not None:
         return manual_time_settings
     if subtype == 'DTOC':
         return [t_gg, t_g, t_diff]
     if subtype == 'IDMT':
         return [tms, t_grade]
-    if subtype == 'IDTOC':
-        return [t_gg, t_g, t_diff, tms, t_grade]
     return [t_gg, t_g, t_diff]
 
 
@@ -12760,14 +13051,13 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
             except Exception:
                 pass
             curve_type = spec.get('curve_type', 'standard_inverse')
-            # IEEE curves use the Electrisim evaluator below, sharing the SC result
-            # and output pipeline with native relay / fuse devices.
-            if curve_type in _IEEE_OC_CURVES or (grading_mode == 'manual' and subtype == 'IDTOC'):
+            # IEEE curves are not implemented by pandapower OCRelay (IEC 60255 only).
+            if curve_type in _IEEE_OC_CURVES:
                 summaries.append({
                     'switch_id': sw_id, 'switch_name': spec.get('sw_name'),
                     'user_friendly_name': spec.get('user_friendly_name'), 'sw_idx': int(sw_idx),
                     'kind': 'OCR', 'subtype': subtype, 'curve_type': curve_type,
-                    'attached': True, 'custom_evaluator': 'ieee_oc' if curve_type in _IEEE_OC_CURVES else 'manual_idtoc',
+                    'attached': True, 'custom_evaluator': 'ieee_oc',
                     'not_computed': False, 'settings': dict(spec),
                 })
                 continue
@@ -12797,7 +13087,8 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     pickup_df = pd.concat([pickup_df] * len(net.switch), ignore_index=True)
                     pickup_df['switch_id'] = list(net.switch.index)
                     kwargs['pickup_current_manual'] = pickup_df
-                OCRelay(net, **kwargs)
+                device = OCRelay(net, **kwargs)
+                _prot_apply_ocrelay_overrides(device, spec, grading_mode)
                 summaries.append({
                     'switch_id': sw_id,
                     'switch_name': spec.get('sw_name'),
@@ -12806,7 +13097,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'kind': 'OCR',
                     'subtype': subtype,
                     'curve_type': curve_type,
-                    'time_settings': time_settings,
+                    'time_settings': _prot_to_jsonable(time_settings),
                     'pickup_mode': spec.get('pickup_mode'),
                     'attached': True,
                     'not_computed': False,
@@ -12814,6 +13105,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
             except Exception as e:
                 import traceback as _tb
                 tb_text = _tb.format_exc(limit=10)
+                # Keep the study usable: evaluate trip times and TCC in ElectriSim.
                 summaries.append({
                     'switch_id': sw_id,
                     'switch_name': spec.get('sw_name'),
@@ -12821,9 +13113,12 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'sw_idx': int(sw_idx),
                     'kind': 'OCR',
                     'subtype': subtype,
-                    'attached': False,
+                    'curve_type': curve_type,
+                    'attached': True,
+                    'custom_evaluator': 'oc_electrisim',
                     'not_computed': False,
-                    'reason': f'OCRelay instantiation failed: {e}',
+                    'settings': dict(spec),
+                    'reason': f'Native OCRelay failed, using ElectriSim evaluator: {e}',
                     'traceback': tb_text,
                 })
 
@@ -12905,16 +13200,28 @@ def _prot_sample_oc_relay_characteristic(device, x_min=10.0, x_max=1.0e5, n_poin
         subtype = getattr(device, 'oc_relay_type', None)
         if subtype is None:
             return [], []
-        x = np.logspace(math.log10(max(x_min, 1.0)), math.log10(max(x_max, x_min * 10.0)), int(n_points))
+        x = list(np.logspace(math.log10(max(x_min, 1.0)), math.log10(max(x_max, x_min * 10.0)), int(n_points)))
         I_g = getattr(device, 'I_g', None)
         I_gg = getattr(device, 'I_gg', None)
         I_s = getattr(device, 'I_s', None)
+        for pickup_ka in (I_s, I_g, I_gg):
+            if pickup_ka is None:
+                continue
+            try:
+                p_a = float(pickup_ka) * 1000.0
+            except (TypeError, ValueError):
+                continue
+            if p_a > 0:
+                x.extend([p_a * 0.999, p_a, p_a * 1.001])
+        x = sorted(set(float(v) for v in x if v > 0))
         t_g = getattr(device, 't_g', None)
         t_gg = getattr(device, 't_gg', None)
         t_grade = getattr(device, 't_grade', None)
         tms = getattr(device, 'tms', None)
         k = getattr(device, 'k', None)
         alpha = getattr(device, 'alpha', None)
+        if k is None or alpha is None:
+            k, alpha = _prot_iec_k_alpha(getattr(device, 'curve_type', None))
 
         currents = []
         times = []
@@ -13360,28 +13667,15 @@ def _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx=N
         current_a = (float(current_ka) * 1000.0) if current_ka is not None else None
         tripped, t_trip, detail = False, None, {}
 
-        if evaluator in ('ieee_oc', 'manual_idtoc'):
+        if evaluator in ('ieee_oc', 'manual_idtoc', 'oc_electrisim'):
+            subtype = summary.get('subtype') or spec.get('oc_relay_type') or 'DTOC'
+            tripped, t_trip, detail = _prot_eval_oc_trip(spec, subtype, current_a, evaluator)
             pickup = spec.get('I_s_a') or spec.get('I_g_a')
-            if pickup is None or pickup <= 0:
-                pickup = max(1.0, (current_a or 0.0) / max(spec.get('overload_factor', 1.25), 1.0))
-            multiple = (current_a / pickup) if current_a and pickup else 0.0
-            if evaluator == 'ieee_oc':
-                a, b, p = _IEEE_OC_CURVES.get(spec.get('curve_type'), _IEEE_OC_CURVES['ieee_moderately_inverse'])
-                if multiple > 1.0:
-                    t_trip = float(spec.get('tms', 1.0)) * (a / (multiple ** p - 1.0) + b)
-                    tripped = math.isfinite(t_trip) and t_trip >= 0
-                detail = {'pickup_a': pickup, 'multiple': multiple}
-            else:
-                # pandapower cannot consume an IDTOC manual DataFrame; apply the
-                # same definite/inverse terms explicitly for this device.
-                if current_a and spec.get('I_gg_a') and current_a >= spec['I_gg_a']:
-                    t_trip, tripped = spec.get('t_gg', 0.07), True
-                elif current_a and spec.get('I_g_a') and current_a >= spec['I_g_a']:
-                    t_trip, tripped = spec.get('t_g', 0.5), True
-                elif multiple > 1.0:
-                    t_trip = spec.get('tms', 1.0) * 0.14 / (multiple ** 0.02 - 1.0) + spec.get('t_grade', 0.5)
-                    tripped = True
-                detail = {'pickup_a': pickup, 'multiple': multiple}
+            if pickup:
+                detail = dict(detail or {})
+                detail['pickup_a'] = pickup
+                if current_a and pickup:
+                    detail['multiple'] = current_a / pickup
         elif evaluator == _PROTECTION_KIND_EARTH_FAULT:
             pickup = spec.get('I_e_a') or 1.0
             # For a 1ph SC, Ikss is the fault-loop current and is the available
@@ -13449,14 +13743,20 @@ def _prot_append_custom_devices(devices, attach_summaries):
     for summary in attach_summaries:
         if not summary.get('custom_evaluator'):
             continue
-        spec = summary.get('settings', {})
+        spec = summary.get('settings', {}) or {}
+        evaluator = summary.get('custom_evaluator')
+        subtype = summary.get('subtype') or spec.get('oc_relay_type')
+        curve_type = summary.get('curve_type') or spec.get('curve_type')
+        i_a, t_s = [], []
+        if evaluator in ('ieee_oc', 'manual_idtoc', 'oc_electrisim') or summary.get('kind') == 'OCR':
+            i_a, t_s = _prot_sample_spec_oc_characteristic(spec, subtype, curve_type)
         devices.append({
             'switch_idx': summary.get('sw_idx'), 'switch_id': summary.get('switch_id'),
             'switch_name': summary.get('switch_name'),
             'user_friendly_name': summary.get('user_friendly_name'),
-            'type': summary.get('kind'), 'subtype': summary.get('subtype'),
-            'curve_type': summary.get('curve_type'), 'settings': spec,
-            'characteristic': {'i_a': [], 't_s': []},
+            'type': summary.get('kind'), 'subtype': subtype,
+            'curve_type': curve_type, 'settings': spec,
+            'characteristic': {'i_a': i_a, 't_s': t_s},
         })
     return devices
 
@@ -13503,23 +13803,27 @@ def _prot_resolve_fault_bus_idx(in_data, net, fault_bus_cell_id):
     return None
 
 
+def _prot_native_and_custom_trips(net_sc, attach_summaries, summary_by_sw_idx, fault_type, fault_bus_idx):
+    """Run pandapower protection times only when net.protection exists."""
+    warning = None
+    trip = []
+    if _prot_has_native_protection(net_sc):
+        try:
+            from pandapower.protection.run_protection import calculate_protection_times
+            prot_results = calculate_protection_times(net_sc, scenario='sc')
+            trip.extend(_prot_parse_prot_results(prot_results, summary_by_sw_idx))
+        except Exception as e:
+            warning = f'calculate_protection_times failed: {e}'
+    trip.extend(_prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus_idx))
+    return trip, warning
+
+
 def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_summaries):
     """Short-circuit and protection times for a fault placed directly on a bus."""
-    try:
-        from pandapower.protection.run_protection import calculate_protection_times
-    except ImportError as e:
-        return {
-            'fault_location_mode': 'bus',
-            'fault_bus_idx': int(fault_bus_idx),
-            'error': f'pandapower.protection is unavailable: {e}',
-            'fault_bus': _prot_fault_bus_label(base_net, fault_bus_idx),
-            'trip': [],
-            'short_circuit': {},
-        }
-
     summary_by_sw_idx = {int(s['sw_idx']): s for s in attach_summaries if s.get('sw_idx') is not None}
     net_sc = deepcopy(base_net)
     try:
+        ensure_ext_grid_zero_sequence_min(net_sc)
         sc.calc_sc(net_sc, bus=int(fault_bus_idx), branch_results=True, fault=fault_type, case=case)
     except Exception as e:
         return {
@@ -13532,21 +13836,10 @@ def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_sum
         }
 
     sc_info = _prot_extract_short_circuit_at_bus(net_sc, fault_bus_idx)
-    try:
-        prot_results = calculate_protection_times(net_sc, scenario='sc')
-    except Exception as e:
-        return {
-            'fault_location_mode': 'bus',
-            'fault_bus_idx': int(fault_bus_idx),
-            'error': f'calculate_protection_times failed: {e}',
-            'fault_bus': _prot_fault_bus_label(net_sc, fault_bus_idx),
-            'fault_type': fault_type,
-            'case': case,
-            'short_circuit': sc_info,
-            'trip': _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, int(fault_bus_idx)),
-        }
-
-    return {
+    trip, prot_warning = _prot_native_and_custom_trips(
+        net_sc, attach_summaries, summary_by_sw_idx, fault_type, int(fault_bus_idx)
+    )
+    out = {
         'fault_location_mode': 'bus',
         'fault_bus_idx': int(fault_bus_idx),
         'sc_line_id': None,
@@ -13555,9 +13848,11 @@ def _prot_run_bus_scenario(base_net, fault_bus_idx, fault_type, case, attach_sum
         'fault_type': fault_type,
         'case': case,
         'short_circuit': sc_info,
-        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx)
-                + _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, int(fault_bus_idx)),
+        'trip': trip,
     }
+    if prot_warning:
+        out['warning'] = prot_warning
+    return out
 
 
 def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, attach_summaries):
@@ -13570,7 +13865,6 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
     """
     try:
         from pandapower.protection.utility_functions import create_sc_bus
-        from pandapower.protection.run_protection import calculate_protection_times
     except ImportError as e:
         return {
             'sc_line_id': int(sc_line_id),
@@ -13596,6 +13890,7 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
 
     try:
         fault_bus = int(max(net_sc.bus.index))
+        ensure_ext_grid_zero_sequence_min(net_sc)
         sc.calc_sc(net_sc, bus=fault_bus, branch_results=True, fault=fault_type, case=case)
     except Exception as e:
         return {
@@ -13606,20 +13901,11 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
             'trip': [],
         }
 
-    try:
-        prot_results = calculate_protection_times(net_sc, scenario='sc')
-    except Exception as e:
-        return {
-            'fault_location_mode': 'line',
-            'sc_line_id': int(sc_line_id),
-            'sc_fraction': float(sc_fraction),
-            'error': f'calculate_protection_times failed: {e}',
-            'fault_bus': _prot_fault_bus_label(net_sc, fault_bus),
-            'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
-            'trip': _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus),
-        }
+    trip, prot_warning = _prot_native_and_custom_trips(
+        net_sc, attach_summaries, summary_by_sw_idx, fault_type, fault_bus
+    )
 
-    return {
+    out = {
         'fault_location_mode': 'line',
         'sc_line_id': int(sc_line_id),
         'sc_fraction': float(sc_fraction),
@@ -13628,9 +13914,11 @@ def _prot_run_scenario(base_net, sc_line_id, sc_fraction, fault_type, case, atta
         'fault_type': fault_type,
         'case': case,
         'short_circuit': _prot_extract_short_circuit_at_bus(net_sc, fault_bus),
-        'trip': _prot_parse_prot_results(prot_results, summary_by_sw_idx)
-                + _prot_custom_trip_rows(net_sc, attach_summaries, fault_type, fault_bus),
+        'trip': trip,
     }
+    if prot_warning:
+        out['warning'] = prot_warning
+    return out
 
 
 def _prot_bus_distances(net, starts):
@@ -13870,7 +14158,11 @@ def protection_coordination(net, prot_params, in_data):
         }
         if scenario_warning:
             response['warning'] = scenario_warning
-        return json.dumps(response, default=_json_serialize_default, separators=(',', ':'))
+        return json.dumps(
+            _prot_to_jsonable(response),
+            default=_json_serialize_default,
+            separators=(',', ':'),
+        )
     except Exception as e:
         import traceback
         return json.dumps({

@@ -6,6 +6,7 @@ sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 import pandapower_electrisim
 import grid_code_pq_electrisim
 import opendss_electrisim
+import opender_electrisim
 import arcflash_electrisim
 import andes_electrisim
 import motor_starting_electrisim
@@ -98,6 +99,22 @@ def simulation():
        
         Busbars = {}
         
+        # BESS dispatch reversal / P-step voltage screening (OpenDER + OpenDSS)
+        bess_rev_params = in_data.get('bess_dispatch_reversal_params')
+        if isinstance(bess_rev_params, dict) and bess_rev_params.get('typ') == 'BessDispatchReversalOpenDss':
+            user_email = bess_rev_params.get('user_email', 'unknown@user.com')
+            print(f"=== BESS DISPATCH REVERSAL REQUESTED BY USER: {user_email} ===")
+            response_data = opender_electrisim.bess_dispatch_reversal(in_data, bess_rev_params)
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                return response
+            return response_data
+
         # DG Interconnection Screening (OpenDSS)
         dg_params = in_data.get('dg_interconnection_params')
         if isinstance(dg_params, dict) and 'DgInterconnectionOpenDss' in str(dg_params.get('typ', '')):
@@ -1800,6 +1817,8 @@ def import_opendss():
                         rx_min = 0.0
                         r0x0_max = 0.0
                         x0x_max = 0.0
+                        r0x0_min = 0.0
+                        x0x_min = 0.0
                         try:
                             dss.Circuit.SetActiveClass('Vsource')
                             dss.ActiveClass.Name(vname)
@@ -1817,6 +1836,9 @@ def import_opendss():
                                     if z0 > 0 and bus_vn_ll > 0:
                                         s_sc_min = (bus_vn_ll ** 2) / z0
                                         r0x0_max = r0 / x0 if abs(x0) > 1e-9 else 0.0
+                                        r0x0_min = r0x0_max
+                                        x0x_max = 1.0
+                                        x0x_min = 1.0
                             else:
                                 try:
                                     mvasc3 = float(dss.Vsources.MVAsc3())
@@ -1831,7 +1853,7 @@ def import_opendss():
                         if idx == 0:
                             ext_grid_row = [
                                 vname, bus_idx, pu, angle, 1.0, True,
-                                s_sc_max, s_sc_min, rx_max, rx_min, r0x0_max, x0x_max,
+                                s_sc_max, s_sc_min, rx_max, rx_min, r0x0_max, x0x_max, r0x0_min, x0x_min,
                             ]
                             ext_grids.append(ext_grid_row)
                         else:
