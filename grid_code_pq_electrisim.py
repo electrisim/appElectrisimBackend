@@ -21,6 +21,7 @@ import pandas as pd
 import pandapower as pp
 
 import pandapower_electrisim as pp_el
+from storage_q_capability import interp_storage_pq_limits
 
 
 class GridCodePqCancelled(Exception):
@@ -181,7 +182,13 @@ def _pq_check_cancel(ctx):
 def _pq_emit(msg, ctx=None, progress=False):
     """Always print to the backend console. Optionally also update the UI progress overlay."""
     _pq_check_cancel(ctx)
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        # Windows consoles default to a legacy code page, so drop characters
+        # the console cannot represent rather than aborting the study.
+        enc = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        print(str(msg).encode(enc, 'replace').decode(enc, 'replace'), flush=True)
     if not progress:
         return
     cb = None
@@ -198,14 +205,16 @@ def _pq_emit(msg, ctx=None, progress=False):
 
 def _pq_sgen_q_sum(net, gen_info):
     s = 0.0
-    use_res = hasattr(net, 'res_sgen') and net.res_sgen is not None and not net.res_sgen.empty
     for g in gen_info:
         idx = g['idx']
+        storage = g.get('type') == 'storage'
+        res_tbl = getattr(net, 'res_storage' if storage else 'res_sgen', None)
+        el_tbl = getattr(net, 'storage' if storage else 'sgen', None)
         try:
-            if use_res and idx in net.res_sgen.index:
-                s += float(net.res_sgen.at[idx, 'q_mvar'])
-            else:
-                s += float(net.sgen.at[idx, 'q_mvar'] or 0.0)
+            if res_tbl is not None and not res_tbl.empty and idx in res_tbl.index:
+                s += float(res_tbl.at[idx, 'q_mvar'])
+            elif el_tbl is not None and idx in el_tbl.index:
+                s += float(el_tbl.at[idx, 'q_mvar'] or 0.0)
         except Exception:
             continue
     return s
@@ -653,7 +662,7 @@ def _pq_voltage_violation(net, gen_info, u_min, u_max):
         return False
     for g in gen_info:
         try:
-            bus = int(net.sgen.at[g['idx'], 'bus'])
+            bus = _pq_gen_bus(net, g)
             vm = float(net.res_bus.at[bus, 'vm_pu'])
         except Exception:
             continue
@@ -662,8 +671,59 @@ def _pq_voltage_violation(net, gen_info, u_min, u_max):
     return False
 
 
+def _pq_storage_q_caps(net, storage_idx, p_gen, sn_mva, q_mode, element_data=None):
+    """Q caps for Storage (Electrisim sign: p_gen is plant P at POC scale, map to storage p)."""
+    if element_data and _pq_bool(element_data.get('reactive_capability_curve')):
+        lim = interp_storage_pq_limits(element_data, p_gen)
+        if lim is not None:
+            q_mi, q_ma = lim
+            return max(0.0, float(q_ma)), max(0.0, float(-q_mi))
+    if q_mode == 'from_rating' and sn_mva > 0:
+        fr = math.sqrt(max(sn_mva ** 2 - abs(p_gen) ** 2, 0))
+        return fr, fr
+    half = sn_mva * 0.5 if sn_mva > 0 else 0.0
+    return half, half
+
+
+def _pq_storage_element_data(in_data, storage_name):
+    if not in_data:
+        return {}
+    for el in in_data.values():
+        if isinstance(el, dict) and str(el.get('typ', '')).startswith('Storage') and str(el.get('name')) == str(storage_name):
+            return el
+    return {}
+
+
+def _pq_gen_bus(net, g):
+    """Bus index of a gen_info entry, which may be an sgen or a storage unit."""
+    tbl = net.storage if g.get('type') == 'storage' else net.sgen
+    return int(tbl.at[g['idx'], 'bus'])
+
+
+def _pq_gen_p(net, g):
+    """Current P of a gen_info entry in generator convention (positive = into
+    the grid). Electrisim storage stores the opposite sign."""
+    if g.get('type') == 'storage':
+        val = net.storage.at[g['idx'], 'p_mw']
+        return 0.0 if pd.isna(val) else -float(val)
+    val = net.sgen.at[g['idx'], 'p_mw']
+    return 0.0 if pd.isna(val) else float(val)
+
+
+def _pq_set_gen_pq(net, g, p_gen, q_mvar):
+    """p_gen and q_mvar are in generator convention (positive = injected into
+    the grid). Electrisim storage uses p_mw > 0 for charging and q_mvar > 0 for
+    absorbing, so both are inverted for storage units."""
+    if g.get('type') == 'storage':
+        net.storage.at[g['idx'], 'p_mw'] = -float(p_gen)
+        net.storage.at[g['idx'], 'q_mvar'] = -float(q_mvar)
+    else:
+        net.sgen.at[g['idx'], 'p_mw'] = float(p_gen)
+        net.sgen.at[g['idx'], 'q_mvar'] = float(q_mvar)
+
+
 def _pq_dispatch_p(net, gen_info, p_val, exclude_names):
-    """Scale P across selected sgens; excluded units keep diagram P."""
+    """Scale P across selected sgens or storage; excluded units keep diagram P."""
     exclude = set(exclude_names or [])
     scale = [g for g in gen_info if g.get('name') not in exclude]
     total = sum(float(g['p_rated_mw']) for g in scale) or 0.0
@@ -672,13 +732,18 @@ def _pq_dispatch_p(net, gen_info, p_val, exclude_names):
         if g.get('name') in exclude:
             continue
         if total <= 0:
-            net.sgen.at[idx, 'p_mw'] = 0.0
+            p_set = 0.0
         else:
             share = float(g['p_rated_mw']) / total
-            net.sgen.at[idx, 'p_mw'] = float(p_val) * share
+            p_set = float(p_val) * share
+        if g.get('type') == 'storage':
+            # POC export (+) → storage discharge (p_mw < 0)
+            net.storage.at[idx, 'p_mw'] = -p_set
+        else:
+            net.sgen.at[idx, 'p_mw'] = p_set
 
 
-def _pq_plant_q_caps(net, gen_info, p_val, q_mode, exclude_names):
+def _pq_plant_q_caps(net, gen_info, p_val, q_mode, exclude_names, in_data=None):
     """Plant Qmax / Qmin magnitudes at this P (positive numbers)."""
     exclude = set(exclude_names or [])
     scale = [g for g in gen_info if g.get('name') not in exclude]
@@ -687,12 +752,16 @@ def _pq_plant_q_caps(net, gen_info, p_val, q_mode, exclude_names):
     q_neg = 0.0
     for g in gen_info:
         if g.get('name') in exclude:
-            p_gen = float(net.sgen.at[g['idx'], 'p_mw']) if not pd.isna(net.sgen.at[g['idx'], 'p_mw']) else 0.0
+            p_gen = _pq_gen_p(net, g)
         elif total <= 0:
             p_gen = 0.0
         else:
             p_gen = float(p_val) * (float(g['p_rated_mw']) / total)
-        qp, qn = pp_el._rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_mode)
+        if g.get('type') == 'storage':
+            el = _pq_storage_element_data(in_data, g.get('name'))
+            qp, qn = _pq_storage_q_caps(net, g['idx'], abs(p_gen), g['sn_mva'], q_mode, el)
+        else:
+            qp, qn = pp_el._rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_mode)
         q_pos += float(qp)
         q_neg += float(qn)
     return q_pos, q_neg
@@ -730,12 +799,15 @@ def _pq_snapshot_solved(net):
         snap['tap_pos'] = net.trafo['tap_pos'].copy()
     if hasattr(net, 'trafo3w') and net.trafo3w is not None and not net.trafo3w.empty and 'tap_pos' in net.trafo3w.columns:
         snap['tap_pos_3w'] = net.trafo3w['tap_pos'].copy()
-    if hasattr(net, 'sgen') and net.sgen is not None and not net.sgen.empty:
-        if 'p_mw' in net.sgen.columns:
-            snap['sgen_p'] = net.sgen['p_mw'].copy()
-        if 'q_mvar' in net.sgen.columns:
-            snap['sgen_q'] = net.sgen['q_mvar'].copy()
-    for name in ('res_bus', 'res_sgen', 'res_gen', 'res_trafo', 'res_trafo3w',
+    for el in ('sgen', 'storage'):
+        tbl = getattr(net, el, None)
+        if tbl is None or tbl.empty:
+            continue
+        if 'p_mw' in tbl.columns:
+            snap[f'{el}_p'] = tbl['p_mw'].copy()
+        if 'q_mvar' in tbl.columns:
+            snap[f'{el}_q'] = tbl['q_mvar'].copy()
+    for name in ('res_bus', 'res_sgen', 'res_storage', 'res_gen', 'res_trafo', 'res_trafo3w',
                  'res_line', 'res_ext_grid', 'res_load', 'res_shunt'):
         tbl = getattr(net, name, None)
         if tbl is not None:
@@ -753,11 +825,14 @@ def _pq_restore_solved(net, snap):
         net.trafo['tap_pos'] = snap['tap_pos']
     if 'tap_pos_3w' in snap and hasattr(net, 'trafo3w') and not net.trafo3w.empty:
         net.trafo3w['tap_pos'] = snap['tap_pos_3w']
-    if hasattr(net, 'sgen') and not net.sgen.empty:
-        if 'sgen_p' in snap:
-            net.sgen['p_mw'] = snap['sgen_p']
-        if 'sgen_q' in snap:
-            net.sgen['q_mvar'] = snap['sgen_q']
+    for el in ('sgen', 'storage'):
+        tbl = getattr(net, el, None)
+        if tbl is None or tbl.empty:
+            continue
+        if f'{el}_p' in snap:
+            tbl['p_mw'] = snap[f'{el}_p']
+        if f'{el}_q' in snap:
+            tbl['q_mvar'] = snap[f'{el}_q']
     for name, tbl in snap.items():
         if name.startswith('res_'):
             setattr(net, name, tbl)
@@ -899,7 +974,10 @@ def _pq_settle_and_freeze_taps(base_net, ctx, p_val, tap_bound):
     _pq_dispatch_p(net_try, ctx['gen_info'], p_val, ctx['exclude_names'])
     for g in ctx['gen_info']:
         try:
-            net_try.sgen.at[g['idx'], 'q_mvar'] = 0.0
+            if g.get('type') == 'storage':
+                net_try.storage.at[g['idx'], 'q_mvar'] = 0.0
+            else:
+                net_try.sgen.at[g['idx'], 'q_mvar'] = 0.0
         except Exception:
             pass
     ctx['iLDF'][0] += 1
@@ -912,22 +990,25 @@ def _pq_settle_and_freeze_taps(base_net, ctx, p_val, tap_bound):
     return net_try
 
 
-def _pq_apply_local_q(net, gen_info, p_val, q_mode, direction, frac, exclude_names):
+def _pq_apply_local_q(net, gen_info, p_val, q_mode, direction, frac, exclude_names, in_data=None):
     exclude = set(exclude_names or [])
     scale = [g for g in gen_info if g.get('name') not in exclude]
     total = sum(float(g['p_rated_mw']) for g in scale) or 0.0
     sign = 1.0 if direction == 'max' else -1.0
     for g in gen_info:
         if g.get('name') in exclude:
-            p_gen = float(net.sgen.at[g['idx'], 'p_mw']) if not pd.isna(net.sgen.at[g['idx'], 'p_mw']) else 0.0
+            p_gen = _pq_gen_p(net, g)
         elif total <= 0:
             p_gen = 0.0
         else:
             p_gen = float(p_val) * (float(g['p_rated_mw']) / total)
-        q_pos, q_neg = pp_el._rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_mode)
+        if g.get('type') == 'storage':
+            el = _pq_storage_element_data(in_data, g.get('name'))
+            q_pos, q_neg = _pq_storage_q_caps(net, g['idx'], abs(p_gen), g['sn_mva'], q_mode, el)
+        else:
+            q_pos, q_neg = pp_el._rpc_sgen_q_caps(net, g['idx'], p_gen, g['sn_mva'], q_mode)
         q_full = q_pos if direction == 'max' else q_neg
-        net.sgen.at[g['idx'], 'p_mw'] = p_gen
-        net.sgen.at[g['idx'], 'q_mvar'] = sign * q_full * float(frac)
+        _pq_set_gen_pq(net, g, p_gen, sign * q_full * float(frac))
 
 
 def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, use_park=False,
@@ -960,7 +1041,7 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
     else:
         _pq_apply_local_q(
             net_try, ctx['gen_info'], p_val, ctx['q_mode'], direction, float(frac_or_q),
-            ctx['exclude_names'])
+            ctx['exclude_names'], ctx.get('in_data'))
 
     ctx['iLDF'][0] += 1
     _pq_check_cancel(ctx)
@@ -990,6 +1071,30 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
         unphysical = True
         reason = 'unphysical_q'
 
+    limiting_element = None
+    if overloaded and hasattr(net_try, 'res_line') and not net_try.res_line.empty:
+        try:
+            idx = net_try.res_line['loading_percent'].idxmax()
+            limiting_element = {
+                'type': 'line',
+                'name': str(net_try.line.at[idx, 'name']),
+                'loading_percent': float(net_try.res_line.at[idx, 'loading_percent']),
+            }
+        except Exception:
+            pass
+    if overloaded and limiting_element is None and hasattr(net_try, 'res_trafo') and not net_try.res_trafo.empty:
+        try:
+            idx = net_try.res_trafo['loading_percent'].idxmax()
+            limiting_element = {
+                'type': 'transformer',
+                'name': str(net_try.trafo.at[idx, 'name']),
+                'loading_percent': float(net_try.res_trafo.at[idx, 'loading_percent']),
+            }
+        except Exception:
+            pass
+    if volt_viol and limiting_element is None:
+        limiting_element = {'type': 'voltage', 'name': ctx.get('pcc_bus_name'), 'limit_reason': 'voltage'}
+
     r = {
         'converged': True,
         'overloaded': overloaded,
@@ -999,6 +1104,7 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
         'p_pcc': _pq_pcc_p(net_try, ctx['pcc_bus_idx'], ctx['ext_grid_idx']),
         'net': net_try,
         'limit_reason': reason,
+        'limiting_element': limiting_element,
         'pf_stage': pf_stage,
     }
     return _pq_fill_diag(r, ctx)
@@ -1052,7 +1158,7 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
        Park control on: Park Controller constant-Q setpoint at the point of connection.
     """
     q_pos, q_neg = _pq_plant_q_caps(
-        base_net, ctx['gen_info'], p_val, ctx['q_mode'], ctx['exclude_names'])
+        base_net, ctx['gen_info'], p_val, ctx['q_mode'], ctx['exclude_names'], ctx.get('in_data'))
     q_cap = q_pos if direction == 'max' else q_neg
     work = deepcopy(base_net)
     _pq_clear_controllers(work)
@@ -1149,6 +1255,44 @@ def _pq_net_matching_q(pairs, q_sel):
     return None
 
 
+def _pq_r_matching_q(rs, q_sel):
+    """Pick the trial result whose PCC Q matches the envelope value."""
+    if q_sel is not None:
+        target = float(q_sel)
+        for r in rs:
+            if not r or r.get('q_pcc') is None:
+                continue
+            if abs(float(r['q_pcc']) - target) < 1e-9:
+                return r
+    for r in reversed(rs or []):
+        if r is not None:
+            return r
+    return None
+
+
+def _pq_limit_payload(r):
+    """JSON-safe limiter for one envelope point. Full capability → PCS rating."""
+    if not r:
+        return None
+    payload = {}
+    el = r.get('limiting_element')
+    if isinstance(el, dict):
+        for k, v in el.items():
+            try:
+                fv = float(v)
+                payload[k] = None if math.isnan(fv) else fv
+            except (TypeError, ValueError):
+                payload[k] = v
+    reason = r.get('limit_reason')
+    if reason:
+        payload.setdefault('limit_reason', reason)
+        payload.setdefault('type', reason)
+        payload.setdefault('name', reason)
+    if not payload:
+        payload = {'type': 'pcs', 'name': 'unit rating', 'limit_reason': 'rating'}
+    return payload
+
+
 def _pq_trafo_display_name(net, table, idx):
     name = str(table.at[idx, 'name'])
     ufn = getattr(net, 'user_friendly_names', None) or {}
@@ -1163,7 +1307,7 @@ def _pq_update_summary(summary, net, gen_info):
     summary['umin_tot'] = min(summary['umin_tot'], float(vm.min()))
     for g in gen_info:
         try:
-            bus = int(net.sgen.at[g['idx'], 'bus'])
+            bus = _pq_gen_bus(net, g)
             v = float(net.res_bus.at[bus, 'vm_pu'])
             summary['ugenmax_tot'] = max(summary['ugenmax_tot'], v)
             summary['ugenmin_tot'] = min(summary['ugenmin_tot'], v)
@@ -1365,9 +1509,14 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
         if ext_grid_idx is None:
             return json.dumps({'error': f'External grid "{ext_grid_name}" not found in network'}, separators=(',', ':'))
 
+        storage_names = list(pq_params.get('storage_names') or [])
         sgen_indices = [idx for idx in net.sgen.index if net.sgen.at[idx, 'name'] in generator_names]
-        if not sgen_indices:
-            return json.dumps({'error': 'No matching generators found in the network'}, separators=(',', ':'))
+        storage_indices = []
+        if hasattr(net, 'storage') and net.storage is not None and not net.storage.empty:
+            storage_indices = [idx for idx in net.storage.index if str(net.storage.at[idx, 'name']) in storage_names]
+
+        if not sgen_indices and not storage_indices:
+            return json.dumps({'error': 'No matching generators or storage units found in the network'}, separators=(',', ':'))
 
         gen_info = []
         for idx in sgen_indices:
@@ -1382,10 +1531,25 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 'p_rated_mw': p_rated,
                 'sn_mva': sn_f if sn_f > 0 else p_rated,
             })
+        for idx in storage_indices:
+            sn = net.storage.at[idx, 'sn_mva'] if 'sn_mva' in net.storage.columns and not pd.isna(net.storage.at[idx, 'sn_mva']) else 0
+            try:
+                p_mw = float(net.storage.at[idx, 'p_mw']) if not pd.isna(net.storage.at[idx, 'p_mw']) else 0.0
+            except Exception:
+                p_mw = 0.0
+            sn_f = float(sn) if sn and sn > 0 else 0.0
+            p_rated = abs(p_mw) if abs(p_mw) > 0 else sn_f
+            gen_info.append({
+                'type': 'storage',
+                'idx': idx,
+                'name': net.storage.at[idx, 'name'],
+                'p_rated_mw': p_rated,
+                'sn_mva': sn_f if sn_f > 0 else p_rated,
+            })
         total_installed_mw = sum(g['p_rated_mw'] for g in gen_info)
         if total_installed_mw <= 0:
             return json.dumps(
-                {'error': 'Total installed capacity is zero. Set p_mw on static generators or wind turbines.'},
+                {'error': 'Total installed capacity is zero. Set ratings on storage or generators.'},
                 separators=(',', ':'))
 
         pn = _pq_float(pq_params.get('pn_mw'), 0.0)
@@ -1569,8 +1733,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             f'  Q dispatch={"Park" if i_park else "Local"} {park_name or "—"}  '
             f'tap {" ".join(tap_bits)}  shunt {" ".join(shunt_bits)}',
             ctx, progress=True)
-        q0p, q0n = _pq_plant_q_caps(net, gen_info, 0.0, q_mode, exclude_names)
-        qnp, qnn = _pq_plant_q_caps(net, gen_info, pn, q_mode, exclude_names)
+        q0p, q0n = _pq_plant_q_caps(net, gen_info, 0.0, q_mode, exclude_names, in_data)
+        qnp, qnn = _pq_plant_q_caps(net, gen_info, pn, q_mode, exclude_names, in_data)
         _pq_emit(
             f'  Plant Q capability: at P=0  Qmax={q0p:.2f} / Qmin=-{q0n:.2f} Mvar; '
             f'at P=Pn  Qmax={qnp:.2f} / Qmin=-{qnn:.2f} Mvar',
@@ -1621,6 +1785,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             p_result, p_max_result, p_min_result, p_disp_result = [], [], [], []
             q_max_result, q_min_result = [], []
             cos_over, cos_under = [], []
+            limit_max_result, limit_min_result = [], []
 
             for p_val in p_points:
                 _pq_check_cancel(ctx)
@@ -1628,6 +1793,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 qmin_cands = []
                 max_pairs = []
                 min_pairs = []
+                max_rs = []
+                min_rs = []
                 reasons_max = []
                 reasons_min = []
                 for bound in tap_bounds:
@@ -1645,6 +1812,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                         None if rmin is None else rmin.get('q_pcc'),
                         None if rmin is None else rmin.get('net'),
                     ))
+                    max_rs.append(rmax)
+                    min_rs.append(rmin)
                     if rsn_max:
                         reasons_max.append(rsn_max)
                     if rsn_min:
@@ -1724,6 +1893,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 q_min_result.append(None if qmin_plot is None else round(qmin_plot, 4))
                 cos_over.append(None if qmax_plot is None else round(_pq_cosphi(p_max_r, qmax_plot), 4))
                 cos_under.append(None if qmin_plot is None else round(_pq_cosphi(p_min_r, qmin_plot), 4))
+                limit_max_result.append(_pq_limit_payload(_pq_r_matching_q(max_rs, q_max_pcc)))
+                limit_min_result.append(_pq_limit_payload(_pq_r_matching_q(min_rs, q_min_pcc)))
 
             curves[v_key] = {
                 'p_mw': p_result,
@@ -1734,6 +1905,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 'q_min_mvar': q_min_result,
                 'cosphi_over': cos_over,
                 'cosphi_under': cos_under,
+                'limit_max': limit_max_result,
+                'limit_min': limit_min_result,
             }
             pmax_pcc = _pq_pmax_pcc_for_req(curves[v_key])
             v_req = requirements.get(v_key) if requirements else None
@@ -1762,8 +1935,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             _pq_clear_controllers(net0)
             _pq_apply_tap_family_filter(net0, ctx)
             for g in gen_info:
-                net0.sgen.at[g['idx'], 'p_mw'] = 0.0
-                net0.sgen.at[g['idx'], 'q_mvar'] = 0.0
+                _pq_set_gen_pq(net0, g, 0.0, 0.0)
             net0.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(voltage_levels[0]) * u_scale if voltage_levels else 1.0
             iLDF[0] += 1
             if _pq_run_pf(

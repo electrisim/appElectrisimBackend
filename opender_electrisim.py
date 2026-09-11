@@ -264,12 +264,31 @@ def _read_storage_terminal_pq_kw(storage_name):
         return 0.0, 0.0
 
 
-def _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command):
-    state = 'DISCHARGING' if kw > 0 else ('CHARGING' if kw < 0 else 'IDLING')
-    execute_dss_command(f'Storage.{storage_name}.DispMode=EXTERNAL')
+def _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command, pct_stored=None):
+    """Apply P/Q to OpenDSS Storage for a snapshot P-step.
+
+    OpenDSS treats kW as signed (negative = charging, positive = discharging).
+    TimeChargeTrig must be -1 or DEFAULT/clock logic re-enters CHARGE after P=0.
+    """
+    kw = float(kw)
+    kvar = float(kvar)
+    if kw > 1e-6:
+        state = 'DISCHARGING'
+    elif kw < -1e-6:
+        state = 'CHARGING'
+    else:
+        state = 'IDLING'
+    stored = ''
+    if pct_stored is not None:
+        stored = f' %stored={float(pct_stored)}'
+    execute_dss_command(
+        f'Edit Storage.{storage_name} DispMode=EXTERNAL TimeChargeTrig=-1 '
+        f'ChargeTrigger=0 DischargeTrigger=0 State={state} kW={kw} kvar={kvar}{stored}'
+    )
+    # Re-assert after DispMode (OpenDSS may rewrite State on energy/dispatch properties).
     execute_dss_command(f'Storage.{storage_name}.State={state}')
     execute_dss_command(f'Storage.{storage_name}.kW={kw}')
-    execute_dss_command(f'Storage.{storage_name}.kvar={kvar}')
+    return state
 
 
 def _electrisim_p_to_opendss_kw(p_mw):
@@ -290,8 +309,10 @@ def _opendss_q_for_storage(storage_el, p_mw):
                 kw = abs(_electrisim_p_to_opendss_kw(p_mw))
                 if kw == 0:
                     return 0.0
-                kva = abs(_sf(storage_el.get('sn_mva'), 0.0)) * 1000.0 or kw
-                q_mag = math.sqrt(max(0.0, kva * kva - kw * kw))
+                pf_mag = min(0.999999, abs(pf_val))
+                if pf_mag >= 0.999:
+                    return 0.0
+                q_mag = kw * math.tan(math.acos(pf_mag))
                 return q_mag if pf_val >= 0 else -q_mag
             except (TypeError, ValueError):
                 pass
@@ -372,9 +393,16 @@ def bess_dispatch_reversal(in_data, params):
 
     storage_name = ods._sanitize_opendss_name(storage_el.get('name') or storage_el.get('userFriendlyName') or 'storage')
     storage_label = str(storage_el.get('userFriendlyName') or storage_el.get('name') or storage_name)
+    soc_hold = _sf(storage_el.get('soc_percent'), 50.0)
+    if soc_hold <= 1.0 or soc_hold >= 99.0:
+        soc_hold = 50.0
 
     study_storage = copy.deepcopy(storage_el)
     study_storage['disp_mode'] = 'EXTERNAL'
+    # Snapshot P-step: clock-based charging would snap the unit back to CHARGE after P=0.
+    study_storage['time_charge_trig'] = -1
+    study_storage['charge_trigger'] = 0
+    study_storage['discharge_trigger'] = 0
     opender_inv_settings = copy.deepcopy(storage_el)
     if engine == 'opender':
         # Disable native OpenDSS InvControl; OpenDER owns P/Q in co-simulation.
@@ -432,6 +460,7 @@ def bess_dispatch_reversal(in_data, params):
             _electrisim_p_to_opendss_kw(p_start_mw),
             0.0,
             execute_dss_command,
+            pct_stored=soc_hold,
         )
         execute_dss_command('solve')
         v_warm = _read_bus_v_pu(poc_bus_name) or v_init
@@ -456,7 +485,7 @@ def bess_dispatch_reversal(in_data, params):
 
     if engine == 'opender':
         warnings.append(
-            'OpenDER IEEE 1547 generic inverter model (RMS screening). Not a vendor EMT/PCS model for formal TSO submission.'
+            'OpenDER IEEE 1547 generic inverter model (RMS screening).'
         )
 
     converged_all = True
@@ -471,27 +500,32 @@ def bess_dispatch_reversal(in_data, params):
 
         v_before = v_last
 
+        kw_cmd = _electrisim_p_to_opendss_kw(p_cmd_mw)
+        kvar = _opendss_q_for_storage(opender_inv_settings, p_cmd_mw)
+
         if engine == 'opender' and der is not None:
             _update_opender_pf_modes(der, opender_inv_settings, p_cmd_mw)
             p_dem_pu = _electrisim_p_to_opender_p_dem_pu(p_cmd_mw, p_max_mw)
             der.update_der_input(v_pu=v_before, p_dem_pu=p_dem_pu, f=frequency_hz)
             der.run()
-            kw = float(der.p_out_kw or 0.0)
-            kvar = float(der.q_out_kvar or 0.0)
+            kw_der = float(der.p_out_kw or 0.0)
+            kvar_der = float(der.q_out_kvar or 0.0)
             if der.der_status == 'Trip' and not trip_warned:
                 warnings.append(
                     'OpenDER DER reported Trip during the study (often frequency/enter-service at 50 Hz). '
-                    'Using commanded P when inverter output is near zero.'
+                    'Active power follows the P command; Q uses the Storage inverter settings.'
                 )
                 trip_warned = True
-            if abs(p_cmd_mw) > 0.01 * p_max_mw and abs(kw) < 0.05 * abs(_electrisim_p_to_opendss_kw(p_cmd_mw)):
-                kw = _electrisim_p_to_opendss_kw(p_cmd_mw)
-                kvar = _opendss_q_for_storage(opender_inv_settings, p_cmd_mw)
+            # P-step screening: OpenDSS must follow the commanded P. OpenDER Q is used when
+            # it is producing vars (Volt-VAR / PF); otherwise fall back to Storage PF/Q.
+            kw = kw_cmd
+            # Prefer Storage PF/Q setpoint; OpenDER Q only when it is actually producing vars.
+            if abs(kvar_der) > max(1.0, 0.02 * abs(kw_cmd)):
+                kvar = kvar_der
         else:
-            kw = _electrisim_p_to_opendss_kw(p_cmd_mw)
-            kvar = _opendss_q_for_storage(opender_inv_settings, p_cmd_mw)
+            kw = kw_cmd
 
-        _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command)
+        _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command, pct_stored=soc_hold)
         execute_dss_command('solve')
         if not dss.Solution.Converged():
             converged_all = False
@@ -504,23 +538,27 @@ def bess_dispatch_reversal(in_data, params):
 
         time_s.append(round(t, 4))
         v_poc.append(round(v_last, 6))
-        # Match OpenDSS load-flow result convention (CktElement.Powers, kW/kvar → MW/Mvar).
-        p_mw_series.append(round(kw_meas / 1000.0, 4))
-        q_mvar_series.append(round(kvar_meas / 1000.0, 4))
+        # OpenDSS generator convention (+ discharge / + inject) → Electrisim (+ charge / + absorb).
+        p_mw_series.append(round(-kw_meas / 1000.0, 4))
+        q_mvar_series.append(round(-kvar_meas / 1000.0, 4))
 
     if not time_s:
         return json.dumps({'error': True, 'message': 'Simulation produced no time steps.'})
 
     v_min = min(v_poc)
     v_max = max(v_poc)
+    v_init = v_poc[0]
     within_limits = (v_min >= vmin_pu - 1e-9) and (v_max <= vmax_pu + 1e-9)
-    dv_overshoot = max(abs(v_max - 1.0), abs(1.0 - v_min))
-
-    t_peak_s = time_s[0]
-    if v_max >= vmax_pu:
-        t_peak_s = time_s[v_poc.index(v_max)]
-    elif v_min <= vmin_pu:
-        t_peak_s = time_s[v_poc.index(v_min)]
+    dv_from_nominal = max(abs(v_max - 1.0), abs(1.0 - v_min))
+    dv_event = [abs(v - v_init) for v in v_poc]
+    imax = max(range(len(dv_event)), key=lambda i: dv_event[i])
+    dv_overshoot = dv_event[imax]
+    t_peak_s = time_s[imax]
+    if dv_overshoot < 5e-4:
+        warnings.append(
+            'POC voltage barely changed during the P ramp. The selected POC is likely the slack/source bus. '
+            'Choose the plant HV / POC bus (not the External Grid bus) and re-run.'
+        )
 
     ds_time, ds = _downsample_series(time_s, {
         'v_poc': v_poc,
@@ -545,6 +583,8 @@ def bess_dispatch_reversal(in_data, params):
         'vmax_pu': vmax_pu,
         'v_min': round(v_min, 6),
         'v_max': round(v_max, 6),
+        'v_init': round(v_init, 6),
+        'dv_from_nominal_pu': round(dv_from_nominal, 6),
         'dv_overshoot_pu': round(dv_overshoot, 6),
         't_peak_s': round(t_peak_s, 3),
         'within_limits': within_limits,

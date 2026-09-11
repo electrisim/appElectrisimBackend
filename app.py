@@ -131,6 +131,83 @@ def simulation():
                 return response
             return response_data
 
+        # BESS preliminary design study
+        bess_prelim_params = in_data.get('bess_preliminary_params')
+        if isinstance(bess_prelim_params, dict) and bess_prelim_params.get('typ') == 'BessPreliminaryPandaPower':
+            import bess_preliminary_electrisim
+            user_email = bess_prelim_params.get('user_email', 'unknown@user.com')
+            print(f"=== BESS PRELIMINARY DESIGN REQUESTED BY USER: {user_email} ===")
+            frequency = float(bess_prelim_params.get('frequency', 50))
+            net = pp.create_empty_network(f_hz=frequency)
+            Busbars = pandapower_electrisim.create_busbars(in_data, net)
+            pandapower_electrisim.create_other_elements(in_data, net, None, Busbars)
+            use_stream = bool(bess_prelim_params.get('rpc_stream', False))
+            if use_stream:
+                def _prelim_ndjson_stream():
+                    q = queue.Queue()
+                    cancel_event = threading.Event()
+
+                    def _progress_cb(msg):
+                        if cancel_event.is_set():
+                            raise grid_code_pq_electrisim.GridCodePqCancelled('Stopped by user')
+                        q.put(('p', msg))
+
+                    def _worker():
+                        try:
+                            rp = {**bess_prelim_params, '_progress_callback': _progress_cb, '_cancel_event': cancel_event}
+                            out = bess_preliminary_electrisim.bess_preliminary_study(net, rp, in_data)
+                            q.put(('d', out))
+                        except grid_code_pq_electrisim.GridCodePqCancelled:
+                            q.put(('c', 'Stopped by user'))
+                        except Exception as ex:
+                            q.put(('e', str(ex)))
+
+                    threading.Thread(target=_worker, daemon=True).start()
+                    try:
+                        while True:
+                            try:
+                                kind, payload = q.get(timeout=10)
+                            except queue.Empty:
+                                if cancel_event.is_set():
+                                    yield json.dumps({'type': 'cancelled', 'message': 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                    break
+                                yield json.dumps({'type': 'heartbeat'}, ensure_ascii=False) + '\n'
+                                continue
+                            if kind == 'p':
+                                yield json.dumps({'type': 'progress', 'message': payload}, ensure_ascii=False) + '\n'
+                            elif kind == 'd':
+                                raw = payload if isinstance(payload, str) else json.dumps(payload)
+                                try:
+                                    obj = json.loads(raw)
+                                except Exception:
+                                    yield json.dumps({'type': 'error', 'message': 'Invalid study JSON'}, ensure_ascii=False) + '\n'
+                                    break
+                                if isinstance(obj, dict) and obj.get('error'):
+                                    yield json.dumps({'type': 'error', 'message': obj['error']}, ensure_ascii=False) + '\n'
+                                    break
+                                yield json.dumps({'type': 'result', 'data': obj}, ensure_ascii=False, separators=(',', ':')) + '\n'
+                                break
+                            elif kind == 'c':
+                                yield json.dumps({'type': 'cancelled', 'message': payload or 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                break
+                            elif kind == 'e':
+                                yield json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False) + '\n'
+                                break
+                    except GeneratorExit:
+                        cancel_event.set()
+
+                return Response(_prelim_ndjson_stream(), mimetype='application/x-ndjson')
+            response_data = bess_preliminary_electrisim.bess_preliminary_study(net, bess_prelim_params, in_data)
+            accept_encoding = request.headers.get('Accept-Encoding', '')
+            if 'gzip' in accept_encoding and len(response_data) > 1024:
+                compressed = gzip.compress(response_data.encode('utf-8'))
+                response = make_response(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Type'] = 'application/json'
+                response.headers['Content-Length'] = len(compressed)
+                return response
+            return response_data
+
         # Check for BESS sizing request first (it's in a nested structure)
         bess_params = in_data.get('bess_sizing_params')
         if isinstance(bess_params, dict) and bess_params.get('typ') == 'BessSizingPandaPower':
