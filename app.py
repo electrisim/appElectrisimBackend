@@ -1,7 +1,33 @@
 # -*- coding: utf-8 -*-
+import os
 import sys
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+# line_buffering: PowerShell/Cursor often capture Werkzeug stderr but drop block-buffered stdout.
+sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+
+
+_DEV_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'electrisim-dev.log')
+
+
+def _console(msg):
+    """Main-thread stderr plus a file. Windows hides prints from Flask worker threads."""
+    line = str(msg)
+    try:
+        sys.stderr.write(line + '\n')
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        sys.stdout.write(line + '\n')
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        with open(_DEV_LOG_PATH, 'a', encoding='utf-8') as logf:
+            logf.write(line + '\n')
+            logf.flush()
+    except Exception:
+        pass
 
 import pandapower_electrisim
 import grid_code_pq_electrisim
@@ -10,7 +36,6 @@ import opender_electrisim
 import arcflash_electrisim
 import andes_electrisim
 import motor_starting_electrisim
-import os
 import json
 
 from flask import Flask, request, jsonify, make_response, Response, stream_with_context
@@ -50,7 +75,8 @@ cors_origins = os.getenv('CORS_ORIGINS', '').split(',') if os.getenv('CORS_ORIGI
 CORS(app, 
      origins=cors_origins, 
      methods=['GET', 'POST', 'OPTIONS'],
-     allow_headers=['Content-Type', 'Authorization', 'Access-Control-Allow-Credentials'],
+     allow_headers=['Content-Type', 'Authorization', 'Accept', 'Accept-Encoding',
+                    'Access-Control-Allow-Credentials'],
      supports_credentials=True)
 
 app.config['CORS_HEADERS'] = 'Content-Type'
@@ -71,6 +97,7 @@ def _element_typ(item):
 def add_noindex_header(response):
     """API host is not a website — keep it out of Google Search index."""
     response.headers.setdefault('X-Robots-Tag', 'noindex, nofollow')
+    response.headers.setdefault('Access-Control-Allow-Private-Network', 'true')
     return response
 
 
@@ -87,6 +114,11 @@ def robots_txt():
 def index():
         return 'Please send data to backend'
 
+@app.before_request
+def _log_incoming_request():
+    _console(f"[incoming] {request.method} {request.path} from {request.remote_addr}")
+
+
 @app.route('/', methods=['POST'])
 def simulation():
     try:
@@ -95,7 +127,7 @@ def simulation():
             return jsonify({
                 'error': 'Request body must be a JSON object with simulation elements.'
             }), 400
-        print(in_data) 
+        print(in_data, flush=True)
        
         Busbars = {}
         
@@ -103,7 +135,7 @@ def simulation():
         bess_rev_params = in_data.get('bess_dispatch_reversal_params')
         if isinstance(bess_rev_params, dict) and bess_rev_params.get('typ') == 'BessDispatchReversalOpenDss':
             user_email = bess_rev_params.get('user_email', 'unknown@user.com')
-            print(f"=== BESS DISPATCH REVERSAL REQUESTED BY USER: {user_email} ===")
+            _console(f"=== BESS DISPATCH REVERSAL REQUESTED BY USER: {user_email} ===")
             response_data = opender_electrisim.bess_dispatch_reversal(in_data, bess_rev_params)
             accept_encoding = request.headers.get('Accept-Encoding', '')
             if 'gzip' in accept_encoding and len(response_data) > 1024:
@@ -2397,5 +2429,17 @@ if __name__ == '__main__':
         # Production mode
         app.run(host='0.0.0.0', port=port, debug=False)
     else:
-        # Development mode - disable reloader to prevent MemoryError with numba/pandapower
-        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+        import socket
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            already = probe.connect_ex(('127.0.0.1', port)) == 0
+        finally:
+            probe.close()
+        if already:
+            _console(
+                f'[Electrisim] Port {port} is already taken by another python app.py. '
+                f'Stop that process first or this window will get no requests/logs.'
+            )
+            raise SystemExit(1)
+        _console(f'[Electrisim] logging to this terminal; POST / on port {port}')
+        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False, threaded=False)

@@ -4,9 +4,14 @@
 import copy
 import json
 import math
+import sys
 
 import opendss_electrisim as ods
-from storage_q_capability import interp_storage_pq_limits
+from storage_q_capability import (
+    interp_storage_pq_limits,
+    resolve_storage_operating_pq,
+    storage_q_setpoint_from_curve,
+)
 
 try:
     import opendssdirect as dss
@@ -99,7 +104,8 @@ def _configure_opender_from_storage(storage_el, frequency_hz, olrt_s):
         sn_mva = p_max_mw
     p_max_w = max(p_max_mw, sn_mva) * 1e6
     va_max_w = sn_mva * 1e6
-    q_max_w = min(va_max_w * 0.5, p_max_w * 0.6)
+    # Four-quadrant PCS: full Q at P = 0 (STATCOM). Curve overrides below.
+    q_max_w = va_max_w
     curve_lim = interp_storage_pq_limits(storage_el)
     if curve_lim is not None:
         q_mi, q_ma = curve_lim
@@ -285,9 +291,10 @@ def _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command, pct_store
         f'Edit Storage.{storage_name} DispMode=EXTERNAL TimeChargeTrig=-1 '
         f'ChargeTrigger=0 DischargeTrigger=0 State={state} kW={kw} kvar={kvar}{stored}'
     )
-    # Re-assert after DispMode (OpenDSS may rewrite State on energy/dispatch properties).
+    # Re-assert after DispMode (OpenDSS may rewrite State / kvar on energy/dispatch properties).
     execute_dss_command(f'Storage.{storage_name}.State={state}')
     execute_dss_command(f'Storage.{storage_name}.kW={kw}')
+    execute_dss_command(f'Storage.{storage_name}.kvar={kvar}')
     return state
 
 
@@ -296,28 +303,95 @@ def _electrisim_p_to_opendss_kw(p_mw):
     return -float(p_mw) * 1000.0
 
 
+def _electrisim_q_mvar_from_fixed_pf(storage_el, p_mw):
+    """Electrisim Q at |P| for FIXED_PF: +absorb / −inject."""
+    charging = float(p_mw) > 0
+    mag_raw = storage_el.get('pf_charge') if charging else storage_el.get('pf')
+    if mag_raw is None or str(mag_raw).strip() == '':
+        mag_raw = storage_el.get('pf', 1.0)
+    mode = storage_el.get('pf_charge_q_mode') if charging else storage_el.get('pf_q_mode')
+    if not mode:
+        mode = storage_el.get('pf_q_mode') or 'lagging'
+    try:
+        pf_val = float(mag_raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if pf_val < 0:
+        mode = 'leading'
+    pf_mag = min(0.999999, abs(pf_val))
+    if pf_mag >= 0.999 or abs(p_mw) < 1e-9:
+        return 0.0
+    q_mag = abs(float(p_mw)) * math.tan(math.acos(pf_mag))
+    leading = str(mode).lower() == 'leading'
+    return -q_mag if leading else q_mag
+
+
 def _opendss_q_for_storage(storage_el, p_mw):
-    """Fixed-PF Q for OpenDSS-only fallback (kvar, generator convention)."""
+    """Storage kvar for OpenDSS (generator convention: +inject)."""
     inv_mode = str(storage_el.get('inv_control_mode') or 'NONE').upper()
     if inv_mode == 'FIXED_PF':
-        charging = float(p_mw) > 0
-        state = 'CHARGING' if charging else 'DISCHARGING'
-        pf_suffix = ods._opendss_storage_fixed_pf_suffix(storage_el, state)
-        if 'pf=' in pf_suffix:
-            try:
-                pf_val = float(pf_suffix.split('pf=')[1].strip())
-                kw = abs(_electrisim_p_to_opendss_kw(p_mw))
-                if kw == 0:
-                    return 0.0
-                pf_mag = min(0.999999, abs(pf_val))
-                if pf_mag >= 0.999:
-                    return 0.0
-                q_mag = kw * math.tan(math.acos(pf_mag))
-                return q_mag if pf_val >= 0 else -q_mag
-            except (TypeError, ValueError):
-                pass
-    q_mvar = _sf(storage_el.get('q_mvar'), 0.0)
+        q_mvar = _electrisim_q_mvar_from_fixed_pf(storage_el, p_mw)
+    else:
+        q_mvar = _sf(storage_el.get('q_mvar'), 0.0)
     return -q_mvar * 1000.0
+
+
+def _storage_flag(val):
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _q_source_for_study(params, storage_el):
+    """
+    Where dispatch-reversal Q comes from.
+    The P–Q curve / voltage-dependent envelope only change results when Q is
+    taken from the envelope (or a non-unity PF hits the limit).
+    """
+    raw = (params or {}).get('q_source') or (params or {}).get('qSource') or ''
+    src = str(raw).strip().lower().replace('-', '_')
+    aliases = {
+        'qmin': 'curve_inject',
+        'q_min': 'curve_inject',
+        'inject': 'curve_inject',
+        'inductive_max': 'curve_inject',
+        'qmax': 'curve_absorb',
+        'q_max': 'curve_absorb',
+        'absorb': 'curve_absorb',
+        'capacitive_max': 'curve_absorb',
+        'setpoint': 'curve_setpoint',
+        'storage': 'inverter',
+        'pf': 'inverter',
+    }
+    src = aliases.get(src, src)
+    if src in ('inverter', 'curve_inject', 'curve_absorb', 'curve_setpoint'):
+        return src
+    if _storage_flag((storage_el or {}).get('reactive_capability_curve')):
+        mode = str((storage_el or {}).get('q_setpoint_mode') or 'manual').strip().lower()
+        if mode == 'capacitive_max':
+            return 'curve_absorb'
+        if mode == 'inductive_max':
+            return 'curve_inject'
+        return 'curve_inject'
+    return 'inverter'
+
+
+def _requested_q_mvar(storage_el, p_mw, v_pu, q_source):
+    """Electrisim Q command: +absorb / −inject."""
+    src = str(q_source or 'inverter')
+    if src == 'curve_inject':
+        lim = interp_storage_pq_limits(storage_el, p_mw, v_pu=v_pu)
+        return float(lim[0]) if lim else 0.0
+    if src == 'curve_absorb':
+        lim = interp_storage_pq_limits(storage_el, p_mw, v_pu=v_pu)
+        return float(lim[1]) if lim else 0.0
+    if src == 'curve_setpoint':
+        q0 = _sf((storage_el or {}).get('q_mvar'), 0.0)
+        q = storage_q_setpoint_from_curve(storage_el, p_mw, q0, v_pu=v_pu)
+        return float(q if q is not None else q0)
+    return -_opendss_q_for_storage(storage_el, p_mw) / 1000.0
 
 
 def _build_circuit(in_data, frequency_hz):
@@ -326,7 +400,7 @@ def _build_circuit(in_data, frequency_hz):
     opendss_commands = []
 
     def execute_dss_command(command):
-        print(f"[OpenDSS BESS P-step] {command}")
+        print(f"[OpenDSS BESS P-step] {command}", file=sys.stderr, flush=True)
         dss.Text.Command(command)
         opendss_commands.append(command)
 
@@ -391,6 +465,7 @@ def bess_dispatch_reversal(in_data, params):
             'message': f'Storage element not found (id={storage_id}). Select a Storage element on the canvas.',
         })
 
+    q_source = _q_source_for_study(params, storage_el)
     storage_name = ods._sanitize_opendss_name(storage_el.get('name') or storage_el.get('userFriendlyName') or 'storage')
     storage_label = str(storage_el.get('userFriendlyName') or storage_el.get('name') or storage_name)
     soc_hold = _sf(storage_el.get('soc_percent'), 50.0)
@@ -480,6 +555,8 @@ def bess_dispatch_reversal(in_data, params):
     v_poc = []
     p_mw_series = []
     q_mvar_series = []
+    q_min_series = []
+    q_max_series = []
     p_cmd_series = []
     warnings = list(getattr(ods, '_opendss_warnings', []) or [])
 
@@ -500,15 +577,19 @@ def bess_dispatch_reversal(in_data, params):
 
         v_before = v_last
 
-        kw_cmd = _electrisim_p_to_opendss_kw(p_cmd_mw)
-        kvar = _opendss_q_for_storage(opender_inv_settings, p_cmd_mw)
+        lim = interp_storage_pq_limits(opender_inv_settings, p_cmd_mw, v_pu=v_before)
+        q_req_mvar = _requested_q_mvar(opender_inv_settings, p_cmd_mw, v_before, q_source)
 
         if engine == 'opender' and der is not None:
+            if lim is not None and der.der_file is not None:
+                q_hi = max(abs(float(lim[0])), abs(float(lim[1])))
+                if q_hi > 0:
+                    der.der_file.NP_Q_MAX_INJ = q_hi * 1e6
+                    der.der_file.NP_Q_MAX_ABS = q_hi * 1e6
             _update_opender_pf_modes(der, opender_inv_settings, p_cmd_mw)
             p_dem_pu = _electrisim_p_to_opender_p_dem_pu(p_cmd_mw, p_max_mw)
             der.update_der_input(v_pu=v_before, p_dem_pu=p_dem_pu, f=frequency_hz)
             der.run()
-            kw_der = float(der.p_out_kw or 0.0)
             kvar_der = float(der.q_out_kvar or 0.0)
             if der.der_status == 'Trip' and not trip_warned:
                 warnings.append(
@@ -516,14 +597,14 @@ def bess_dispatch_reversal(in_data, params):
                     'Active power follows the P command; Q uses the Storage inverter settings.'
                 )
                 trip_warned = True
-            # P-step screening: OpenDSS must follow the commanded P. OpenDER Q is used when
-            # it is producing vars (Volt-VAR / PF); otherwise fall back to Storage PF/Q.
-            kw = kw_cmd
-            # Prefer Storage PF/Q setpoint; OpenDER Q only when it is actually producing vars.
-            if abs(kvar_der) > max(1.0, 0.02 * abs(kw_cmd)):
-                kvar = kvar_der
-        else:
-            kw = kw_cmd
+            # Curve Q is the study command. OpenDER Q only when following inverter / Volt-VAR.
+            if q_source == 'inverter' and abs(kvar_der) > max(1.0, 0.02 * abs(p_cmd_mw) * 1000.0):
+                q_req_mvar = -kvar_der / 1000.0
+
+        p_app_mw, q_app_mvar = resolve_storage_operating_pq(
+            opender_inv_settings, p_cmd_mw, q_req_mvar, v_pu=v_before)
+        kw = _electrisim_p_to_opendss_kw(p_app_mw)
+        kvar = -q_app_mvar * 1000.0
 
         _set_storage_dispatch(storage_name, kw, kvar, execute_dss_command, pct_stored=soc_hold)
         execute_dss_command('solve')
@@ -538,9 +619,16 @@ def bess_dispatch_reversal(in_data, params):
 
         time_s.append(round(t, 4))
         v_poc.append(round(v_last, 6))
-        # OpenDSS generator convention (+ discharge / + inject) → Electrisim (+ charge / + absorb).
-        p_mw_series.append(round(-kw_meas / 1000.0, 4))
-        q_mvar_series.append(round(-kvar_meas / 1000.0, 4))
+        # CktElement.Powers() is power *into* the element (load convention), same as Electrisim
+        # Storage: +P charge / +Q absorb.
+        p_mw_series.append(round(kw_meas / 1000.0, 4))
+        q_mvar_series.append(round(kvar_meas / 1000.0, 4))
+        if lim is not None:
+            q_min_series.append(round(float(lim[0]), 4))
+            q_max_series.append(round(float(lim[1]), 4))
+        else:
+            q_min_series.append(None)
+            q_max_series.append(None)
 
     if not time_s:
         return json.dumps({'error': True, 'message': 'Simulation produced no time steps.'})
@@ -560,11 +648,41 @@ def bess_dispatch_reversal(in_data, params):
             'Choose the plant HV / POC bus (not the External Grid bus) and re-run.'
         )
 
+    curve_on = _storage_flag(opender_inv_settings.get('reactive_capability_curve'))
+    volt_dep = _storage_flag(opender_inv_settings.get('q_cap_voltage_dependent'))
+    if curve_on and q_source == 'inverter':
+        q_abs_max = max((abs(q) for q in q_mvar_series if q is not None), default=0.0)
+        lim_abs = [
+            max(abs(a), abs(b))
+            for a, b in zip(q_min_series, q_max_series)
+            if a is not None and b is not None
+        ]
+        lim_peak = max(lim_abs) if lim_abs else 0.0
+        if q_abs_max < 0.05 and lim_peak > 0.05:
+            warnings.append(
+                'Q capability curve is on, but this run used Storage inverter Q (unity PF / Q = 0). '
+                'The envelope only changes V(t) when Q is taken from the curve. '
+                'Re-run with Q source = inject or absorb max, or set Q setpoint mode to Capacitive/Inductive max.'
+            )
+    if q_source.startswith('curve'):
+        q_label = {
+            'curve_inject': 'Q capability inject max (q_min)',
+            'curve_absorb': 'Q capability absorb max (q_max)',
+            'curve_setpoint': 'Q capability setpoint mode',
+        }.get(q_source, q_source)
+        extra = ' Voltage-dependent envelope is applied at each step.' if volt_dep else ''
+        warnings.append(
+            f'Q follows the Storage P–Q envelope ({q_label}).{extra} '
+            'Dashed Qmin/Qmax on the results chart are that envelope.'
+        )
+
     ds_time, ds = _downsample_series(time_s, {
         'v_poc': v_poc,
         'p_mw': p_mw_series,
         'q_mvar': q_mvar_series,
         'p_cmd_mw': p_cmd_series,
+        'q_min_mvar': q_min_series,
+        'q_max_mvar': q_max_series,
     })
 
     result = {
@@ -592,7 +710,12 @@ def bess_dispatch_reversal(in_data, params):
         'bus_voltage': [{'name': poc_bus_name, 'values': ds['v_poc']}],
         'p_mw': [{'name': storage_label, 'values': ds['p_mw']}],
         'q_mvar': [{'name': storage_label, 'values': ds['q_mvar']}],
+        'q_min_mvar': [{'name': 'Qmin (envelope)', 'values': ds.get('q_min_mvar') or []}],
+        'q_max_mvar': [{'name': 'Qmax (envelope)', 'values': ds.get('q_max_mvar') or []}],
         'p_cmd_mw': [{'name': 'P command', 'values': ds['p_cmd_mw']}],
+        'q_source': q_source,
+        'q_curve_enabled': curve_on,
+        'q_voltage_dependent': volt_dep,
         'warnings': warnings,
     }
     return json.dumps(result)
