@@ -155,6 +155,27 @@ def _clamp_to_rating(p_each, q_each, sn_unit):
     return p_lim, q_lim, True
 
 
+def _clamp_unit_pq(p_each, q_each, params):
+    """Clamp per-PCS P/Q for the POC-target solver.
+
+    Battery DC Pmax, when set, is a physical P cap. Wizard PCS Pmax is not
+    applied here so the plant can still cover auxiliaries and losses up to
+    Sn (named cases already use _capped_unit_p).
+    """
+    sn_unit = _f(params.get('storageSnMva'), 0.0)
+    batt = abs(_f(params.get('batteryPmax_MW'), 0.0))
+    reason = None
+    if batt > 0:
+        p_lim = max(-batt, min(batt, p_each))
+        if abs(p_lim - p_each) > 1e-9:
+            reason = 'Battery DC Pmax'
+            p_each = p_lim
+    p_each, q_each, sn_hit = _clamp_to_rating(p_each, q_each, sn_unit)
+    if sn_hit and reason is None:
+        reason = 'PCS apparent power'
+    return p_each, q_each, reason is not None, reason
+
+
 def _solve_poc_target(net, params, target_p_mw, target_q_mvar, max_iter=25, tol=1e-3):
     """Adjust storage dispatch until the POC exchange matches the requested
     P/Q, so auxiliary consumption and internal losses are absorbed by the
@@ -165,7 +186,6 @@ def _solve_poc_target(net, params, target_p_mw, target_q_mvar, max_iter=25, tol=
     """
     names = params.get('storageNames') or []
     n = max(1, len(names))
-    sn_unit = _f(params.get('storageSnMva'), 0.0)
     ext_idx = _find_ext_grid_idx(net, params['extGridName'])
     poc_idx = _find_bus_idx(net, params['pocBusName'])
     if ext_idx is None:
@@ -177,9 +197,12 @@ def _solve_poc_target(net, params, target_p_mw, target_q_mvar, max_iter=25, tol=
     clamped = False
     p_poc = q_poc = None
 
+    clamp_reason = None
     for i in range(max_iter):
-        p_each, q_each, hit = _clamp_to_rating(p_each, q_each, sn_unit)
+        p_each, q_each, hit, reason = _clamp_unit_pq(p_each, q_each, params)
         clamped = clamped or hit
+        if hit and reason:
+            clamp_reason = reason
         _set_storage_dispatch(net, names, p_each, q_each)
         if not _run_lf(net, params.get('algorithm', 'nr')):
             return {'converged': False, 'limit_reason': 'divergence',
@@ -191,11 +214,18 @@ def _solve_poc_target(net, params, target_p_mw, target_q_mvar, max_iter=25, tol=
         dq = target_q_mvar - q_poc
         if abs(dp) <= tol and abs(dq) <= tol:
             break
-        if hit:
-            # Rating is the binding constraint; the target is unreachable.
+        p_try = p_each - dp / n
+        q_try = q_each - dq / n
+        p_new, q_new, hit2, reason2 = _clamp_unit_pq(p_try, q_try, params)
+        if hit2:
+            clamped = True
+            if reason2:
+                clamp_reason = reason2
+        # P may already sit on Battery DC Pmax / Sn; still walk Q until the
+        # circle or Pmax also blocks that step.
+        if abs(p_new - p_each) < 1e-9 and abs(q_new - q_each) < 1e-9:
             break
-        p_each -= dp / n
-        q_each -= dq / n
+        p_each, q_each = p_new, q_new
 
     return {
         'converged': True,
@@ -204,6 +234,7 @@ def _solve_poc_target(net, params, target_p_mw, target_q_mvar, max_iter=25, tol=
         'p_poc_mw': p_poc,
         'q_poc_mvar': q_poc,
         'rating_clamped': clamped,
+        'clamp_reason': clamp_reason,
         'iterations': i + 1,
     }
 
@@ -217,11 +248,162 @@ def _json_num(val):
         return None
 
 
+def _table_cell_id(table, idx):
+    """mxGraph cell.id stored on the pandapower element, if present."""
+    if table is None or 'id' not in getattr(table, 'columns', []):
+        return None
+    try:
+        raw = table.at[idx, 'id']
+        if raw is None or pd.isna(raw):
+            return None
+        s = str(raw).strip()
+        if not s or s.lower() in ('none', 'nan'):
+            return None
+        return s
+    except Exception:
+        return None
+
+
+def _result_keys(net, table, idx):
+    """Identity keys the SLD painter uses: cell.id, display name, mxObjectId name."""
+    tech = str(table.at[idx, 'name'])
+    return {
+        'id': _table_cell_id(table, idx) or tech,
+        'name': _display_name(net, tech),
+        'technical_name': tech,
+    }
+
+
 def _unit_p_limits(params):
-    """Wizard Pmax charge/discharge are per PCS, not plant totals."""
+    """Wizard Pmax charge/discharge are per PCS, not plant totals.
+
+    Battery DC Pmax, when set, is the tighter limit on the AC storage
+    dispatch. Isolated DC islands are stripped before AC load-flow
+    (pandapower 3.2 Jacobian mismatch on transformer nets).
+    """
     p_dis = abs(_f(params.get('pMaxDischarge_MW'), 10))
     p_chg = abs(_f(params.get('pMaxCharge_MW'), 10))
+    batt = abs(_f(params.get('batteryPmax_MW'), 0.0))
+    if batt > 0:
+        p_dis = min(p_dis, batt)
+        p_chg = min(p_chg, batt)
     return p_dis, p_chg
+
+
+def _dc_rack_snapshot(net):
+    """Identity of DC bus / Source DC cells before they are stripped for AC LF."""
+    out = {'bus_dc': [], 'source_dc': []}
+    bus_dc = getattr(net, 'bus_dc', None)
+    if bus_dc is not None and not getattr(bus_dc, 'empty', True):
+        for idx in bus_dc.index:
+            out['bus_dc'].append(_result_keys(net, bus_dc, idx))
+    src = getattr(net, 'source_dc', None)
+    if src is not None and not getattr(src, 'empty', True):
+        for idx in src.index:
+            out['source_dc'].append(_result_keys(net, src, idx))
+    return out
+
+
+def _strip_dc_for_ac_lf(net):
+    """Drop isolated DC rows. pandapower 3.2 mismatches the AC Jacobian when a
+    transformer net also has an uncoupled DC island, even if those rows are
+    out of service."""
+    for tbl in ('vsc', 'line_dc', 'load_dc', 'source_dc', 'bus_dc'):
+        df = getattr(net, tbl, None)
+        if df is None or getattr(df, 'empty', True):
+            continue
+        try:
+            df.drop(df.index, inplace=True)
+        except Exception:
+            pass
+
+
+def _apply_storage_p_limits(net, params):
+    """Write wizard Pmax (including Battery DC Pmax) onto storage min/max P."""
+    p_dis, p_chg = _unit_p_limits(params)
+    idxs = _storage_indices(net, params.get('storageNames') or [])
+    if not idxs and hasattr(net, 'storage') and net.storage is not None:
+        idxs = list(net.storage.index)
+    for idx in idxs:
+        try:
+            net.storage.at[idx, 'max_p_mw'] = p_chg
+            net.storage.at[idx, 'min_p_mw'] = -p_dis
+        except Exception:
+            pass
+
+
+def _battery_dc_rows(net, params):
+    """Rating rows: |AC Storage P| / Battery DC Pmax, keyed to SLD Source DC."""
+    batt = abs(_f((params or {}).get('batteryPmax_MW'), 0.0))
+    if batt <= 0:
+        return []
+    snap = ((params or {}).get('_dc_snapshot') or {}).get('source_dc') or []
+    names = (params or {}).get('storageNames') or []
+    idxs = _storage_indices(net, names)
+    if not idxs and hasattr(net, 'storage') and net.storage is not None \
+            and not net.storage.empty:
+        idxs = list(net.storage.index)
+    rows = []
+    for i, idx in enumerate(idxs):
+        p, _q, _lp, _sn = _storage_loading(net, idx)
+        p_abs = abs(p)
+        ident = snap[i] if i < len(snap) else {}
+        stor_disp = _display_name(net, net.storage.at[idx, 'name'])
+        name = ident.get('name') or f'Battery_{i + 1}'
+        row = {
+            'id': ident.get('id') or ident.get('technical_name') or name,
+            'name': name,
+            'technical_name': ident.get('technical_name') or name,
+            'type': 'battery_dc',
+            'p_mw': _json_num(p),
+            'p_dc_mw': _json_num(p_abs),
+            'pmax_mw': batt,
+            'loading_percent': (p_abs / batt * 100.0) if batt else 0.0,
+            'paired_storage': stor_disp,
+        }
+        rows.append(row)
+    return rows
+
+
+def _n_units(params):
+    return max(1, len(params.get('storageNames') or []))
+
+
+def _q_from_p_pf(p_mw, pf):
+    """|Q| implied by |P| and a lagging/leading power factor (Q/P = tan acos PF)."""
+    pf = min(0.999999, max(0.1, abs(_f(pf, 0.95))))
+    return abs(_f(p_mw, 0.0)) * math.tan(math.acos(pf))
+
+
+def _poc_pn(params):
+    """Grid-code Pn is the requested POC active power, not the sum of PCS nameplates."""
+    n = _n_units(params)
+    p_dis, _ = _unit_p_limits(params)
+    return abs(_f(params.get('pocP_MW'), p_dis * n))
+
+
+def _capped_unit_p(params):
+    """Per-PCS P for named cases / tap sweep: never above the user's POC Pn share."""
+    n = _n_units(params)
+    p_dis, p_chg = _unit_p_limits(params)
+    pn = _poc_pn(params)
+    share = pn / n
+    return min(p_dis, share), min(p_chg, share)
+
+
+def _storage_pq_requirement(pn, pf):
+    """Four-quadrant P/Q rectangle at cosφ: |Q|/Pn = tan(acos(PF)) from -Pn to +Pn (export-positive P)."""
+    pn = abs(_f(pn, 0.0))
+    q = _q_from_p_pf(pn, pf)
+    # Closed rectangle so the chart can stroke a polygon.
+    return {
+        'p_mw': [-pn, -pn, pn, pn, -pn],
+        'q_req_max_mvar': [q, q, q, q, q],
+        'q_req_min_mvar': [-q, -q, -q, -q, -q],
+        'pf': abs(_f(pf, 0.95)),
+        'q_over_pn': (q / pn) if pn else 0.0,
+        'label': 'Grid-code Q at PF={:.3g} (|Q|/Pn={:.3f})'.format(abs(_f(pf, 0.95)), (q / pn) if pn else 0.0),
+    }
 
 
 def _network_losses(net):
@@ -261,7 +443,7 @@ def _storage_loading(net, idx):
     return p, q, loading, sn
 
 
-def _max_loading_element(net):
+def _max_loading_element(net, params=None):
     best = None
     best_load = -1.0
     if hasattr(net, 'res_line') and net.res_line is not None and not net.res_line.empty:
@@ -290,6 +472,22 @@ def _max_loading_element(net):
                     }
             except Exception:
                 pass
+    if hasattr(net, 'res_trafo3w') and net.res_trafo3w is not None and not net.res_trafo3w.empty:
+        for idx in net.res_trafo3w.index:
+            try:
+                if idx in net.trafo3w.index and 'in_service' in net.trafo3w.columns \
+                        and not bool(net.trafo3w.at[idx, 'in_service']):
+                    continue
+                lp = float(net.res_trafo3w.at[idx, 'loading_percent'])
+                if lp > best_load:
+                    best_load = lp
+                    best = {
+                        'type': 'transformer',
+                        'name': _display_name(net, net.trafo3w.at[idx, 'name']),
+                        'loading_percent': lp,
+                    }
+            except Exception:
+                pass
     if hasattr(net, 'storage') and net.storage is not None and not net.storage.empty:
         for idx in net.storage.index:
             try:
@@ -304,6 +502,19 @@ def _max_loading_element(net):
                     }
             except Exception:
                 pass
+    for row in _battery_dc_rows(net, params):
+        try:
+            lp = float(row.get('loading_percent') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if lp > best_load:
+            best_load = lp
+            best = {
+                'type': 'battery_dc',
+                'name': row.get('name') or 'Battery DC Pmax',
+                'loading_percent': lp,
+                'pmax_mw': row.get('pmax_mw'),
+            }
     return best
 
 
@@ -325,6 +536,23 @@ def _voltage_violations(net, vmin, vmax):
     return issues
 
 
+def _copy_res_fields(row, res, idx, cols):
+    if res is None or getattr(res, 'empty', True):
+        return
+    try:
+        if idx not in res.index:
+            return
+    except Exception:
+        return
+    for col in cols:
+        if col not in res.columns:
+            continue
+        try:
+            row[col] = _json_num(res.at[idx, col])
+        except Exception:
+            pass
+
+
 def _voltage_profile(net):
     """Per-bus voltage throughout the plant (not only violations)."""
     out = []
@@ -332,22 +560,15 @@ def _voltage_profile(net):
     if res is None or res.empty:
         return out
     for idx in net.bus.index:
-        vm = None
-        try:
-            if idx in res.index:
-                vm = _json_num(res.at[idx, 'vm_pu'])
-        except (TypeError, ValueError, KeyError):
-            vm = None
-        out.append({
-            'name': _display_name(net, net.bus.at[idx, 'name']),
-            'vn_kv': _json_num(net.bus.at[idx, 'vn_kv']),
-            'vm_pu': vm,
-        })
+        row = _result_keys(net, net.bus, idx)
+        row['vn_kv'] = _json_num(net.bus.at[idx, 'vn_kv'])
+        _copy_res_fields(row, res, idx, ('vm_pu', 'va_degree', 'p_mw', 'q_mvar'))
+        out.append(row)
     return out
 
 
-def _limiting_element(net, vmax_loading, vmin_pu, vmax_pu):
-    loader = _max_loading_element(net)
+def _limiting_element(net, vmax_loading, vmin_pu, vmax_pu, params=None):
+    loader = _max_loading_element(net, params)
     if loader and loader['loading_percent'] > vmax_loading:
         return loader
     vissues = _voltage_violations(net, vmin_pu, vmax_pu)
@@ -377,12 +598,13 @@ def _rating_table(net, cases):
     return list(ratings.values())
 
 
-def _collect_element_loadings(net):
-    """Loadings for in-service branches and PCS/storage, including nameplate."""
+def _collect_element_loadings(net, params=None):
+    """Loadings for in-service branches, PCS/storage, and Battery DC Pmax."""
     out = []
     for res_attr, el_attr, el_type, rating_col, rating_key in (
             ('res_line', 'line', 'line', 'max_i_ka', 'max_i_ka'),
-            ('res_trafo', 'trafo', 'transformer', 'sn_mva', 'sn_mva')):
+            ('res_trafo', 'trafo', 'transformer', 'sn_mva', 'sn_mva'),
+            ('res_trafo3w', 'trafo3w', 'transformer', 'sn_hv_mva', 'sn_mva')):
         res = getattr(net, res_attr, None)
         els = getattr(net, el_attr, None)
         if res is None or els is None or res.empty:
@@ -391,20 +613,36 @@ def _collect_element_loadings(net):
             if idx not in els.index:
                 continue
             try:
+                if 'in_service' in els.columns and not bool(els.at[idx, 'in_service']):
+                    continue
+            except Exception:
+                pass
+            try:
                 lp = float(res.at[idx, 'loading_percent'])
             except (TypeError, ValueError, KeyError):
                 continue
             if math.isnan(lp):
                 continue
-            row = {
-                'type': el_type,
-                'name': _display_name(net, els.at[idx, 'name']),
-                'loading_percent': lp,
-            }
+            row = _result_keys(net, els, idx)
+            row['type'] = el_type
+            row['loading_percent'] = lp
             try:
                 row[rating_key] = _json_num(els.at[idx, rating_col])
             except Exception:
                 pass
+            if el_type == 'line':
+                _copy_res_fields(row, res, idx, (
+                    'p_from_mw', 'q_from_mvar', 'p_to_mw', 'q_to_mvar', 'i_from_ka',
+                ))
+            elif el_attr == 'trafo':
+                _copy_res_fields(row, res, idx, (
+                    'p_hv_mw', 'q_hv_mvar', 'p_lv_mw', 'q_lv_mvar',
+                ))
+            elif el_attr == 'trafo3w':
+                _copy_res_fields(row, res, idx, (
+                    'p_hv_mw', 'q_hv_mvar', 'p_mv_mw', 'q_mv_mvar',
+                    'p_lv_mw', 'q_lv_mvar',
+                ))
             out.append(row)
     if hasattr(net, 'storage') and net.storage is not None and not net.storage.empty:
         for idx in net.storage.index:
@@ -414,18 +652,48 @@ def _collect_element_loadings(net):
             except Exception:
                 pass
             p, q, lp, sn = _storage_loading(net, idx)
-            row = {
+            row = _result_keys(net, net.storage, idx)
+            row.update({
                 'type': 'storage',
-                'name': _display_name(net, net.storage.at[idx, 'name']),
                 'sn_mva': sn,
                 'p_mw': p,
                 'q_mvar': q,
                 'loading_percent': lp,
-            }
+            })
             for col in ('max_p_mw', 'min_p_mw', 'max_q_mvar', 'min_q_mvar'):
                 if col in net.storage.columns:
                     row[col] = _json_num(net.storage.at[idx, col])
             out.append(row)
+    if hasattr(net, 'load') and net.load is not None and not net.load.empty:
+        resl = getattr(net, 'res_load', None)
+        for idx in net.load.index:
+            try:
+                if 'in_service' in net.load.columns and not bool(net.load.at[idx, 'in_service']):
+                    continue
+            except Exception:
+                pass
+            row = _result_keys(net, net.load, idx)
+            row['type'] = 'load'
+            if resl is not None and not resl.empty and idx in resl.index:
+                try:
+                    row['p_mw'] = _json_num(resl.at[idx, 'p_mw'])
+                    row['q_mvar'] = _json_num(resl.at[idx, 'q_mvar'])
+                except Exception:
+                    pass
+            out.append(row)
+    if hasattr(net, 'ext_grid') and net.ext_grid is not None and not net.ext_grid.empty:
+        rese = getattr(net, 'res_ext_grid', None)
+        for idx in net.ext_grid.index:
+            try:
+                if 'in_service' in net.ext_grid.columns and not bool(net.ext_grid.at[idx, 'in_service']):
+                    continue
+            except Exception:
+                pass
+            row = _result_keys(net, net.ext_grid, idx)
+            row['type'] = 'ext_grid'
+            _copy_res_fields(row, rese, idx, ('p_mw', 'q_mvar'))
+            out.append(row)
+    out.extend(_battery_dc_rows(net, params))
     return out
 
 
@@ -475,11 +743,11 @@ def _run_named_case(base_net, params, case_def):
     vmax = _f(params.get('max_loading_percent'), 100)
     vmin_pu = _f(case_def.get('vmin_pu', params.get('vmin_pu')), 0.95)
     vmax_pu = _f(case_def.get('vmax_pu', params.get('vmax_pu')), 1.05)
-    limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu)
+    limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu, params)
     vviol = _voltage_violations(net, vmin_pu, vmax_pu)
     overloaded = (
         limiter
-        and limiter.get('type') in ('line', 'transformer', 'storage')
+        and limiter.get('type') in ('line', 'transformer', 'storage', 'battery_dc')
         and limiter.get('loading_percent', 0) > vmax
     )
 
@@ -491,7 +759,7 @@ def _run_named_case(base_net, params, case_def):
         'q_poc_mvar': q_poc,
         'p_loss_mw': p_loss_mw,
         'q_loss_mvar': q_loss_mvar,
-        'elements': _collect_element_loadings(net),
+        'elements': _collect_element_loadings(net, params),
         'voltage_profile': _voltage_profile(net),
         'limiting_element': limiter,
         'pass': not overloaded and not vviol,
@@ -512,11 +780,23 @@ def _run_named_case(base_net, params, case_def):
             'q_error_mvar': q_err,
             'target_met': target_met,
             'rating_clamped': bool(solve.get('rating_clamped')),
+            'clamp_reason': solve.get('clamp_reason'),
             'pcs_p_each_mw': solve.get('p_each'),
             'pcs_q_each_mvar': solve.get('q_each'),
         })
         result['pass'] = result['pass'] and target_met
-        if not target_met and result['limiting_element'] is None:
+        if not target_met and solve.get('rating_clamped'):
+            lim = result.get('limiting_element') or {}
+            over = lim.get('loading_percent', 0) > vmax
+            if not over and lim.get('type') != 'battery_dc':
+                reason = solve.get('clamp_reason') or (
+                    'PCS apparent power' if solve.get('rating_clamped') else 'POC target')
+                result['limiting_element'] = {
+                    'type': 'battery_dc' if reason == 'Battery DC Pmax' else 'rating',
+                    'name': reason,
+                    'limit_reason': 'rating',
+                }
+        elif not target_met and result['limiting_element'] is None:
             result['limiting_element'] = {
                 'type': 'rating' if solve.get('rating_clamped') else 'unreachable',
                 'name': 'PCS apparent power' if solve.get('rating_clamped') else 'POC target',
@@ -526,11 +806,12 @@ def _run_named_case(base_net, params, case_def):
 
 
 def _build_named_cases(params):
-    p_dis, p_chg = _unit_p_limits(params)
-    poc_p = _f(params.get('pocP_MW'), p_dis)
-    poc_q = _f(params.get('pocQ_Mvar'), 0)
-    # storageSnMva / pMax* are per-unit PCS ratings. Do not divide by N.
-    q_cap_unit = _f(params.get('storageSnMva'), p_dis * 1.1)
+    p_dis, p_chg = _capped_unit_p(params)
+    poc_p = _poc_pn(params)
+    pf = _f(params.get('powerFactor'), 0.95)
+    specify_q = params.get('specifyQDirectly') is True or params.get('specifyQDirectly') == 'true'
+    poc_q = _f(params.get('pocQ_Mvar'), 0) if specify_q else _q_from_p_pf(poc_p, pf)
+    q_pf_unit = _q_from_p_pf(poc_p, pf) / _n_units(params)
     u_levels = [
         ('Umin', _f(params.get('umin_pu'), 0.95)),
         ('Unom', _f(params.get('unom_pu'), 1.0)),
@@ -538,40 +819,48 @@ def _build_named_cases(params):
     ]
     cases = []
     for label, vm in u_levels:
-        # Headline check: can the plant actually deliver the requested POC P/Q
-        # once auxiliaries and internal losses are covered?
         cases.append({
             'name': f'{label}_POC_Target',
             'vm_pu': vm,
             'target_p_mw': poc_p,
             'target_q_mvar': poc_q,
         })
-        # Discharge: storage p < 0
         cases.append({
             'name': f'{label}_Rated_Discharge',
             'vm_pu': vm,
             'p_each': -p_dis,
             'q_each': 0.0,
         })
-        # Charge: storage p > 0
         cases.append({
             'name': f'{label}_Rated_Charge',
             'vm_pu': vm,
             'p_each': p_chg,
             'q_each': 0.0,
         })
-        # Q support at P ~ 0; export-positive Q means negative storage q_mvar.
+        # Q corners at |P|=Pn: discharge and charge, ±Q from PF.
         cases.append({
-            'name': f'{label}_Qmax_Capacitive',
+            'name': f'{label}_Pmax_Qpf_Capacitive',
             'vm_pu': vm,
-            'p_each': 0.0,
-            'q_each': -q_cap_unit,
+            'p_each': -p_dis,
+            'q_each': -q_pf_unit,
         })
         cases.append({
-            'name': f'{label}_Qmax_Inductive',
+            'name': f'{label}_Pmax_Qpf_Inductive',
             'vm_pu': vm,
-            'p_each': 0.0,
-            'q_each': q_cap_unit,
+            'p_each': -p_dis,
+            'q_each': q_pf_unit,
+        })
+        cases.append({
+            'name': f'{label}_Pmin_Qpf_Capacitive',
+            'vm_pu': vm,
+            'p_each': p_chg,
+            'q_each': -q_pf_unit,
+        })
+        cases.append({
+            'name': f'{label}_Pmin_Qpf_Inductive',
+            'vm_pu': vm,
+            'p_each': p_chg,
+            'q_each': q_pf_unit,
         })
     return cases
 
@@ -587,10 +876,10 @@ def _dispatch_trial(net, params, p_each, q_each):
     vmax = _f(params.get('max_loading_percent'), 100)
     vmin_pu = _f(params.get('vmin_pu'), 0.95)
     vmax_pu = _f(params.get('vmax_pu'), 1.05)
-    limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu)
+    limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu, params)
     overloaded = (
         limiter
-        and limiter.get('type') in ('line', 'transformer', 'storage')
+        and limiter.get('type') in ('line', 'transformer', 'storage', 'battery_dc')
         and limiter.get('loading_percent', 0) > vmax
     )
     vviol = _voltage_violations(net, vmin_pu, vmax_pu)
@@ -706,7 +995,7 @@ def _tap_sweep(base_net, params):
         tap_min, tap_max = -5, 5
     results = []
     from copy import deepcopy
-    p_dis, _p_chg = _unit_p_limits(params)
+    p_dis, _p_chg = _capped_unit_p(params)
     ext_idx = _find_ext_grid_idx(base_net, params['extGridName'])
     poc_idx = _find_bus_idx(base_net, params['pocBusName'])
 
@@ -744,7 +1033,8 @@ def _tap_sweep(base_net, params):
             'voltage_profile': _voltage_profile(net),
             'limiting_element': _limiting_element(
                 net, _f(params.get('max_loading_percent'), 100),
-                _f(params.get('vmin_pu'), 0.95), _f(params.get('vmax_pu'), 1.05)),
+                _f(params.get('vmin_pu'), 0.95), _f(params.get('vmax_pu'), 1.05),
+                params),
         }
         if params.get('tapQCapability', True):
             qmax = _bisect_available_q(net, params, -p_dis, -1.0)
@@ -779,8 +1069,13 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
     if not storage_names:
         return {'error': 'No Storage/PCS units from the wizard were found in the network.'}
     n_units = len(storage_names)
-
-    total_p = _f(params.get('pMaxDischarge_MW'), 10) * n_units
+    pn = _poc_pn({**params, 'storageNames': requested or storage_names})
+    req = _storage_pq_requirement(pn, _f(params.get('powerFactor'), 0.95))
+    v_keys = [
+        f"{_f(params.get('umin_pu'), 0.95):.4f}",
+        f"{_f(params.get('unom_pu'), 1.0):.4f}",
+        f"{_f(params.get('umax_pu'), 1.05):.4f}",
+    ]
     pq_params = {
         'pcc_bus_name': _technical_name(net, getattr(net, 'bus', None), params['pocBusName']),
         'ext_grid_name': _technical_name(net, getattr(net, 'ext_grid', None), params['extGridName']),
@@ -791,10 +1086,7 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
             _f(params.get('unom_pu'), 1.0),
             _f(params.get('umax_pu'), 1.05),
         ],
-        'pn_mw': total_p,
-        # Coarser than the dedicated Grid Code P-Q study: 25 % Pn in both
-        # directions, 5 % Pn Q resolution. Fine enough for a preliminary
-        # envelope, far fewer load-flows than a 0.5 % Q / 20 % P sweep.
+        'pn_mw': pn,
         'p_start_pct': 0,
         'p_end_pct': 100,
         'p_step_pct': 25,
@@ -803,13 +1095,11 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
         'q_capability_mode': 'from_curve' if params.get('useQCurve') else 'from_rating',
         'limit_overloads': True,
         'max_loading_percent': _f(params.get('max_loading_percent'), 100),
-        # Envelope at the diagram tap. Searching both OLTC extremes at every
-        # P point (i_trf_ctrl) roughly doubled-to-quadrupled the load-flow
-        # count; the tap sweep already reports Q vs tap separately.
         'i_trf_ctrl': False,
         'run_control_trafo2w': False,
         'generator_oriented': True,
         'frequency': _f(params.get('frequency'), 50),
+        'requirements': {k: req for k in v_keys},
         '_progress_callback': progress_cb,
         '_cancel_event': params.get('_cancel_event'),
     }
@@ -835,6 +1125,11 @@ def bess_preliminary_study(net, params, in_data=None):
         progress_cb = params.get('_progress_callback')
         if progress_cb:
             progress_cb('Building named load-flow cases…')
+
+        params = dict(params or {})
+        params['_dc_snapshot'] = _dc_rack_snapshot(net)
+        _strip_dc_for_ac_lf(net)
+        _apply_storage_p_limits(net, params)
 
         case_defs = _build_named_cases(params)
         named_cases = []

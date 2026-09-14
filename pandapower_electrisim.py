@@ -1567,12 +1567,14 @@ def create_busbars(in_data, net):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
-            DcBuses[dc_bus_name] = pp.create_bus_dc(
-                net,
-                vn_kv=float(in_data[x].get('vn_kv', 0.0)),
+            dc_kw = dict(
+                vn_kv=float(in_data[x].get('vn_kv', 0.0) or 0.0),
                 name=dc_bus_name,
-                in_service=in_service
+                in_service=in_service,
             )
+            if in_data[x].get('id') is not None:
+                dc_kw['id'] = in_data[x]['id']
+            DcBuses[dc_bus_name] = pp.create_bus_dc(net, **dc_kw)
             
             # Store the user-friendly name mapping
             net.user_friendly_names[dc_bus_name] = user_friendly_name
@@ -3778,7 +3780,23 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_load_dc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x].get('p_mw', 0.0)), in_service=in_service)
+            p_dc = safe_float(in_data[x].get('p_dc_mw', in_data[x].get('p_mw', 0.0)))
+            dc_extra = {}
+            if in_data[x].get('id') is not None:
+                dc_extra['id'] = in_data[x]['id']
+            try:
+                pp.create_load_dc(net, bus_dc=bus_idx, name=in_data[x]['name'],
+                                  p_dc_mw=p_dc, in_service=in_service, **dc_extra)
+            except TypeError:
+                try:
+                    pp.create_load_dc(net, bus=bus_idx, name=in_data[x]['name'],
+                                      p_mw=p_dc, in_service=in_service, **dc_extra)
+                except Exception as load_dc_err:
+                    print(f"Warning: Load DC '{in_data[x].get('name')}' not created: {load_dc_err}")
+                    continue
+            except Exception as load_dc_err:
+                print(f"Warning: Load DC '{in_data[x].get('name')}' not created: {load_dc_err}")
+                continue
             
             # Store user-friendly name for load DC
             load_dc_name = in_data[x]['name']
@@ -3795,7 +3813,24 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_source_dc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)), in_service=in_service)
+            src_extra = {}
+            if in_data[x].get('id') is not None:
+                src_extra['id'] = in_data[x]['id']
+            try:
+                pp.create_source_dc(net, bus_dc=bus_idx, name=in_data[x]['name'],
+                                    vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)),
+                                    in_service=in_service, **src_extra)
+            except TypeError:
+                try:
+                    pp.create_source_dc(net, bus=bus_idx, name=in_data[x]['name'],
+                                        vm_pu=safe_float(in_data[x].get('vm_pu', 1.0)),
+                                        in_service=in_service, **src_extra)
+                except Exception as src_dc_err:
+                    print(f"Warning: Source DC '{in_data[x].get('name')}' not created: {src_dc_err}")
+                    continue
+            except Exception as src_dc_err:
+                print(f"Warning: Source DC '{in_data[x].get('name')}' not created: {src_dc_err}")
+                continue
             
             # Store user-friendly name for source DC
             source_dc_name = in_data[x]['name']
