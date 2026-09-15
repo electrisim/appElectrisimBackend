@@ -172,19 +172,19 @@ def test_poc_target_flags_infeasible_request():
     assert r.get('rating_clamped'), r
 
 
-def test_qpf_corners_split_plant_q_across_units():
-    """Grid-code Q is a plant requirement at Pn, shared by the PCS units."""
+def test_qpf_corners_are_plant_level_targets():
+    """Grid-code Q is a plant requirement at Pn, not a per-PCS split in the case list."""
+    q_plant = bess_prelim._q_from_p_pf(8, 0.95)
     one = bess_prelim._build_named_cases(_base_params(storageNames=['BESS_1'], pocP_MW=8, powerFactor=0.95))
     two = bess_prelim._build_named_cases(
         _base_params(storageNames=['BESS_1', 'BESS_2'], pocP_MW=8, powerFactor=0.95))
-
-    def qcap(cases):
-        c = next(c for c in cases if c['name'] == 'Unom_Pmax_Qpf_Capacitive')
-        return abs(c['q_each'])
-
-    q_plant = bess_prelim._q_from_p_pf(8, 0.95)
-    assert abs(qcap(one) - q_plant) < 1e-9, qcap(one)
-    assert abs(qcap(two) - q_plant / 2) < 1e-9, qcap(two)
+    for cases in (one, two):
+        cap = next(c for c in cases if c['name'] == 'Unom_Export_Capacitive')
+        assert abs(cap['target_p_mw'] - 8) < 1e-9 and abs(cap['target_q_mvar'] - q_plant) < 1e-9, cap
+        ind = next(c for c in cases if c['name'] == 'Unom_Export_Inductive')
+        assert abs(ind['target_q_mvar'] + q_plant) < 1e-9, ind
+        imp = next(c for c in cases if c['name'] == 'Unom_Import_Capacitive')
+        assert abs(imp['target_p_mw'] + 8) < 1e-9, imp
 
 
 def test_battery_pmax_caps_named_case_p():
@@ -413,11 +413,12 @@ def test_q_follows_power_factor():
     assert abs(q / 23.5 - 0.3287) < 1e-3, q
     cases = bess_prelim._build_named_cases(
         _base_params(storageNames=['BESS_1'], pocP_MW=23.5, powerFactor=0.95, pMaxDischarge_MW=23.5))
-    tgt = next(c for c in cases if c['name'] == 'Unom_POC_Target')
+    tgt = next(c for c in cases if c['name'] == 'Unom_Export_Capacitive')
     assert abs(tgt['target_q_mvar'] - q) < 1e-6, tgt
-    cap = next(c for c in cases if c['name'] == 'Unom_Pmax_Qpf_Capacitive')
-    assert cap['p_each'] == -23.5, cap
-    assert abs(cap['q_each'] + q) < 1e-6, cap
+    ind = next(c for c in cases if c['name'] == 'Unom_Export_Inductive')
+    assert abs(ind['target_q_mvar'] + q) < 1e-6, ind
+    imp = next(c for c in cases if c['name'] == 'Unom_Import_Capacitive')
+    assert abs(imp['target_p_mw'] + 23.5) < 1e-6, imp
 
 
 def test_two_unit_plant_doubles_active_export():
@@ -437,7 +438,7 @@ def test_two_unit_plant_doubles_reactive_export():
         storageNames=['BESS_1', 'BESS_2'], storageSnMva=15,
         pocP_MW=20, powerFactor=0.95, pMaxDischarge_MW=10)
     cases = bess_prelim._build_named_cases(params)
-    case = next(c for c in cases if c['name'] == 'Unom_Pmax_Qpf_Capacitive')
+    case = next(c for c in cases if c['name'] == 'Unom_Export_Capacitive')
     r = bess_prelim._run_named_case(net, params, case)
     assert r['converged'], r
     assert r['q_poc_mvar'] > 4.0, r
@@ -487,6 +488,66 @@ def test_envelope_sign_and_voltage_dependence():
     req = env.get('requirements') or {}
     sample = next(iter(req.values()), None)
     assert sample and sample.get('p_mw') and sample.get('q_req_max_mvar'), req
+    uq = env.get('uq_at_rated_p')
+    assert uq and isinstance(uq.get('compliant'), bool), uq
+    assert uq.get('points') and uq.get('q_over_pn'), uq
+
+
+def test_uq_at_rated_p_pass_and_fail():
+    """U–Q at rated P covers the required |Q|/Pn at every inner-band voltage."""
+    env = {
+        'pn_mw': 50.0,
+        'requirements': {
+            '1.0000': {
+                'p_mw': [-50.0, 50.0],
+                'q_req_max_mvar': [16.43, 16.43],
+                'q_req_min_mvar': [-16.43, -16.43],
+                'q_over_pn': 0.3286,
+            }
+        },
+        'curves': {
+            '0.9500': {'p_mw': [-50.0, 50.0], 'q_max_mvar': [20.0, 20.0], 'q_min_mvar': [-20.0, -20.0]},
+            '1.0000': {'p_mw': [-50.0, 50.0], 'q_max_mvar': [20.0, 20.0], 'q_min_mvar': [-20.0, -20.0]},
+            '1.0500': {'p_mw': [-50.0, 50.0], 'q_max_mvar': [20.0, 20.0], 'q_min_mvar': [-20.0, -20.0]},
+        },
+    }
+    params = {'umin_pu': 0.95, 'umax_pu': 1.05}
+    ok = bess_prelim._assess_uq_at_rated_p(env, params)
+    assert ok and ok['compliant'] is True, ok
+    # Weak import / charge Q must not fail U–Q/Pmax (export only).
+    env['curves']['0.9500']['q_max_mvar'] = [5.0, 20.0]
+    env['curves']['0.9500']['q_min_mvar'] = [-5.0, -20.0]
+    still_ok = bess_prelim._assess_uq_at_rated_p(env, params)
+    assert still_ok and still_ok['compliant'] is True, still_ok
+    env['curves']['1.0000']['q_max_mvar'] = [5.0, 5.0]
+    env['curves']['1.0000']['q_min_mvar'] = [-20.0, -20.0]
+    bad = bess_prelim._assess_uq_at_rated_p(env, params)
+    assert bad and bad['compliant'] is False, bad
+    fail_u = [p['u_pu'] for p in bad['points'] if not p['covers']]
+    assert 1.0 in fail_u, fail_u
+
+
+def test_uq_requirement_uses_grid_code_pn_not_pcc_pmax():
+    """|Q|/Pn is tan(acos(PF)) at wizard Pn, not Q divided by a lower PCC Pmax."""
+    env = {
+        'pn_mw': 48.9,
+        'requirements': {
+            '1.0000': {
+                'p_mw': [-50.0, 50.0],
+                'q_req_max_mvar': [16.43, 16.43],
+                'q_over_pn': 0.3286,
+            }
+        },
+        'curves': {
+            '0.9500': {'p_mw': [50.0], 'q_max_mvar': [16.5], 'q_min_mvar': [-16.5]},
+            '1.0000': {'p_mw': [50.0], 'q_max_mvar': [16.5], 'q_min_mvar': [-16.5]},
+            '1.0500': {'p_mw': [50.0], 'q_max_mvar': [16.5], 'q_min_mvar': [-16.5]},
+        },
+    }
+    uq = bess_prelim._assess_uq_at_rated_p(env, {'umin_pu': 0.95, 'umax_pu': 1.05})
+    assert uq and abs(uq['q_over_pn'] - 0.3286) < 1e-4, uq
+    assert abs(uq['pn_mw'] - 50.0) < 1e-6, uq
+    assert uq['compliant'] is True
 
 
 def test_named_case_voltage_profile_and_pcs_nameplate():
@@ -562,6 +623,46 @@ def test_tap_sweep_reports_inactive_tap_changer():
     net.trafo.at[pp.get_element_index(net, 'trafo', 'POC_Transformer'), 'tap_side'] = None
     rows = bess_prelim._tap_sweep(net, _base_params(tapSweep=True))
     assert len(rows) == 1 and rows[0].get('error') == 'inactive_tap_changer', rows
+
+
+def test_named_cases_cover_four_quadrants_at_each_voltage():
+    cases = bess_prelim._build_named_cases(
+        _base_params(pocP_MW=23.5, powerFactor=0.95, pMaxDischarge_MW=23.5))
+    names = {c['name'] for c in cases}
+    for u in ('Umin', 'Unom', 'Umax'):
+        for p in ('Export', 'Import'):
+            for q in ('Capacitive', 'Inductive'):
+                assert f'{u}_{p}_{q}' in names, names
+        assert f'{u}_Rated_Discharge' in names and f'{u}_Rated_Charge' in names, names
+    targets = [c for c in cases if 'target_p_mw' in c]
+    assert len(targets) == 12, len(targets)
+
+
+def test_oltc_regulates_mv_at_umin():
+    """At Umin the POC OLTC must lift MV / string HV toward 1.0 pu."""
+    net = _minimal_bess_net()
+    case = {'name': 'Umin_Rated_Discharge', 'vm_pu': 0.95, 'p_each': -8.0, 'q_each': 0.0}
+
+    def mv_pu(result):
+        return next(b['vm_pu'] for b in result['voltage_profile'] if b['name'] == 'MV_Collection')
+
+    off = bess_prelim._run_named_case(net, _base_params(oltcEnabled=False), case)
+    on = bess_prelim._run_named_case(net, _base_params(oltcEnabled=True), case)
+    assert off['converged'] and on['converged'], (off, on)
+    assert mv_pu(on) > mv_pu(off) + 0.02, (mv_pu(off), mv_pu(on), on.get('tap_pos'))
+    assert abs(mv_pu(on) - 1.0) < abs(mv_pu(off) - 1.0), (mv_pu(off), mv_pu(on))
+    assert abs(on.get('tap_pos') or 0) >= 1, on
+
+
+def test_rated_charge_poc_does_not_exceed_pn():
+    """Auxiliaries and losses must not push charge import above the entered Pn."""
+    net = _minimal_bess_net()
+    params = _base_params(pMaxDischarge_MW=8, pMaxCharge_MW=8, pocP_MW=8)
+    case = next(c for c in bess_prelim._build_named_cases(params)
+                if c['name'] == 'Unom_Rated_Charge')
+    r = bess_prelim._run_named_case(net, params, case)
+    assert r['converged'], r
+    assert abs(r['p_poc_mw']) <= 8.0 + 0.05, r
 
 
 def test_named_case_converges():

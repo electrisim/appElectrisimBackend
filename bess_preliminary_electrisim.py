@@ -106,15 +106,84 @@ def _set_storage_dispatch(net, storage_names, p_each, q_each):
         net.storage.at[idx, 'q_mvar'] = float(q_each)
 
 
-def _run_lf(net, algorithm='nr'):
-    """Single Newton-Raphson load-flow. Controllers stay off so named cases
-    and the tap sweep do not iterate an OLTC at every trial (the envelope
-    engine has its own controller path)."""
+def _has_controllers(net):
+    try:
+        ctrl = getattr(net, 'controller', None)
+        return ctrl is not None and not getattr(ctrl, 'empty', True)
+    except Exception:
+        return False
+
+
+def _oltc_wanted(params):
+    v = (params or {}).get('oltcEnabled', True)
+    return v not in (False, 'false', 'False', '0', 0)
+
+
+def _ensure_oltc(net, params):
+    """Attach DiscreteTapControl on the POC transformer for named-case LF.
+
+    The tap sweep and the envelope engine keep their own tap handling, so
+    controllers are attached only on the deepcopy used by a named case.
+    """
+    if not _oltc_wanted(params):
+        return False
+    if _has_controllers(net):
+        return True
+    specs = list(getattr(net, 'trafo_discrete_tap_controllers', None) or [])
+    if not specs:
+        tidx = _find_trafo_by_name(net, params.get('hvTrafoName', 'POC_Transformer'))
+        if tidx is None:
+            return False
+        vm_lo = _f(params.get('oltcVmLower'), 0.99)
+        vm_hi = _f(params.get('oltcVmUpper'), 1.01)
+        if vm_hi < vm_lo:
+            vm_lo, vm_hi = vm_hi, vm_lo
+        side = str(params.get('oltcControlSide') or 'lv')
+        specs = [(int(tidx), side, vm_lo, vm_hi)]
+        net.trafo_discrete_tap_controllers = specs
+    try:
+        pp_el._electrisim_attach_discrete_tap_controllers(
+            net, attach_trafo=True, attach_trafo3w=True)
+    except Exception:
+        traceback.print_exc()
+    if _has_controllers(net):
+        return True
+    try:
+        from pandapower.control import DiscreteTapControl
+        for row in specs:
+            tid, side, vm_lo, vm_hi = int(row[0]), str(row[1]), float(row[2]), float(row[3])
+            try:
+                DiscreteTapControl(net, tid=tid, side=side,
+                                   vm_lower_pu=vm_lo, vm_upper_pu=vm_hi)
+            except TypeError:
+                DiscreteTapControl(net, element_index=tid, side=side,
+                                   vm_lower_pu=vm_lo, vm_upper_pu=vm_hi)
+    except Exception:
+        traceback.print_exc()
+        return False
+    return _has_controllers(net)
+
+
+def _hv_trafo_tap_pos(net, params):
+    tidx = _find_trafo_by_name(net, params.get('hvTrafoName', 'POC_Transformer'))
+    if tidx is None:
+        return None
+    try:
+        return float(net.trafo.at[tidx, 'tap_pos'])
+    except Exception:
+        return None
+
+
+def _run_lf(net, algorithm='nr', run_control=None):
+    """Newton-Raphson load-flow. run_control follows attached controllers
+    unless the caller forces it (tap sweep keeps OLTC off)."""
+    if run_control is None:
+        run_control = _has_controllers(net)
     kwargs = dict(
         algorithm=algorithm,
         calculate_voltage_angles=True,
         verbose=False,
-        run_control=False,
+        run_control=bool(run_control),
     )
     try:
         has_res = (
@@ -129,6 +198,34 @@ def _run_lf(net, algorithm='nr'):
             return True
         except Exception:
             return False
+
+
+def _trim_poc_p_to_pn(net, params, p_each, q_each, pn, algorithm='nr'):
+    """Scale fixed-dispatch P so |P_POC| does not exceed the entered Pn.
+
+    Charge plus auxiliaries and losses would otherwise import more than Pn.
+    """
+    if pn <= 0:
+        return p_each
+    poc_idx = _find_bus_idx(net, params['pocBusName'])
+    ext_idx = _find_ext_grid_idx(net, params['extGridName'])
+    names = params.get('storageNames') or []
+    for _ in range(8):
+        p_poc, _q = _poc_exchange(net, poc_idx, ext_idx)
+        if p_poc is None or abs(p_poc) < 1e-9:
+            return p_each
+        if abs(p_poc) <= pn + 1e-3:
+            return p_each
+        p_each = p_each * (pn / abs(p_poc))
+        _set_storage_dispatch(net, names, p_each, q_each)
+        if not _run_lf(net, algorithm):
+            break
+    return p_each
+
+
+def _is_default_poc_case(name):
+    n = str(name or '')
+    return n in ('Unom_Export_Capacitive', 'Unom_POC_Target')
 
 
 def _poc_exchange(net, poc_idx, ext_idx):
@@ -632,16 +729,31 @@ def _collect_element_loadings(net, params=None):
                 pass
             if el_type == 'line':
                 _copy_res_fields(row, res, idx, (
-                    'p_from_mw', 'q_from_mvar', 'p_to_mw', 'q_to_mvar', 'i_from_ka',
+                    'p_from_mw', 'q_from_mvar', 'p_to_mw', 'q_to_mvar',
+                    'i_from_ka', 'i_to_ka',
                 ))
             elif el_attr == 'trafo':
                 _copy_res_fields(row, res, idx, (
                     'p_hv_mw', 'q_hv_mvar', 'p_lv_mw', 'q_lv_mvar',
+                    'i_hv_ka', 'i_lv_ka',
                 ))
+                try:
+                    row['tap_pos'] = _json_num(els.at[idx, 'tap_pos'])
+                    row['tap_min'] = _json_num(els.at[idx, 'tap_min'])
+                    row['tap_max'] = _json_num(els.at[idx, 'tap_max'])
+                    if row.get('tap_pos') is not None:
+                        row['tap_control_result'] = {
+                            'tap_pos': row['tap_pos'],
+                            'tap_min': row.get('tap_min'),
+                            'tap_max': row.get('tap_max'),
+                        }
+                except Exception:
+                    pass
             elif el_attr == 'trafo3w':
                 _copy_res_fields(row, res, idx, (
                     'p_hv_mw', 'q_hv_mvar', 'p_mv_mw', 'q_mv_mvar',
                     'p_lv_mw', 'q_lv_mvar',
+                    'i_hv_ka', 'i_mv_ka', 'i_lv_ka',
                 ))
             out.append(row)
     if hasattr(net, 'storage') and net.storage is not None and not net.storage.empty:
@@ -711,6 +823,7 @@ def _run_named_case(base_net, params, case_def):
         }
 
     net.ext_grid.at[ext_idx, 'vm_pu'] = float(case_def['vm_pu'])
+    _ensure_oltc(net, params)
     is_target = 'target_p_mw' in case_def
     solve = None
 
@@ -728,7 +841,13 @@ def _run_named_case(base_net, params, case_def):
             case_def['p_each'],
             case_def['q_each'],
         )
-        converged = _run_lf(net, params.get('algorithm', 'nr'))
+        algorithm = params.get('algorithm', 'nr')
+        converged = _run_lf(net, algorithm)
+        if converged:
+            case_def = dict(case_def)
+            case_def['p_each'] = _trim_poc_p_to_pn(
+                net, params, case_def['p_each'], case_def['q_each'],
+                _poc_pn(params), algorithm)
 
     if not converged:
         return {
@@ -764,6 +883,7 @@ def _run_named_case(base_net, params, case_def):
         'limiting_element': limiter,
         'pass': not overloaded and not vviol,
         'voltage_violations': vviol,
+        'tap_pos': _hv_trafo_tap_pos(net, params),
     }
 
     if is_target:
@@ -811,7 +931,6 @@ def _build_named_cases(params):
     pf = _f(params.get('powerFactor'), 0.95)
     specify_q = params.get('specifyQDirectly') is True or params.get('specifyQDirectly') == 'true'
     poc_q = _f(params.get('pocQ_Mvar'), 0) if specify_q else _q_from_p_pf(poc_p, pf)
-    q_pf_unit = _q_from_p_pf(poc_p, pf) / _n_units(params)
     u_levels = [
         ('Umin', _f(params.get('umin_pu'), 0.95)),
         ('Unom', _f(params.get('unom_pu'), 1.0)),
@@ -819,12 +938,14 @@ def _build_named_cases(params):
     ]
     cases = []
     for label, vm in u_levels:
-        cases.append({
-            'name': f'{label}_POC_Target',
-            'vm_pu': vm,
-            'target_p_mw': poc_p,
-            'target_q_mvar': poc_q,
-        })
+        for p_name, p_sign in (('Export', 1.0), ('Import', -1.0)):
+            for q_name, q_sign in (('Capacitive', 1.0), ('Inductive', -1.0)):
+                cases.append({
+                    'name': f'{label}_{p_name}_{q_name}',
+                    'vm_pu': vm,
+                    'target_p_mw': p_sign * poc_p,
+                    'target_q_mvar': q_sign * poc_q,
+                })
         cases.append({
             'name': f'{label}_Rated_Discharge',
             'vm_pu': vm,
@@ -837,38 +958,13 @@ def _build_named_cases(params):
             'p_each': p_chg,
             'q_each': 0.0,
         })
-        # Q corners at |P|=Pn: discharge and charge, ±Q from PF.
-        cases.append({
-            'name': f'{label}_Pmax_Qpf_Capacitive',
-            'vm_pu': vm,
-            'p_each': -p_dis,
-            'q_each': -q_pf_unit,
-        })
-        cases.append({
-            'name': f'{label}_Pmax_Qpf_Inductive',
-            'vm_pu': vm,
-            'p_each': -p_dis,
-            'q_each': q_pf_unit,
-        })
-        cases.append({
-            'name': f'{label}_Pmin_Qpf_Capacitive',
-            'vm_pu': vm,
-            'p_each': p_chg,
-            'q_each': -q_pf_unit,
-        })
-        cases.append({
-            'name': f'{label}_Pmin_Qpf_Inductive',
-            'vm_pu': vm,
-            'p_each': p_chg,
-            'q_each': q_pf_unit,
-        })
     return cases
 
 
 def _dispatch_trial(net, params, p_each, q_each):
     """One load-flow at a fixed storage dispatch. Returns None if the LF diverges."""
     _set_storage_dispatch(net, params.get('storageNames') or [], p_each, q_each)
-    if not _run_lf(net, params.get('algorithm', 'nr')):
+    if not _run_lf(net, params.get('algorithm', 'nr'), run_control=False):
         return None
     poc_idx = _find_bus_idx(net, params['pocBusName'])
     ext_idx = _find_ext_grid_idx(net, params['extGridName'])
@@ -1011,7 +1107,7 @@ def _tap_sweep(base_net, params):
         if ext_idx is not None:
             net.ext_grid.at[ext_idx, 'vm_pu'] = _f(params.get('unom_pu'), 1.0)
         _set_storage_dispatch(net, params.get('storageNames') or [], -p_dis, 0.0)
-        if not _run_lf(net):
+        if not _run_lf(net, run_control=False):
             results.append({'tap_pos': tap, 'converged': False})
             continue
         hv_v = mv_v = None
@@ -1045,6 +1141,127 @@ def _tap_sweep(base_net, params):
             row['q_min_limiter'] = qmin.get('limiting_element')
         results.append(row)
     return results
+
+
+def _requirement_pn_q(envelope, params=None):
+    """Grid-code Pn and |Q| from the requirement rectangle (PF × Pn), not PCC Pmax."""
+    params = params or {}
+    req_map = envelope.get('requirements') or {}
+    req = next((r for r in req_map.values() if isinstance(r, dict)), None) or {}
+    pn = 0.0
+    if isinstance(req.get('p_mw'), (list, tuple)) and req.get('p_mw'):
+        try:
+            pn = max(abs(float(p)) for p in req['p_mw'])
+        except (TypeError, ValueError):
+            pn = 0.0
+    if pn <= 0:
+        pn = abs(_f(envelope.get('pn_mw'), 0.0))
+    if pn <= 0 and params:
+        pn = abs(_poc_pn(params))
+    q_over = abs(_f(req.get('q_over_pn'), 0.0))
+    if q_over <= 0 and pn > 0 and req.get('q_req_max_mvar'):
+        try:
+            q_over = max(abs(float(q)) for q in req['q_req_max_mvar'] if q is not None) / pn
+        except (TypeError, ValueError, ZeroDivisionError):
+            q_over = 0.0
+    return pn, q_over * pn, q_over
+
+
+def _q_at_rated_p(curve):
+    """Qmax / Qmin at rated export (max P > 0) — U–Q / Pmax, not charge."""
+    pts = curve.get('p_mw') or []
+    if not pts:
+        return None
+    try:
+        pvals = [float(p) for p in pts]
+    except (TypeError, ValueError):
+        return None
+    qmax_arr = curve.get('q_max_mvar') or []
+    qmin_arr = curve.get('q_min_mvar') or []
+    i_exp = max(range(len(pvals)), key=lambda i: pvals[i])
+    if pvals[i_exp] <= 1e-6:
+        return None
+
+    def _at(idx):
+        qx = qn = None
+        try:
+            qx = float(qmax_arr[idx]) if idx < len(qmax_arr) and qmax_arr[idx] is not None else None
+        except (TypeError, ValueError, IndexError):
+            qx = None
+        try:
+            qn = float(qmin_arr[idx]) if idx < len(qmin_arr) and qmin_arr[idx] is not None else None
+        except (TypeError, ValueError, IndexError):
+            qn = None
+        return qx, qn
+
+    qx, qn = _at(i_exp)
+    return {
+        'p_rated_mw': pvals[i_exp],
+        'q_max_mvar': qx,
+        'q_min_mvar': qn,
+    }
+
+
+def _assess_uq_at_rated_p(envelope, params=None):
+    """Whether plant Q at rated export covers required |Q|/Pn over Umin–Umax."""
+    if not isinstance(envelope, dict) or envelope.get('error'):
+        return None
+    params = params or {}
+    umin = _f(params.get('umin_pu'), 0.95)
+    umax = _f(params.get('umax_pu'), 1.05)
+    pn, q_req, q_over = _requirement_pn_q(envelope, params)
+    if pn <= 0 or q_over <= 0:
+        return None
+    # 0.5 % of Pn on the Q/Pn axis (~0.25 Mvar at 50 MW); also 2 % of required Q.
+    tol_pu = 0.005
+    points = []
+    overall = True
+    any_in_band = False
+    for vk, curve in (envelope.get('curves') or {}).items():
+        if not isinstance(curve, dict):
+            continue
+        try:
+            u = float(vk)
+        except (TypeError, ValueError):
+            continue
+        in_band = (umin - 1e-4) <= u <= (umax + 1e-4)
+        rated = _q_at_rated_p(curve) or {}
+        qmax = rated.get('q_max_mvar')
+        qmin = rated.get('q_min_mvar')
+        qmax_pu = (qmax / pn) if qmax is not None else None
+        qmin_pu = (qmin / pn) if qmin is not None else None
+        covers = (
+            qmax_pu is not None and qmin_pu is not None
+            and qmax_pu + tol_pu >= q_over
+            and qmin_pu - tol_pu <= -q_over
+        )
+        if in_band:
+            any_in_band = True
+            if not covers:
+                overall = False
+        points.append({
+            'u_pu': round(u, 4),
+            'in_inner_band': in_band,
+            'p_rated_mw': rated.get('p_rated_mw'),
+            'q_max_mvar': qmax,
+            'q_min_mvar': qmin,
+            'q_max_over_pn': qmax_pu,
+            'q_min_over_pn': qmin_pu,
+            'covers': covers,
+        })
+    if not points or not any_in_band:
+        return None
+    return {
+        'compliant': bool(overall),
+        'q_req_mvar': q_req,
+        'q_over_pn': q_over,
+        'pn_mw': pn,
+        'u_inner_min': umin,
+        'u_inner_max': umax,
+        'u_outer_min': 0.90,
+        'u_outer_max': 1.10,
+        'points': sorted(points, key=lambda p: p['u_pu']),
+    }
 
 
 def _relabel_envelope_limiters(net, results):
@@ -1110,6 +1327,9 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
             return {'error': parsed.get('error')}
         results = parsed.get('grid_code_pq_results') or parsed
         _relabel_envelope_limiters(net, results)
+        uq = _assess_uq_at_rated_p(results, params)
+        if uq:
+            results['uq_at_rated_p'] = uq
         return results
     except Exception as ex:
         traceback.print_exc()
@@ -1156,12 +1376,13 @@ def bess_preliminary_study(net, params, in_data=None):
         voltage_profile = []
         for c in named_cases:
             if c.get('converged') and c.get('voltage_profile'):
-                if 'Unom_POC_Target' in str(c.get('name')) or (
+                if _is_default_poc_case(c.get('name')) or (
                         not voltage_profile and 'Unom' in str(c.get('name'))):
                     voltage_profile = c['voltage_profile']
-                    if 'POC_Target' in str(c.get('name')):
+                    if _is_default_poc_case(c.get('name')):
                         break
 
+        uq = (pq_envelope or {}).get('uq_at_rated_p') if isinstance(pq_envelope, dict) else None
         summary = {
             'total_cases': len(named_cases),
             'passed_cases': sum(1 for c in named_cases if c.get('pass')),
@@ -1169,6 +1390,7 @@ def bess_preliminary_study(net, params, in_data=None):
             'diverged_cases': sum(1 for c in named_cases if not c.get('converged')),
             'target_cases': sum(1 for c in named_cases if 'target_met' in c),
             'target_met_cases': sum(1 for c in named_cases if c.get('target_met')),
+            'uq_at_rated_p_compliant': None if not uq else bool(uq.get('compliant')),
         }
 
         result = {
