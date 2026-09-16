@@ -860,8 +860,8 @@ def _run_named_case(base_net, params, case_def):
     p_poc, q_poc = _poc_exchange(net, poc_idx, ext_idx)
     p_loss_mw, q_loss_mvar = _network_losses(net)
     vmax = _f(params.get('max_loading_percent'), 100)
-    vmin_pu = _f(case_def.get('vmin_pu', params.get('vmin_pu')), 0.95)
-    vmax_pu = _f(case_def.get('vmax_pu', params.get('vmax_pu')), 1.05)
+    vmin_pu = _f(case_def.get('vmin_pu', params.get('vmin_pu')), 0.90)
+    vmax_pu = _f(case_def.get('vmax_pu', params.get('vmax_pu')), 1.10)
     limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu, params)
     vviol = _voltage_violations(net, vmin_pu, vmax_pu)
     overloaded = (
@@ -970,8 +970,8 @@ def _dispatch_trial(net, params, p_each, q_each):
     ext_idx = _find_ext_grid_idx(net, params['extGridName'])
     p_poc, q_poc = _poc_exchange(net, poc_idx, ext_idx)
     vmax = _f(params.get('max_loading_percent'), 100)
-    vmin_pu = _f(params.get('vmin_pu'), 0.95)
-    vmax_pu = _f(params.get('vmax_pu'), 1.05)
+    vmin_pu = _f(params.get('vmin_pu'), 0.90)
+    vmax_pu = _f(params.get('vmax_pu'), 1.10)
     limiter = _limiting_element(net, vmax, vmin_pu, vmax_pu, params)
     overloaded = (
         limiter
@@ -1129,7 +1129,7 @@ def _tap_sweep(base_net, params):
             'voltage_profile': _voltage_profile(net),
             'limiting_element': _limiting_element(
                 net, _f(params.get('max_loading_percent'), 100),
-                _f(params.get('vmin_pu'), 0.95), _f(params.get('vmax_pu'), 1.05),
+                _f(params.get('vmin_pu'), 0.90), _f(params.get('vmax_pu'), 1.10),
                 params),
         }
         if params.get('tapQCapability', True):
@@ -1368,7 +1368,7 @@ def bess_preliminary_study(net, params, in_data=None):
         pq_envelope = _run_pq_envelope(deepcopy(net), params, in_data, progress_cb)
 
         tap_results = []
-        if params.get('tapSweep', True):
+        if params.get('tapSweep', False):
             if progress_cb:
                 progress_cb('Tap position sweep…')
             tap_results = _tap_sweep(net, params)
@@ -1405,6 +1405,10 @@ def bess_preliminary_study(net, params, in_data=None):
                     'pocBusName': params.get('pocBusName'),
                     'storageNames': params.get('storageNames'),
                     'poc_convention': 'export_positive',
+                    'vmin_pu': _f(params.get('vmin_pu'), 0.90),
+                    'vmax_pu': _f(params.get('vmax_pu'), 1.10),
+                    'umin_pu': _f(params.get('umin_pu'), 0.95),
+                    'umax_pu': _f(params.get('umax_pu'), 1.05),
                 },
             }
         }

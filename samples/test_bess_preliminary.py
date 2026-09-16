@@ -736,6 +736,19 @@ def test_preliminary_study_json():
     assert any(el.get('type') == 'transformer' and el.get('loading_percent') is not None for el in els), els
 
 
+def test_tap_sweep_off_by_default_and_voltage_params_echoed():
+    net = _minimal_bess_net()
+    params = _base_params()
+    params.pop('vmin_pu', None)
+    params.pop('vmax_pu', None)
+    params.pop('tapSweep', None)
+    raw = bess_prelim.bess_preliminary_study(net, params, {})
+    res = json.loads(raw)['bess_preliminary_results']
+    assert not res.get('tap_sweep'), res.get('tap_sweep')
+    assert abs(float(res['params']['vmin_pu']) - 0.90) < 1e-9
+    assert abs(float(res['params']['vmax_pu']) - 1.10) < 1e-9
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     failed = []
