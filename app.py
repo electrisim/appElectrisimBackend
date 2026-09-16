@@ -31,6 +31,7 @@ def _console(msg):
 
 import pandapower_electrisim
 import grid_code_pq_electrisim
+import grid_code_vq_electrisim
 import opendss_electrisim
 import opender_electrisim
 import arcflash_electrisim
@@ -621,6 +622,112 @@ def simulation():
                 else:
                     return response_data
 
+            if "GridCodeVqPandaPower" in typ:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== GRID CODE COMPLIANCE (V-Q) REQUESTED BY USER: {user_email} ===")
+
+                frequency = float(in_data[x].get('frequency', 50))
+                net = pp.create_empty_network(f_hz=frequency)
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+
+                q_mode = in_data[x].get('q_capability_mode', 'from_rating')
+                if q_mode == 'from_sgen_curve':
+                    pandapower_electrisim.apply_sgen_q_capability_curves(
+                        net, in_data, rpc_use_diagram_curves=True)
+
+                vq_params = dict(in_data[x])
+                use_vq_stream = bool(in_data[x].get('rpc_stream', False))
+
+                if use_vq_stream:
+
+                    def _vq_ndjson_stream():
+                        q = queue.Queue()
+                        cancel_event = threading.Event()
+
+                        def _progress_cb(msg):
+                            if cancel_event.is_set():
+                                raise grid_code_vq_electrisim.GridCodeVqCancelled('Stopped by user')
+                            q.put(('p', msg))
+
+                        def _worker():
+                            try:
+                                rp = {
+                                    **vq_params,
+                                    '_progress_callback': _progress_cb,
+                                    '_cancel_event': cancel_event,
+                                }
+                                out = grid_code_vq_electrisim.grid_code_vq_capability(net, rp, in_data)
+                                q.put(('d', out))
+                            except grid_code_vq_electrisim.GridCodeVqCancelled:
+                                q.put(('c', 'Stopped by user'))
+                            except Exception as ex:
+                                q.put(('e', str(ex)))
+
+                        threading.Thread(target=_worker, daemon=True).start()
+
+                        try:
+                            while True:
+                                try:
+                                    kind, payload = q.get(timeout=10)
+                                except queue.Empty:
+                                    if cancel_event.is_set():
+                                        yield json.dumps({'type': 'cancelled', 'message': 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                        return
+                                    yield json.dumps({'type': 'heartbeat'}, ensure_ascii=False) + '\n'
+                                    continue
+                                if kind == 'p':
+                                    yield json.dumps({'type': 'progress', 'message': payload}, ensure_ascii=False) + '\n'
+                                elif kind == 'c':
+                                    yield json.dumps({'type': 'cancelled', 'message': payload or 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                    return
+                                elif kind == 'e':
+                                    yield json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False) + '\n'
+                                    return
+                                elif kind == 'd':
+                                    raw = payload
+                                    break
+
+                            if raw is None:
+                                yield json.dumps({'type': 'error', 'message': 'No V-Q result'}, ensure_ascii=False) + '\n'
+                                return
+                            try:
+                                obj = json.loads(raw)
+                            except Exception:
+                                yield json.dumps({'type': 'error', 'message': 'Invalid V-Q JSON'}, ensure_ascii=False) + '\n'
+                                return
+                            if isinstance(obj, dict) and obj.get('error'):
+                                yield json.dumps({'type': 'error', 'message': obj['error']}, ensure_ascii=False) + '\n'
+                                return
+                            yield json.dumps({'type': 'result', 'data': obj}, ensure_ascii=False, separators=(',', ':')) + '\n'
+                        except GeneratorExit:
+                            cancel_event.set()
+                            raise
+                        except Exception:
+                            cancel_event.set()
+                            raise
+
+                    resp = Response(
+                        stream_with_context(_vq_ndjson_stream()),
+                        mimetype='application/x-ndjson'
+                    )
+                    resp.headers['Cache-Control'] = 'no-cache'
+                    resp.headers['X-Accel-Buffering'] = 'no'
+                    return resp
+
+                response_data = grid_code_vq_electrisim.grid_code_vq_capability(net, vq_params, in_data)
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
             if "ShortCircuitPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
@@ -1005,7 +1112,23 @@ def simulation():
 #print(net.line))
 
 # If no simulation type matches, return error
-        return jsonify({'error': 'No valid simulation type found in request data'})
+        seen_typs = sorted({
+            _element_typ(v) for v in in_data.values() if _element_typ(v)
+        })
+        param_typs = [t for t in seen_typs if 'Parameters' in t or 'PandaPower' in t or 'OpenDss' in t]
+        print(
+            f'=== NO MATCHING SIMULATION TYPE. Parameter-like typs: {param_typs} ===',
+            flush=True,
+        )
+        hint = ', '.join(param_typs) if param_typs else '(none)'
+        return jsonify({
+            'error': (
+                'No valid simulation type found in request data. '
+                f'Parameter types in payload: {hint}. '
+                'If you just added Grid Code Compliance (V-Q), restart the Flask backend '
+                'so it loads GridCodeVqPandaPower.'
+            )
+        })
     
     except ValueError as ve:
         # Handle validation errors (like missing bus connections)
