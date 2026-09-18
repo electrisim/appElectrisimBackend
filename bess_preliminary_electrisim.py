@@ -1317,6 +1317,9 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
         'generator_oriented': True,
         'frequency': _f(params.get('frequency'), 50),
         'requirements': {k: req for k in v_keys},
+        # Contracted POC Pn is the grid-code rectangle, not plant Pmax at the PCC
+        # (import |P| can exceed Pn by losses if the sweep is not recapped).
+        'scale_requirement_to_pcc': False,
         '_progress_callback': progress_cb,
         '_cancel_event': params.get('_cancel_event'),
     }

@@ -157,11 +157,15 @@ def _pq_scale_requirement(req, k):
                 out.append(x)
         return out
 
-    return {
+    out = {
         'p_mw': _s(req.get('p_mw')),
         'q_req_max_mvar': _s(req.get('q_req_max_mvar')),
         'q_req_min_mvar': _s(req.get('q_req_min_mvar')),
     }
+    for key in ('pf', 'q_over_pn', 'label'):
+        if key in req:
+            out[key] = req[key]
+    return out
 
 
 def _pq_fmt(v, digits=2):
@@ -1486,6 +1490,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
         i_curve_mw = _pq_bool(pq_params.get('i_curve_mw'), True)
         i_curve_mvar = _pq_bool(pq_params.get('i_curve_mvar'), True)
         requirements = pq_params.get('requirements') or None
+        scale_requirement_to_pcc = _pq_bool(pq_params.get('scale_requirement_to_pcc'), True)
         verbose = _pq_bool(pq_params.get('verbose_iwamoto'), False)
         progress_cb = pq_params.get('_progress_callback')
         rc2 = bool(i_trf)
@@ -1910,13 +1915,21 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             }
             pmax_pcc = _pq_pmax_pcc_for_req(curves[v_key])
             v_req = requirements.get(v_key) if requirements else None
-            if v_req and pn > 0 and pmax_pcc and pmax_pcc > 0:
+            if (
+                scale_requirement_to_pcc
+                and v_req and pn > 0 and pmax_pcc and pmax_pcc > 0
+            ):
                 k = float(pmax_pcc) / float(pn)
                 v_req = _pq_scale_requirement(v_req, k)
                 requirements[v_key] = v_req
                 _pq_emit(
                     f'  Grid-code envelope: Pmax at PCC={pmax_pcc:.3f} MW '
                     f'(Pn={pn:.3f} MW, scale={k:.4f})',
+                    ctx, progress=True)
+            elif v_req and pn > 0:
+                _pq_emit(
+                    f'  Grid-code envelope: requirement held at Pn={pn:.3f} MW '
+                    f'(Pmax at PCC={_pq_fmt(pmax_pcc)} MW, not used as Pn)',
                     ctx, progress=True)
             if v_req:
                 # Compare in generator-oriented MW/Mvar (requirements are always generator-oriented)
@@ -2001,7 +2014,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 'point_loadflows': point_loadflows,
                 'requirements': requirements if requirements else {},
                 'requirements_base': (
-                    'pcc_pmax' if (requirements and pmax_pcc_mw and pn > 0) else
+                    'pcc_pmax' if (scale_requirement_to_pcc and requirements and pmax_pcc_mw and pn > 0) else
                     ('pn' if requirements else None)
                 ),
                 'compliance': compliance,

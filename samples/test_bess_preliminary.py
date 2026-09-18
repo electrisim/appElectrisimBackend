@@ -749,6 +749,76 @@ def test_tap_sweep_off_by_default_and_voltage_params_echoed():
     assert abs(float(res['params']['vmax_pu']) - 1.10) < 1e-9
 
 
+def _interp_q_at_p(p_arr, q_arr, p_want):
+    pts = [(float(p), float(q)) for p, q in zip(p_arr or [], q_arr or [])
+           if p is not None and q is not None]
+    if not pts:
+        return None
+    pts.sort()
+    p = min(pts[-1][0], max(pts[0][0], float(p_want)))
+    if len(pts) == 1:
+        return pts[0][1]
+    for i in range(len(pts) - 1):
+        if pts[i][0] <= p <= pts[i + 1][0]:
+            den = pts[i + 1][0] - pts[i][0]
+            t = 0.0 if den == 0 else (p - pts[i][0]) / den
+            return pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+    return pts[-1][1]
+
+
+def _wizard_default_50mw_net():
+    """Ratings matching BESS Preliminary Design Generate defaults (50 MW / PF 0.95)."""
+    net = pp.create_empty_network(f_hz=50)
+    b_hv = pp.create_bus(net, vn_kv=132, name='POC_HV')
+    b_mv = pp.create_bus(net, vn_kv=33, name='MV_Collection')
+    pp.create_ext_grid(net, bus=b_hv, vm_pu=1.0, name='Grid')
+    pp.create_transformer_from_parameters(
+        net, hv_bus=b_hv, lv_bus=b_mv, sn_mva=75, vn_hv_kv=132, vn_lv_kv=33,
+        vk_percent=8, vkr_percent=0.4, pfe_kw=0, i0_percent=0, name='POC_Transformer',
+        tap_side='hv', tap_min=-5, tap_max=5, tap_neutral=0, tap_pos=0,
+        tap_step_percent=1.25, tap_changer_type='Ratio')
+    pp.create_load(net, bus=b_mv, p_mw=0.5, q_mvar=0.1, name='Aux_Load')
+    names = []
+    for i in range(4):
+        b_str = pp.create_bus(net, vn_kv=33, name=f'String_HV_{i + 1}')
+        b_lv = pp.create_bus(net, vn_kv=0.69, name=f'LV_Bus_{i + 1}')
+        pp.create_line_from_parameters(
+            net, from_bus=b_mv, to_bus=b_str, length_km=0.3,
+            r_ohm_per_km=0.08, x_ohm_per_km=0.12, c_nf_per_km=0, max_i_ka=0.6,
+            name=f'MV_Cable_{i + 1}')
+        pp.create_transformer_from_parameters(
+            net, hv_bus=b_str, lv_bus=b_lv, sn_mva=22, vn_hv_kv=33, vn_lv_kv=0.69,
+            vk_percent=6, vkr_percent=0.5, pfe_kw=0, i0_percent=0,
+            name=f'MV_LV_Trafo_{i + 1}')
+        pp.create_storage(
+            net, bus=b_lv, p_mw=0, q_mvar=0, sn_mva=22, max_e_mwh=44,
+            max_p_mw=15, min_p_mw=-15, max_q_mvar=22, min_q_mvar=-22,
+            name=f'PCS_{i + 1}')
+        names.append(f'PCS_{i + 1}')
+    return net, names
+
+
+def test_default_50mw_plant_pq_envelope_covers_pf_rectangle_at_umin():
+    """Catalog 15 MVA / vk 12 % failed |Q|/Pn at U=0.95; wizard defaults must pass."""
+    net, names = _wizard_default_50mw_net()
+    params = _base_params(
+        storageNames=names, storageSnMva=22, pocP_MW=50, pocQ_Mvar=16.434,
+        powerFactor=0.95, pMaxDischarge_MW=15, pMaxCharge_MW=15)
+    env = bess_prelim._run_pq_envelope(net, params, {})
+    assert env and not env.get('error'), env
+    pn, q_req, tol = 50.0, 16.43, 0.2
+    curve = env['curves']['0.9500']
+    p_arr = curve['p_mw']
+    for p_want in list(p_arr) + [0.0, pn, -pn]:
+        if abs(float(p_want)) > pn + 1.0:
+            continue
+        qmax = _interp_q_at_p(p_arr, curve['q_max_mvar'], p_want)
+        qmin = _interp_q_at_p(p_arr, curve['q_min_mvar'], p_want)
+        assert qmax is not None and qmin is not None, (p_want, qmax, qmin)
+        assert qmax >= q_req - tol, (p_want, qmax, q_req)
+        assert qmin <= -q_req + tol, (p_want, qmin, q_req)
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     failed = []
