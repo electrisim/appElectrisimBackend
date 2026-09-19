@@ -1167,8 +1167,8 @@ def _requirement_pn_q(envelope, params=None):
     return pn, q_over * pn, q_over
 
 
-def _q_at_rated_p(curve):
-    """Qmax / Qmin at rated export (max P > 0) — U–Q / Pmax, not charge."""
+def _q_at_full_p(curve, direction='export'):
+    """Qmax / Qmin at full active power: rated export (max P) or charge (min P)."""
     pts = curve.get('p_mw') or []
     if not pts:
         return None
@@ -1178,32 +1178,36 @@ def _q_at_rated_p(curve):
         return None
     qmax_arr = curve.get('q_max_mvar') or []
     qmin_arr = curve.get('q_min_mvar') or []
-    i_exp = max(range(len(pvals)), key=lambda i: pvals[i])
-    if pvals[i_exp] <= 1e-6:
-        return None
+    if direction == 'charge':
+        idx = min(range(len(pvals)), key=lambda i: pvals[i])
+        if pvals[idx] >= -1e-6:
+            return None
+    else:
+        idx = max(range(len(pvals)), key=lambda i: pvals[i])
+        if pvals[idx] <= 1e-6:
+            return None
 
-    def _at(idx):
-        qx = qn = None
+    def _at(arr):
         try:
-            qx = float(qmax_arr[idx]) if idx < len(qmax_arr) and qmax_arr[idx] is not None else None
+            return float(arr[idx]) if idx < len(arr) and arr[idx] is not None else None
         except (TypeError, ValueError, IndexError):
-            qx = None
-        try:
-            qn = float(qmin_arr[idx]) if idx < len(qmin_arr) and qmin_arr[idx] is not None else None
-        except (TypeError, ValueError, IndexError):
-            qn = None
-        return qx, qn
+            return None
 
-    qx, qn = _at(i_exp)
     return {
-        'p_rated_mw': pvals[i_exp],
-        'q_max_mvar': qx,
-        'q_min_mvar': qn,
+        'p_rated_mw': pvals[idx],
+        'q_max_mvar': _at(qmax_arr),
+        'q_min_mvar': _at(qmin_arr),
     }
 
 
+def _q_at_rated_p(curve):
+    """Qmax / Qmin at rated export (max P > 0)."""
+    return _q_at_full_p(curve, 'export')
+
+
 def _assess_uq_at_rated_p(envelope, params=None):
-    """Whether plant Q at rated export covers required |Q|/Pn over Umin–Umax."""
+    """Whether plant Q at full active power — rated discharge and rated charge —
+    covers the required |Q|/Pn over Umin–Umax."""
     if not isinstance(envelope, dict) or envelope.get('error'):
         return None
     params = params or {}
@@ -1216,7 +1220,17 @@ def _assess_uq_at_rated_p(envelope, params=None):
     tol_pu = 0.005
     points = []
     overall = True
+    overall_charge = True
     any_in_band = False
+    any_charge = False
+
+    def _covers(qmax_pu, qmin_pu):
+        return (
+            qmax_pu is not None and qmin_pu is not None
+            and qmax_pu + tol_pu >= q_over
+            and qmin_pu - tol_pu <= -q_over
+        )
+
     for vk, curve in (envelope.get('curves') or {}).items():
         if not isinstance(curve, dict):
             continue
@@ -1225,20 +1239,27 @@ def _assess_uq_at_rated_p(envelope, params=None):
         except (TypeError, ValueError):
             continue
         in_band = (umin - 1e-4) <= u <= (umax + 1e-4)
-        rated = _q_at_rated_p(curve) or {}
+        rated = _q_at_full_p(curve, 'export') or {}
+        charge = _q_at_full_p(curve, 'charge') or {}
         qmax = rated.get('q_max_mvar')
         qmin = rated.get('q_min_mvar')
+        qmax_chg = charge.get('q_max_mvar')
+        qmin_chg = charge.get('q_min_mvar')
         qmax_pu = (qmax / pn) if qmax is not None else None
         qmin_pu = (qmin / pn) if qmin is not None else None
-        covers = (
-            qmax_pu is not None and qmin_pu is not None
-            and qmax_pu + tol_pu >= q_over
-            and qmin_pu - tol_pu <= -q_over
-        )
+        qmax_chg_pu = (qmax_chg / pn) if qmax_chg is not None else None
+        qmin_chg_pu = (qmin_chg / pn) if qmin_chg is not None else None
+        covers = _covers(qmax_pu, qmin_pu)
+        has_charge = qmax_chg_pu is not None and qmin_chg_pu is not None
+        covers_charge = _covers(qmax_chg_pu, qmin_chg_pu) if has_charge else None
         if in_band:
             any_in_band = True
             if not covers:
                 overall = False
+            if has_charge:
+                any_charge = True
+                if not covers_charge:
+                    overall_charge = False
         points.append({
             'u_pu': round(u, 4),
             'in_inner_band': in_band,
@@ -1248,11 +1269,20 @@ def _assess_uq_at_rated_p(envelope, params=None):
             'q_max_over_pn': qmax_pu,
             'q_min_over_pn': qmin_pu,
             'covers': covers,
+            'p_charge_mw': charge.get('p_rated_mw'),
+            'q_max_charge_mvar': qmax_chg,
+            'q_min_charge_mvar': qmin_chg,
+            'q_max_charge_over_pn': qmax_chg_pu,
+            'q_min_charge_over_pn': qmin_chg_pu,
+            'covers_charge': covers_charge,
         })
     if not points or not any_in_band:
         return None
     return {
-        'compliant': bool(overall),
+        'compliant': bool(overall and overall_charge),
+        'compliant_discharge': bool(overall),
+        'compliant_charge': bool(overall_charge) if any_charge else None,
+        'has_charge': any_charge,
         'q_req_mvar': q_req,
         'q_over_pn': q_over,
         'pn_mw': pn,

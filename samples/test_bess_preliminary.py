@@ -493,8 +493,9 @@ def test_envelope_sign_and_voltage_dependence():
     assert uq.get('points') and uq.get('q_over_pn'), uq
 
 
-def test_uq_at_rated_p_pass_and_fail():
-    """U–Q at rated P covers the required |Q|/Pn at every inner-band voltage."""
+def test_uq_at_full_p_pass_and_fail():
+    """U–Q covers the required |Q|/Pn at every inner-band voltage, at full
+    discharge and at full charge."""
     env = {
         'pn_mw': 50.0,
         'requirements': {
@@ -514,11 +515,15 @@ def test_uq_at_rated_p_pass_and_fail():
     params = {'umin_pu': 0.95, 'umax_pu': 1.05}
     ok = bess_prelim._assess_uq_at_rated_p(env, params)
     assert ok and ok['compliant'] is True, ok
-    # Weak import / charge Q must not fail U–Q/Pmax (export only).
+    assert ok['compliant_discharge'] is True and ok['compliant_charge'] is True, ok
+    # Weak charge Q fails the charge side; discharge stays compliant.
     env['curves']['0.9500']['q_max_mvar'] = [5.0, 20.0]
     env['curves']['0.9500']['q_min_mvar'] = [-5.0, -20.0]
-    still_ok = bess_prelim._assess_uq_at_rated_p(env, params)
-    assert still_ok and still_ok['compliant'] is True, still_ok
+    chg = bess_prelim._assess_uq_at_rated_p(env, params)
+    assert chg and chg['compliant_discharge'] is True, chg
+    assert chg['compliant_charge'] is False and chg['compliant'] is False, chg
+    fail_chg = [p['u_pu'] for p in chg['points'] if p['covers_charge'] is False]
+    assert 0.95 in fail_chg, fail_chg
     env['curves']['1.0000']['q_max_mvar'] = [5.0, 5.0]
     env['curves']['1.0000']['q_min_mvar'] = [-20.0, -20.0]
     bad = bess_prelim._assess_uq_at_rated_p(env, params)
