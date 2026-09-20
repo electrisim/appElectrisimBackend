@@ -6,9 +6,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
 import pandapower as pp
 import pandapower_electrisim as pp_el
 import bess_preliminary_electrisim as bess_prelim
+import grid_code_pq_electrisim as gc_pq
 
 
 def _minimal_bess_net():
@@ -530,6 +532,33 @@ def test_uq_at_full_p_pass_and_fail():
     assert bad and bad['compliant'] is False, bad
     fail_u = [p['u_pu'] for p in bad['points'] if not p['covers']]
     assert 1.0 in fail_u, fail_u
+
+
+def test_envelope_closing_points_and_uq_stays_at_pn():
+    """The sweep is carried past Pn to the PCS P limit, and U–Q at full P still
+    reads the ±Pn point rather than the new extreme ones."""
+    pts = bess_prelim._envelope_closing_points(23.5, 27.6, 27.6)
+    assert len(pts) == 6, pts
+    assert max(pts) == pytest.approx(27.6) and min(pts) == pytest.approx(-27.6), pts
+    assert all(abs(p) > 23.5 for p in pts), pts
+    # A plant that cannot exceed Pn gets no extra points.
+    assert bess_prelim._envelope_closing_points(23.5, 20.0, 20.0) == []
+
+    merged = gc_pq._pq_merge_extra_p(gc_pq._pq_p_sweep(23.5, 0, 25, 100, 2), pts)
+    assert merged == sorted(merged) and len(set(merged)) == len(merged)
+    assert 23.5 in merged and pytest.approx(27.6) == max(merged)
+
+    curve = {
+        'p_mw': [-27.6, -23.5, 0.0, 23.5, 27.6],
+        'q_max_mvar': [3.0, 12.0, 15.0, 12.0, 3.0],
+        'q_min_mvar': [-3.0, -12.0, -15.0, -12.0, -3.0],
+    }
+    rated = bess_prelim._q_at_full_p(curve, 'export', 23.5)
+    charge = bess_prelim._q_at_full_p(curve, 'charge', 23.5)
+    assert rated['p_rated_mw'] == pytest.approx(23.5), rated
+    assert rated['q_max_mvar'] == pytest.approx(12.0), rated
+    assert charge['p_rated_mw'] == pytest.approx(-23.5), charge
+    assert charge['q_min_mvar'] == pytest.approx(-12.0), charge
 
 
 def test_uq_requirement_uses_grid_code_pn_not_pcc_pmax():

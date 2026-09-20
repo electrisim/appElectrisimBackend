@@ -1167,8 +1167,12 @@ def _requirement_pn_q(envelope, params=None):
     return pn, q_over * pn, q_over
 
 
-def _q_at_full_p(curve, direction='export'):
-    """Qmax / Qmin at full active power: rated export (max P) or charge (min P)."""
+def _q_at_full_p(curve, direction='export', pn=None):
+    """Qmax / Qmin at full active power: rated export (+Pn) or charge (−Pn).
+
+    The sweep runs past ±Pn to close the envelope at the PCS P limit, so the
+    point nearest the contracted ±Pn is taken, not the extreme P point.
+    """
     pts = curve.get('p_mw') or []
     if not pts:
         return None
@@ -1178,14 +1182,20 @@ def _q_at_full_p(curve, direction='export'):
         return None
     qmax_arr = curve.get('q_max_mvar') or []
     qmin_arr = curve.get('q_min_mvar') or []
-    if direction == 'charge':
-        idx = min(range(len(pvals)), key=lambda i: pvals[i])
-        if pvals[idx] >= -1e-6:
-            return None
+    sign = -1.0 if direction == 'charge' else 1.0
+    try:
+        pn_target = abs(float(pn)) if pn is not None else 0.0
+    except (TypeError, ValueError):
+        pn_target = 0.0
+    side = [i for i, p in enumerate(pvals) if p * sign > 1e-6]
+    if not side:
+        return None
+    if pn_target > 0:
+        idx = min(side, key=lambda i: abs(abs(pvals[i]) - pn_target))
+    elif direction == 'charge':
+        idx = min(side, key=lambda i: pvals[i])
     else:
-        idx = max(range(len(pvals)), key=lambda i: pvals[i])
-        if pvals[idx] <= 1e-6:
-            return None
+        idx = max(side, key=lambda i: pvals[i])
 
     def _at(arr):
         try:
@@ -1200,9 +1210,9 @@ def _q_at_full_p(curve, direction='export'):
     }
 
 
-def _q_at_rated_p(curve):
-    """Qmax / Qmin at rated export (max P > 0)."""
-    return _q_at_full_p(curve, 'export')
+def _q_at_rated_p(curve, pn=None):
+    """Qmax / Qmin at rated export (P = +Pn)."""
+    return _q_at_full_p(curve, 'export', pn)
 
 
 def _assess_uq_at_rated_p(envelope, params=None):
@@ -1239,8 +1249,8 @@ def _assess_uq_at_rated_p(envelope, params=None):
         except (TypeError, ValueError):
             continue
         in_band = (umin - 1e-4) <= u <= (umax + 1e-4)
-        rated = _q_at_full_p(curve, 'export') or {}
-        charge = _q_at_full_p(curve, 'charge') or {}
+        rated = _q_at_full_p(curve, 'export', pn) or {}
+        charge = _q_at_full_p(curve, 'charge', pn) or {}
         qmax = rated.get('q_max_mvar')
         qmin = rated.get('q_min_mvar')
         qmax_chg = charge.get('q_max_mvar')
@@ -1308,6 +1318,48 @@ def _relabel_envelope_limiters(net, results):
                     lim['name'] = _display_name(net, lim['name'])
 
 
+def _plant_p_capability(net, params, storage_names):
+    """Plant dispatch P the PCS fleet can hold, per direction (MW, magnitudes).
+
+    Each unit is limited by the tighter of its MVA rating and its P limit
+    (PCS Pmax, or Battery DC Pmax when that is smaller).
+    """
+    p_dis_unit, p_chg_unit = _unit_p_limits(params)
+    idxs = _storage_indices(net, storage_names)
+    if not idxs:
+        return 0.0, 0.0
+    cap_dis = cap_chg = 0.0
+    for idx in idxs:
+        try:
+            sn = abs(_f(net.storage.at[idx, 'sn_mva'], 0.0))
+        except Exception:
+            sn = 0.0
+        if sn <= 0:
+            sn = max(p_dis_unit, p_chg_unit)
+        cap_dis += min(sn, p_dis_unit)
+        cap_chg += min(sn, p_chg_unit)
+    return cap_dis, cap_chg
+
+
+def _envelope_closing_points(pn, cap_discharge, cap_charge, n_points=3):
+    """P dispatch points between Pn and the plant P limit, both directions.
+
+    The uniform % sweep stops at Pn, so the Qmax and Qmin branches are left
+    unconnected at the ends. These points carry the envelope up to the P where
+    the PCS MVA circle closes it.
+    """
+    pn = abs(_f(pn, 0.0))
+    if pn <= 0:
+        return []
+    out = []
+    for cap, sign in ((abs(_f(cap_discharge, 0.0)), 1.0), (abs(_f(cap_charge, 0.0)), -1.0)):
+        if cap <= pn * 1.005:
+            continue
+        for k in range(1, int(n_points) + 1):
+            out.append(sign * (pn + (cap - pn) * k / float(n_points)))
+    return [round(p, 6) for p in out]
+
+
 def _run_pq_envelope(net, params, in_data, progress_cb=None):
     requested = list(params.get('storageNames') or [])
     if not requested:
@@ -1350,6 +1402,9 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
         # Contracted POC Pn is the grid-code rectangle, not plant Pmax at the PCC
         # (import |P| can exceed Pn by losses if the sweep is not recapped).
         'scale_requirement_to_pcc': False,
+        # Carry the sweep past Pn up to the PCS P limit so the Qmax and Qmin
+        # branches meet instead of leaving the envelope open at ±Pn.
+        'extra_p_mw': _envelope_closing_points(pn, *_plant_p_capability(net, params, storage_names)),
         '_progress_callback': progress_cb,
         '_cancel_event': params.get('_cancel_event'),
     }

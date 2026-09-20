@@ -47,6 +47,7 @@ import gzip
 import io
 import queue
 import threading
+import re
 
 import numpy as np
 
@@ -58,18 +59,16 @@ warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
 # Get CORS origins from environment variable or use defaults
-cors_origins = os.getenv('CORS_ORIGINS', '').split(',') if os.getenv('CORS_ORIGINS') else [
-    # Development origins
-    'http://127.0.0.1:5500',
-    'http://127.0.0.1:5501',
-    'http://localhost:5500',
-    'http://localhost:5501',
-    'http://localhost:5502',
-    'https://03dht3kc-5000.euw.devtunnels.ms',
+_cors_env = os.getenv('CORS_ORIGINS', '').strip()
+cors_origins = [o.strip() for o in _cors_env.split(',') if o.strip()] if _cors_env else [
+    # Any live-server / Cursor Simple Browser port on loopback
+    re.compile(r'^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$'),
+    re.compile(r'^https://[\w.-]+\.devtunnels\.ms$'),
+    re.compile(r'^https://[\w.-]+\.githubpreview\.dev$'),
     # Production origins
     'https://app.electrisim.com',
     'https://www.electrisim.com',
-    'https://electrisim.com'
+    'https://electrisim.com',
 ]
 
 # CORS configuration for both development and production
@@ -128,7 +127,13 @@ def simulation():
             return jsonify({
                 'error': 'Request body must be a JSON object with simulation elements.'
             }), 400
-        print(in_data, flush=True)
+        try:
+            _typs = sorted({
+                _element_typ(v) for v in in_data.values() if _element_typ(v)
+            })
+            _console(f"payload keys={len(in_data)} typs={_typs[:16]}")
+        except Exception:
+            _console('payload (unprintable)')
        
         Busbars = {}
         
@@ -229,7 +234,13 @@ def simulation():
                     except GeneratorExit:
                         cancel_event.set()
 
-                return Response(_prelim_ndjson_stream(), mimetype='application/x-ndjson')
+                resp = Response(
+                    stream_with_context(_prelim_ndjson_stream()),
+                    mimetype='application/x-ndjson',
+                )
+                resp.headers['Cache-Control'] = 'no-cache'
+                resp.headers['X-Accel-Buffering'] = 'no'
+                return resp
             response_data = bess_preliminary_electrisim.bess_preliminary_study(net, bess_prelim_params, in_data)
             accept_encoding = request.headers.get('Accept-Encoding', '')
             if 'gzip' in accept_encoding and len(response_data) > 1024:
@@ -2565,4 +2576,4 @@ if __name__ == '__main__':
             )
             raise SystemExit(1)
         _console(f'[Electrisim] logging to this terminal; POST / on port {port}')
-        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False, threaded=False)
+        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False, threaded=True)

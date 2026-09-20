@@ -1380,6 +1380,29 @@ def _pq_p_sweep(pn, p_start_pct, p_step_pct, p_end_pct, i_op_range):
     return out
 
 
+def _pq_merge_extra_p(p_points, extra_p_mw):
+    """Add caller-supplied P points (MW, signed) to the uniform sweep.
+
+    Used to close the envelope between Pn and the plant P limit, where the
+    uniform % step would stop short and leave the curve open at the ends.
+    """
+    merged = list(p_points or [])
+    for val in extra_p_mw or []:
+        try:
+            merged.append(float(val))
+        except (TypeError, ValueError):
+            continue
+    seen = set()
+    out = []
+    for p in sorted(merged):
+        key = round(float(p), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(p))
+    return out
+
+
 def _pq_check_compliance(p_max_result, q_max_result, p_min_result, q_min_result, v_req):
     """
     True when plant Qmax/Qmin at the PCC cover the required envelope.
@@ -1578,6 +1601,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             pq_params.get('p_end_pct', 100),
             int(pq_params.get('i_op_range') or 0),
         )
+        p_points = _pq_merge_extra_p(p_points, pq_params.get('extra_p_mw'))
         q_step_pct = abs(_pq_float(pq_params.get('q_step_pct'), 0.5))
         q_step_mw = (q_step_pct / 100.0) * pn
 
