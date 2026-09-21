@@ -1561,12 +1561,25 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             })
         for idx in storage_indices:
             sn = net.storage.at[idx, 'sn_mva'] if 'sn_mva' in net.storage.columns and not pd.isna(net.storage.at[idx, 'sn_mva']) else 0
-            try:
-                p_mw = float(net.storage.at[idx, 'p_mw']) if not pd.isna(net.storage.at[idx, 'p_mw']) else 0.0
-            except Exception:
-                p_mw = 0.0
             sn_f = float(sn) if sn and sn > 0 else 0.0
-            p_rated = abs(p_mw) if abs(p_mw) > 0 else sn_f
+            caps = [sn_f] if sn_f > 0 else []
+            try:
+                mx = float(net.storage.at[idx, 'max_p_mw'])
+                if mx > 0:
+                    caps.append(mx)
+            except Exception:
+                pass
+            try:
+                mn = float(net.storage.at[idx, 'min_p_mw'])
+                if abs(mn) > 0:
+                    caps.append(abs(mn))
+            except Exception:
+                pass
+            # Operating p_mw is often 0 on the diagram; the nameplate that
+            # actually limits the sweep is min(Sn, charge Pmax, discharge Pmax),
+            # which includes Battery DC Pmax when the wizard wrote it onto
+            # max_p_mw / min_p_mw.
+            p_rated = min(caps) if caps else 0.0
             gen_info.append({
                 'type': 'storage',
                 'idx': idx,

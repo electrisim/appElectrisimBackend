@@ -1415,6 +1415,9 @@ def _run_pq_envelope(net, params, in_data, progress_cb=None):
             return {'error': parsed.get('error')}
         results = parsed.get('grid_code_pq_results') or parsed
         _relabel_envelope_limiters(net, results)
+        cap_dis, cap_chg = _plant_p_capability(net, params, storage_names)
+        results['plant_p_discharge_mw'] = round(cap_dis, 4)
+        results['plant_p_charge_mw'] = round(cap_chg, 4)
         uq = _assess_uq_at_rated_p(results, params)
         if uq:
             results['uq_at_rated_p'] = uq

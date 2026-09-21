@@ -493,6 +493,19 @@ def test_envelope_sign_and_voltage_dependence():
     uq = env.get('uq_at_rated_p')
     assert uq and isinstance(uq.get('compliant'), bool), uq
     assert uq.get('points') and uq.get('q_over_pn'), uq
+    assert env.get('plant_p_discharge_mw') > 0, env.get('plant_p_discharge_mw')
+
+
+def test_battery_dc_pmax_caps_envelope_plant_p():
+    """Matching PCS MW to MVA does not extend the sweep if Battery DC Pmax is lower."""
+    net = _minimal_bess_net()
+    params = _base_params(
+        tapSweep=False, storageSnMva=2.0, pMaxDischarge_MW=2.0, pMaxCharge_MW=2.0,
+        batteryPmax_MW=1.5, pocP_MW=1.0)
+    cap_d, cap_c = bess_prelim._plant_p_capability(net, params, params['storageNames'])
+    assert cap_d == pytest.approx(1.5) and cap_c == pytest.approx(1.5), (cap_d, cap_c)
+    extra = bess_prelim._envelope_closing_points(1.0, cap_d, cap_c)
+    assert extra and max(extra) == pytest.approx(1.5), extra
 
 
 def test_uq_at_full_p_pass_and_fail():
