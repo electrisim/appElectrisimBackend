@@ -3,6 +3,7 @@ from typing import List, Optional
 import math
 import json
 import re
+import threading
 
 from storage_q_capability import (
     resolve_storage_pq,
@@ -220,6 +221,10 @@ def _sanitize_opendss_name(name):
 _opendss_warnings = []
 # Requested storage dispatch (Electrisim / pandapower sign) for post-solve checks.
 _opendss_storage_dispatch = {}
+# OpenDSSDirect is process-global and not thread-safe. Flask runs threaded=True.
+_opendss_engine_lock = threading.Lock()
+# First FaultStudy after a cold build often returns milliamps (Voc≈0). Treat below 1 A as empty.
+_ISC_KA_FLOOR = 0.001
 
 
 def _reset_opendss_warnings():
@@ -847,7 +852,11 @@ def _thevenin_impedance_ohm(vn_kv_ll, s_sc_mva, rx, r0x0=None, s_sc_min_mva=None
 
 
 def _ext_grid_vsource_impedance(element_data, bus_voltage_ll):
-    """Build OpenDSS Vsource impedance clause from external grid SC parameters."""
+    """Build OpenDSS Vsource impedance clause from external grid SC parameters.
+
+    Always includes Mvasc3 (Electrisim s_sc_max_mva) so exported DSS scripts show
+    short-circuit power. When R/X is known, Thevenin ohms follow so they govern.
+    """
     try:
         s_sc_max = float(element_data.get('s_sc_max_mva') or 10000.0)
     except (TypeError, ValueError):
@@ -865,20 +874,26 @@ def _ext_grid_vsource_impedance(element_data, bus_voltage_ll):
     except (TypeError, ValueError):
         r0x0_max = 0.0
 
+    if s_sc_max <= 0.1:
+        s_sc_max = 10000.0
+
     thev = _thevenin_impedance_ohm(
         bus_voltage_ll, s_sc_max, rx_max, r0x0_max,
         s_sc_min if s_sc_min > 0.1 else None,
     )
+    mvasc_part = f" Mvasc3={s_sc_max:g}"
+    if s_sc_min > 0.1:
+        mvasc_part += f" Mvasc1={s_sc_min:g}"
+    if rx_max > 0:
+        mvasc_part += f" x1r1={1.0 / rx_max:g}"
     if thev is not None:
         r, x, r0, x0 = thev
         return (
             'thevenin',
-            f" R1={r:.6f} X1={x:.6f} R0={r0:.6f} X0={x0:.6f}",
-            None,
+            f"{mvasc_part} R1={r:.6f} X1={x:.6f} R0={r0:.6f} X0={x0:.6f}",
+            s_sc_max,
         )
-    if s_sc_max <= 0.1:
-        s_sc_max = 10000.0
-    return 'mvasc3', '', s_sc_max
+    return 'mvasc3', mvasc_part, s_sc_max
 
 
 def _prescan_external_grid(in_data):
@@ -929,7 +944,7 @@ def _prescan_external_grid(in_data):
 
 
 def _new_circuit_command(ext_scan):
-    """OpenDSS New Circuit line; Thevenin grid omits Mvasc3 (set on Edit Vsource.source)."""
+    """OpenDSS New Circuit line including Mvasc3 (s_sc_max_mva) when known."""
     if not ext_scan:
         return 'New Circuit.OpenDSS_Circuit'
     parts = [
@@ -939,7 +954,7 @@ def _new_circuit_command(ext_scan):
         f"phases={ext_scan.get('phases', 3)}",
         f"angle={ext_scan['angle']}",
     ]
-    if ext_scan['mode'] == 'mvasc3' and ext_scan['mvasc3']:
+    if ext_scan.get('mvasc3'):
         parts.append(f"Mvasc3={ext_scan['mvasc3']}")
     return ' '.join(parts)
 
@@ -1456,7 +1471,7 @@ def create_source_1ph_element(dss, element_data, element_name, element_id, Busba
     except (TypeError, ValueError):
         angle = 0.0
     mode, imp_suffix, mvasc3 = _ext_grid_vsource_impedance(element_data, bus_voltage)
-    imp_part = imp_suffix if mode == 'thevenin' else f" mvasc3={mvasc3}"
+    imp_part = imp_suffix if imp_suffix else (f" mvasc3={mvasc3}" if mvasc3 else '')
     if 'circuit_source_configured' not in created_elements:
         edit_cmd = (f"Edit Vsource.source Bus1={bus_terminal} basekv={basekv} "
                     f"pu={vm_pu} Phases=1 angle={angle}{imp_part}")
@@ -3817,7 +3832,7 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             if spectrum_resolved:
                 spectrum_suffix = f" spectrum={spectrum_resolved}"
 
-            imp_part = imp_suffix if mode == 'thevenin' else f" mvasc3={mvasc3}"
+            imp_part = imp_suffix if imp_suffix else (f" mvasc3={mvasc3}" if mvasc3 else '')
             
             if 'circuit_source_configured' not in created_elements:
                 # First external grid: configure the default Circuit source directly.
@@ -3870,7 +3885,182 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
         pass
 
 
-def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_results=False):
+def _opendss_seq_mean_abs(arr):
+    """Mean magnitude from OpenDSS Isc()/Voc() (flat re/im, complex seq, or numpy)."""
+    if arr is None:
+        return 0.0
+    try:
+        seq = list(arr)
+    except TypeError:
+        return 0.0
+    if not seq:
+        return 0.0
+    mags = []
+    first = seq[0]
+    if hasattr(first, 'real') and hasattr(first, 'imag') and not isinstance(first, (int, float)):
+        for x in seq:
+            try:
+                mags.append(abs(complex(float(x.real), float(x.imag))))
+            except (TypeError, ValueError):
+                break
+    elif hasattr(first, '__len__') and not isinstance(first, (str, bytes)):
+        for x in seq:
+            try:
+                mags.append(abs(complex(float(x[0]), float(x[1]))))
+            except (TypeError, ValueError, IndexError):
+                break
+    else:
+        for i in range(0, len(seq) - 1, 2):
+            try:
+                mags.append(abs(complex(float(seq[i]), float(seq[i + 1]))))
+            except (TypeError, ValueError):
+                break
+    if not mags:
+        return 0.0
+    return sum(mags) / len(mags)
+
+
+def _opendss_parse_zsc1(zsc1):
+    rk_ohm, xk_ohm = 0.0, 0.0
+    if zsc1 is None:
+        return rk_ohm, xk_ohm
+    try:
+        if hasattr(zsc1, 'real') and hasattr(zsc1, 'imag') and not hasattr(zsc1, '__len__'):
+            return float(zsc1.real), float(zsc1.imag)
+        if hasattr(zsc1, '__len__') and len(zsc1) >= 1:
+            a0 = zsc1[0]
+            if hasattr(a0, 'real') and hasattr(a0, 'imag') and not isinstance(a0, (int, float)):
+                return float(a0.real), float(a0.imag)
+            if len(zsc1) >= 2:
+                return float(a0), float(zsc1[1])
+        if hasattr(zsc1, 'real') and hasattr(zsc1, 'imag'):
+            return float(zsc1.real), float(zsc1.imag)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return rk_ohm, xk_ohm
+
+
+def _opendss_run_fault_study_solves(execute_dss_command):
+    """Snapshot (Normal) then FaultStudy. A second FaultStudy solve is required on many
+    OpenDSSDirect builds: the first Solve after Clear / another study leaves Isc/Zsc empty.
+    """
+    try:
+        execute_dss_command('set ControlMode=OFF')
+        execute_dss_command('set Algorithm=Normal')
+        execute_dss_command('set MaxIterations=100')
+        execute_dss_command('set Mode=Snapshot')
+        execute_dss_command('solve')
+        print(f"[OpenDSS SC] Snapshot Converged={getattr(dss.Solution, 'Converged', lambda: None)()}")
+        try:
+            execute_dss_command('calcv')
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[OpenDSS SC] Snapshot solve exception: {e}")
+    try:
+        execute_dss_command('set Mode=FaultStudy')
+        execute_dss_command('solve')
+        # Second solve: after Clear / another study, the first FaultStudy often
+        # leaves Isc()/Zsc1() empty; the next Solve populates them.
+        execute_dss_command('solve')
+        print(f"[OpenDSS SC] FaultStudy Mode={dss.Solution.Mode()} "
+              f"Converged={getattr(dss.Solution, 'Converged', lambda: None)()}")
+    except Exception as e1:
+        try:
+            dss.Solution.Mode(4)
+            dss.Solution.Solve()
+            dss.Solution.Solve()
+        except Exception as e2:
+            raise RuntimeError(f"Fault study solve failed: {e1}; {e2}") from e2
+
+
+def _opendss_read_bus_sc(dss_mod, kappa=1.8, vn_kv_ll=None):
+    """ikss_ka, ip_ka, ith_ka, rk_ohm, xk_ohm for the active bus.
+
+    Cold OpenDSS FaultStudy often returns Isc≈0 (Voc≈0) and the wrong kVBase on
+    LV buses. Prefer Isc when it is at least 1 A; otherwise Ikss = Vln / |Zsc1|
+    using the diagram Un when OpenDSS kVBase is missing or on the wrong winding.
+    """
+    ikss_ka = 0.0
+    try:
+        ikss_ka = _opendss_seq_mean_abs(dss_mod.Bus.Isc()) / 1000.0
+    except Exception:
+        pass
+    if not math.isfinite(ikss_ka) or ikss_ka < _ISC_KA_FLOOR:
+        ikss_ka = 0.0
+        if hasattr(dss_mod.Bus, 'ZscRefresh'):
+            try:
+                dss_mod.Bus.ZscRefresh()
+                ikss_ka = _opendss_seq_mean_abs(dss_mod.Bus.Isc()) / 1000.0
+            except Exception:
+                ikss_ka = 0.0
+        if not math.isfinite(ikss_ka) or ikss_ka < _ISC_KA_FLOOR:
+            ikss_ka = 0.0
+
+    rk_ohm, xk_ohm = 0.0, 0.0
+    try:
+        rk_ohm, xk_ohm = _opendss_parse_zsc1(dss_mod.Bus.Zsc1())
+    except Exception:
+        pass
+    if not math.isfinite(rk_ohm):
+        rk_ohm = 0.0
+    if not math.isfinite(xk_ohm):
+        xk_ohm = 0.0
+
+    kv_ln = 0.0
+    try:
+        kv_ln = float(dss_mod.Bus.kVBase() or 0)
+    except Exception:
+        kv_ln = 0.0
+    if not math.isfinite(kv_ln):
+        kv_ln = 0.0
+    expected_ln = 0.0
+    try:
+        if vn_kv_ll is not None and float(vn_kv_ll) > 0:
+            expected_ln = float(vn_kv_ll) / math.sqrt(3.0)
+    except (TypeError, ValueError):
+        expected_ln = 0.0
+    if expected_ln > 0 and (kv_ln <= 0 or abs(kv_ln - expected_ln) / expected_ln > 0.25):
+        kv_ln = expected_ln
+
+    z_mag = math.sqrt(rk_ohm * rk_ohm + xk_ohm * xk_ohm)
+    if ikss_ka < _ISC_KA_FLOOR and z_mag > 0:
+        v_ln = 0.0
+        try:
+            v_ln = _opendss_seq_mean_abs(dss_mod.Bus.Voc())
+        except Exception:
+            pass
+        if not math.isfinite(v_ln) or v_ln < 1.0:
+            v_ln = kv_ln * 1000.0 if kv_ln > 0 else 0.0
+        if v_ln > 0:
+            ikss_ka = (v_ln / z_mag) / 1000.0
+            if not math.isfinite(ikss_ka):
+                ikss_ka = 0.0
+
+    ip_ka = kappa * math.sqrt(2) * ikss_ka if ikss_ka else 0.0
+    return ikss_ka, ip_ka, ikss_ka, rk_ohm, xk_ohm
+
+
+def _opendss_any_bus_isc_ready(dss_mod, min_amp=1.0):
+    """True when FaultStudy actually filled Isc (not milliamps from Voc≈0)."""
+    try:
+        names = dss_mod.Circuit.AllBusNames() or []
+    except Exception:
+        return False
+    for name in names:
+        if str(name).lower() in ('sourcebus', 'source'):
+            continue
+        try:
+            dss_mod.Circuit.SetActiveBus(name)
+            mag = _opendss_seq_mean_abs(dss_mod.Bus.Isc())
+            if math.isfinite(mag) and mag >= min_amp:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_results=False, export_commands=False):
     """OpenDSS fault study / short circuit analysis.
 
     Builds the circuit from in_data (same as powerflow), sets Solution.Mode to FaultStudy,
@@ -3885,84 +4075,13 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     def execute_dss_command(command):
         print(f"[OpenDSS] {command}")  # Log all commands
         dss.Text.Command(command)
-        if export_open_dss_results:
+        if export_open_dss_results or export_commands:
             opendss_commands.append(command)
 
     f = int(frequency) if frequency else 50
     ext_scan = _prescan_external_grid(in_data)
+    kappa = 1.8  # Peak current factor for ip_ka = kappa * sqrt(2) * ikss_ka
 
-    execute_dss_command('clear')
-    execute_dss_command(_new_circuit_command(ext_scan))
-    execute_dss_command(f'set DefaultBaseFrequency={f}')
-
-    try:
-        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(in_data, dss, False, opendss_commands)
-        (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
-         Transformers3WDict, Transformers3WDictId,
-         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
-         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
-         _circuit_source) = create_other_elements(in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)
-    except ValueError as ve:
-        return json.dumps({"error": str(ve)})
-    except Exception as e:
-        return json.dumps({"error": f"Error creating network elements: {str(e)}"})
-
-    # Set voltage bases (required for fault study and per-unit results)
-    try:
-        vb_list = _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage)
-        if vb_list:
-            execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
-        print("[OpenDSS] calcv")
-        dss.Text.Command('calcv')
-    except Exception:
-        pass
-
-    # Run Snapshot solve first so circuit has a solution and open-circuit voltages exist
-    # Fault Study uses these for Isc = Ysc * Voc; some engines need this before FaultStudy
-    try:
-        dss.Solution.Mode(0)  # 0 = Snapshot
-        dss.Solution.Solve()
-        print(f"[DEBUG] Snapshot solve completed. Converged: {dss.Solution.Converged()}")
-        # Check if buses have voltage after snapshot solve
-        for bus_name in (dss.Circuit.AllBusNames() or [])[:3]:
-            dss.Circuit.SetActiveBus(bus_name)
-            vmag = dss.Bus.VMagAngle()
-            print(f"[DEBUG] After Snapshot - Bus {bus_name}: VMagAngle={vmag[:4] if vmag and len(vmag) >= 4 else vmag}")
-    except Exception as e:
-        print(f"[DEBUG] Snapshot solve exception: {e}")
-        try:
-            execute_dss_command('set Mode=Snapshot')
-            print("[OpenDSS] solve")
-            dss.Text.Command('solve')
-        except Exception:
-            pass
-
-    # Set solution mode to Fault Study (mode 4) and solve
-    # https://opendss.epri.com/OpenDSSFaultStudyMode.html
-    # Use run_command so the engine runs the full fault-study sequence (Solve populates Isc/Zsc per bus)
-    try:
-        execute_dss_command('set Mode=FaultStudy')
-        print("[OpenDSS] solve")
-        dss.Text.Command('solve')
-        print(f"[DEBUG] FaultStudy solve completed. Solution.Mode: {dss.Solution.Mode()}")
-        if hasattr(dss.Solution, 'Converged'):
-            print(f"[DEBUG] Solution.Converged: {dss.Solution.Converged()}")
-    except Exception as e1:
-        try:
-            dss.Solution.Mode(4)
-            dss.Solution.Solve()
-            print(f"[DEBUG] FaultStudy solve (API) completed. Solution.Mode: {dss.Solution.Mode()}")
-        except Exception as e2:
-            return json.dumps({"error": f"Fault study solve failed: {str(e1)}; {str(e2)}"})
-
-    # Build bus index mapping (same as powerflow)
-    BusbarsDict = {}
-    nBusbar = 0
-    for bus_id in BusbarsDictConnectionToName.keys():
-        BusbarsDict[bus_id] = nBusbar
-        nBusbar += 1
-
-    # Map bus name (with _) to graph cell id from in_data for frontend getCell(cell.id)
     bus_name_to_graph_id = {}
     for key in in_data:
         try:
@@ -3972,133 +4091,67 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
         except (TypeError, AttributeError):
             continue
 
-    busbarList = []
-    processed_buses = set()
-    kappa = 1.8  # Peak current factor for ip_ka = kappa * sqrt(2) * ikss_ka
+    BusbarsDict = {}
+    BusbarsDictVoltage = {}
+    BusbarsDictConnectionToName = {}
 
-    try:
-        all_bus_names = dss.Circuit.AllBusNames()
-        print(f"[DEBUG] Total buses in circuit: {len(all_bus_names) if all_bus_names else 0}")
-        print(f"[DEBUG] All bus names: {all_bus_names}")
-        for bus_name_from_list in all_bus_names:
-            dss.Circuit.SetActiveBus(bus_name_from_list)
-            actual_bus_name = dss.Bus.Name()
-            if actual_bus_name.lower() in ['sourcebus', 'source'] or bus_name_from_list.lower() in ['sourcebus', 'source']:
-                continue
+    def _collect_bus_sc():
+        collected = []
+        processed_buses = set()
+        try:
+            all_bus_names = dss.Circuit.AllBusNames()
+            print(f"[OpenDSS SC] Total buses in circuit: {len(all_bus_names) if all_bus_names else 0}")
+            for bus_name_from_list in all_bus_names or []:
+                dss.Circuit.SetActiveBus(bus_name_from_list)
+                actual_bus_name = dss.Bus.Name()
+                if actual_bus_name.lower() in ['sourcebus', 'source'] or bus_name_from_list.lower() in ['sourcebus', 'source']:
+                    continue
 
-            matched_bus_id = None
-            bus_number = None
-            for key, value in BusbarsDict.items():
-                if key.lower() == actual_bus_name.lower():
-                    matched_bus_id = key
-                    bus_number = value
-                    break
-            if not matched_bus_id or bus_number in processed_buses:
-                continue
-            processed_buses.add(bus_number)
+                matched_bus_id = None
+                bus_number = None
+                for key, value in BusbarsDict.items():
+                    if key.lower() == actual_bus_name.lower():
+                        matched_bus_id = key
+                        bus_number = value
+                        break
+                if not matched_bus_id or bus_number in processed_buses:
+                    continue
+                processed_buses.add(bus_number)
 
-            try:
-                # Ensure Zsc/Isc are populated for this bus (required in some OpenDSS versions)
-                if hasattr(dss.Bus, 'ZscRefresh'):
-                    try:
-                        dss.Bus.ZscRefresh()
-                    except Exception:
-                        pass
-                # Isc() returns complex array: [I1_re, I1_im, I2_re, I2_im, ...] in Amps (flat), or list of 3 complex when AdvancedTypes
-                isc_arr = dss.Bus.Isc()
-                print(f"[DEBUG] Bus {actual_bus_name}: Isc() = {isc_arr}, type: {type(isc_arr)}, len: {len(isc_arr) if isc_arr else 0}")
-                ikss_ka = 0.0
-                if isc_arr is not None:
-                    if len(isc_arr) >= 6:
-                        # Flat [re, im, re, im, re, im]
-                        try:
-                            I_a = complex(float(isc_arr[0]), float(isc_arr[1]))
-                            I_b = complex(float(isc_arr[2]), float(isc_arr[3]))
-                            I_c = complex(float(isc_arr[4]), float(isc_arr[5]))
-                            ikss_mag = (abs(I_a) + abs(I_b) + abs(I_c)) / 3.0
-                            ikss_ka = ikss_mag / 1000.0
-                        except (TypeError, ValueError, IndexError):
-                            pass
-                    elif len(isc_arr) >= 3:
-                        # List of 3 complex numbers (AdvancedTypes)
-                        try:
-                            mags = []
-                            for x in isc_arr[:3]:
-                                if hasattr(x, 'real') and hasattr(x, 'imag'):
-                                    mags.append(abs(x))
-                                elif hasattr(x, '__len__') and len(x) >= 2:
-                                    mags.append(abs(complex(float(x[0]), float(x[1]))))
-                                else:
-                                    mags.append(0.0)
-                            ikss_mag = sum(mags) / 3.0
-                            ikss_ka = ikss_mag / 1000.0
-                        except (TypeError, ValueError, IndexError):
-                            pass
-
-                # Peak short-circuit current: ip = kappa * sqrt(2) * ikss
-                ip_ka = kappa * math.sqrt(2) * ikss_ka if ikss_ka else 0.0
-                # Thermal short-circuit current (short duration): ith ? ikss
-                ith_ka = ikss_ka
-
-                # Zsc1() returns complex positive-sequence short-circuit impedance at bus (ohms)
-                # May be [real, imag] list or a single complex number
-                zsc1 = dss.Bus.Zsc1()
-                print(f"[DEBUG] Bus {actual_bus_name}: Zsc1() = {zsc1}, type: {type(zsc1)}")
-                rk_ohm = 0.0
-                xk_ohm = 0.0
-                if zsc1 is not None:
-                    if hasattr(zsc1, '__len__') and len(zsc1) >= 2:
-                        try:
-                            rk_ohm = float(zsc1[0])
-                            xk_ohm = float(zsc1[1])
-                        except (TypeError, ValueError, IndexError):
-                            pass
-                    elif hasattr(zsc1, 'real') and hasattr(zsc1, 'imag'):
-                        rk_ohm = float(zsc1.real)
-                        xk_ohm = float(zsc1.imag)
-
-                # When Isc() returns zeros but Zsc1 is valid, derive Isc from OpenDSS Voc and Zsc1 (Isc = Ysc*Voc = Voc/Zsc1)
-                if ikss_ka <= 0.0 and (rk_ohm != 0.0 or xk_ohm != 0.0) and hasattr(dss.Bus, 'Voc'):
-                    try:
-                        voc_arr = dss.Bus.Voc()
-                        print(f"[DEBUG] Bus {actual_bus_name}: Voc() = {voc_arr}, type: {type(voc_arr)}, len: {len(voc_arr) if voc_arr else 0}")
-                        v_ln = 0.0
-                        if voc_arr is not None and len(voc_arr) >= 2:
-                            if len(voc_arr) >= 6:
-                                # Flat [re, im, re, im, re, im] - use first phase magnitude (line-to-neutral)
-                                v1 = complex(float(voc_arr[0]), float(voc_arr[1]))
-                                v2 = complex(float(voc_arr[2]), float(voc_arr[3]))
-                                v3 = complex(float(voc_arr[4]), float(voc_arr[5]))
-                                v_ln = (abs(v1) + abs(v2) + abs(v3)) / 3.0
-                            else:
-                                v_ln = abs(complex(float(voc_arr[0]), float(voc_arr[1])))
-                        if v_ln > 0:
-                            z_mag = math.sqrt(rk_ohm * rk_ohm + xk_ohm * xk_ohm)
-                            if z_mag > 0:
-                                ikss_ka = (v_ln / z_mag) / 1000.0  # Amps -> kA
-                                ip_ka = kappa * math.sqrt(2) * ikss_ka
-                                ith_ka = ikss_ka
-                    except (TypeError, ValueError, IndexError, ZeroDivisionError):
-                        pass
-
-                # Use graph cell id from in_data so frontend getCell(cell.id) finds the bus
                 frontend_bus_id = bus_name_to_graph_id.get(matched_bus_id) or matched_bus_id.replace('_', '#')
                 frontend_bus_name = BusbarsDictConnectionToName.get(matched_bus_id, matched_bus_id).replace('_', '#')
-                print(f"[DEBUG] Bus {actual_bus_name}: Final ikss_ka={ikss_ka}, ip_ka={ip_ka}, ith_ka={ith_ka}, rk_ohm={rk_ohm}, xk_ohm={xk_ohm}")
-                busbar = BusbarScOut(
-                    name=frontend_bus_name,
-                    id=frontend_bus_id,
-                    ikss_ka=round(ikss_ka, 6),
-                    ip_ka=round(ip_ka, 6),
-                    ith_ka=round(ith_ka, 6),
-                    rk_ohm=round(rk_ohm, 6),
-                    xk_ohm=round(xk_ohm, 6)
-                )
-                busbarList.append(busbar)
-            except Exception as e:
-                frontend_bus_id = bus_name_to_graph_id.get(matched_bus_id) or matched_bus_id.replace('_', '#')
-                frontend_bus_name = BusbarsDictConnectionToName.get(matched_bus_id, matched_bus_id).replace('_', '#')
-                busbarList.append(BusbarScOut(
+                try:
+                    vn_kv_ll = BusbarsDictVoltage.get(matched_bus_id)
+                    ikss_ka, ip_ka, ith_ka, rk_ohm, xk_ohm = _opendss_read_bus_sc(
+                        dss, kappa, vn_kv_ll)
+                    print(f"[OpenDSS SC] Bus {actual_bus_name}: ikss_ka={ikss_ka:.6f} "
+                          f"rk={rk_ohm:.6f} xk={xk_ohm:.6f}")
+                    collected.append(BusbarScOut(
+                        name=frontend_bus_name,
+                        id=frontend_bus_id,
+                        ikss_ka=round(ikss_ka, 6),
+                        ip_ka=round(ip_ka, 6),
+                        ith_ka=round(ith_ka, 6),
+                        rk_ohm=round(rk_ohm, 6),
+                        xk_ohm=round(xk_ohm, 6)
+                    ))
+                except Exception as e:
+                    print(f"[OpenDSS SC] Bus {actual_bus_name} read failed: {e}")
+                    collected.append(BusbarScOut(
+                        name=frontend_bus_name,
+                        id=frontend_bus_id,
+                        ikss_ka=0.0,
+                        ip_ka=0.0,
+                        ith_ka=0.0,
+                        rk_ohm=0.0,
+                        xk_ohm=0.0
+                    ))
+        except Exception as e:
+            print(f"[OpenDSS SC] Bus collection failed: {e}")
+            for bus_name in BusbarsDictConnectionToName.keys():
+                frontend_bus_name = bus_name.replace('_', '#')
+                frontend_bus_id = bus_name_to_graph_id.get(bus_name) or bus_name.replace('_', '#')
+                collected.append(BusbarScOut(
                     name=frontend_bus_name,
                     id=frontend_bus_id,
                     ikss_ka=0.0,
@@ -4107,22 +4160,78 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
                     rk_ohm=0.0,
                     xk_ohm=0.0
                 ))
+        return collected
 
-    except Exception as e:
-        for bus_name in BusbarsDictConnectionToName.keys():
-            frontend_bus_name = bus_name.replace('_', '#')
-            frontend_bus_id = bus_name_to_graph_id.get(bus_name) or bus_name.replace('_', '#')
-            busbarList.append(BusbarScOut(
-                name=frontend_bus_name,
-                id=frontend_bus_id,
-                ikss_ka=0.0,
-                ip_ka=0.0,
-                ith_ka=0.0,
-                rk_ohm=0.0,
-                xk_ohm=0.0
-            ))
+    with _opendss_engine_lock:
+        busbarList = []
+        for attempt in (1, 2):
+            opendss_commands.clear()
+            try:
+                dss.Basic.ClearAll()
+            except Exception:
+                pass
+            execute_dss_command('clear')
+            execute_dss_command(_new_circuit_command(ext_scan))
+            execute_dss_command(f'set DefaultBaseFrequency={f}')
 
-    result = {"busbars": [vars(b) for b in busbarList]}
+            try:
+                BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
+                    in_data, dss, export_commands, opendss_commands)
+                (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
+                 Transformers3WDict, Transformers3WDictId,
+                 ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
+                 StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId, ExternalGridsDict, ExternalGridsDictId,
+                 _circuit_source) = create_other_elements(
+                    in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
+                    export_commands, opendss_commands, execute_dss_command)
+            except ValueError as ve:
+                return json.dumps({"error": str(ve)})
+            except Exception as e:
+                return json.dumps({"error": f"Error creating network elements: {str(e)}"})
+
+            try:
+                vb_list = _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage)
+                if vb_list:
+                    execute_dss_command('set voltagebases=[' + ','.join(str(v) for v in vb_list) + ']')
+                print("[OpenDSS] calcv")
+                dss.Text.Command('calcv')
+            except Exception:
+                pass
+
+            # Snapshot then FaultStudy twice. A cold multi-winding circuit still leaves
+            # Voc=0 / Isc≈0; the next full rebuild in this process fills them.
+            try:
+                _opendss_run_fault_study_solves(execute_dss_command)
+            except RuntimeError as e:
+                return json.dumps({"error": str(e)})
+
+            BusbarsDict = {}
+            nBusbar = 0
+            for bus_id in BusbarsDictConnectionToName.keys():
+                BusbarsDict[bus_id] = nBusbar
+                nBusbar += 1
+
+            isc_ready = _opendss_any_bus_isc_ready(dss)
+            print(f"[OpenDSS SC] attempt {attempt} Isc populated={isc_ready}")
+            if not isc_ready and attempt == 1:
+                print("[OpenDSS SC] Cold FaultStudy left Voc/Isc empty — rebuilding circuit")
+                continue
+
+            busbarList = _collect_bus_sc()
+            break
+
+    result = {
+        "busbars": [vars(b) for b in busbarList],
+        "study": "shortcircuit",
+        "engine": "opendss",
+        "study_params": {
+            "fault_type": fault_type,
+            "frequency_hz": f,
+            "standard": "opendss_fault_study",
+        },
+    }
+    if export_commands and opendss_commands:
+        result["opendss_commands"] = '\n'.join(opendss_commands)
     return json.dumps(result, separators=(',', ':'))
 
 

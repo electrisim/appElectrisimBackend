@@ -898,15 +898,80 @@ def _append_electrisim_sgen_setup_python(lines, net):
     return True
 
 
-def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init):
-    """Generate Python code to recreate the pandapower network"""
+# IEC 60909 ext_grid impedance inputs (needed so exported SC scripts match Electrisim).
+_EXT_GRID_SC_EXPORT_COLS = (
+    's_sc_max_mva', 's_sc_min_mva',
+    'rx_max', 'rx_min',
+    'r0x0_max', 'x0x_max',
+    'r0x0_min', 'x0x_min',
+)
+
+
+def _export_float_from_payload(val):
+    if val is None or val == '' or str(val).lower() in ('null', 'none'):
+        return None
+    try:
+        f = float(val)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _export_sc_param_value(row, in_data_elem, col):
+    """Prefer net.ext_grid row; fall back to diagram payload (in_data) for IEC SC fields."""
+    index = getattr(row, 'index', None)
+    if index is not None and col in index:
+        try:
+            val = row[col]
+            if val is not None and not pd.isna(val):
+                return float(val)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(in_data_elem, dict):
+        return _export_float_from_payload(in_data_elem.get(col))
+    return None
+
+
+def _ext_grid_sc_kwargs_for_export(row, in_data_elem=None):
+    parts = []
+    for col in _EXT_GRID_SC_EXPORT_COLS:
+        v = _export_sc_param_value(row, in_data_elem, col)
+        if v is not None:
+            parts.append(f", {col}={_export_py_literal(v)}")
+    return ''.join(parts)
+
+
+def _electrisim_find_in_data_by_ext_grid(in_data, ext_name, ext_id=None):
+    if not isinstance(in_data, dict):
+        return None
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if not (typ.startswith('External Grid') or typ.startswith('ExternalGrid')):
+            continue
+        if ext_id is not None and el.get('id') is not None and str(el.get('id')) == str(ext_id):
+            return el
+        if el.get('name') == ext_name or el.get('userFriendlyName') == ext_name:
+            return el
+    return None
+
+
+def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init,
+                                    study='powerflow', sc_in_data=None):
+    """Generate Python code to recreate the pandapower network (load flow or short circuit)."""
     lines = []
+    is_sc = study == 'shortcircuit'
     
     # Add header
     lines.append("# Pandapower Network Model")
     lines.append("# Auto-generated code to recreate the network")
+    if is_sc:
+        lines.append("# Short-circuit study (IEC 60909 via pandapower.shortcircuit.calc_sc)")
     lines.append("")
     lines.append("import pandapower as pp")
+    if is_sc:
+        lines.append("import pandapower.shortcircuit as sc")
     lines.append("")
     
     # Get frequency from network
@@ -931,7 +996,13 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             vm_pu = row['vm_pu']
             va_degree = row['va_degree']
             name = row['name'] if 'name' in row else f"ExtGrid_{idx}"
-            lines.append(f"pp.create_ext_grid(net, bus=bus_{bus}, vm_pu={vm_pu}, va_degree={va_degree}, name='{name}')")
+            ext_id = row.get('id') if hasattr(row, 'get') else (row['id'] if 'id' in row.index else None)
+            in_elem = _electrisim_find_in_data_by_ext_grid(in_data, name, ext_id)
+            sc_kwargs = _ext_grid_sc_kwargs_for_export(row, in_elem)
+            lines.append(
+                f"pp.create_ext_grid(net, bus=bus_{bus}, vm_pu={vm_pu}, va_degree={va_degree}, "
+                f"name='{name}'{sc_kwargs})"
+            )
         lines.append("")
     
     # Create lines
@@ -1489,6 +1560,48 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     
     # Electrisim Q capability + initial Q (before controllers)
     _append_electrisim_sgen_setup_python(lines, net)
+
+    if is_sc:
+        sc = sc_in_data or {}
+        fault_type = sc.get('fault_type', '3ph')
+        if fault_type not in ('3ph', '2ph', '1ph'):
+            fault_type = '3ph'
+        fault_location = sc.get('fault_location', 'max')
+        if fault_location not in ('max', 'min'):
+            fault_location = 'max'
+        tk_s = float(sc.get('tk_s', 1.0))
+        r_fault_ohm = float(sc.get('r_fault_ohm', 0.0))
+        x_fault_ohm = float(sc.get('x_fault_ohm', 0.0))
+        lines.append("# Short-circuit calculation (matches Electrisim IEC 60909 run)")
+        if not net.sgen.empty:
+            lines.append('net.sgen["k"] = 1.1')
+        lines.append("")
+        lines.append("sc.calc_sc(")
+        lines.append("    net,")
+        lines.append(f"    fault={fault_type!r},")
+        lines.append(f"    case={fault_location!r},")
+        lines.append("    bus=None,")
+        lines.append("    ip=True,")
+        lines.append("    ith=True,")
+        lines.append(f"    tk_s={tk_s},")
+        lines.append("    kappa_method='C',")
+        lines.append(f"    r_fault_ohm={r_fault_ohm},")
+        lines.append(f"    x_fault_ohm={x_fault_ohm},")
+        lines.append("    check_connectivity=False,")
+        lines.append("    branch_results=True,")
+        lines.append("    return_all_currents=False,")
+        lines.append(")")
+        lines.append("")
+        lines.append("# Print short-circuit results")
+        lines.append("print('\\nBus SC Results:')")
+        lines.append("print(net.res_bus_sc)")
+        lines.append("if hasattr(net, 'res_line_sc') and net.res_line_sc is not None and not net.res_line_sc.empty:")
+        lines.append("    print('\\nLine SC Results:')")
+        lines.append("    print(net.res_line_sc)")
+        lines.append("if hasattr(net, 'res_trafo_sc') and net.res_trafo_sc is not None and not net.res_trafo_sc.empty:")
+        lines.append("    print('\\nTransformer SC Results:')")
+        lines.append("    print(net.res_trafo_sc)")
+        return '\n'.join(lines)
 
     # Electrisim Park / Wind Turbine controllers (must run before runpp)
     run_control = _append_electrisim_controllers_to_python(
@@ -7165,7 +7278,7 @@ def analyze_shortcircuit_input_data(in_data):
     return recommendations
 
 
-def shortcircuit(net, in_data, in_data_full=None):
+def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=None):
     
     # Add diagnostic prints
     # Print key parameters
@@ -7583,6 +7696,30 @@ def shortcircuit(net, in_data, in_data_full=None):
         print(f"Short Circuit: Sending {len(result['trafos_sc'])} trafo SC results")
     if "trafos3w_sc" in result:
         print(f"Short Circuit: Sending {len(result['trafos3w_sc'])} trafo3w SC results")
+
+    result['study'] = 'shortcircuit'
+    result['engine'] = 'pandapower'
+    result['study_params'] = {
+        'fault_type': fault_type,
+        'fault_location': fault_location,
+        'tk_s': tk_s,
+        'r_fault_ohm': r_fault_ohm,
+        'x_fault_ohm': x_fault_ohm,
+        'standard': 'iec60909',
+    }
+
+    if export_python and in_data_full is not None and Busbars is not None:
+        try:
+            python_code = generate_pandapower_python_code(
+                net, in_data_full, Busbars,
+                algorithm='nr', calculate_voltage_angles=True, init='auto',
+                study='shortcircuit', sc_in_data=in_data,
+            )
+            if python_code:
+                result['pandapower_python'] = python_code
+        except Exception as py_err:
+            print(f"Short Circuit: pandapower Python export failed: {py_err}")
+            result['pandapower_python_error'] = str(py_err)
 
     # OPTIMIZED: Compact JSON for faster transfer
     response = json.dumps(result, default=_json_serialize_default, separators=(",", ":"))

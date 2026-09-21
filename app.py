@@ -29,6 +29,16 @@ def _console(msg):
     except Exception:
         pass
 
+
+def _coerce_export_flag(value):
+    """Normalize JSON export checkboxes from the Electrisim frontend."""
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ('true', '1', 'yes', 'on'):
+        return True
+    return False
+
+
 import pandapower_electrisim
 import grid_code_pq_electrisim
 import grid_code_vq_electrisim
@@ -746,7 +756,10 @@ def simulation():
                 net = pp.create_empty_network()
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
-                response_data = pandapower_electrisim.shortcircuit(net, in_data[x], in_data)
+                export_python = _coerce_export_flag(in_data[x].get('exportPython', False))
+                response_data = pandapower_electrisim.shortcircuit(
+                    net, in_data[x], in_data, export_python=export_python, Busbars=Busbars,
+                )
                 
                 # Check if client accepts gzip compression
                 accept_encoding = request.headers.get('Accept-Encoding', '')
@@ -859,13 +872,15 @@ def simulation():
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 frequency = int(in_data[x].get('frequency', 50))
                 fault_type = in_data[x].get('fault', '3ph')
-                export_open_dss_results = in_data[x].get('exportOpenDSSResults', False)
+                export_open_dss_results = _coerce_export_flag(in_data[x].get('exportOpenDSSResults', False))
+                export_commands = _coerce_export_flag(in_data[x].get('exportCommands', False))
 
                 response_data = opendss_electrisim.shortcircuit(
                     in_data,
                     frequency=frequency,
                     fault_type=fault_type,
-                    export_open_dss_results=export_open_dss_results
+                    export_open_dss_results=export_open_dss_results,
+                    export_commands=export_commands,
                 )
 
                 accept_encoding = request.headers.get('Accept-Encoding', '')

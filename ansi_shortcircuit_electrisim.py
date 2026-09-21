@@ -849,6 +849,15 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
         "device_duties": device_duties,
         "lines_sc": lines_sc,
         "trafos_sc": trafos_sc,
+        "study": "shortcircuit",
+        "engine": "ansi",
+        "study_params": {
+            "fault_type": fault,
+            "frequency_hz": freq_hz,
+            "prefault_v_pu": prefault_v,
+            "contact_parting_cycles": cp_cycles,
+            "standard": "ansi_c37",
+        },
     }
     return json.dumps(result, separators=(",", ":"))
 
