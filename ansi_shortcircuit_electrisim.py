@@ -891,6 +891,81 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
     return json.dumps(result, separators=(",", ":"))
 
 
+def _parse_id_list(text) -> set:
+    if not text:
+        return set()
+    if isinstance(text, list):
+        return {str(x).strip() for x in text if str(x).strip()}
+    return {p.strip() for p in str(text).replace(";", ",").split(",") if p.strip()}
+
+
+def _set_project_out_of_service(net, element_ids) -> None:
+    """Disable loads/gens/sgen/storage matching diagram ids (pre-project case)."""
+    want = _parse_id_list(element_ids)
+    if not want:
+        return
+    for attr in ("load", "gen", "sgen", "storage"):
+        if not hasattr(net, attr):
+            continue
+        df = getattr(net, attr)
+        if df.empty:
+            continue
+        for idx in df.index:
+            lid = str(df.loc[idx, "id"]) if "id" in df.columns else ""
+            name = str(df.loc[idx, "name"])
+            if lid in want or name in want:
+                df.loc[idx, "in_service"] = False
+
+
+def _merge_pre_post_ansi(pre: dict, post: dict) -> dict:
+    pre_by = {str(b.get("id") or b.get("name")): b for b in pre.get("busbars", [])}
+    comparison = []
+    for bus in post.get("busbars", []):
+        key = str(bus.get("id") or bus.get("name"))
+        pb = pre_by.get(key, {})
+        row = {
+            "name": bus.get("userFriendlyName") or bus.get("name"),
+            "id": bus.get("id"),
+            "vn_kv": bus.get("vn_kv"),
+            "fault_type": post.get("fault_type"),
+            "i_first_sym_pre_ka": pb.get("i_first_sym_ka"),
+            "i_first_sym_post_ka": bus.get("i_first_sym_ka"),
+            "i_first_peak_pre_ka": pb.get("i_first_peak_ka"),
+            "i_first_peak_post_ka": bus.get("i_first_peak_ka"),
+            "i_interrupting_pre_ka": pb.get("i_interrupting_ka"),
+            "i_interrupting_post_ka": bus.get("i_interrupting_ka"),
+            "slg_note": "Use i_first_sym for 1ph SLG / NGR sizing at POI" if post.get("fault_type") == "1ph" else "",
+        }
+        comparison.append(row)
+
+    duties_pre = {d.get("name"): d for d in pre.get("device_duties", [])}
+    duty_comparison = []
+    for d in post.get("device_duties", []):
+        pd = duties_pre.get(d.get("name"), {})
+        duty_comparison.append({**d, "pre_duty_interrupting_ka": pd.get("duty_interrupting_ka"), "pre_interrupting_pass": pd.get("interrupting_pass")})
+
+    merged = dict(post)
+    merged["pre_post_comparison"] = True
+    merged["bus_comparison"] = comparison
+    merged["device_duties"] = duty_comparison
+    merged["pre_project"] = {"busbars": pre.get("busbars", []), "device_duties": pre.get("device_duties", [])}
+    return merged
+
+
+def shortcircuit_with_optional_pre_post(net, in_data, in_data_full=None) -> str:
+    compare = str(in_data.get("compare_pre_post", "false")).lower() in ("true", "1", "yes")
+    project_ids = in_data.get("project_element_ids", "")
+    if compare and _parse_id_list(project_ids):
+        from copy import deepcopy
+
+        net_pre = deepcopy(net)
+        _set_project_out_of_service(net_pre, project_ids)
+        pre = json.loads(shortcircuit_ansi(net_pre, {**in_data, "compare_pre_post": "false"}, in_data_full))
+        post = json.loads(shortcircuit_ansi(net, {**in_data, "compare_pre_post": "false"}, in_data_full))
+        return json.dumps(_merge_pre_post_ansi(pre, post), separators=(",", ":"))
+    return shortcircuit_ansi(net, in_data, in_data_full)
+
+
 def shortcircuit(net, in_data, in_data_full=None) -> str:
     """Alias used by app.py routing."""
-    return shortcircuit_ansi(net, in_data, in_data_full)
+    return shortcircuit_with_optional_pre_post(net, in_data, in_data_full)

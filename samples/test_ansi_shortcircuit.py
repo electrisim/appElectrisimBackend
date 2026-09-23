@@ -326,6 +326,36 @@ def test_line_mapping_with_out_of_service_branch():
     print(f"PASS out-of-service mapping: L_LIVE={got:.4f} kA (hand {i_hand:.4f})")
 
 
+def test_pre_post_ansi_delta():
+    """Post-project gen increases fault level vs pre-project out-of-service."""
+    net = pp.create_empty_network(sn_mva=100, f_hz=60)
+    b = pp.create_bus(net, vn_kv=13.8, name="POI")
+    pp.create_ext_grid(net, bus=b, vm_pu=1.0, s_sc_max_mva=500.0, rx_max=0.1, rx_min=0.1)
+    pp.create_gen(
+        net,
+        bus=b,
+        p_mw=0.0,
+        vm_pu=1.0,
+        sn_mva=50.0,
+        vn_kv=13.8,
+        name="Backup_Gen",
+        xdss_pu=0.15,
+        rdss_pu=0.01,
+    )
+    params = dict(PARAMS)
+    params["compare_pre_post"] = "true"
+    params["project_element_ids"] = "Backup_Gen"
+    out = json.loads(ansi_sc.shortcircuit_with_optional_pre_post(net, params))
+    assert out.get("pre_post_comparison") is True
+    cmp_rows = out.get("bus_comparison") or []
+    assert len(cmp_rows) >= 1
+    row = cmp_rows[0]
+    pre = float(row["i_first_sym_pre_ka"])
+    post = float(row["i_first_sym_post_ka"])
+    assert post > pre + 0.01, f"expected post > pre, got pre={pre} post={post}"
+    print(f"PASS pre/post SC delta pre={pre:.3f} post={post:.3f} kA")
+
+
 def test_two_phase_fault_ratio():
     """A line-to-line fault is sqrt(3)/2 of the three-phase value."""
     net = pp.create_empty_network(sn_mva=100, f_hz=60)
@@ -355,5 +385,6 @@ if __name__ == "__main__":
     test_line_peak_within_physical_bound()
     test_transformer_branch_results()
     test_line_mapping_with_out_of_service_branch()
+    test_pre_post_ansi_delta()
     test_two_phase_fault_ratio()
     print("\nAll ANSI short-circuit tests passed.")

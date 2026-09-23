@@ -782,7 +782,9 @@ def simulation():
                 net = pp.create_empty_network()
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
-                response_data = ansi_shortcircuit_electrisim.shortcircuit(net, in_data[x], in_data)
+                response_data = ansi_shortcircuit_electrisim.shortcircuit_with_optional_pre_post(
+                    net, in_data[x], in_data
+                )
 
                 accept_encoding = request.headers.get('Accept-Encoding', '')
                 if 'gzip' in accept_encoding and len(response_data) > 1024:
@@ -976,6 +978,42 @@ def simulation():
                 else:
                     return response_data
             
+            if "DataCenterSiteScreeningPandaPower" in typ:
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                import data_center_site_screening_electrisim
+
+                screening_params = {
+                    'site_load_ids': in_data[x].get('site_load_ids', ''),
+                    'mw_sizes': in_data[x].get('mw_sizes', '300,500,1000'),
+                    'power_factor': in_data[x].get('power_factor', '0.95'),
+                    'include_n11': in_data[x].get('include_n11', 'true'),
+                    'element_type': in_data[x].get('element_type', 'all'),
+                    'voltage_limits': in_data[x].get('voltage_limits', 'true'),
+                    'thermal_limits': in_data[x].get('thermal_limits', 'true'),
+                    'min_vm_pu': in_data[x].get('min_vm_pu', '0.95'),
+                    'max_vm_pu': in_data[x].get('max_vm_pu', '1.05'),
+                    'max_loading_percent': in_data[x].get('max_loading_percent', '100'),
+                }
+
+                net = pp.create_empty_network()
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+
+                response_data = data_center_site_screening_electrisim.site_screening_analysis(
+                    net, screening_params
+                )
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                else:
+                    return response_data
+
             if "ContingencyAnalysisPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')

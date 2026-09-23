@@ -848,6 +848,23 @@ def build_system(
         else:
             warnings.append(f"Line outage target '{toggle_line}' not found; no Toggle applied.")
 
+    toggle_gen = params.get("toggle_gen") or params.get("generator_trip") or ""
+    toggle_gen_t = _sf(params.get("toggle_gen_t"), toggle_t)
+    if toggle_gen:
+        syn_dev = None
+        gm = gen_map.get(toggle_gen)
+        if gm and gm.get("syn_idx"):
+            syn_dev = gm["syn_idx"]
+        else:
+            for gname, ginfo in gen_map.items():
+                if str(gname) == str(toggle_gen) or str(ginfo.get("name")) == str(toggle_gen):
+                    syn_dev = ginfo.get("syn_idx")
+                    break
+        if syn_dev:
+            ss.add("Toggle", idx="Toggle_Gen_1", model="SynGen", dev=syn_dev, t=toggle_gen_t)
+        else:
+            warnings.append(f"Generator trip target '{toggle_gen}' not found; no Toggle applied.")
+
     ss.setup()
 
     meta = {
@@ -1007,6 +1024,70 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             mean_w = np.mean([np.asarray(s["values"], dtype=float) for s in omega], axis=0)
             freq_hz = (mean_w * meta["frequency"]).tolist()
 
+        poi_bus_key = params.get("poi_bus") or params.get("poi_bus_name") or ""
+        poi_v_min = None
+        poi_v_series = None
+        if poi_bus_key and bus_v:
+            for s in bus_v:
+                if s.get("id") == poi_bus_key or s.get("name") == poi_bus_key:
+                    poi_v_series = s.get("values") or []
+                    if poi_v_series:
+                        poi_v_min = min(poi_v_series)
+                    break
+
+        freq_nadir = None
+        freq_settling = None
+        if freq_hz:
+            arr = np.asarray(freq_hz, dtype=float)
+            freq_nadir = float(np.min(arr))
+            if len(arr) > 10:
+                freq_settling = float(arr[-1])
+
+        ride_csv = params.get("ride_through_csv") or ""
+        if not ride_csv:
+            for _, el, typ in _iter_elements(in_data):
+                if not typ.startswith("Load") or typ.startswith("Load DC"):
+                    continue
+                if str(el.get("dc_computational_enabled", "")).lower() in ("true", "1", "yes"):
+                    ride_csv = el.get("dc_ride_through_csv") or "0,0.9\n10,0.9"
+                    break
+        ride_pts = []
+        for line in str(ride_csv).strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.replace(";", ",").split(",")
+            if len(parts) >= 2:
+                ride_pts.append((_sf(parts[0]), _sf(parts[1])))
+        ride_pts.sort(key=lambda p: p[0])
+
+        def _vmin_curve(t_val: float) -> float:
+            if not ride_pts:
+                return 0.0
+            if t_val <= ride_pts[0][0]:
+                return ride_pts[0][1]
+            for i in range(len(ride_pts) - 1):
+                t0, v0 = ride_pts[i]
+                t1, v1 = ride_pts[i + 1]
+                if t0 <= t_val <= t1:
+                    if t1 <= t0:
+                        return v0
+                    return v0 + (v1 - v0) * (t_val - t0) / (t1 - t0)
+            return ride_pts[-1][1]
+
+        ride_pass = None
+        ride_fail_t = None
+        ride_fail_v = None
+        if poi_v_series and ride_pts and t_ds is not None:
+            ride_pass = True
+            for ti, vi in zip(t_ds.tolist(), poi_v_series):
+                vmin = _vmin_curve(float(ti))
+                if float(vi) < vmin - 1e-5:
+                    ride_pass = False
+                    ride_fail_t = float(ti)
+                    ride_fail_v = float(vi)
+                    break
+
         result = {
             "error": False,
             "routine": "tds",
@@ -1031,6 +1112,21 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 "fault_tc": params.get("fault_tc"),
                 "toggle_line": params.get("toggle_line") or params.get("line_outage"),
                 "toggle_t": params.get("toggle_t"),
+                "toggle_gen": params.get("toggle_gen") or params.get("generator_trip"),
+                "toggle_gen_t": params.get("toggle_gen_t"),
+            },
+            "poi_metrics": {
+                "poi_bus": poi_bus_key or None,
+                "v_min_pu": _clean_num(poi_v_min) if poi_v_min is not None else None,
+                "frequency_nadir_hz": _clean_num(freq_nadir) if freq_nadir is not None else None,
+                "frequency_final_hz": _clean_num(freq_settling) if freq_settling is not None else None,
+            },
+            "ride_through": {
+                "enabled": bool(ride_pts),
+                "pass": ride_pass,
+                "fail_time_s": _clean_num(ride_fail_t) if ride_fail_t is not None else None,
+                "fail_voltage_pu": _clean_num(ride_fail_v) if ride_fail_v is not None else None,
+                "curve_points": [{"t_s": a, "v_min_pu": b} for a, b in ride_pts],
             },
         }
         return json.dumps(result)

@@ -2382,6 +2382,185 @@ def _electrisim_enforce_q_lims_kw(net):
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
 
 
+def _electrisim_net_has_facts(net):
+    """True when an in-service FACTS device is present.
+
+    Pandapower solves SSC (STATCOM), SVC, TCSC, and VSC only with algorithm='nr'.
+    """
+    for table in ('svc', 'tcsc', 'ssc', 'vsc', 'b2b_vsc'):
+        df = getattr(net, table, None)
+        if df is None or getattr(df, 'empty', True):
+            continue
+        if 'in_service' in getattr(df, 'columns', []):
+            try:
+                if bool(df.in_service.fillna(False).any()):
+                    return True
+                continue
+            except Exception:
+                return True
+        return True
+    return False
+
+
+def _electrisim_validate_ssc(net):
+    """Reject STATCOM data that pandapower cannot solve, and log the values that were sent.
+
+    The element dialog used to default r, x, voltage setpoint and internal voltage to 0.
+    A coupling reactance of 0 makes the STATCOM admittance infinite, and a voltage setpoint
+    of 0 pu asks Newton-Raphson to collapse the bus. The same network converges with the
+    STATCOM removed because those equations are not in the model.
+    """
+    ssc = getattr(net, 'ssc', None)
+    if ssc is None or ssc.empty:
+        return
+    ext_buses = set()
+    gen_buses = set()
+    try:
+        if hasattr(net, 'ext_grid') and not net.ext_grid.empty and 'bus' in net.ext_grid.columns:
+            ext_buses = set(int(b) for b in net.ext_grid.bus.values)
+    except Exception:
+        ext_buses = set()
+    try:
+        if hasattr(net, 'gen') and not net.gen.empty and 'bus' in net.gen.columns:
+            gens = net.gen
+            if 'in_service' in gens.columns:
+                gens = gens[gens.in_service.fillna(True).astype(bool)]
+            gen_buses = set(int(b) for b in gens.bus.values)
+    except Exception:
+        gen_buses = set()
+
+    problems = []
+    for idx, row in ssc.iterrows():
+        in_service = True
+        if 'in_service' in ssc.columns:
+            try:
+                in_service = bool(row['in_service'])
+            except Exception:
+                in_service = True
+        name = row['name'] if 'name' in ssc.columns else idx
+        try:
+            r_ohm = float(row['r_ohm'])
+            x_ohm = float(row['x_ohm'])
+            set_vm = float(row['set_vm_pu'])
+            vm_int = float(row['vm_internal_pu'])
+        except (TypeError, ValueError, KeyError) as ex:
+            problems.append(f"SSC '{name}': parameters are not numeric ({ex}).")
+            continue
+        bus = None
+        try:
+            bus = int(row['bus'])
+        except Exception:
+            bus = None
+        bus_name = ''
+        if bus is not None and hasattr(net, 'bus') and bus in net.bus.index and 'name' in net.bus.columns:
+            bus_name = str(net.bus.at[bus, 'name'])
+        vn_kv = None
+        x_pu = None
+        try:
+            if bus is not None and bus in net.bus.index:
+                vn_kv = float(net.bus.at[bus, 'vn_kv'])
+                sn_mva = float(getattr(net, 'sn_mva', 1.0) or 1.0)
+                base_z = (vn_kv ** 2) / sn_mva
+                if base_z > 0:
+                    x_pu = x_ohm / base_z
+        except Exception:
+            vn_kv = None
+            x_pu = None
+        # powerflow() redirects stdout/stderr into a buffer, so write to the real console.
+        try:
+            sys.__stderr__.write(
+                f"SSC '{name}' bus={bus_name or bus} vn_kv={vn_kv}: r_ohm={r_ohm}, x_ohm={x_ohm}, "
+                f"x_pu={None if x_pu is None else round(x_pu, 6)}, set_vm_pu={set_vm}, "
+                f"vm_internal_pu={vm_int}, in_service={in_service}\n"
+            )
+            sys.__stderr__.flush()
+        except Exception:
+            pass
+        if not in_service:
+            continue
+        if abs(x_ohm) < 1e-9 and abs(r_ohm) < 1e-9:
+            problems.append(
+                f"SSC '{name}': coupling impedance is 0 Ω (r_ohm={r_ohm}, x_ohm={x_ohm}). "
+                "Set the coupling reactance x_ohm above 0. Pandapower divides by r + jx, "
+                "so 0 Ω makes the STATCOM admittance infinite and Newton-Raphson cannot converge."
+            )
+        elif abs(x_ohm) < 1e-9:
+            problems.append(
+                f"SSC '{name}': coupling reactance x_ohm is 0. Set x_ohm above 0 Ω."
+            )
+        if set_vm <= 0:
+            problems.append(
+                f"SSC '{name}': voltage setpoint set_vm_pu is {set_vm}. "
+                "Use a setpoint near 1.0 pu. A value of 0 asks the STATCOM to hold the bus at 0 pu, "
+                "which cannot be solved at normal generation levels."
+            )
+        if vm_int <= 0:
+            replacement = set_vm if set_vm > 0 else 1.0
+            net.ssc.at[idx, 'vm_internal_pu'] = replacement
+            print(
+                f"SSC '{name}': internal voltage was {vm_int} pu; "
+                f"using {replacement} pu as the Newton-Raphson starting value. The voltage setpoint is unchanged."
+            )
+        if bus is not None and bus in ext_buses:
+            problems.append(
+                f"SSC '{name}' is connected to external-grid bus '{bus_name or bus}'. "
+                "Pandapower cannot voltage-control a slack bus. Connect the STATCOM to a load or collector bus."
+            )
+        elif bus is not None and bus in gen_buses:
+            problems.append(
+                f"SSC '{name}' is connected to generator bus '{bus_name or bus}'. "
+                "Pandapower cannot put a STATCOM on a bus that already has a generator voltage setpoint. "
+                "Connect it to a PQ bus."
+            )
+    if problems:
+        raise ValueError("STATCOM (SSC) cannot be solved. " + " ".join(problems))
+
+
+def _electrisim_diagnose_ssc_failure(net, calculate_voltage_angles=True):
+    """After an SSC net fails Newton-Raphson, re-solve with the STATCOM out of service.
+
+    The comparison separates "the STATCOM setpoint is unreachable" from "the network itself
+    does not solve", and reports the voltage each STATCOM would have to move.
+    """
+    lines = []
+    ssc = getattr(net, 'ssc', None)
+    if ssc is None or ssc.empty:
+        return ''
+    try:
+        probe = deepcopy(net)
+        probe.ssc['in_service'] = False
+        pp.runpp(probe, algorithm='nr', calculate_voltage_angles=calculate_voltage_angles,
+                 init='auto', max_iteration=100)
+    except Exception as ex:
+        lines.append(
+            f"Without the STATCOM the network also fails Newton-Raphson ({type(ex).__name__}), "
+            "so the STATCOM is not the only problem."
+        )
+        probe = None
+    if probe is not None:
+        lines.append("Without the STATCOM the network converges.")
+        for idx, row in ssc.iterrows():
+            try:
+                bus = int(row['bus'])
+                vm = float(probe.res_bus.at[bus, 'vm_pu'])
+                set_vm = float(row['set_vm_pu'])
+                bus_label = str(net.bus.at[bus, 'name']) if 'name' in net.bus.columns else bus
+                lines.append(
+                    f"STATCOM '{row.get('name')}' at bus '{bus_label}': the bus settles at "
+                    f"{vm:.4f} pu on its own, and the STATCOM is set to hold {set_vm:.4f} pu "
+                    f"(gap {vm - set_vm:+.4f} pu)."
+                )
+            except Exception:
+                continue
+    msg = ' '.join(lines)
+    try:
+        sys.__stderr__.write('[SSC diagnosis] ' + msg + '\n')
+        sys.__stderr__.flush()
+    except Exception:
+        pass
+    return msg
+
+
 def _ensure_shunt_characteristic_table(net):
     """Ensure pandapower net has net.shunt_characteristic_table DataFrame for step-dependent shunts."""
     if "shunt_characteristic_table" not in net or net["shunt_characteristic_table"] is None:
@@ -5384,6 +5563,18 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 attach_3w = rc3 and bool(tc3_list)
                 attach_sh_disc = rcs and bool(shunt_ctrl_list)
                 attach_lf_sh = rcs and bool(lf_shunt_list)
+                # BinarySearchControl writes straight into net.sgen.q_mvar, and attaching the park
+                # controllers already runs a power flow. Snapshot the diagram/capability-curve Q
+                # first: pandapower's enforce_q_lims only bounds net.gen, so a controller that fails
+                # to settle can leave net.sgen.q_mvar far outside the machine capability curve and
+                # every later solve attempt would inherit those values.
+                initial_sgen_q = {}
+                try:
+                    if hasattr(net, 'sgen') and not net.sgen.empty and 'q_mvar' in net.sgen.columns:
+                        initial_sgen_q = {int(i): float(net.sgen.at[i, 'q_mvar']) for i in net.sgen.index}
+                except Exception:
+                    initial_sgen_q = {}
+
                 # ParkController is an explicit diagram element with its own enable toggle, so it is
                 # not gated on the run_control_* checkboxes (those cover tap/shunt control only).
                 park_attached = 0
@@ -5535,8 +5726,21 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             net.shunt.at[si, 'step'] = s0
                         except Exception:
                             pass
+                    for si, q0 in initial_sgen_q.items():
+                        try:
+                            net.sgen.at[si, 'q_mvar'] = q0
+                        except Exception:
+                            pass
 
                 pf_kwargs = _electrisim_enforce_q_lims_kw(net)
+                facts_present = _electrisim_net_has_facts(net)
+                if facts_present and str(algorithm) != 'nr':
+                    raise NotImplementedError(
+                        "The STATCOM (SSC) and other FACTS devices require the Newton-Raphson algorithm. "
+                        f"Selected algorithm: '{algorithm}'."
+                    )
+                if facts_present:
+                    _electrisim_validate_ssc(net)
 
                 # A heavily compensated cable network needs more than the 10 Newton iterations
                 # pandapower allows by default, so work through progressively more robust solver
@@ -5558,11 +5762,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                      {'algorithm': algorithm, 'init': 'flat', 'max_iteration': 100}, False)
                 )
                 # Iwamoto's step-size multiplier is built for ill-conditioned cases that plain
-                # Newton-Raphson overshoots.
-                solve_plans.append(
-                    ("iwamoto_nr, init=flat, max_iteration=100",
-                     {'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 100}, False)
-                )
+                # Newton-Raphson overshoots. Pandapower implements FACTS only for algorithm='nr',
+                # so an in-service STATCOM/SSC stays on Newton-Raphson.
+                if not facts_present:
+                    solve_plans.append(
+                        ("iwamoto_nr, init=flat, max_iteration=100",
+                         {'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 100}, False)
+                    )
 
                 pf_plan_used = None
                 pf_last_error = None
@@ -5587,14 +5793,74 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         print(f"Power flow attempt failed [{detail}]")
 
                 if pf_plan_used is None:
+                    if facts_present and pf_attempt_log:
+                        ssc_desc = ""
+                        ssc_df = getattr(net, 'ssc', None)
+                        if ssc_df is not None and not ssc_df.empty:
+                            bits = []
+                            for _, srow in ssc_df.iterrows():
+                                bits.append(
+                                    f"{srow.get('name')}: r_ohm={srow.get('r_ohm')} x_ohm={srow.get('x_ohm')} "
+                                    f"set_vm_pu={srow.get('set_vm_pu')} vm_internal_pu={srow.get('vm_internal_pu')} "
+                                    f"bus={srow.get('bus')}"
+                                )
+                            ssc_desc = " SSC data: " + "; ".join(bits) + "."
+                        ssc_diag = _electrisim_diagnose_ssc_failure(net, calculate_voltage_angles)
+                        raise RuntimeError(
+                            "Load flow with the STATCOM (SSC) did not converge with Newton-Raphson. "
+                            "FACTS devices stay on Newton-Raphson. "
+                            "Attempts: " + " | ".join(pf_attempt_log) + "." + ssc_desc +
+                            (" " + ssc_diag if ssc_diag else "")
+                        ) from pf_last_error
                     raise pf_last_error
+
+                # A park controller that never settled leaves machines outside their capability
+                # curve; report it instead of returning those values as a valid operating point.
+                park_q_violations = []
+                try:
+                    if park_attached and hasattr(net, 'sgen') and not net.sgen.empty:
+                        for si in net.sgen.index:
+                            q = float(net.sgen.at[si, 'q_mvar'])
+                            q_mi = net.sgen.at[si, 'min_q_mvar'] if 'min_q_mvar' in net.sgen.columns else None
+                            q_ma = net.sgen.at[si, 'max_q_mvar'] if 'max_q_mvar' in net.sgen.columns else None
+                            if q_mi is None or q_ma is None or q_mi != q_mi or q_ma != q_ma:
+                                continue
+                            # Voltage-dependent curves shift by a few kVAr between the setpoint
+                            # evaluation and the solved voltage. Only flag a real excursion.
+                            q_tol = max(0.05, 0.02 * max(abs(float(q_mi)), abs(float(q_ma)), 1.0))
+                            if q < float(q_mi) - q_tol or q > float(q_ma) + q_tol:
+                                sname = net.sgen.at[si, 'name'] if 'name' in net.sgen.columns else si
+                                ufn = getattr(net, 'user_friendly_names', {}) or {}
+                                park_q_violations.append(
+                                    f"{ufn.get(sname, sname)}: {q:.3f} Mvar "
+                                    f"(curve allows {float(q_mi):.3f} to {float(q_ma):.3f})"
+                                )
+                except Exception:
+                    park_q_violations = []
+                if park_q_violations:
+                    msg = (
+                        "The Park controller drove static generators outside their reactive capability "
+                        "curve: " + "; ".join(park_q_violations) + ". The controller could not reach its "
+                        "setpoint, most often because another voltage-controlling element (STATCOM/SSC, "
+                        "generator, or tap changer) regulates the same bus. Results are not a valid "
+                        "operating point until the controller setpoint or the machine capability is changed."
+                    )
+                    print(msg)
+                    controller_fallback_warning = (
+                        msg if not controller_fallback_warning
+                        else controller_fallback_warning + " " + msg
+                    )
 
                 if pf_plan_used != solve_plans[0][0]:
                     print(f"Power flow converged with fallback settings [{pf_plan_used}]")
-                    controller_fallback_warning = (
+                    fallback_msg = (
                         f"Load flow did not converge with the requested settings ({requested_label}) "
                         f"and succeeded with [{pf_plan_used}]. Failed attempts: "
                         + " | ".join(pf_attempt_log)
+                    )
+                    controller_fallback_warning = (
+                        fallback_msg if not controller_fallback_warning
+                        else controller_fallback_warning + " " + fallback_msg
                     )
                 
                 # Check if tap positions changed
@@ -12565,6 +12831,8 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
             {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
             {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
         ]
+    if _electrisim_net_has_facts(net_pf):
+        strategies = [s for s in strategies if s['algorithm'] == 'nr']
     for s in strategies:
         algo = s['algorithm']
         try:
