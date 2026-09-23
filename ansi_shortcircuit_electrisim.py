@@ -26,6 +26,12 @@ from pandapower.pypower.idx_bus_sc import C_MAX, C_MIN
 from pandapower.pypower.idx_brch_sc import K_T, K_ST
 from pandapower.shortcircuit.impedance import _calc_ybus, _calc_zbus
 
+from sc_fault_location import (
+    collect_fault_bus_refs,
+    normalize_fault_bus_mode,
+    resolve_pp_fault_bus_indices,
+)
+
 try:
     from pandapower.pf.makeYbus_numba import makeYbus
 except ImportError:
@@ -450,6 +456,7 @@ def _branch_currents_ka(
     prefault_v: float,
     r_fault_ohm: float,
     x_fault_ohm: float,
+    fault_ppc_indices: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Worst-case branch end currents in kA, per ppci branch row.
 
@@ -489,7 +496,12 @@ def _branch_currents_ka(
     max_t = np.zeros(n_br)
     v0 = np.full(n_bus, prefault_v, dtype=np.complex128)
 
-    for f in range(n_bus):
+    if fault_ppc_indices is None:
+        fault_iter = range(n_bus)
+    else:
+        fault_iter = [int(i) for i in fault_ppc_indices if 0 <= int(i) < n_bus]
+
+    for f in fault_iter:
         z_ff = zbus[f, f]
         if z_extra != 0:
             z_ff = z_ff + z_extra / base_z[f]
@@ -641,6 +653,7 @@ def _solve_network(
     r_fault_ohm: float,
     x_fault_ohm: float,
     gen_meta: Dict[int, dict],
+    fault_pp_buses: Optional[List[int]] = None,
 ) -> Dict[str, dict]:
     """Solve one ANSI network.
 
@@ -671,7 +684,16 @@ def _solve_network(
     lines: Dict[int, Tuple[float, float]] = {}
     trafos: Dict[int, Tuple[float, float]] = {}
     if fault != "1ph":
-        i_f, i_t = _branch_currents_ka(ppci, fault, prefault_v, r_fault_ohm, x_fault_ohm)
+        fault_ppc = None
+        if fault_pp_buses is not None:
+            fault_ppc = []
+            for b in fault_pp_buses:
+                ppc_b = _ppc_bus(work, int(b))
+                if ppc_b is not None:
+                    fault_ppc.append(ppc_b)
+        i_f, i_t = _branch_currents_ka(
+            ppci, fault, prefault_v, r_fault_ohm, x_fault_ohm, fault_ppc_indices=fault_ppc
+        )
         for element, target in (("line", lines), ("trafo", trafos)):
             for elm_idx, row in _ppci_branch_rows(work, ppci, element).items():
                 if row < len(i_f):
@@ -760,11 +782,13 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
     cp_cycles = _f(in_data.get("contact_parting_cycles", 3), 3.0)
     r_fault = _f(in_data.get("r_fault_ohm", 0), 0.0)
     x_fault = _f(in_data.get("x_fault_ohm", 0), 0.0)
+    fault_bus_mode = normalize_fault_bus_mode(in_data)
+    fault_pp_buses = resolve_pp_fault_bus_indices(net, in_data)
 
     gen_meta: Dict[int, dict] = {}
-    sol_first = _solve_network(net, NETWORK_FIRST, fault, prefault_v, r_fault, x_fault, gen_meta)
-    sol_int = _solve_network(net, NETWORK_INT, fault, prefault_v, r_fault, x_fault, gen_meta)
-    sol_30 = _solve_network(net, NETWORK_30, fault, prefault_v, r_fault, x_fault, gen_meta)
+    sol_first = _solve_network(net, NETWORK_FIRST, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
+    sol_int = _solve_network(net, NETWORK_INT, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
+    sol_30 = _solve_network(net, NETWORK_30, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
     rx_first, rx_int, rx_30 = sol_first["bus"], sol_int["bus"], sol_30["bus"]
 
     busbar_list = []
@@ -772,6 +796,8 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
 
     for bus_idx in net.bus[net.bus.in_service].index:
         bi = int(bus_idx)
+        if fault_pp_buses is not None and bi not in fault_pp_buses:
+            continue
         if bi not in rx_first:
             continue
         i_fc_sym, r_ohm, x_ohm = rx_first[bi]
@@ -853,6 +879,9 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
         "engine": "ansi",
         "study_params": {
             "fault_type": fault,
+            "fault_bus_mode": fault_bus_mode,
+            "fault_bus_ids": collect_fault_bus_refs(in_data) if fault_bus_mode == "selection" else [],
+            "fault_bus_names": list(in_data.get("fault_bus_names") or []) if fault_bus_mode == "selection" else [],
             "frequency_hz": freq_hz,
             "prefault_v_pu": prefault_v,
             "contact_parting_cycles": cp_cycles,

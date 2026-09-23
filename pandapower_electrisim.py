@@ -19,6 +19,11 @@ from copy import deepcopy
 import weakref
 
 from storage_q_capability import resolve_storage_pq
+from sc_fault_location import (
+    collect_fault_bus_refs,
+    normalize_fault_bus_mode,
+    resolve_pp_fault_bus_indices,
+)
 
 
 Busbars = {}
@@ -1572,6 +1577,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         tk_s = float(sc.get('tk_s', 1.0))
         r_fault_ohm = float(sc.get('r_fault_ohm', 0.0))
         x_fault_ohm = float(sc.get('x_fault_ohm', 0.0))
+        sc_bus = resolve_pp_fault_bus_indices(net, sc, Busbars)
+        if sc_bus is not None and len(sc_bus) == 1:
+            sc_bus = sc_bus[0]
         lines.append("# Short-circuit calculation (matches Electrisim IEC 60909 run)")
         if not net.sgen.empty:
             lines.append('net.sgen["k"] = 1.1')
@@ -1580,7 +1588,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         lines.append("    net,")
         lines.append(f"    fault={fault_type!r},")
         lines.append(f"    case={fault_location!r},")
-        lines.append("    bus=None,")
+        lines.append(f"    bus={_export_py_literal(sc_bus)},")
         lines.append("    ip=True,")
         lines.append("    ith=True,")
         lines.append(f"    tk_s={tk_s},")
@@ -7332,15 +7340,10 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
     # According to Pandapower docs: fault=fault_type, case=calculation_case
     fault_type = in_data.get('fault_type', '3ph')  # Frontend 'fault_type' becomes pandapower 'fault'
     fault_location = in_data.get('fault_location', 'max')  # Frontend 'fault_location' becomes pandapower 'case'
-    
-    # Convert fault_location to bus index for bus parameter (if needed)
-    if isinstance(fault_location, str) and fault_location.isdigit():
-        bus = int(fault_location)
-    elif isinstance(fault_location, str) and fault_location in ['max', 'min']:
-        # If it's 'max' or 'min', use None (calculate for all buses)
-        bus = None
-    else:
-        bus = None  # Default to None (calculate for all buses)
+    fault_bus_mode = normalize_fault_bus_mode(in_data)
+    bus = resolve_pp_fault_bus_indices(net, in_data, Busbars)
+    if bus is not None and len(bus) == 1:
+        bus = bus[0]
     
     # Get other parameters
     lv_tol_percent = int(in_data.get('fault_impedance', 10))  # Frontend 'fault_impedance' becomes 'lv_tol_percent'
@@ -7702,6 +7705,9 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
     result['study_params'] = {
         'fault_type': fault_type,
         'fault_location': fault_location,
+        'fault_bus_mode': fault_bus_mode,
+        'fault_bus_ids': collect_fault_bus_refs(in_data) if fault_bus_mode == 'selection' else [],
+        'fault_bus_names': list(in_data.get('fault_bus_names') or []) if fault_bus_mode == 'selection' else [],
         'tk_s': tk_s,
         'r_fault_ohm': r_fault_ohm,
         'x_fault_ohm': x_fault_ohm,

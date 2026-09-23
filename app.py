@@ -881,6 +881,9 @@ def simulation():
                     fault_type=fault_type,
                     export_open_dss_results=export_open_dss_results,
                     export_commands=export_commands,
+                    fault_bus_mode=in_data[x].get('fault_bus_mode', 'all'),
+                    fault_bus_ids=in_data[x].get('fault_bus_ids') or [],
+                    fault_bus_names=in_data[x].get('fault_bus_names') or [],
                 )
 
                 accept_encoding = request.headers.get('Accept-Encoding', '')

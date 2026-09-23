@@ -10,6 +10,11 @@ from storage_q_capability import (
     interp_storage_pq_limits,
     _truthy as _storage_qcap_truthy,
 )
+from sc_fault_location import (
+    collect_fault_bus_refs,
+    filter_bus_result_rows,
+    normalize_fault_bus_mode,
+)
 
 # Output classes for OpenDSS results (similar to pandapower_electrisim.py structure)
 class BusbarOut(object):
@@ -4060,7 +4065,8 @@ def _opendss_any_bus_isc_ready(dss_mod, min_amp=1.0):
     return False
 
 
-def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_results=False, export_commands=False):
+def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_results=False, export_commands=False,
+                 fault_bus_mode='all', fault_bus_ids=None, fault_bus_names=None):
     """OpenDSS fault study / short circuit analysis.
 
     Builds the circuit from in_data (same as powerflow), sets Solution.Mode to FaultStudy,
@@ -4220,12 +4226,35 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             busbarList = _collect_bus_sc()
             break
 
+    sc_params = {
+        "fault_bus_mode": fault_bus_mode,
+        "fault_bus_ids": fault_bus_ids or [],
+        "fault_bus_names": fault_bus_names or [],
+    }
+    mode = normalize_fault_bus_mode(sc_params)
+    bus_rows = [vars(b) for b in busbarList]
+    if mode == "selection":
+        if not collect_fault_bus_refs(sc_params):
+            raise ValueError(
+                "Fault location is User Selection, but no busbars were selected. "
+                "Select one or more busbars on the diagram or in the Short Circuit dialog."
+            )
+        bus_rows = filter_bus_result_rows(bus_rows, sc_params)
+        if not bus_rows:
+            raise ValueError(
+                "Fault location is User Selection, but none of the selected busbars "
+                "could be matched to the OpenDSS circuit."
+            )
+
     result = {
-        "busbars": [vars(b) for b in busbarList],
+        "busbars": bus_rows,
         "study": "shortcircuit",
         "engine": "opendss",
         "study_params": {
             "fault_type": fault_type,
+            "fault_bus_mode": mode,
+            "fault_bus_ids": collect_fault_bus_refs(sc_params) if mode == "selection" else [],
+            "fault_bus_names": list(sc_params.get("fault_bus_names") or []) if mode == "selection" else [],
             "frequency_hz": f,
             "standard": "opendss_fault_study",
         },
