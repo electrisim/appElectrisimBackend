@@ -78,6 +78,11 @@ def _set_load_mw(net, load_idx: int, p_mw: float, power_factor: float) -> None:
     net.load.loc[load_idx, "q_mvar"] = max(q, 0.0)
 
 
+def _named(net, table, idx):
+    raw = str(table.loc[idx, "name"]) if "name" in table.columns else str(idx)
+    return raw, _contingency_friendly_name(net, raw)
+
+
 def _count_violations(
     net,
     voltage_limits: bool,
@@ -85,25 +90,115 @@ def _count_violations(
     min_vm_pu: float,
     max_vm_pu: float,
     max_loading_percent: float,
-) -> Tuple[int, List[str]]:
+) -> Tuple[int, List[Dict[str, Any]]]:
     violations = []
-    if voltage_limits:
+    if voltage_limits and hasattr(net, "res_bus") and not net.res_bus.empty:
         bad = net.res_bus[(net.res_bus.vm_pu < min_vm_pu) | (net.res_bus.vm_pu > max_vm_pu)]
         for bus_idx, row in bad.iterrows():
-            nm = _contingency_friendly_name(net, net.bus.loc[bus_idx, "name"])
-            violations.append(f"Bus_{nm}:{row.vm_pu:.3f}pu")
+            raw, nm = _named(net, net.bus, bus_idx)
+            vm = float(row.vm_pu)
+            violations.append({
+                "kind": "Bus",
+                "id": raw,
+                "name": nm,
+                "text": f"{vm:.3f} pu",
+                "limit": f"{min_vm_pu:.2f}–{max_vm_pu:.2f} pu",
+            })
     if thermal_limits:
-        if not net.res_line.empty:
+        if hasattr(net, "res_line") and not net.res_line.empty:
             ol = net.res_line[net.res_line.loading_percent > max_loading_percent]
             for li, row in ol.iterrows():
-                nm = _contingency_friendly_name(net, net.line.loc[li, "name"])
-                violations.append(f"Line_{nm}:{row.loading_percent:.1f}%")
-        if not net.res_trafo.empty:
+                raw, nm = _named(net, net.line, li)
+                ld = float(row.loading_percent)
+                violations.append({
+                    "kind": "Line",
+                    "id": raw,
+                    "name": nm,
+                    "text": f"{ld:.1f}% loaded",
+                    "limit": f"{max_loading_percent:.0f}%",
+                })
+        if hasattr(net, "res_trafo") and not net.res_trafo.empty:
             ot = net.res_trafo[net.res_trafo.loading_percent > max_loading_percent]
             for ti, row in ot.iterrows():
-                nm = _contingency_friendly_name(net, net.trafo.loc[ti, "name"])
-                violations.append(f"Trafo_{nm}:{row.loading_percent:.1f}%")
+                raw, nm = _named(net, net.trafo, ti)
+                ld = float(row.loading_percent)
+                violations.append({
+                    "kind": "Transformer",
+                    "id": raw,
+                    "name": nm,
+                    "text": f"{ld:.1f}% loaded",
+                    "limit": f"{max_loading_percent:.0f}%",
+                })
     return len(violations), violations
+
+
+def _site_marker(net, load_idx) -> Dict[str, Any]:
+    raw, nm = _named(net, net.load, load_idx)
+    p = float(net.load.at[load_idx, "p_mw"]) if "p_mw" in net.load.columns else 0.0
+    q = float(net.load.at[load_idx, "q_mvar"]) if "q_mvar" in net.load.columns else 0.0
+    return {"id": raw, "name": nm, "p_mw": round(p, 3), "q_mvar": round(q, 3)}
+
+
+def _dashboard_snapshot(net, title: str, site_load: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Compact load-flow payload for the Network Health Dashboard."""
+    buses, lines, trafos, loads, gens = [], [], [], [], []
+
+    def fnum(row, key):
+        try:
+            v = float(row[key])
+        except Exception:
+            return None
+        if not math.isfinite(v):
+            return None
+        return round(v, 4)
+
+    if hasattr(net, "res_bus") and not net.res_bus.empty:
+        for idx, row in net.res_bus.iterrows():
+            raw, nm = _named(net, net.bus, idx)
+            buses.append({"id": raw, "name": nm, "vm_pu": fnum(row, "vm_pu"), "p_mw": fnum(row, "p_mw") or 0})
+    if hasattr(net, "res_line") and not net.res_line.empty:
+        for idx, row in net.res_line.iterrows():
+            raw, nm = _named(net, net.line, idx)
+            lines.append({
+                "id": raw,
+                "name": nm,
+                "loading_percent": fnum(row, "loading_percent"),
+                "p_from_mw": fnum(row, "p_from_mw"),
+                "pl_mw": fnum(row, "pl_mw"),
+            })
+    if hasattr(net, "res_trafo") and not net.res_trafo.empty:
+        for idx, row in net.res_trafo.iterrows():
+            raw, nm = _named(net, net.trafo, idx)
+            trafos.append({
+                "id": raw,
+                "name": nm,
+                "loading_percent": fnum(row, "loading_percent"),
+                "p_hv_mw": fnum(row, "p_hv_mw"),
+                "pl_mw": fnum(row, "pl_mw"),
+            })
+    if hasattr(net, "res_load") and not net.res_load.empty:
+        for idx, row in net.res_load.iterrows():
+            raw, nm = _named(net, net.load, idx)
+            loads.append({"id": raw, "name": nm, "p_mw": fnum(row, "p_mw") or 0, "q_mvar": fnum(row, "q_mvar") or 0})
+    if hasattr(net, "res_gen") and not net.res_gen.empty:
+        for idx, row in net.res_gen.iterrows():
+            raw, nm = _named(net, net.gen, idx)
+            gens.append({"id": raw, "name": nm, "p_mw": fnum(row, "p_mw") or 0})
+    ext = []
+    if hasattr(net, "res_ext_grid") and not net.res_ext_grid.empty:
+        for idx, row in net.res_ext_grid.iterrows():
+            raw, nm = _named(net, net.ext_grid, idx)
+            ext.append({"id": raw, "name": nm, "p_mw": fnum(row, "p_mw") or 0})
+    return {
+        "study_label": title,
+        "busbars": buses,
+        "lines": lines,
+        "transformers": trafos,
+        "loads": loads,
+        "generators": gens,
+        "externalgrids": ext,
+        "site_load": site_load,
+    }
 
 
 def _run_pf(net) -> bool:
@@ -237,9 +332,12 @@ def _run_contingency_batch(
     cases: List[Dict[str, Any]],
     limits: Dict[str, Any],
     on_step=None,
-) -> Tuple[int, str, int]:
+    site_load: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str, int, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     worst = 0
     worst_name = ""
+    worst_details: List[Dict[str, Any]] = []
+    worst_snap = None
     failed = 0
     total = len(cases)
     for i, case in enumerate(cases, 1):
@@ -254,11 +352,13 @@ def _run_contingency_batch(
         if not _run_pf(net_c):
             failed += 1
             continue
-        n_v, _ = _count_violations(net_c, **limits)
+        n_v, details = _count_violations(net_c, **limits)
         if n_v > worst:
             worst = n_v
             worst_name = case.get("name", "")
-    return worst, worst_name, failed
+            worst_details = details
+            worst_snap = _dashboard_snapshot(net_c, worst_name or "Contingency", site_load)
+    return worst, worst_name, failed, worst_details, worst_snap
 
 
 def site_screening_analysis(net, params: Dict[str, Any]) -> str:
@@ -323,8 +423,11 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                 net0.load.loc[idx, "p_mw"] = 0.0
                 net0.load.loc[idx, "q_mvar"] = 0.0
             base_violations = 0
+            base_details: List[Dict[str, Any]] = []
+            base_snap = None
             if _run_pf(net0):
-                base_violations, _ = _count_violations(net0, **limits)
+                base_violations, base_details = _count_violations(net0, **limits)
+                base_snap = _dashboard_snapshot(net0, f"{site_name} — intact system, 0 MW", _site_marker(net0, load_idx))
 
             for mw in mw_sizes:
                 label = f"{site_name} · {mw:g} MW"
@@ -350,6 +453,15 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                             "n11_failed_cases": 0,
                             "upgrade_likely": True,
                             "notes": "Base load flow did not converge at requested MW.",
+                            "base_violation_details": base_details,
+                            "base_snapshot": base_snap,
+                            "case_violations": -1,
+                            "case_violation_details": [],
+                            "case_snapshot": None,
+                            "n1_violation_details": [],
+                            "n1_snapshot": None,
+                            "n11_violation_details": [],
+                            "n11_snapshot": None,
                         }
                     )
                     continue
@@ -358,16 +470,21 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                     net, load_idx, load_indices, load_snapshot, power_factor, limits,
                     on_step=lambda i, n, label=label: _progress(params, f"{label} — headroom {i}/{n}"),
                 )
-                w_n1, n1_name, n1_fail = _run_contingency_batch(
+                case_n, case_details = _count_violations(net_case, **limits)
+                case_snap = _dashboard_snapshot(net_case, f"{label} — intact", _site_marker(net_case, load_idx))
+                site_mark = _site_marker(net_case, load_idx)
+                w_n1, n1_name, n1_fail, n1_details, n1_snap = _run_contingency_batch(
                     net_case, n1_cases, limits,
                     on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1 {i}/{n}"),
+                    site_load=site_mark,
                 )
-                w_n11, n11_name, n11_fail = (
+                w_n11, n11_name, n11_fail, n11_details, n11_snap = (
                     _run_contingency_batch(
                         net_case, n11_cases, limits,
                         on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1-1 {i}/{n}"),
+                        site_load=site_mark,
                     )
-                    if n11_cases else (0, "", 0)
+                    if n11_cases else (0, "", 0, [], None)
                 )
                 _progress(params, f"{label} — headroom {headroom:g} MW")
 
@@ -390,6 +507,15 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                         "n11_failed_cases": n11_fail,
                         "upgrade_likely": upgrade,
                         "notes": "",
+                        "base_violation_details": base_details,
+                        "base_snapshot": base_snap,
+                        "case_violations": case_n,
+                        "case_violation_details": case_details,
+                        "case_snapshot": case_snap,
+                        "n1_violation_details": n1_details,
+                        "n1_snapshot": n1_snap,
+                        "n11_violation_details": n11_details,
+                        "n11_snapshot": n11_snap,
                     }
                 )
 
@@ -406,6 +532,7 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
         return json.dumps(
             {"study": "data_center_site_screening", "summary": summary, "screening_results": rows},
             default=_json_serialize_default,
+            allow_nan=False,
             separators=(",", ":"),
         )
     except SiteScreeningCancelled:
