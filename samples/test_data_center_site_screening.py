@@ -85,6 +85,19 @@ def test_screening_json_shape():
     data = json.loads(raw)
     assert "screening_results" in data
     assert len(data["screening_results"]) == 2
+    notes = []
+    dcs.site_screening_analysis(
+        net,
+        {
+            "site_load_ids": "load_site_1",
+            "mw_sizes": "5",
+            "include_n11": "false",
+            "power_factor": "0.95",
+            "_progress_callback": notes.append,
+        },
+    )
+    assert any("N-1" in m for m in notes)
+    assert any("headroom" in m for m in notes)
     row = data["screening_results"][0]
     assert "headroom_mw" in row and "upgrade_likely" in row
 

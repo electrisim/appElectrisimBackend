@@ -994,14 +994,85 @@ def simulation():
                     'max_vm_pu': in_data[x].get('max_vm_pu', '1.05'),
                     'max_loading_percent': in_data[x].get('max_loading_percent', '100'),
                 }
+                use_stream = in_data[x].get('rpc_stream') in (True, 'true', '1', 1, 'yes')
 
-                net = pp.create_empty_network()
-                Busbars = pandapower_electrisim.create_busbars(in_data, net)
-                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                def _run_site_screening(progress_cb=None, cancel_event=None):
+                    if progress_cb:
+                        progress_cb('Building network model…')
+                    net = pp.create_empty_network()
+                    Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                    pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                    if progress_cb:
+                        progress_cb('Network model ready.')
+                    rp = dict(screening_params)
+                    if progress_cb:
+                        rp['_progress_callback'] = progress_cb
+                    if cancel_event is not None:
+                        rp['_cancel_event'] = cancel_event
+                    return data_center_site_screening_electrisim.site_screening_analysis(net, rp)
 
-                response_data = data_center_site_screening_electrisim.site_screening_analysis(
-                    net, screening_params
-                )
+                if use_stream:
+                    def _site_ndjson_stream():
+                        q = queue.Queue()
+                        cancel_event = threading.Event()
+
+                        def _progress_cb(msg):
+                            if cancel_event.is_set():
+                                raise data_center_site_screening_electrisim.SiteScreeningCancelled('Stopped by user')
+                            q.put(('p', msg))
+
+                        def _worker():
+                            try:
+                                out = _run_site_screening(_progress_cb, cancel_event)
+                                q.put(('d', out))
+                            except data_center_site_screening_electrisim.SiteScreeningCancelled:
+                                q.put(('c', 'Stopped by user'))
+                            except Exception as ex:
+                                q.put(('e', str(ex)))
+
+                        threading.Thread(target=_worker, daemon=True).start()
+                        try:
+                            while True:
+                                try:
+                                    kind, payload = q.get(timeout=10)
+                                except queue.Empty:
+                                    if cancel_event.is_set():
+                                        yield json.dumps({'type': 'cancelled', 'message': 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                        break
+                                    yield json.dumps({'type': 'heartbeat'}, ensure_ascii=False) + '\n'
+                                    continue
+                                if kind == 'p':
+                                    yield json.dumps({'type': 'progress', 'message': payload}, ensure_ascii=False) + '\n'
+                                elif kind == 'd':
+                                    raw = payload if isinstance(payload, str) else json.dumps(payload)
+                                    try:
+                                        obj = json.loads(raw)
+                                    except Exception:
+                                        yield json.dumps({'type': 'error', 'message': 'Invalid study JSON'}, ensure_ascii=False) + '\n'
+                                        break
+                                    if isinstance(obj, dict) and obj.get('error'):
+                                        yield json.dumps({'type': 'error', 'message': obj['error']}, ensure_ascii=False) + '\n'
+                                        break
+                                    yield json.dumps({'type': 'result', 'data': obj}, ensure_ascii=False, separators=(',', ':')) + '\n'
+                                    break
+                                elif kind == 'c':
+                                    yield json.dumps({'type': 'cancelled', 'message': payload or 'Stopped by user'}, ensure_ascii=False) + '\n'
+                                    break
+                                elif kind == 'e':
+                                    yield json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False) + '\n'
+                                    break
+                        except GeneratorExit:
+                            cancel_event.set()
+
+                    resp = Response(
+                        stream_with_context(_site_ndjson_stream()),
+                        mimetype='application/x-ndjson',
+                    )
+                    resp.headers['Cache-Control'] = 'no-cache'
+                    resp.headers['X-Accel-Buffering'] = 'no'
+                    return resp
+
+                response_data = _run_site_screening()
 
                 accept_encoding = request.headers.get('Accept-Encoding', '')
                 if 'gzip' in accept_encoding and len(response_data) > 1024:
@@ -1261,7 +1332,7 @@ def pandapower_net_to_json(net):
         return val
 
     def _bus_geo_xy_from_cell(val):
-        """Return (x, y) from pandapower bus ``geo`` cell (GeoJSON Point) or (None, None)."""
+        """Return (x, y) from pandapower bus ``geo`` (GeoJSON Point dict or JSON string)."""
         if val is None:
             return None, None
         try:
@@ -1270,10 +1341,18 @@ def pandapower_net_to_json(net):
         except Exception:
             pass
         try:
+            if isinstance(val, str):
+                text = val.strip()
+                if not text:
+                    return None, None
+                import json as _json
+                val = _json.loads(text)
             if isinstance(val, dict):
                 coord = val.get('coordinates')
                 if isinstance(coord, (list, tuple)) and len(coord) >= 2:
                     return float(coord[0]), float(coord[1])
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                return float(val[0]), float(val[1])
         except (TypeError, ValueError):
             return None, None
         return None, None

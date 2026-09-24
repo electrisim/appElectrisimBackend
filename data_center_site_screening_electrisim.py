@@ -17,6 +17,22 @@ from pandapower_electrisim import _contingency_friendly_name, _json_serialize_de
 
 N11_MAX_CASES = 400
 HEADROOM_SEARCH_MAX_MW = 5000.0
+HEADROOM_STEPS = 22
+
+
+class SiteScreeningCancelled(Exception):
+    """Raised when the user stops a streaming site-screening run."""
+
+
+def _progress(params: Dict[str, Any], message: str) -> None:
+    if not isinstance(params, dict):
+        return
+    cancel = params.get("_cancel_event")
+    if cancel is not None and getattr(cancel, "is_set", lambda: False)():
+        raise SiteScreeningCancelled("Stopped by user")
+    cb = params.get("_progress_callback")
+    if callable(cb):
+        cb(str(message))
 
 
 def _parse_float_list(text: str, default: List[float]) -> List[float]:
@@ -45,10 +61,12 @@ def _parse_id_list(text: str) -> List[str]:
 def _load_indices_for_ids(net, load_ids: List[str]) -> List[int]:
     want = set(load_ids)
     found = []
+    ufn = getattr(net, "user_friendly_names", None) or {}
     for idx in net.load.index:
         lid = str(net.load.loc[idx, "id"]) if "id" in net.load.columns else ""
         name = str(net.load.loc[idx, "name"])
-        if lid in want or name in want:
+        friendly = str(ufn.get(name, name))
+        if lid in want or name in want or friendly in want:
             found.append(idx)
     return found
 
@@ -188,10 +206,13 @@ def _headroom_mw(
     load_snapshot: Dict[int, Tuple[float, float]],
     power_factor: float,
     limits: Dict[str, Any],
+    on_step=None,
 ) -> float:
     lo, hi = 0.0, HEADROOM_SEARCH_MAX_MW
     best = 0.0
-    for _ in range(22):
+    for step in range(HEADROOM_STEPS):
+        if on_step and (step == 0 or step == HEADROOM_STEPS - 1 or (step + 1) % 5 == 0):
+            on_step(step + 1, HEADROOM_STEPS)
         mid = (lo + hi) / 2.0
         net = deepcopy(net_template)
         for idx in site_load_indices:
@@ -215,11 +236,15 @@ def _run_contingency_batch(
     net_template,
     cases: List[Dict[str, Any]],
     limits: Dict[str, Any],
+    on_step=None,
 ) -> Tuple[int, str, int]:
     worst = 0
     worst_name = ""
     failed = 0
-    for case in cases:
+    total = len(cases)
+    for i, case in enumerate(cases, 1):
+        if on_step and (i == 1 or i == total or i % 10 == 0):
+            on_step(i, total)
         net_c = deepcopy(net_template)
         if case.get("outages"):
             for typ, eidx in case["outages"]:
@@ -260,6 +285,7 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
             "max_loading_percent": max_loading_percent,
         }
 
+        _progress(params, "Checking connectivity…")
         isolated = top.unsupplied_buses(net)
         if len(isolated) > 0:
             raise ValueError(f"Isolated buses: {list(isolated)}")
@@ -267,19 +293,29 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
         load_indices = _load_indices_for_ids(net, load_ids)
         if not load_indices:
             raise ValueError(f"No loads matched IDs: {load_ids}")
+        size_label = ", ".join(f"{mw:g}" for mw in mw_sizes)
+        _progress(params, f"Sites: {len(load_indices)}. Sizes: {size_label} MW.")
 
         load_snapshot = {
             idx: (float(net.load.loc[idx, "p_mw"]), float(net.load.loc[idx, "q_mvar"]))
             for idx in load_indices
         }
 
+        _progress(params, "Preparing N-1 cases…")
         n1_cases = _build_n1_cases(net, element_type)
-        n11_cases = _build_n11_cases(net, element_type) if include_n11 else []
+        if include_n11:
+            _progress(params, "Preparing N-1-1 cases…")
+            n11_cases = _build_n11_cases(net, element_type)
+        else:
+            n11_cases = []
+        _progress(params, f"Contingencies ready: {len(n1_cases)} N-1, {len(n11_cases)} N-1-1.")
 
         rows = []
-        for load_idx in load_indices:
+        n_sites = len(load_indices)
+        for site_i, load_idx in enumerate(load_indices, 1):
             site_name = _contingency_friendly_name(net, net.load.loc[load_idx, "name"])
             site_id = str(net.load.loc[load_idx, "id"]) if "id" in net.load.columns else site_name
+            _progress(params, f"{site_name} ({site_i}/{n_sites}) — intact system")
 
             # Baseline violations at 0 MW project load
             net0 = deepcopy(net)
@@ -291,6 +327,8 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                 base_violations, _ = _count_violations(net0, **limits)
 
             for mw in mw_sizes:
+                label = f"{site_name} · {mw:g} MW"
+                _progress(params, f"{label} — base case")
                 net_case = deepcopy(net)
                 for idx in load_indices:
                     net_case.load.loc[idx, "p_mw"] = 0.0
@@ -317,12 +355,21 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                     continue
 
                 headroom = _headroom_mw(
-                    net, load_idx, load_indices, load_snapshot, power_factor, limits
+                    net, load_idx, load_indices, load_snapshot, power_factor, limits,
+                    on_step=lambda i, n, label=label: _progress(params, f"{label} — headroom {i}/{n}"),
                 )
-                w_n1, n1_name, n1_fail = _run_contingency_batch(net_case, n1_cases, limits)
+                w_n1, n1_name, n1_fail = _run_contingency_batch(
+                    net_case, n1_cases, limits,
+                    on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1 {i}/{n}"),
+                )
                 w_n11, n11_name, n11_fail = (
-                    _run_contingency_batch(net_case, n11_cases, limits) if n11_cases else (0, "", 0)
+                    _run_contingency_batch(
+                        net_case, n11_cases, limits,
+                        on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1-1 {i}/{n}"),
+                    )
+                    if n11_cases else (0, "", 0)
                 )
+                _progress(params, f"{label} — headroom {headroom:g} MW")
 
                 upgrade = headroom < mw or w_n1 > 0 or w_n11 > 0
                 if base_violations == 0 and (w_n1 > 0 or w_n11 > 0):
@@ -355,10 +402,13 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
             "upgrade_likely_count": sum(1 for r in rows if r.get("upgrade_likely")),
         }
 
+        _progress(params, "Screening finished.")
         return json.dumps(
             {"study": "data_center_site_screening", "summary": summary, "screening_results": rows},
             default=_json_serialize_default,
             separators=(",", ":"),
         )
+    except SiteScreeningCancelled:
+        raise
     except Exception as e:
         return json.dumps({"error": str(e), "screening_results": []})
