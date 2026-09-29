@@ -3512,8 +3512,14 @@ def create_other_elements(in_data,net,x, Busbars):
             vector_group, phase_shift_from_group = parse_vector_group(vector_group_raw)
             
             # Get bus indices with error checking
-            hv_bus_name = in_data[x]['hv_bus']
-            lv_bus_name = in_data[x]['lv_bus']
+            hv_bus_name = in_data[x].get('hv_bus')
+            lv_bus_name = in_data[x].get('lv_bus')
+            if not hv_bus_name or not lv_bus_name:
+                label = in_data[x].get('userFriendlyName') or in_data[x].get('name') or in_data[x].get('id')
+                raise ValueError(
+                    f"Transformer '{label}' is not connected to two busbars "
+                    f"(HV '{hv_bus_name or '—'}', LV '{lv_bus_name or '—'}')."
+                )
             hv_bus_idx = Busbars.get(hv_bus_name)
             lv_bus_idx = Busbars.get(lv_bus_name)
             
@@ -3607,6 +3613,12 @@ def create_other_elements(in_data,net,x, Busbars):
                 transformer_params['max_loading_percent'] = _mlp_t2
 
             trafo_idx = pp.create_transformer_from_parameters(net, **transformer_params)
+            for _ngr_col in ('rn_ohm', 'xn_ohm'):
+                if _ngr_col not in net.trafo.columns:
+                    net.trafo[_ngr_col] = 0.0
+                _ngr_val = safe_float(in_data[x].get(_ngr_col))
+                if _ngr_val is not None and _ngr_val != 0.0:
+                    net.trafo.at[trafo_idx, _ngr_col] = _ngr_val
             TrafoDict[in_data[x]['name']] = trafo_idx
             _ufn_tr = in_data[x].get('userFriendlyName')
             if _ufn_tr not in (None, '') and str(_ufn_tr) != str(in_data[x]['name']):
@@ -4051,7 +4063,24 @@ def create_other_elements(in_data,net,x, Busbars):
                     storage_kwargs['min_q_mvar'] = float(min_q_mvar_raw)
                 except (TypeError, ValueError):
                     pass
-            pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], **storage_kwargs)
+            stor_idx = pp.create_storage(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], **storage_kwargs)
+            for _sc_col, _sc_key, _sc_default in (
+                ('max_ik_ka', 'max_ik_ka', 0.0),
+                ('rx', 'rx', 0.1),
+                ('current_source', 'current_source', False),
+            ):
+                if _sc_col not in net.storage.columns:
+                    net.storage[_sc_col] = _sc_default
+                raw_sc = in_data[x].get(_sc_key)
+                if raw_sc is None or str(raw_sc).strip().lower() in ('', 'none', 'null', 'nan'):
+                    continue
+                if _sc_col == 'current_source':
+                    net.storage.at[stor_idx, _sc_col] = bool(raw_sc) if isinstance(raw_sc, bool) else str(raw_sc).lower() in ('true', '1', 'yes')
+                else:
+                    try:
+                        net.storage.at[stor_idx, _sc_col] = float(raw_sc)
+                    except (TypeError, ValueError):
+                        pass
             stor_nm = in_data[x]['name']
             stor_cell_id = in_data[x]['id']
             try:
@@ -4181,6 +4210,17 @@ def create_other_elements(in_data,net,x, Busbars):
             in_ka = safe_float(in_ka_val) if in_ka_val not in (None, '', 'nan') else float('nan')
             switch_name = in_data[x].get('name', in_data[x].get('userFriendlyName', f'Switch_{x}'))
             in_service = True
+
+            if et == 'l':
+                line_from = int(net.line.at[int(element_idx), 'from_bus'])
+                line_to = int(net.line.at[int(element_idx), 'to_bus'])
+                if int(bus_idx) not in (line_from, line_to):
+                    label = in_data[x].get('userFriendlyName') or switch_name
+                    print(
+                        f"Warning: Switch '{label}' bus index {bus_idx} is not an end of "
+                        f"line {element_idx} (ends {line_from}, {line_to}). Using bus {line_from}."
+                    )
+                    bus_idx = line_from
 
             sw_idx = pp.create_switch(net, bus=bus_idx, element=int(element_idx), et=et, name=switch_name,
                            closed=closed, type=switch_type, z_ohm=z_ohm, in_ka=in_ka, in_service=in_service)

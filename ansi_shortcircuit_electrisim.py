@@ -367,16 +367,39 @@ def _add_sgen_ansi(net, ppci, network: str):
             _y_add_shunt(ppci, bus_ppc, _z_to_y_pu(r_ohm, x_ohm, base_z))
 
 
+def _add_storage_ansi(net, ppci, network: str):
+    if not hasattr(net, "storage") or net.storage.empty:
+        return
+    if network == NETWORK_30:
+        return
+    for _, row in net.storage[net.storage.in_service].iterrows():
+        max_ik = _f(row.get("max_ik_ka"), 0.0)
+        cs = row.get("current_source")
+        if not (cs in (True, "true", "True", 1, "1") or max_ik > 0):
+            continue
+        if max_ik <= 0:
+            continue
+        bus = int(row["bus"])
+        bus_ppc = _ppc_bus(net, bus)
+        if bus_ppc is None:
+            continue
+        vn = float(net.bus.at[bus, "vn_kv"])
+        base_z = vn * vn / ppci["baseMVA"]
+        rx = _f(row.get("rx"), 0.1) or 0.1
+        z_ohm = vn / (math.sqrt(3) * max_ik)
+        x_ohm = z_ohm / math.sqrt(1.0 + rx * rx)
+        r_ohm = x_ohm * rx
+        _y_add_shunt(ppci, bus_ppc, _z_to_y_pu(r_ohm, x_ohm, base_z))
+
+
 def _build_zero_sequence_y(net, prefault_v: float):
     """Approximate zero-sequence Y for LG faults."""
     _, ppci0 = _init_ansi_ppc(net, prefault_v)
     if not net.line.empty:
-        f_idx, t_idx = net["_pd2ppc_lookups"]["branch"]["line"]
-        for li, row in net.line[net.line.in_service].iterrows():
-            try:
-                f_ppc = f_idx[li]
-                t_ppc = t_idx[li]
-            except (KeyError, IndexError):
+        for _, row in net.line[net.line.in_service].iterrows():
+            f_ppc = _ppc_bus(net, int(row["from_bus"]))
+            t_ppc = _ppc_bus(net, int(row["to_bus"]))
+            if f_ppc is None or t_ppc is None:
                 continue
             from_bus = int(row["from_bus"])
             vn = float(net.bus.at[from_bus, "vn_kv"])
@@ -669,6 +692,7 @@ def _solve_network(
     _add_gen_ansi(work, ppci, network, gen_meta)
     _add_motor_ansi(work, ppci, network)
     _add_sgen_ansi(work, ppci, network)
+    _add_storage_ansi(work, ppci, network)
     _calc_ybus(ppci)
     _calc_zbus(work, ppci)
     ppci0 = _build_zero_sequence_y(work, prefault_v) if fault == "1ph" else None

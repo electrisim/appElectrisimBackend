@@ -797,6 +797,25 @@ def simulation():
                 else:
                     return response_data
 
+            if "PoiFaultStudy" in typ:
+                import poi_fault_study_electrisim
+
+                net = pp.create_empty_network()
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                response_data = poi_fault_study_electrisim.poi_fault_study(
+                    net, in_data[x], in_data
+                )
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
+
             if "ArcFlashPandaPower" in typ:
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== ARC FLASH REQUESTED BY USER: {user_email} ===")
@@ -1439,6 +1458,71 @@ def pandapower_net_to_json(net):
             ])
         return rows
 
+    def build_electrisim_import_sidecar():
+        """Extra SC / breaker fields keyed by element name for frontend import."""
+        sidecar = {'switch': {}, 'gen': {}, 'sgen': {}, 'storage': {}, 'trafo': {}}
+        if hasattr(net, 'switch') and net.switch is not None and not net.switch.empty:
+            for idx, r in net.switch.iterrows():
+                nm = r.get('name', f'Switch_{idx}')
+                if _is_blank_name(nm):
+                    nm = f'Switch_{idx}'
+                sidecar['switch'][str(nm)] = {
+                    'interrupting_rating_ka': _scalar(r.get('interrupting_rating_ka')),
+                    'momentary_rating_ka': _scalar(r.get('momentary_rating_ka')),
+                    'in_ka': _scalar(r.get('in_ka')),
+                    'type': _scalar(r.get('type')),
+                    'ansi_device_class': _scalar(r.get('ansi_device_class')),
+                }
+        if hasattr(net, 'gen') and not net.gen.empty:
+            for idx, r in net.gen.iterrows():
+                nm = r.get('name', f'Gen_{idx}')
+                if _is_blank_name(nm):
+                    nm = f'Gen_{idx}'
+                sidecar['gen'][str(nm)] = {
+                    'vn_kv': _scalar(r.get('vn_kv')),
+                    'xdss_pu': _scalar(r.get('xdss_pu')),
+                    'rdss_ohm': _scalar(r.get('rdss_ohm')),
+                    'rdss_pu': _scalar(r.get('rdss_pu')),
+                    'min_p_mw': _scalar(r.get('min_p_mw')),
+                    'max_p_mw': _scalar(r.get('max_p_mw')),
+                }
+        if hasattr(net, 'sgen') and not net.sgen.empty:
+            for idx, r in net.sgen.iterrows():
+                nm = r.get('name', f'Sgen_{idx}')
+                if _is_blank_name(nm):
+                    nm = f'Sgen_{idx}'
+                sidecar['sgen'][str(nm)] = {
+                    'generator_type': _scalar(r.get('generator_type')),
+                    'max_ik_ka': _scalar(r.get('max_ik_ka')),
+                    'rx': _scalar(r.get('rx')),
+                    'k': _scalar(r.get('k')),
+                    'current_source': _scalar(r.get('current_source')),
+                    'lrc_pu': _scalar(r.get('lrc_pu')),
+                }
+        if hasattr(net, 'storage') and not net.storage.empty:
+            for idx, r in net.storage.iterrows():
+                nm = r.get('name', f'Storage_{idx}')
+                if _is_blank_name(nm):
+                    nm = f'Storage_{idx}'
+                sidecar['storage'][str(nm)] = {
+                    'max_ik_ka': _scalar(r.get('max_ik_ka')),
+                    'rx': _scalar(r.get('rx')),
+                    'current_source': _scalar(r.get('current_source')),
+                }
+        if hasattr(net, 'trafo') and not net.trafo.empty:
+            for idx, r in net.trafo.iterrows():
+                nm = r.get('name', f'Trafo_{idx}')
+                if _is_blank_name(nm):
+                    nm = f'Trafo_{idx}'
+                sidecar['trafo'][str(nm)] = {
+                    'vector_group': _scalar(r.get('vector_group')),
+                    'vk0_percent': _scalar(r.get('vk0_percent')),
+                    'vkr0_percent': _scalar(r.get('vkr0_percent')),
+                    'rn_ohm': _scalar(r.get('rn_ohm')),
+                    'xn_ohm': _scalar(r.get('xn_ohm')),
+                }
+        return sidecar
+
     def normalize_load_rows():
         df = net.load
         if df.empty:
@@ -1678,7 +1762,13 @@ def pandapower_net_to_json(net):
                 "_object": json.dumps({
                     "data": dataframe_to_list(net.dcline) if hasattr(net, 'dcline') and not net.dcline.empty else []
                 })
-            }
+            },
+            "electrisim_import_sidecar": {
+                "_object": json.dumps(build_electrisim_import_sidecar())
+            },
+            "user_friendly_names": {
+                "_object": json.dumps(getattr(net, 'user_friendly_names', {}) or {})
+            },
         }
     }
 
