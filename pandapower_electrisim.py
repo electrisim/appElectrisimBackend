@@ -4020,14 +4020,19 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            # Convert all numeric values to float explicitly
-            p_mw = float(in_data[x].get('p_mw', 0.0))
-            q_mvar = float(in_data[x].get('q_mvar', 0.0))
-            sn_mva = float(in_data[x].get('sn_mva', 1.0))
-            max_e_mwh = float(in_data[x].get('max_e_mwh', 1.0))
-            min_e_mwh = float(in_data[x].get('min_e_mwh', 0.0))
-            soc_percent = float(in_data[x].get('soc_percent', 50.0))
-            scaling = float(in_data[x].get('scaling', 1.0))
+            # Imported cases (for example CIGRE batteries) leave energy and state of
+            # charge empty. The diagram then sends the text "null", which float() rejects.
+            p_mw = safe_float(in_data[x].get('p_mw'), 0.0)
+            q_mvar = safe_float(in_data[x].get('q_mvar'), 0.0)
+            sn_mva = safe_float(in_data[x].get('sn_mva'), 0.0)
+            max_e_mwh = safe_float(in_data[x].get('max_e_mwh'), 0.0)
+            min_e_mwh = safe_float(in_data[x].get('min_e_mwh'), 0.0)
+            soc_percent = safe_float(in_data[x].get('soc_percent'), 50.0)
+            scaling = safe_float(in_data[x].get('scaling'), 1.0)
+            if max_e_mwh <= 0:
+                max_e_mwh = sn_mva if sn_mva > 0 else max(abs(p_mw), 0.001)
+            if sn_mva <= 0:
+                sn_mva = max(abs(p_mw), max_e_mwh, 0.001)
             storage_type = str(in_data[x].get('type', ''))
             # OPF parameters (optional)
             controllable_raw = in_data[x].get('controllable', False)

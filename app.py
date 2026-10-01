@@ -1376,27 +1376,57 @@ def pandapower_net_to_json(net):
             return None, None
         return None, None
 
+    # The diagram addresses buses as T.data[i], i.e. the row in this export.
+    # Pandapower bus.index is often sparse (LV Schutterwald is 1..3298 with
+    # gaps). Leaving those ids in from_bus/to_bus makes lines miss their busbars.
+    bus_pos = {}
+    bus_export_name = {}
+    if hasattr(net, 'bus') and net.bus is not None and not net.bus.empty:
+        _used_bus_names = set()
+        for _bi, _bidx in enumerate(net.bus.index):
+            _raw = net.bus.at[_bidx, 'name'] if 'name' in net.bus.columns else None
+            if _is_blank_name(_raw):
+                _base = f'Bus_{_bidx}'
+            else:
+                _base = str(_raw).strip()
+            _uniq = _base
+            _dup = 0
+            while _uniq in _used_bus_names:
+                _dup += 1
+                _uniq = f'{_base}_{_dup}'
+            _used_bus_names.add(_uniq)
+            bus_pos[int(_bidx)] = _bi
+            bus_export_name[int(_bidx)] = _uniq
+
+    def _pos_bus(val):
+        try:
+            i = int(_scalar(val))
+        except (TypeError, ValueError):
+            return val
+        return bus_pos.get(i, i)
+
+    def export_element_rows(df):
+        if df is None or getattr(df, 'empty', True):
+            return []
+        bus_cols = [c for c in (
+            'bus', 'from_bus', 'to_bus', 'hv_bus', 'mv_bus', 'lv_bus',
+        ) if c in getattr(df, 'columns', [])]
+        if not bus_cols:
+            return dataframe_to_list(df)
+        slim = df.copy()
+        for c in bus_cols:
+            slim[c] = [_pos_bus(v) for v in slim[c].tolist()]
+        return dataframe_to_list(slim)
+
     def normalize_bus_rows():
         df = net.bus
         if df.empty:
             return []
-        used = set()
         names_out = []
         geo_x_out = []
         geo_y_out = []
         for idx in df.index:
-            raw = df.at[idx, 'name'] if 'name' in df.columns else None
-            if _is_blank_name(raw):
-                base = f'Bus_{idx}'
-            else:
-                base = str(raw).strip()
-            uniq = base
-            dup = 0
-            while uniq in used:
-                dup += 1
-                uniq = f'{base}_{dup}'
-            used.add(uniq)
-            names_out.append(uniq)
+            names_out.append(bus_export_name.get(int(idx), f'Bus_{idx}'))
             gx, gy = None, None
             if 'geo' in df.columns:
                 gx, gy = _bus_geo_xy_from_cell(df.at[idx, 'geo'])
@@ -1424,7 +1454,7 @@ def pandapower_net_to_json(net):
                 nm = f'ExtGrid_{idx}'
             rows.append([
                 nm,
-                int(_scalar(r['bus'])),
+                _pos_bus(r['bus']),
                 _scalar(r['vm_pu']),
                 _scalar(r['va_degree']),
                 _scalar(r['slack_weight']),
@@ -1444,7 +1474,7 @@ def pandapower_net_to_json(net):
                 nm = f'Gen_{idx}'
             rows.append([
                 nm,
-                int(_scalar(r['bus'])),
+                _pos_bus(r['bus']),
                 _scalar(r['p_mw']),
                 _scalar(r['vm_pu']),
                 _scalar(r['sn_mva']),
@@ -1545,7 +1575,7 @@ def pandapower_net_to_json(net):
                 ci = _scalar(r['const_i_p_percent'])
             rows.append([
                 nm,
-                int(_scalar(r['bus'])),
+                _pos_bus(r['bus']),
                 _scalar(r['p_mw']),
                 _scalar(r['q_mvar']),
                 cz,
@@ -1572,8 +1602,8 @@ def pandapower_net_to_json(net):
             rows.append([
                 nm,
                 _scalar(r['std_type']),
-                int(_scalar(r['hv_bus'])),
-                int(_scalar(r['lv_bus'])),
+                _pos_bus(r['hv_bus']),
+                _pos_bus(r['lv_bus']),
                 _scalar(r['sn_mva']),
                 _scalar(r['vn_hv_kv']),
                 _scalar(r['vn_lv_kv']),
@@ -1610,7 +1640,7 @@ def pandapower_net_to_json(net):
         for idx in slim.index:
             if _is_blank_name(slim.at[idx, 'name']):
                 slim.at[idx, 'name'] = f'Line_{idx}'
-        return dataframe_to_list(slim)
+        return export_element_rows(slim)
 
     def normalize_switch_rows():
         """Export pandapower switches for Electrisim import (protection coordination).
@@ -1627,10 +1657,7 @@ def pandapower_net_to_json(net):
             if _is_blank_name(nm):
                 nm = f'Switch_{idx}'
             bus_i = int(_scalar(r['bus']))
-            try:
-                bus_nm = net.bus.at[bus_i, 'name'] if bus_i in net.bus.index else None
-            except Exception:
-                bus_nm = None
+            bus_nm = bus_export_name.get(bus_i)
             if _is_blank_name(bus_nm):
                 bus_nm = f'Bus_{bus_i}'
             et = _scalar(r['et']) if 'et' in net.switch.columns else 'l'
@@ -1646,8 +1673,8 @@ def pandapower_net_to_json(net):
                     elem_nm = net.trafo.at[el_i, 'name']
                 elif et == 't3' and hasattr(net, 'trafo3w') and not net.trafo3w.empty and el_i in net.trafo3w.index:
                     elem_nm = net.trafo3w.at[el_i, 'name']
-                elif et == 'b' and el_i in net.bus.index:
-                    elem_nm = net.bus.at[el_i, 'name']
+                elif et == 'b':
+                    elem_nm = bus_export_name.get(el_i)
             except Exception:
                 elem_nm = None
             if _is_blank_name(elem_nm):
@@ -1690,12 +1717,12 @@ def pandapower_net_to_json(net):
             },
             "sgen": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.sgen) if hasattr(net, 'sgen') and not net.sgen.empty else []
+                    "data": export_element_rows(net.sgen) if hasattr(net, 'sgen') and not net.sgen.empty else []
                 })
             },
             "asymmetric_sgen": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.asymmetric_sgen) if hasattr(net, 'asymmetric_sgen') and not net.asymmetric_sgen.empty else []
+                    "data": export_element_rows(net.asymmetric_sgen) if hasattr(net, 'asymmetric_sgen') and not net.asymmetric_sgen.empty else []
                 })
             },
             "trafo": {
@@ -1705,12 +1732,12 @@ def pandapower_net_to_json(net):
             },
             "trafo3w": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.trafo3w) if hasattr(net, 'trafo3w') and not net.trafo3w.empty else []
+                    "data": export_element_rows(net.trafo3w) if hasattr(net, 'trafo3w') and not net.trafo3w.empty else []
                 })
             },
             "shunt": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.shunt) if hasattr(net, 'shunt') and not net.shunt.empty else []
+                    "data": export_element_rows(net.shunt) if hasattr(net, 'shunt') and not net.shunt.empty else []
                 })
             },
             "load": {
@@ -1720,47 +1747,47 @@ def pandapower_net_to_json(net):
             },
             "asymmetric_load": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.asymmetric_load) if hasattr(net, 'asymmetric_load') and not net.asymmetric_load.empty else []
+                    "data": export_element_rows(net.asymmetric_load) if hasattr(net, 'asymmetric_load') and not net.asymmetric_load.empty else []
                 })
             },
             "impedance": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.impedance) if hasattr(net, 'impedance') and not net.impedance.empty else []
+                    "data": export_element_rows(net.impedance) if hasattr(net, 'impedance') and not net.impedance.empty else []
                 })
             },
             "ward": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.ward) if hasattr(net, 'ward') and not net.ward.empty else []
+                    "data": export_element_rows(net.ward) if hasattr(net, 'ward') and not net.ward.empty else []
                 })
             },
             "xward": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.xward) if hasattr(net, 'xward') and not net.xward.empty else []
+                    "data": export_element_rows(net.xward) if hasattr(net, 'xward') and not net.xward.empty else []
                 })
             },
             "motor": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.motor) if hasattr(net, 'motor') and not net.motor.empty else []
+                    "data": export_element_rows(net.motor) if hasattr(net, 'motor') and not net.motor.empty else []
                 })
             },
             "storage": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.storage) if hasattr(net, 'storage') and not net.storage.empty else []
+                    "data": export_element_rows(net.storage) if hasattr(net, 'storage') and not net.storage.empty else []
                 })
             },
             "svc": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.svc) if hasattr(net, 'svc') and not net.svc.empty else []
+                    "data": export_element_rows(net.svc) if hasattr(net, 'svc') and not net.svc.empty else []
                 })
             },
             "tcsc": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.tcsc) if hasattr(net, 'tcsc') and not net.tcsc.empty else []
+                    "data": export_element_rows(net.tcsc) if hasattr(net, 'tcsc') and not net.tcsc.empty else []
                 })
             },
             "dcline": {
                 "_object": json.dumps({
-                    "data": dataframe_to_list(net.dcline) if hasattr(net, 'dcline') and not net.dcline.empty else []
+                    "data": export_element_rows(net.dcline) if hasattr(net, 'dcline') and not net.dcline.empty else []
                 })
             },
             "electrisim_import_sidecar": {
