@@ -399,13 +399,62 @@ def _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name):
     return None
 
 
+def _opendss_single_phase_bus_voltage(dss_mod, user_vn_kv):
+    """Solved voltage for a bus that has one node.
+
+    The reported kV is the actual voltage on that node. Per-unit is that
+    voltage divided by the bus vn_kv typed on the diagram (3 kV at 1.05 pu
+    is 3.150 kV). OpenDSS puVmagAngle is not used: after calcv its base is
+    vn_kv/sqrt(3), which is not this voltage.
+    """
+    try:
+        voltages = dss_mod.Bus.Voltages()
+    except Exception:
+        return None
+    if not voltages or len(voltages) < 2:
+        return None
+    best = -1.0
+    best_re = best_im = 0.0
+    for i in range(0, len(voltages) - 1, 2):
+        try:
+            re = float(voltages[i])
+            im = float(voltages[i + 1])
+        except (TypeError, ValueError):
+            continue
+        mag = math.hypot(re, im)
+        if mag > best:
+            best = mag
+            best_re, best_im = re, im
+    if best < 0:
+        return None
+    vm_kv = best / 1000.0
+    va_degree = math.degrees(math.atan2(best_im, best_re)) if best > 0 else 0.0
+    try:
+        vn = float(user_vn_kv)
+    except (TypeError, ValueError):
+        vn = 0.0
+    if vn > 0:
+        vm_pu = vm_kv / vn
+    else:
+        try:
+            base_ln = float(dss_mod.Bus.kVBase())
+        except (TypeError, ValueError):
+            base_ln = 0.0
+        vm_pu = (vm_kv / base_ln) if base_ln > 0 else 1.0
+    return vm_pu, vm_kv, va_degree
+
+
 def _opendss_read_bus_vm_pu(dss_mod, bus_name, BusbarsDictVoltage):
-    """Positive-sequence L-L voltage in pu after a solve."""
+    """Positive-sequence L-L voltage in pu after a solve. Single-phase buses use the phase pu."""
     if not bus_name:
         return None
     try:
         dss_mod.Circuit.SetActiveBus(str(bus_name))
         voltages = dss_mod.Bus.Voltages()
+        if voltages is not None and len(voltages) < 6:
+            solved = _opendss_single_phase_bus_voltage(
+                dss_mod, _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name))
+            return solved[0] if solved else None
         if voltages is None or len(voltages) < 6:
             return None
         va = complex(voltages[0] / 1000.0, voltages[1] / 1000.0)
@@ -728,7 +777,12 @@ def _format_opendss_bus_terminal(bus_name, phase=1, conn='wye'):
 
 
 def _resolve_1ph_kv(bus_voltage_ll, conn='wye', explicit_kv=None):
-    """Rated kV for single-phase OpenDSS elements."""
+    """Rated kV across a single-phase element.
+
+    The bus vn_kv is the voltage between the two conductors, which is what
+    OpenDSS uses as basekV for phases=1. It is not a three-phase line voltage,
+    so it is not divided by sqrt(3).
+    """
     if explicit_kv not in (None, '', '0'):
         try:
             return float(explicit_kv)
@@ -738,11 +792,7 @@ def _resolve_1ph_kv(bus_voltage_ll, conn='wye', explicit_kv=None):
         v = float(bus_voltage_ll)
     except (TypeError, ValueError):
         return 0.0
-    if v <= 0:
-        return v
-    if (conn or 'wye').strip().lower() == 'delta':
-        return v
-    return v / math.sqrt(3)
+    return v if v > 0 else 0.0
 
 
 def _element_phase_conn(element_data):
@@ -758,19 +808,13 @@ def _element_phase_conn(element_data):
     return phase, conn
 
 def _resolve_load_1ph_kv(bus_voltage_ll, conn, explicit_kv=None):
-    """Rated kV for OpenDSS Load (phases=1). Explicit kV from UI is often L-L bus vn_kv."""
+    """Rated kV for OpenDSS Load (phases=1): the voltage across the load."""
     if explicit_kv not in (None, '', '0'):
-        kv = float(explicit_kv)
-    else:
-        return _resolve_1ph_kv(bus_voltage_ll, conn, None)
-    conn_l = (conn or 'wye').strip().lower()
-    try:
-        v_ll = float(bus_voltage_ll)
-    except (TypeError, ValueError):
-        return kv
-    if conn_l == 'wye' and v_ll > 0 and abs(kv - v_ll) / v_ll < 0.25:
-        return v_ll / math.sqrt(3)
-    return kv
+        try:
+            return float(explicit_kv)
+        except (TypeError, ValueError):
+            return _resolve_1ph_kv(bus_voltage_ll, conn, None)
+    return _resolve_1ph_kv(bus_voltage_ll, conn, None)
 
 
 def _opendss_ckt_pq_mw(powers, terminal_index=0):
@@ -2365,8 +2409,12 @@ def _opendss_terminal_pq_kw(powers, terminal_index, n_conductors=0, n_phases=3):
     return p_kw, q_kvar
 
 
-def _opendss_terminal_i_ka(currents, terminal_index, n_conductors=0, n_phases=3):
-    """Average phase/conductor current magnitude (kA) for one OpenDSS terminal."""
+def _opendss_terminal_i_ka(currents, terminal_index, n_conductors=0, n_phases=3, mag_ang=False):
+    """Average phase/conductor current magnitude (kA) for one OpenDSS terminal.
+
+    Currents() is real/imag pairs. CurrentsMagAng() is magnitude (A) and angle
+    (degrees). mag_ang=True reads the magnitude and ignores the angle.
+    """
     n_per_terminal = _opendss_n_per_terminal(n_conductors, n_phases)
     start = terminal_index * n_per_terminal
     n_cond = int(n_conductors) if n_conductors else int(n_phases or 3)
@@ -2374,7 +2422,11 @@ def _opendss_terminal_i_ka(currents, terminal_index, n_conductors=0, n_phases=3)
     count = 0
     for c in range(n_cond):
         idx = start + c * 2
-        if idx + 1 < len(currents):
+        if mag_ang:
+            if idx < len(currents):
+                i_sum += abs(float(currents[idx]))
+                count += 1
+        elif idx + 1 < len(currents):
             i_sum += math.sqrt(float(currents[idx]) ** 2 + float(currents[idx + 1]) ** 2)
             count += 1
     return (i_sum / count / 1000.0) if count else 0.0
@@ -4328,7 +4380,7 @@ def _capture_monte_carlo_sample(BusbarsDictConnectionToName, LinesDict, LinesDic
             currents = dss.CktElement.CurrentsMagAng()
             n_conductors = dss.CktElement.NumConductors()
             n_phases = dss.CktElement.NumPhases()
-            current_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases) if currents else 0.0
+            current_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases, mag_ang=True) if currents else 0.0
             rating_ka = float(line_ratings.get(key) or 0)
             lines[key] = {
                 'id': LinesDictId.get(key, key),
@@ -4754,31 +4806,27 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             processed_buses.add(bus_number)
             
             try:
-                # Calculate positive sequence voltage using symmetrical components
-                # This matches the notebook approach exactly
-                voltages = dss.Bus.Voltages()  # in Volts: [Va_real, Va_imag, Vb_real, Vb_imag, Vc_real, Vc_imag]
-                
-                # Convert to kV and create complex numbers
-                Va = complex(voltages[0]/1000, voltages[1]/1000)
-                Vb = complex(voltages[2]/1000, voltages[3]/1000)
-                Vc = complex(voltages[4]/1000, voltages[5]/1000)
-                
-                # Symmetrical component operator: a = e^(j*2?/3)
-                a = complex(-0.5, math.sqrt(3)/2)
-                a2 = complex(-0.5, -math.sqrt(3)/2)  # a^2 = e^(j*4*pi/3)
-                
-                # Positive sequence voltage: V1 = (Va + a*Vb + a^2*Vc) / 3
-                V1 = (Va + a * Vb + a2 * Vc) / 3
-                V1_mag_ln_kv = abs(V1)  # Magnitude in kV (line-to-neutral)
-                
-                # Convert to line-to-line voltage
-                V1_mag_ll_kv = V1_mag_ln_kv * math.sqrt(3)
-                
-                # Per-unit on OpenDSS calcv base (avoids e.g. bus4 at 10.6 kV with 10.0 kV trafo nameplate)
-                vm_pu = _bus_vm_pu_from_opendss(V1_mag_ll_kv, BusbarsDictVoltage, matched_bus_id)
-                
-                # Get angle from vmag_angle_pu
-                va_degree = dss.Bus.puVmagAngle()[1] if len(dss.Bus.puVmagAngle()) > 1 else 0.0
+                # 1-phase buses return one node (2 numbers). The 3-phase formula
+                # indexes Vb/Vc and then the result box falls back to the rated voltage.
+                voltages = dss.Bus.Voltages()
+                user_vn = BusbarsDictVoltage.get(matched_bus_id)
+                if voltages is None or len(voltages) < 6:
+                    solved = _opendss_single_phase_bus_voltage(dss, user_vn)
+                    if not solved:
+                        raise ValueError(f"No solved voltage for single-phase bus {actual_bus_name}")
+                    vm_pu, V1_mag_ll_kv, va_degree = solved
+                else:
+                    # Positive sequence voltage. Matches the notebook approach.
+                    Va = complex(voltages[0]/1000, voltages[1]/1000)
+                    Vb = complex(voltages[2]/1000, voltages[3]/1000)
+                    Vc = complex(voltages[4]/1000, voltages[5]/1000)
+                    a = complex(-0.5, math.sqrt(3)/2)
+                    a2 = complex(-0.5, -math.sqrt(3)/2)
+                    V1 = (Va + a * Vb + a2 * Vc) / 3
+                    V1_mag_ln_kv = abs(V1)
+                    V1_mag_ll_kv = V1_mag_ln_kv * math.sqrt(3)
+                    vm_pu = _bus_vm_pu_from_opendss(V1_mag_ll_kv, BusbarsDictVoltage, matched_bus_id)
+                    va_degree = dss.Bus.puVmagAngle()[1] if len(dss.Bus.puVmagAngle()) > 1 else 0.0
                 
                 # P, Q, PF, Q/P for bus result box (from aggregated bus power)
                 p_mw = None
@@ -4894,8 +4942,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 if len(currents) >= 2:
                     n_conductors = dss.CktElement.NumConductors()
                     n_phases = dss.CktElement.NumPhases()
-                    i_from_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases)
-                    i_to_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases)
+                    i_from_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases, mag_ang=True)
+                    i_to_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases, mag_ang=True)
                 else:
                     i_from_ka = i_to_ka = 0.0
             else:
@@ -4997,9 +5045,16 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     for bname in dss.Circuit.AllBusNames():
                         if bname.lower() == load_bus.lower():
                             dss.Circuit.SetActiveBus(bname)
-                            bus_pu = dss.Bus.puVmagAngle()
-                            if bus_pu and len(bus_pu) >= 1 and not math.isnan(bus_pu[0]):
-                                vm_pu = float(bus_pu[0])
+                            volts = dss.Bus.Voltages()
+                            if volts is not None and len(volts) < 6:
+                                solved = _opendss_single_phase_bus_voltage(
+                                    dss, _opendss_busbar_vn_kv(BusbarsDictVoltage, bname))
+                                if solved:
+                                    vm_pu = solved[0]
+                            else:
+                                bus_pu = dss.Bus.puVmagAngle()
+                                if bus_pu and len(bus_pu) >= 1 and not math.isnan(bus_pu[0]):
+                                    vm_pu = float(bus_pu[0])
                             break
             except Exception:
                 pass
@@ -5075,10 +5130,17 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 break
                     if bus_index is not None:
                         dss.Circuit.SetActiveBus(bus_index)
-                        bus_angles = dss.Bus.puVmagAngle()
-                        if len(bus_angles) >= 2:
-                            vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
-                            va_degree = bus_angles[1] if not math.isnan(bus_angles[1]) else 0.0
+                        volts = dss.Bus.Voltages()
+                        if volts is not None and len(volts) < 6:
+                            solved = _opendss_single_phase_bus_voltage(
+                                dss, _opendss_busbar_vn_kv(BusbarsDictVoltage, gen_bus_name))
+                            if solved:
+                                vm_pu, _, va_degree = solved
+                        else:
+                            bus_angles = dss.Bus.puVmagAngle()
+                            if len(bus_angles) >= 2:
+                                vm_pu = bus_angles[0] if not math.isnan(bus_angles[0]) else 1.0
+                                va_degree = bus_angles[1] if not math.isnan(bus_angles[1]) else 0.0
                 except Exception as e:
                     pass
             else:
@@ -5473,7 +5535,12 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             dss.Circuit.SetActiveBus(bus_name)
                             # Get actual voltage in kV (line-to-line)
                             voltages = dss.Bus.Voltages()  # in Volts
-                            if len(voltages) >= 6:
+                            if voltages is not None and len(voltages) < 6:
+                                solved = _opendss_single_phase_bus_voltage(
+                                    dss, _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name))
+                                if solved:
+                                    vm_pu = solved[0]
+                            elif len(voltages) >= 6:
                                 Va = complex(voltages[0]/1000, voltages[1]/1000)
                                 Vb = complex(voltages[2]/1000, voltages[3]/1000)
                                 Vc = complex(voltages[4]/1000, voltages[5]/1000)
