@@ -16,6 +16,8 @@ import numpy as np
 import pandapower as pp
 import pandapower.shortcircuit as sc
 
+from converter_sc_electrisim import apply_converter_short_circuit_k
+
 try:
     from arcflash.ieee_1584.cubicle import Cubicle
     from arcflash.ieee_1584.calculation import Calculation
@@ -199,12 +201,8 @@ def arcflash(net, in_data, in_data_full=None):
     if clearing_time_min_s <= 0:
         clearing_time_min_s = clearing_time_s
 
-    # Ensure SC parameter present on sgens
-    if hasattr(net, "sgen") and not net.sgen.empty:
-        if "k" not in net.sgen.columns:
-            net.sgen["k"] = 1.1
-        else:
-            net.sgen["k"] = net.sgen["k"].fillna(1.1)
+    # Three-phase converter contribution. Ik" wins, then the dialog k, then 1.1.
+    apply_converter_short_circuit_k(net, "3ph")
 
     try:
         sc.calc_sc(

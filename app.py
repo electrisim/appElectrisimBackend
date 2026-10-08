@@ -86,7 +86,7 @@ CORS(app,
      origins=cors_origins, 
      methods=['GET', 'POST', 'OPTIONS'],
      allow_headers=['Content-Type', 'Authorization', 'Accept', 'Accept-Encoding',
-                    'Access-Control-Allow-Credentials'],
+                    'Content-Encoding', 'Access-Control-Allow-Credentials'],
      supports_credentials=True)
 
 app.config['CORS_HEADERS'] = 'Content-Type'
@@ -127,6 +127,27 @@ def index():
 @app.before_request
 def _log_incoming_request():
     _console(f"[incoming] {request.method} {request.path} from {request.remote_addr}")
+
+
+@app.before_request
+def _decompress_gzip_body():
+    """Accept gzip JSON uploads. The browser sends the load-flow model compressed."""
+    if request.method not in ('POST', 'PUT', 'PATCH'):
+        return None
+    encoding = (request.headers.get('Content-Encoding') or '').lower()
+    if 'gzip' not in encoding:
+        return None
+    raw = request.get_data(cache=True)
+    if not raw:
+        return None
+    try:
+        decoded = gzip.decompress(raw)
+    except OSError:
+        return jsonify({'error': 'Could not decompress gzip request body.'}), 400
+    request._cached_data = decoded
+    request.environ['CONTENT_LENGTH'] = str(len(decoded))
+    request.environ.pop('HTTP_CONTENT_ENCODING', None)
+    return None
 
 
 @app.route('/', methods=['POST'])

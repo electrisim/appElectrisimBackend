@@ -24,6 +24,12 @@ from sc_fault_location import (
     normalize_fault_bus_mode,
     resolve_pp_fault_bus_indices,
 )
+from converter_sc_electrisim import (
+    apply_converter_short_circuit_k,
+    apply_negative_sequence_ikss,
+    attach_converter_sc_inputs,
+    sgen_k_export_lines,
+)
 
 
 Busbars = {}
@@ -1582,7 +1588,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             sc_bus = sc_bus[0]
         lines.append("# Short-circuit calculation (matches Electrisim IEC 60909 run)")
         if not net.sgen.empty:
-            lines.append('net.sgen["k"] = 1.1')
+            lines.extend(sgen_k_export_lines(net, fault_type))
         lines.append("")
         lines.append("sc.calc_sc(")
         lines.append("    net,")
@@ -1621,11 +1627,17 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     need_seed = bool(getattr(net, '_electrisim_export_park_need_seed', False))
     enforce_q = bool(getattr(net, '_electrisim_enforce_q_lims', False))
 
+    ls_export = _electrisim_lightsim2grid_kwargs(net, algorithm)
+    if ls_export.get('lightsim2grid'):
+        ls_export_bits = ["lightsim2grid=True", "voltage_depend_loads=False"]
+    else:
+        ls_export_bits = ["lightsim2grid=False"]
+
     if need_seed:
         lines.append("# Seed load flow (park cosphi(P)/Q(V) measurements)")
         lines.append(
             f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={cva_str}, "
-            f"init='{init}', run_control=False)"
+            f"init='{init}', run_control=False, {', '.join(ls_export_bits)})"
         )
         lines.append("")
 
@@ -1639,6 +1651,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         run_kwargs.append("run_control=True")
     if enforce_q:
         run_kwargs.append("enforce_q_lims=True")
+    run_kwargs.extend(ls_export_bits)
     lines.append(f"pp.runpp(net, {', '.join(run_kwargs)})")
     lines.append("")
     
@@ -2377,6 +2390,147 @@ def apply_sgen_q_setpoint_from_curve(net, in_data):
         print(f"Applied Q setpoint from capability curve for {applied} static generator(s).")
 
 
+_LIGHTSIM2GRID_IMPORTABLE = None
+# Pandapower rejects lightsim2grid=True when any of these tables is non-empty,
+# including out-of-service rows (see pandapower.auxiliary._check_lightsim2grid_compatibility).
+_LIGHTSIM2GRID_BLOCKING_TABLES = ('svc', 'tcsc', 'ssc', 'vsc', 'b2b_vsc', 'bus_dc', 'line_dc')
+_ZIP_LOAD_COLUMNS = (
+    'const_z_percent', 'const_i_percent',
+    'const_z_p_percent', 'const_z_q_percent',
+    'const_i_p_percent', 'const_i_q_percent',
+)
+
+
+def _electrisim_lightsim2grid_importable():
+    """True when the KLU Newton backend can be imported."""
+    global _LIGHTSIM2GRID_IMPORTABLE
+    if _LIGHTSIM2GRID_IMPORTABLE is None:
+        try:
+            from lightsim2grid.newtonpf import newtonpf_new  # noqa: F401
+            _LIGHTSIM2GRID_IMPORTABLE = True
+        except Exception:
+            _LIGHTSIM2GRID_IMPORTABLE = False
+    return _LIGHTSIM2GRID_IMPORTABLE
+
+
+def _electrisim_table_len(net, name):
+    df = getattr(net, name, None)
+    if df is None:
+        return 0
+    try:
+        return len(df)
+    except TypeError:
+        return 0
+
+
+def _electrisim_slack_count(net):
+    """In-service external grids plus in-service slack generators."""
+    n = 0
+    ext_grid = getattr(net, 'ext_grid', None)
+    if ext_grid is not None and len(ext_grid):
+        if 'in_service' in ext_grid.columns:
+            n += int(ext_grid.in_service.fillna(False).astype(bool).sum())
+        else:
+            n += len(ext_grid)
+    gen = getattr(net, 'gen', None)
+    if gen is not None and len(gen) and 'slack' in gen.columns:
+        mask = gen.slack.fillna(False).astype(bool)
+        if 'in_service' in gen.columns:
+            mask = mask & gen.in_service.fillna(False).astype(bool)
+        n += int(mask.sum())
+    return n
+
+
+def _electrisim_has_voltage_dependent_loads(net):
+    """True when an in-service load is not constant power."""
+    load = getattr(net, 'load', None)
+    if load is None or len(load) == 0:
+        return False
+    active = load
+    if 'in_service' in load.columns:
+        active = load[load.in_service.fillna(True).astype(bool)]
+    if len(active) == 0:
+        return False
+    for col in _ZIP_LOAD_COLUMNS:
+        if col not in active.columns:
+            continue
+        values = pd.to_numeric(active[col], errors='coerce').fillna(0.0)
+        if bool((values.abs() > 1e-9).any()):
+            return True
+    return False
+
+
+def _electrisim_has_controllable_shunt(net):
+    shunt = getattr(net, 'shunt', None)
+    if shunt is None or len(shunt) == 0 or 'controllable' not in shunt.columns:
+        return False
+    try:
+        return bool(shunt.controllable.fillna(False).astype(bool).any())
+    except Exception:
+        return True
+
+
+_LIGHTSIM2GRID_MIN_BUSES = 150
+
+
+def _electrisim_bus_count(net):
+    bus = getattr(net, 'bus', None)
+    if bus is None:
+        return 0
+    try:
+        return len(bus)
+    except TypeError:
+        return 0
+
+
+def _electrisim_lightsim2grid_kwargs(net, algorithm='nr', distributed_slack=False, tdpf=False):
+    """runpp kwargs for the lightsim2grid KLU Newton backend, or an explicit opt-out.
+
+    Eligible only for Newton-Raphson on a constant-power network with more than
+    150 buses, one slack (or distributed slack), and without FACTS, controllable
+    shunts, or DC elements. Anything else stays on pandapower's own Newton-Raphson.
+    """
+    try:
+        use = (
+            str(algorithm) == 'nr'
+            and not tdpf
+            and _electrisim_bus_count(net) > _LIGHTSIM2GRID_MIN_BUSES
+            and _electrisim_lightsim2grid_importable()
+            and not _electrisim_has_voltage_dependent_loads(net)
+            and not _electrisim_has_controllable_shunt(net)
+            and not any(_electrisim_table_len(net, name) for name in _LIGHTSIM2GRID_BLOCKING_TABLES)
+            and (_electrisim_slack_count(net) == 1 or bool(distributed_slack))
+        )
+    except Exception:
+        use = False
+    if use:
+        return {'lightsim2grid': True, 'voltage_depend_loads': False}
+    return {'lightsim2grid': False}
+
+
+def electrisim_runpp(net, **kwargs):
+    """pp.runpp with lightsim2grid when the network is eligible, otherwise pandapower NR."""
+    merged = dict(kwargs)
+    backend = _electrisim_lightsim2grid_kwargs(
+        net,
+        algorithm=merged.get('algorithm', 'nr'),
+        distributed_slack=bool(merged.get('distributed_slack', False)),
+        tdpf=bool(merged.get('tdpf', False)),
+    )
+    merged['lightsim2grid'] = bool(backend.get('lightsim2grid'))
+    if merged['lightsim2grid']:
+        merged['voltage_depend_loads'] = False
+    try:
+        return pp.runpp(net, **merged)
+    except NotImplementedError:
+        if not merged.get('lightsim2grid'):
+            raise
+        # Pandapower rejects the backend for a model detail the gate missed.
+        merged['lightsim2grid'] = False
+        merged.pop('voltage_depend_loads', None)
+        return pp.runpp(net, **merged)
+
+
 def _electrisim_enforce_q_lims_kw(net):
     """Keyword args for pp.runpp when static generator Q capability curves are present."""
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
@@ -2529,7 +2683,7 @@ def _electrisim_diagnose_ssc_failure(net, calculate_voltage_angles=True):
     try:
         probe = deepcopy(net)
         probe.ssc['in_service'] = False
-        pp.runpp(probe, algorithm='nr', calculate_voltage_angles=calculate_voltage_angles,
+        electrisim_runpp(probe, algorithm='nr', calculate_voltage_angles=calculate_voltage_angles,
                  init='auto', max_iteration=100)
     except Exception as ex:
         lines.append(
@@ -3470,9 +3624,11 @@ def create_other_elements(in_data,net,x, Busbars):
                 float_keys=('min_p_mw', 'max_p_mw', 'min_q_mvar', 'max_q_mvar'),
                 bool_keys=('controllable',),
             )
-            pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'],
-                           k=1.1, rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service,
+            k_dialog = safe_float(in_data[x].get('k'), 0.0)
+            sgen_idx = pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'],
+                           k=(k_dialog if k_dialog > 0 else float('nan')), rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service,
                            **_sgen_opf)
+            attach_converter_sc_inputs(net, sgen_idx, in_data[x])
             
             # Store user-friendly name for static generator
             sgen_name = in_data[x]['name']
@@ -5323,7 +5479,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
     )
     if need_seed:
         try:
-            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles,
+            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles,
                      init=init, run_control=False)
         except Exception as ex:
             print(f'[ParkController] seed load flow failed (continuing with setpoints only): {ex}')
@@ -5778,6 +5934,12 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             pass
 
                 pf_kwargs = _electrisim_enforce_q_lims_kw(net)
+                _ls_backend = _electrisim_lightsim2grid_kwargs(net, algorithm)
+                print(
+                    "AC load-flow backend: lightsim2grid"
+                    if _ls_backend.get('lightsim2grid')
+                    else "AC load-flow backend: pandapower"
+                )
                 facts_present = _electrisim_net_has_facts(net)
                 if facts_present and str(algorithm) != 'nr':
                     raise NotImplementedError(
@@ -5827,7 +5989,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             except Exception:
                                 pass
                     try:
-                        pp.runpp(net, calculate_voltage_angles=calculate_voltage_angles,
+                        electrisim_runpp(net, calculate_voltage_angles=calculate_voltage_angles,
                                  run_control=plan_run_control, **plan_kwargs, **pf_kwargs)
                         pf_plan_used = plan_label
                         break
@@ -7604,8 +7766,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
     # print("\nBus Data:")
     # print(net.bus)
         
-    net.sgen["k"] = 1.1
-    #print(net.sgen["k"])
+    # k is set from Ik" / the dialog value just before calc_sc, once the fault type is known.
     
     
     # print("\nShunt reactor Data:")
@@ -7690,6 +7851,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         #       return_all_currents=True gives results per (branch, fault_bus) combination (MultiIndex).
         #       For UI display, we want max/min per branch, so keep return_all_currents=False.
         ensure_ext_grid_zero_sequence_min(net)
+        apply_converter_short_circuit_k(net, fault_type)
         sc.calc_sc(
             net,
             fault=fault_type,
@@ -7704,6 +7866,17 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             check_connectivity=False,
             branch_results=True,
             return_all_currents=False,  # Changed: False gives max/min per branch with simple index
+        )
+        # calc_sc above keeps pandapower's default lv_tol_percent (10). The r2/x2
+        # correction must use that same voltage factor.
+        apply_negative_sequence_ikss(
+            net,
+            fault=fault_type,
+            case=fault_location,
+            lv_tol_percent=10,
+            r_fault_ohm=r_fault_ohm,
+            x_fault_ohm=x_fault_ohm,
+            bus=bus,
         )
         
         # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
@@ -8163,7 +8336,7 @@ def contingency_analysis(net, contingency_params):
         # Check if network has elements
         
         # Run base case power flow
-        pp.runpp(net, algorithm='nr', calculate_voltage_angles=True)
+        electrisim_runpp(net, algorithm='nr', calculate_voltage_angles=True)
         
         # Define contingency cases based on element type
         contingency_cases = []
@@ -8232,7 +8405,7 @@ def contingency_analysis(net, contingency_params):
                     net_cont.gen.loc[contingency_case['element_idx'], 'in_service'] = False
                 
                 # Run power flow for contingency case
-                pp.runpp(net_cont, algorithm='nr', calculate_voltage_angles=True)
+                electrisim_runpp(net_cont, algorithm='nr', calculate_voltage_angles=True)
                 
                 # Check for violations
                 case_violations = []
@@ -10665,10 +10838,10 @@ def _ts_run_powerflow(net, timeseries_params, time_index, prev_converged):
         pf_init = 'results'
 
     try:
-        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init=pf_init, **pf_kwargs)
+        electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init=pf_init, **pf_kwargs)
     except Exception:
         if pf_init == 'results':
-            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init='auto', **pf_kwargs)
+            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init='auto', **pf_kwargs)
         else:
             raise
     return bool(net.converged)
@@ -11026,7 +11199,7 @@ class BESSControlForTargetBus(control.basic_controller.Controller):
         
         # Run power flow to get current state (with sufficient iterations)
         try:
-            pp.runpp(net, algorithm='nr', calculate_voltage_angles=True, 
+            electrisim_runpp(net, algorithm='nr', calculate_voltage_angles=True, 
                     init='auto', verbose=False)
         except Exception as e:
             # If power flow fails, don't update - keep current values
@@ -11467,7 +11640,7 @@ def economic_analysis(net, in_data, params):
                 energy_price = None
         
         try:
-            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
+            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
                      **_electrisim_enforce_q_lims_kw(net))
         except Exception as pf_err:
             return {
@@ -11623,7 +11796,7 @@ def economic_analysis(net, in_data, params):
                             net.sgen['q_mvar'] = orig_sgen_q * gs
                     try:
                         init_this = init if i == 0 else "results"
-                        pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
+                        electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
                                  **_electrisim_enforce_q_lims_kw(net))
                         loss_vals[i] = _economic_get_loss_mw(net) if net.converged else 0.0
                     except Exception:
@@ -11646,7 +11819,7 @@ def economic_analysis(net, in_data, params):
                                 net.sgen['q_mvar'] = orig_sgen_q * gs
                         try:
                             init_this = init if (i == 0 and j == 0) else "results"
-                            pp.runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
+                            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init_this,
                                      **_electrisim_enforce_q_lims_kw(net))
                             loss_grid[i, j] = _economic_get_loss_mw(net) if net.converged else 0.0
                         except Exception:
@@ -12846,7 +13019,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
 
     When any of run_control_trafo2w / run_control_trafo3w / run_control_shunt is True and the net
     lists matching controller specs, registers DiscreteTapControl / DiscreteShuntController /
-    line-P CharacteristicControl for shunt step and runs pp.runpp(..., run_control=True) with a single NR
+    line-P CharacteristicControl for shunt step and runs electrisim_runpp(..., run_control=True) with a single NR
     strategy (controller state is not reliable across solver fallbacks on the same net).
     """
     import io
@@ -12886,7 +13059,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
                 old_out, old_err = sys.stdout, sys.stderr
                 sys.stdout = sys.stderr = buf
                 try:
-                    pp.runpp(net_pf,
+                    electrisim_runpp(net_pf,
                              algorithm=algo,
                              calculate_voltage_angles=True,
                              init=s['init'],
@@ -12897,7 +13070,7 @@ def _rpc_run_pf_robust(net_pf, verbose_iwamoto=False, run_control_trafo2w=False,
                     sys.stdout = old_out
                     sys.stderr = old_err
             else:
-                pp.runpp(net_pf,
+                electrisim_runpp(net_pf,
                          algorithm=algo,
                          calculate_voltage_angles=True,
                          init=s['init'],

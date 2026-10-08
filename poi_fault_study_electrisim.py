@@ -15,6 +15,10 @@ import pandapower as pp
 from pandapower import shortcircuit as sc
 
 import ansi_shortcircuit_electrisim as ansi_sc
+from converter_sc_electrisim import (
+    apply_converter_short_circuit_k,
+    apply_negative_sequence_ikss,
+)
 
 
 def _f(v, default=0.0) -> float:
@@ -221,8 +225,7 @@ def _iec_bus_sc(
 ) -> dict:
     work = copy.deepcopy(net)
     apply_ngr_to_net(work)
-    if hasattr(work, "sgen") and not work.sgen.empty and "k" in work.sgen.columns:
-        work.sgen["k"] = 1.1
+    apply_converter_short_circuit_k(work, fault)
     from pandapower_electrisim import ensure_ext_grid_zero_sequence_min
 
     ensure_ext_grid_zero_sequence_min(work)
@@ -240,6 +243,7 @@ def _iec_bus_sc(
             branch_results=False,
             return_all_currents=False,
         )
+        apply_negative_sequence_ikss(work, fault=fault, case=case, bus=int(bus_idx))
     except Exception as e:
         return {"error": str(e), "ikss_ka": None, "ip_ka": None, "ith_ka": None}
     row = work.res_bus_sc.loc[bus_idx]
