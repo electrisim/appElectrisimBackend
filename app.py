@@ -40,6 +40,7 @@ def _coerce_export_flag(value):
 
 
 import pandapower_electrisim
+import warm_loadflow
 import grid_code_pq_electrisim
 import grid_code_vq_electrisim
 import opendss_electrisim
@@ -417,23 +418,29 @@ def simulation():
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
                 print(f"=== LOAD FLOW SIMULATION REQUESTED BY USER: {user_email} ===")
-                
-                frequency=eval(in_data[x]['frequency'])
-                algorithm=in_data[x]['algorithm']
-                calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
-                init = in_data[x]['initialization']
-                export_python = in_data[x].get('exportPython', False)  # Export Python code flag
-                rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(in_data[x])
 
-                net = pp.create_empty_network(f_hz=frequency)
-           
-                Busbars = pandapower_electrisim.create_busbars(in_data, net)
-                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)   
+                response_data = warm_loadflow.solve_if_cached(in_data, x)
+                if response_data is None:
+                    _console("FULL load flow: building the pandapower model")
+                    frequency=eval(in_data[x]['frequency'])
+                    algorithm=in_data[x]['algorithm']
+                    calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
+                    init = in_data[x]['initialization']
+                    export_python = in_data[x].get('exportPython', False)  # Export Python code flag
+                    rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(in_data[x])
 
-                response_data = pandapower_electrisim.powerflow(
-                    net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars,
-                    run_control_trafo2w=rc2, run_control_trafo3w=rc3, run_control_shunt=rcs,
-                )  
+                    net = pp.create_empty_network(f_hz=frequency)
+
+                    Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                    pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+
+                    response_data = pandapower_electrisim.powerflow(
+                        net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars,
+                        run_control_trafo2w=rc2, run_control_trafo3w=rc3, run_control_shunt=rcs,
+                    )
+                    response_data = warm_loadflow.remember_after_full(
+                        response_data, net, Busbars, in_data[x], user_email,
+                    )  
 
                 # Check if client accepts gzip compression
                 accept_encoding = request.headers.get('Accept-Encoding', '')

@@ -5725,8 +5725,11 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
 
 
 def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None,
-              run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False):
+              run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False, reuse_model=False):
             #pandapower - rozpływ mocy
+            # A cached large-grid solve always starts from the previous voltages.
+            if reuse_model:
+                init = 'results'
             # Initialize tap_control_results before try block so it's accessible in else block
             tap_control_results = []
             shunt_control_results = []
@@ -5778,16 +5781,28 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
 
                 # ParkController is an explicit diagram element with its own enable toggle, so it is
                 # not gated on the run_control_* checkboxes (those cover tap/shunt control only).
+                # A warm solve already has those controllers on the cached model. Attaching them
+                # again would run every controller twice.
+                controllers_already = False
+                if reuse_model:
+                    try:
+                        cached_controllers = getattr(net, 'controller', None)
+                        controllers_already = cached_controllers is not None and len(cached_controllers) > 0
+                    except Exception:
+                        controllers_already = False
                 park_attached = 0
-                try:
-                    park_attached = _electrisim_attach_park_controllers(
-                        net, in_data, algorithm=algorithm,
-                        calculate_voltage_angles=calculate_voltage_angles, init=init
-                    )
-                except Exception as park_ex:
-                    print(f"[ParkController] attach error: {park_ex}")
-                    park_attached = 0
-                run_pp_control = attach_2w or attach_3w or attach_sh_disc or attach_lf_sh or bool(park_attached)
+                if controllers_already:
+                    print("Warm solve: keeping controllers already attached to the model")
+                else:
+                    try:
+                        park_attached = _electrisim_attach_park_controllers(
+                            net, in_data, algorithm=algorithm,
+                            calculate_voltage_angles=calculate_voltage_angles, init=init
+                        )
+                    except Exception as park_ex:
+                        print(f"[ParkController] attach error: {park_ex}")
+                        park_attached = 0
+                run_pp_control = attach_2w or attach_3w or attach_sh_disc or attach_lf_sh or bool(park_attached) or controllers_already
                 if run_pp_control:
                     print(
                         f"Controllers active: 2w_tap={attach_2w} ({len(tc2_list)} configured), "
@@ -5861,12 +5876,13 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                       f"use {spec.get('p_col')}, use_abs={spec.get('use_abs')}")
                             except Exception:
                                 pass
-                    if attach_2w or attach_3w:
-                        _electrisim_attach_discrete_tap_controllers(net, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
-                    if attach_sh_disc:
-                        _electrisim_attach_discrete_shunt_controllers(net)
-                    if attach_lf_sh:
-                        _electrisim_attach_line_flow_shunt_controllers(net)
+                    if not controllers_already:
+                        if attach_2w or attach_3w:
+                            _electrisim_attach_discrete_tap_controllers(net, attach_trafo=attach_2w, attach_trafo3w=attach_3w)
+                        if attach_sh_disc:
+                            _electrisim_attach_discrete_shunt_controllers(net)
+                        if attach_lf_sh:
+                            _electrisim_attach_line_flow_shunt_controllers(net)
                 
                 # Snapshot tap positions before runpp whenever controllers may run (for UI / diagnostics)
                 initial_tap_positions = {}
@@ -7695,8 +7711,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     separators=(',', ':'),
                 ) 
             
-                print("Response to FRONTEND CORRECT")   
-                   
+                sys.stdout = _orig_stdout
+                sys.stderr = _orig_stderr
+                print("Response to FRONTEND CORRECT")
+
                 return response  
 
 
