@@ -302,9 +302,9 @@ def apply_negative_sequence_ikss(
 ) -> None:
     """Replace the voltage-source part of bus ikss using Z2 from r2/x2.
 
-    The current-source term already stored by pandapower is kept. Branch
-    currents stay on pandapower's Z2 = Z1 solution. ip and ith on each bus
-    are scaled with the ikss ratio.
+    The current-source term already stored by pandapower is kept. ip and ith
+    on each bus, and the branch currents feeding each bus, are scaled with the
+    ikss ratio of that bus.
     """
     if fault not in ("2ph", "1ph"):
         return
@@ -420,6 +420,7 @@ def _apply_negative_sequence_ikss(net, fault, case, lv_tol_percent, r_fault_ohm,
             if pair is not None:
                 correction[ppc_bus] = pair
 
+    ratio_by_bus = {}
     for pp_bus in studied:
         ppc_bus = _bus_lookup_ppc(work, pp_bus)
         if ppc_bus is None or ppc_bus not in correction:
@@ -435,6 +436,7 @@ def _apply_negative_sequence_ikss(net, fault, case, lv_tol_percent, r_fault_ohm,
             updated = 0.0
         if current > 1e-12:
             ratio = updated / current
+            ratio_by_bus[int(pp_bus)] = ratio
             for column in ("ip_ka", "ith_ka"):
                 if column not in net.res_bus_sc.columns:
                     continue
@@ -442,3 +444,62 @@ def _apply_negative_sequence_ikss(net, fault, case, lv_tol_percent, r_fault_ohm,
                 if math.isfinite(peak):
                     net.res_bus_sc.at[pp_bus, column] = peak * ratio
         net.res_bus_sc.at[pp_bus, "ikss_ka"] = updated
+
+    _scale_branch_results(net, ratio_by_bus)
+
+
+_BRANCH_RESULT_COLUMNS = {
+    "line": (
+        ("from_bus", "to_bus"),
+        ("ikss_ka", "ikss_from_ka", "ikss_to_ka", "ip_ka", "ith_ka"),
+    ),
+    "trafo": (
+        ("hv_bus", "lv_bus"),
+        ("ikss_hv_ka", "ikss_lv_ka"),
+    ),
+    "trafo3w": (
+        ("hv_bus", "mv_bus", "lv_bus"),
+        ("ikss_hv_ka", "ikss_mv_ka", "ikss_lv_ka"),
+    ),
+}
+
+
+def _scale_branch_results(net, ratio_by_bus):
+    """Apply each bus ikss ratio to the branches that feed that bus.
+
+    A branch result is the largest current over the studied fault buses, so it
+    is scaled by the largest ratio among its own terminals. Per-fault-bus
+    results (return_all_currents) carry a MultiIndex and are left alone.
+    """
+    if not ratio_by_bus:
+        return
+    for element, (bus_columns, value_columns) in _BRANCH_RESULT_COLUMNS.items():
+        frame = getattr(net, f"res_{element}_sc", None)
+        if frame is None or frame.empty:
+            continue
+        if isinstance(frame.index, pd.MultiIndex):
+            continue
+        source = net[element]
+        columns = [c for c in value_columns if c in frame.columns]
+        if not columns:
+            continue
+        for idx in frame.index:
+            if idx not in source.index:
+                continue
+            ratios = []
+            for bus_column in bus_columns:
+                if bus_column not in source.columns:
+                    continue
+                try:
+                    terminal = int(source.at[idx, bus_column])
+                except (TypeError, ValueError):
+                    continue
+                if terminal in ratio_by_bus:
+                    ratios.append(ratio_by_bus[terminal])
+            if not ratios:
+                continue
+            ratio = max(ratios)
+            for column in columns:
+                value = _float(frame.at[idx, column], float("nan"))
+                if math.isfinite(value):
+                    frame.at[idx, column] = value * ratio

@@ -30,6 +30,9 @@ from converter_sc_electrisim import (
     attach_converter_sc_inputs,
     sgen_k_export_lines,
 )
+import zero_sequence_dialog
+
+zero_sequence_dialog.install()
 
 
 Busbars = {}
@@ -978,6 +981,15 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     lines.append("# Pandapower Network Model")
     lines.append("# Auto-generated code to recreate the network")
     if is_sc:
+        _sc_fault = (sc_in_data or {}).get('fault_type', '3ph')
+        if _sc_fault not in ('3ph', '2ph', '1ph'):
+            _sc_fault = '3ph'
+        _sc_fault_label = {
+            '3ph': 'three-phase',
+            '2ph': 'two-phase',
+            '1ph': 'single-phase to ground',
+        }[_sc_fault]
+        lines.append(f"# Fault: {_sc_fault_label} ({_sc_fault})")
         lines.append("# Short-circuit study (IEC 60909 via pandapower.shortcircuit.calc_sc)")
     lines.append("")
     lines.append("import pandapower as pp")
@@ -1587,6 +1599,15 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         if sc_bus is not None and len(sc_bus) == 1:
             sc_bus = sc_bus[0]
         lines.append("# Short-circuit calculation (matches Electrisim IEC 60909 run)")
+        lines.append(
+            "# Fault: "
+            + {
+                '3ph': 'three-phase',
+                '2ph': 'two-phase',
+                '1ph': 'single-phase to ground',
+            }[fault_type]
+            + f" ({fault_type})"
+        )
         if not net.sgen.empty:
             lines.extend(sgen_k_export_lines(net, fault_type))
         lines.append("")
@@ -3658,8 +3679,8 @@ def create_other_elements(in_data,net,x, Busbars):
             # Get values with default fallbacks and proper type conversion
             parallel_value = safe_int(in_data[x].get('parallel', 1), 1)
             vector_group_raw = in_data[x].get('vector_group', None)
-            vk0_percent = safe_float(in_data[x].get('vk0_percent', None))
-            vkr0_percent = safe_float(in_data[x].get('vkr0_percent', None))
+            vk0_percent = _optional_sequence_percent(in_data[x].get('vk0_percent', None))
+            vkr0_percent = _optional_sequence_percent(in_data[x].get('vkr0_percent', None))
             mag0_percent = safe_float(in_data[x].get('mag0_percent', None))
             mag0_rx = safe_float(in_data[x].get('mag0_rx', None))
             si0_hv_partial = safe_float(in_data[x].get('si0_hv_partial', None))
@@ -3732,16 +3753,14 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 transformer_params['vector_group'] = 'Dyn'  # Default vector group
             
-            # For zero sequence parameters, use provided values or default to main sequence values
-            if vk0_percent is not None and vk0_percent != 0.0:
-                transformer_params['vk0_percent'] = vk0_percent
-            else:
-                transformer_params['vk0_percent'] = transformer_params['vk_percent']  # Default to main sequence
-            
-            if vkr0_percent is not None and vkr0_percent != 0.0:
-                transformer_params['vkr0_percent'] = vkr0_percent
-            else:
-                transformer_params['vkr0_percent'] = transformer_params['vkr_percent']  # Default to main sequence
+            # An entered 0 is a real zero-sequence voltage, not a missing value.
+            # Fall back to the positive-sequence value only when the field was left empty.
+            transformer_params['vk0_percent'] = (
+                transformer_params['vk_percent'] if vk0_percent is None else vk0_percent
+            )
+            transformer_params['vkr0_percent'] = (
+                transformer_params['vkr_percent'] if vkr0_percent is None else vkr0_percent
+            )
             
             if mag0_percent is not None:
                 transformer_params['mag0_percent'] = mag0_percent
@@ -3769,6 +3788,12 @@ def create_other_elements(in_data,net,x, Busbars):
                 transformer_params['max_loading_percent'] = _mlp_t2
 
             trafo_idx = pp.create_transformer_from_parameters(net, **transformer_params)
+            # create_transformer_from_parameters can leave vk0 at the positive-sequence
+            # value. The dialog value, including an explicit 0, is what must be stored.
+            for _zcol in ('vk0_percent', 'vkr0_percent', 'mag0_percent', 'mag0_rx', 'si0_hv_partial'):
+                if _zcol not in net.trafo.columns:
+                    net.trafo[_zcol] = float('nan')
+                net.trafo.at[trafo_idx, _zcol] = float(transformer_params[_zcol])
             for _ngr_col in ('rn_ohm', 'xn_ohm'):
                 if _ngr_col not in net.trafo.columns:
                     net.trafo[_ngr_col] = 0.0
@@ -10147,6 +10172,12 @@ def _electrisim_optional_max_loading_percent(raw):
         return None
     return v
 
+
+def _optional_sequence_percent(value):
+    """Return a zero-sequence percent as entered. None only when the field is empty."""
+    if value is None or value == 'null' or value == 'None' or value == '':
+        return None
+    return safe_float(value, None)
 
 def safe_float(value, default=0.0):
     """Convert value to float. Returns default for None, 'null', 'None', empty string, or invalid values."""
