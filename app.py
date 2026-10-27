@@ -1,6 +1,51 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+
+
+class _SafeTextStream:
+    """A closed Windows console makes print() raise OSError 22 and abort the request.
+
+    The browser then reports "Failed to fetch" because the debugger page has no
+    CORS header. Swallow console errors and keep the response.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            return 0
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            return None
+
+    def reconfigure(self, **kwargs):
+        try:
+            return self._stream.reconfigure(**kwargs)
+        except OSError:
+            return None
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except OSError:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if not isinstance(getattr(sys, 'stdout', None), _SafeTextStream):
+    sys.stdout = _SafeTextStream(sys.stdout)
+if not isinstance(getattr(sys, 'stderr', None), _SafeTextStream):
+    sys.stderr = _SafeTextStream(sys.stderr)
+
 # line_buffering: PowerShell/Cursor often capture Werkzeug stderr but drop block-buffered stdout.
 sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
@@ -428,6 +473,10 @@ def simulation():
                     init = in_data[x]['initialization']
                     export_python = in_data[x].get('exportPython', False)  # Export Python code flag
                     rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(in_data[x])
+                    _console(
+                        f"Load flow controller ticks: 2w={rc2} 3w={rc3} shunt={rcs} "
+                        f"raw_shunt={in_data[x].get('run_control_shunt')!r}"
+                    )
 
                     net = pp.create_empty_network(f_hz=frequency)
 

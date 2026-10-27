@@ -19,6 +19,11 @@ N11_MAX_CASES = 400
 HEADROOM_SEARCH_MAX_MW = 5000.0
 HEADROOM_STEPS = 22
 
+# Violations are judged against the same case with the project at 0 MW. A violation that is
+# already there at 0 MW counts again only if the project deepens it by more than these margins.
+WORSE_TOL_VM_PU = 0.005
+WORSE_TOL_LOADING_PERCENT = 1.0
+
 
 class SiteScreeningCancelled(Exception):
     """Raised when the user stops a streaming site-screening run."""
@@ -99,8 +104,11 @@ def _count_violations(
             vm = float(row.vm_pu)
             violations.append({
                 "kind": "Bus",
+                "index": int(bus_idx),
                 "id": raw,
                 "name": nm,
+                "value": vm,
+                "side": "low" if vm < min_vm_pu else "high",
                 "text": f"{vm:.3f} pu",
                 "limit": f"{min_vm_pu:.2f}–{max_vm_pu:.2f} pu",
             })
@@ -112,8 +120,11 @@ def _count_violations(
                 ld = float(row.loading_percent)
                 violations.append({
                     "kind": "Line",
+                    "index": int(li),
                     "id": raw,
                     "name": nm,
+                    "value": ld,
+                    "side": "over",
                     "text": f"{ld:.1f}% loaded",
                     "limit": f"{max_loading_percent:.0f}%",
                 })
@@ -124,12 +135,45 @@ def _count_violations(
                 ld = float(row.loading_percent)
                 violations.append({
                     "kind": "Transformer",
+                    "index": int(ti),
                     "id": raw,
                     "name": nm,
+                    "value": ld,
+                    "side": "over",
                     "text": f"{ld:.1f}% loaded",
                     "limit": f"{max_loading_percent:.0f}%",
                 })
     return len(violations), violations
+
+
+def _violation_map(details: List[Dict[str, Any]]) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    return {(d["kind"], d["index"]): d for d in details}
+
+
+def _new_or_worse(
+    details: List[Dict[str, Any]],
+    baseline_map: Optional[Dict[Tuple[str, int], Dict[str, Any]]],
+    tols: Tuple[float, float],
+) -> List[Dict[str, Any]]:
+    """Keep violations that are absent at 0 MW, or deeper than at 0 MW by more than the margin.
+
+    ``baseline_map`` is None when there is no 0 MW reference (it did not converge): then every
+    violation counts as new.
+    """
+    if baseline_map is None:
+        return [dict(d, change="new") for d in details]
+    tol_vm_pu, tol_loading = tols
+    out = []
+    for d in details:
+        b = baseline_map.get((d["kind"], d["index"]))
+        if b is None or b.get("side") != d.get("side"):
+            out.append(dict(d, change="new"))
+            continue
+        tol = tol_vm_pu if d["kind"] == "Bus" else tol_loading
+        worse_by = (b["value"] - d["value"]) if d["side"] == "low" else (d["value"] - b["value"])
+        if worse_by > tol:
+            out.append(dict(d, change="worse", baseline_text=b["text"]))
+    return out
 
 
 def _site_marker(net, load_idx) -> Dict[str, Any]:
@@ -302,7 +346,11 @@ def _headroom_mw(
     power_factor: float,
     limits: Dict[str, Any],
     on_step=None,
+    baseline_map: Optional[Dict[Tuple[str, int], Dict[str, Any]]] = None,
+    tols: Tuple[float, float] = (WORSE_TOL_VM_PU, WORSE_TOL_LOADING_PERCENT),
+    relative_to_baseline: bool = False,
 ) -> float:
+    """Largest project MW with no violations (or, when ``relative_to_baseline``, none new or worse than at 0 MW)."""
     lo, hi = 0.0, HEADROOM_SEARCH_MAX_MW
     best = 0.0
     for step in range(HEADROOM_STEPS):
@@ -318,7 +366,9 @@ def _headroom_mw(
         if not _run_pf(net):
             hi = mid
             continue
-        n_v, _ = _count_violations(net, **limits)
+        n_v, details = _count_violations(net, **limits)
+        if relative_to_baseline:
+            n_v = len(_new_or_worse(details, baseline_map, tols))
         if n_v == 0:
             best = mid
             lo = mid
@@ -327,38 +377,79 @@ def _headroom_mw(
     return round(best, 2)
 
 
+def _outage_net(net_template, case: Dict[str, Any]):
+    net_c = deepcopy(net_template)
+    if case.get("outages"):
+        for typ, eidx in case["outages"]:
+            _apply_outage(net_c, {"type": typ, "element_idx": eidx})
+    else:
+        _apply_outage(net_c, case)
+    return net_c
+
+
+def _contingency_baseline(
+    net0,
+    cases: List[Dict[str, Any]],
+    limits: Dict[str, Any],
+    on_step=None,
+) -> List[Optional[Dict[Tuple[str, int], Dict[str, Any]]]]:
+    """Violations of every outage case with the project at 0 MW (None where it does not converge)."""
+    out: List[Optional[Dict[Tuple[str, int], Dict[str, Any]]]] = []
+    total = len(cases)
+    for i, case in enumerate(cases, 1):
+        if on_step and (i == 1 or i == total or i % 10 == 0):
+            on_step(i, total)
+        net_c = _outage_net(net0, case)
+        if not _run_pf(net_c):
+            out.append(None)
+            continue
+        _, details = _count_violations(net_c, **limits)
+        out.append(_violation_map(details))
+    return out
+
+
 def _run_contingency_batch(
     net_template,
     cases: List[Dict[str, Any]],
     limits: Dict[str, Any],
     on_step=None,
     site_load: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, str, int, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    worst = 0
-    worst_name = ""
-    worst_details: List[Dict[str, Any]] = []
-    worst_snap = None
-    failed = 0
+    baseline: Optional[List[Optional[Dict[Tuple[str, int], Dict[str, Any]]]]] = None,
+    tols: Tuple[float, float] = (WORSE_TOL_VM_PU, WORSE_TOL_LOADING_PERCENT),
+) -> Dict[str, Any]:
+    """Run outage cases at the project size.
+
+    ``worst`` / ``worst_details`` count only violations that are new or worse than the same
+    outage at 0 MW (``baseline``, aligned with ``cases``). ``worst_all`` keeps the plain count.
+    ``new_failed`` counts outages that do not converge with the project but do at 0 MW.
+    """
+    res: Dict[str, Any] = {
+        "worst": 0, "worst_name": "", "worst_details": [], "worst_snap": None,
+        "worst_all": 0, "worst_all_name": "",
+        "failed": 0, "new_failed": 0,
+    }
     total = len(cases)
     for i, case in enumerate(cases, 1):
         if on_step and (i == 1 or i == total or i % 10 == 0):
             on_step(i, total)
-        net_c = deepcopy(net_template)
-        if case.get("outages"):
-            for typ, eidx in case["outages"]:
-                _apply_outage(net_c, {"type": typ, "element_idx": eidx})
-        else:
-            _apply_outage(net_c, case)
+        net_c = _outage_net(net_template, case)
+        has_ref = baseline is not None and baseline[i - 1] is not None
         if not _run_pf(net_c):
-            failed += 1
+            res["failed"] += 1
+            if baseline is None or has_ref:
+                res["new_failed"] += 1
             continue
-        n_v, details = _count_violations(net_c, **limits)
-        if n_v > worst:
-            worst = n_v
-            worst_name = case.get("name", "")
-            worst_details = details
-            worst_snap = _dashboard_snapshot(net_c, worst_name or "Contingency", site_load)
-    return worst, worst_name, failed, worst_details, worst_snap
+        n_all, details = _count_violations(net_c, **limits)
+        if n_all > res["worst_all"]:
+            res["worst_all"] = n_all
+            res["worst_all_name"] = case.get("name", "")
+        counted = _new_or_worse(details, baseline[i - 1] if has_ref else None, tols)
+        if len(counted) > res["worst"]:
+            res["worst"] = len(counted)
+            res["worst_name"] = case.get("name", "")
+            res["worst_details"] = counted
+            res["worst_snap"] = _dashboard_snapshot(net_c, res["worst_name"] or "Contingency", site_load)
+    return res
 
 
 def site_screening_analysis(net, params: Dict[str, Any]) -> str:
@@ -384,6 +475,10 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
             "max_vm_pu": max_vm_pu,
             "max_loading_percent": max_loading_percent,
         }
+        tols = (
+            float(params.get("worse_tol_vm_pu", WORSE_TOL_VM_PU)),
+            float(params.get("worse_tol_loading_percent", WORSE_TOL_LOADING_PERCENT)),
+        )
 
         _progress(params, "Checking connectivity…")
         isolated = top.unsupplied_buses(net)
@@ -410,24 +505,48 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
             n11_cases = []
         _progress(params, f"Contingencies ready: {len(n1_cases)} N-1, {len(n11_cases)} N-1-1.")
 
+        # 0 MW reference: every site load at zero. It is the same for all sites, so run it once and
+        # judge each project size only on violations that are new or worse than here.
+        _progress(params, "Reference case at 0 MW — intact system")
+        net0 = deepcopy(net)
+        for idx in load_indices:
+            net0.load.loc[idx, "p_mw"] = 0.0
+            net0.load.loc[idx, "q_mvar"] = 0.0
+        base_converged = _run_pf(net0)
+        base_violations = 0
+        base_details: List[Dict[str, Any]] = []
+        if base_converged:
+            base_violations, base_details = _count_violations(net0, **limits)
+        base_map = _violation_map(base_details) if base_converged else None
+        n1_base = _contingency_baseline(
+            net0, n1_cases, limits,
+            on_step=lambda i, n: _progress(params, f"Reference case at 0 MW — N-1 {i}/{n}"),
+        ) if base_converged else None
+        n11_base = _contingency_baseline(
+            net0, n11_cases, limits,
+            on_step=lambda i, n: _progress(params, f"Reference case at 0 MW — N-1-1 {i}/{n}"),
+        ) if (base_converged and n11_cases) else None
+        n1_base_with_viol = sum(1 for m in (n1_base or []) if m)
+        n11_base_with_viol = sum(1 for m in (n11_base or []) if m)
+        n1_base_failed = sum(1 for m in (n1_base or []) if m is None)
+        n11_base_failed = sum(1 for m in (n11_base or []) if m is None)
+        if base_converged:
+            _progress(
+                params,
+                f"At 0 MW: {base_violations} intact violations, {n1_base_with_viol} N-1 cases already "
+                f"outside limits. These are not counted against the project unless it makes them worse.",
+            )
+
         rows = []
         n_sites = len(load_indices)
         for site_i, load_idx in enumerate(load_indices, 1):
             site_name = _contingency_friendly_name(net, net.load.loc[load_idx, "name"])
             site_id = str(net.load.loc[load_idx, "id"]) if "id" in net.load.columns else site_name
             _progress(params, f"{site_name} ({site_i}/{n_sites}) — intact system")
-
-            # Baseline violations at 0 MW project load
-            net0 = deepcopy(net)
-            for idx in load_indices:
-                net0.load.loc[idx, "p_mw"] = 0.0
-                net0.load.loc[idx, "q_mvar"] = 0.0
-            base_violations = 0
-            base_details: List[Dict[str, Any]] = []
-            base_snap = None
-            if _run_pf(net0):
-                base_violations, base_details = _count_violations(net0, **limits)
-                base_snap = _dashboard_snapshot(net0, f"{site_name} — intact system, 0 MW", _site_marker(net0, load_idx))
+            base_snap = (
+                _dashboard_snapshot(net0, f"{site_name} — intact system, 0 MW", _site_marker(net0, load_idx))
+                if base_converged else None
+            )
 
             for mw in mw_sizes:
                 label = f"{site_name} · {mw:g} MW"
@@ -451,6 +570,13 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                             "n11_worst_case": "",
                             "n1_failed_cases": 0,
                             "n11_failed_cases": 0,
+                            "n1_new_failed_cases": 0,
+                            "n11_new_failed_cases": 0,
+                            "worst_n1_violations_all": -1,
+                            "worst_n11_violations_all": -1,
+                            "n1_worst_case_all": "",
+                            "n11_worst_case_all": "",
+                            "case_new_violations": -1,
                             "upgrade_likely": True,
                             "notes": "Base load flow did not converge at requested MW.",
                             "base_violation_details": base_details,
@@ -469,28 +595,39 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                 headroom = _headroom_mw(
                     net, load_idx, load_indices, load_snapshot, power_factor, limits,
                     on_step=lambda i, n, label=label: _progress(params, f"{label} — headroom {i}/{n}"),
+                    baseline_map=base_map, tols=tols, relative_to_baseline=True,
                 )
                 case_n, case_details = _count_violations(net_case, **limits)
+                case_new = _new_or_worse(case_details, base_map, tols)
                 case_snap = _dashboard_snapshot(net_case, f"{label} — intact", _site_marker(net_case, load_idx))
                 site_mark = _site_marker(net_case, load_idx)
-                w_n1, n1_name, n1_fail, n1_details, n1_snap = _run_contingency_batch(
+                n1 = _run_contingency_batch(
                     net_case, n1_cases, limits,
                     on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1 {i}/{n}"),
-                    site_load=site_mark,
+                    site_load=site_mark, baseline=n1_base, tols=tols,
                 )
-                w_n11, n11_name, n11_fail, n11_details, n11_snap = (
+                n11 = (
                     _run_contingency_batch(
                         net_case, n11_cases, limits,
                         on_step=lambda i, n, label=label: _progress(params, f"{label} — N-1-1 {i}/{n}"),
-                        site_load=site_mark,
+                        site_load=site_mark, baseline=n11_base, tols=tols,
                     )
-                    if n11_cases else (0, "", 0, [], None)
+                    if n11_cases else _run_contingency_batch(net_case, [], limits)
                 )
                 _progress(params, f"{label} — headroom {headroom:g} MW")
 
-                upgrade = headroom < mw or w_n1 > 0 or w_n11 > 0
-                if base_violations == 0 and (w_n1 > 0 or w_n11 > 0):
-                    upgrade = True
+                # Only what the project adds counts: new or worse violations, and outages that
+                # stop converging with the project although they converge at 0 MW.
+                upgrade = (
+                    headroom < mw
+                    or n1["worst"] > 0 or n11["worst"] > 0
+                    or n1["new_failed"] > 0 or n11["new_failed"] > 0
+                )
+                notes = []
+                if n1["new_failed"]:
+                    notes.append(f"{n1['new_failed']} N-1 outage(s) do not converge with the project but do at 0 MW.")
+                if n11["new_failed"]:
+                    notes.append(f"{n11['new_failed']} N-1-1 outage(s) do not converge with the project but do at 0 MW.")
 
                 rows.append(
                     {
@@ -499,23 +636,30 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
                         "requested_mw": mw,
                         "headroom_mw": headroom,
                         "base_violations": base_violations,
-                        "worst_n1_violations": w_n1,
-                        "worst_n11_violations": w_n11,
-                        "n1_worst_case": n1_name,
-                        "n11_worst_case": n11_name,
-                        "n1_failed_cases": n1_fail,
-                        "n11_failed_cases": n11_fail,
+                        "worst_n1_violations": n1["worst"],
+                        "worst_n11_violations": n11["worst"],
+                        "n1_worst_case": n1["worst_name"],
+                        "n11_worst_case": n11["worst_name"],
+                        "worst_n1_violations_all": n1["worst_all"],
+                        "worst_n11_violations_all": n11["worst_all"],
+                        "n1_worst_case_all": n1["worst_all_name"],
+                        "n11_worst_case_all": n11["worst_all_name"],
+                        "n1_failed_cases": n1["failed"],
+                        "n11_failed_cases": n11["failed"],
+                        "n1_new_failed_cases": n1["new_failed"],
+                        "n11_new_failed_cases": n11["new_failed"],
                         "upgrade_likely": upgrade,
-                        "notes": "",
+                        "notes": " ".join(notes),
                         "base_violation_details": base_details,
                         "base_snapshot": base_snap,
                         "case_violations": case_n,
+                        "case_new_violations": len(case_new),
                         "case_violation_details": case_details,
                         "case_snapshot": case_snap,
-                        "n1_violation_details": n1_details,
-                        "n1_snapshot": n1_snap,
-                        "n11_violation_details": n11_details,
-                        "n11_snapshot": n11_snap,
+                        "n1_violation_details": n1["worst_details"],
+                        "n1_snapshot": n1["worst_snap"],
+                        "n11_violation_details": n11["worst_details"],
+                        "n11_snapshot": n11["worst_snap"],
                     }
                 )
 
@@ -526,6 +670,14 @@ def site_screening_analysis(net, params: Dict[str, Any]) -> str:
             "n1_cases": len(n1_cases),
             "n11_cases": len(n11_cases),
             "upgrade_likely_count": sum(1 for r in rows if r.get("upgrade_likely")),
+            "comparison": "new_or_worse_vs_0_mw" if base_converged else "absolute",
+            "worse_tol_vm_pu": tols[0],
+            "worse_tol_loading_percent": tols[1],
+            "baseline_intact_violations": base_violations if base_converged else -1,
+            "baseline_n1_cases_with_violations": n1_base_with_viol,
+            "baseline_n11_cases_with_violations": n11_base_with_viol,
+            "baseline_n1_failed_cases": n1_base_failed,
+            "baseline_n11_failed_cases": n11_base_failed,
         }
 
         _progress(params, "Screening finished.")

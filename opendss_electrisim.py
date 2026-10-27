@@ -326,7 +326,10 @@ def _opendss_parse_shunt_characteristic_rows(raw_json):
 
 
 def _opendss_shunt_uses_zero_based(electrisim_step, characteristic_rows, line_flow_bands=None):
-    """Mirrors pandapower's _electrisim_shunt_uses_zero_based so both solvers pick the same step."""
+    """Mirrors pandapower's _electrisim_shunt_uses_zero_based so both solvers pick the same step.
+
+    Only used when the characteristic table is on. With the table off, step 0 stays off.
+    """
     try:
         if int(round(float(electrisim_step))) == 0:
             return True
@@ -354,7 +357,7 @@ def _opendss_shunt_step_to_pp(step_val, zero_based):
         s = 1
     if zero_based:
         return max(1, s + 1)
-    return max(1, s)
+    return max(0, s)
 
 
 def _opendss_shunt_max_step_to_pp(max_step, zero_based):
@@ -362,7 +365,7 @@ def _opendss_shunt_max_step_to_pp(max_step, zero_based):
         m = int(round(float(max_step)))
     except (TypeError, ValueError):
         m = 1
-    return max(1, m + 1) if zero_based else max(1, m)
+    return max(1, m + 1) if zero_based else max(0, m)
 
 
 def _opendss_shunt_nominals_for_step(rows, step_val, p_fallback, q_fallback):
@@ -722,9 +725,12 @@ def _opendss_line_p_mw(dss_mod, line_name, p_reference='p_from_mw', use_abs=True
 def _opendss_apply_line_flow_shunt_control(dss_mod, execute_dss_command, LinesDict, LinesDictId, max_iters=3):
     """
     Match pandapower line_flow_step_control: map monitored line P to shunt step.
-    Pandapower attaches this even when DiscreteShuntController is off.
+    Exclusive with discrete voltage control, same as pandapower.
     """
-    specs = [m for m in _opendss_shunt_meta.values() if m.get('line_flow_step_control')]
+    specs = [
+        m for m in _opendss_shunt_meta.values()
+        if m.get('line_flow_step_control') and not m.get('discrete_shunt_control')
+    ]
     if not specs:
         return
     for _ in range(max_iters):
@@ -2410,14 +2416,18 @@ def _opendss_terminal_pq_kw(powers, terminal_index, n_conductors=0, n_phases=3):
 
 
 def _opendss_terminal_i_ka(currents, terminal_index, n_conductors=0, n_phases=3, mag_ang=False):
-    """Average phase/conductor current magnitude (kA) for one OpenDSS terminal.
+    """Average phase current magnitude (kA) for one OpenDSS terminal.
 
     Currents() is real/imag pairs. CurrentsMagAng() is magnitude (A) and angle
     (degrees). mag_ang=True reads the magnitude and ignores the angle.
+    Only the phase conductors are averaged: a wye winding also has a neutral
+    conductor (~0 A when balanced), which would pull the average down by 25 %.
     """
     n_per_terminal = _opendss_n_per_terminal(n_conductors, n_phases)
     start = terminal_index * n_per_terminal
     n_cond = int(n_conductors) if n_conductors else int(n_phases or 3)
+    if n_phases:
+        n_cond = min(n_cond, int(n_phases))
     i_sum = 0.0
     count = 0
     for c in range(n_cond):
@@ -2877,8 +2887,10 @@ def create_shunt_reactor_element(dss, element_data, element_name, element_id, Bu
         use_characteristic = _opendss_is_true(element_data.get('step_dependency_table')) and bool(characteristic_rows)
         step_electrisim = _opendss_float(element_data.get('step', 1), 1.0)
         max_step_electrisim = _opendss_float(element_data.get('max_step', 1), 1.0)
-        zero_based = _opendss_shunt_uses_zero_based(
-            step_electrisim, characteristic_rows, line_flow_bands)
+        zero_based = (
+            _opendss_shunt_uses_zero_based(step_electrisim, characteristic_rows, line_flow_bands)
+            if use_characteristic else False
+        )
         step_pp = _opendss_shunt_step_to_pp(step_electrisim, zero_based)
         max_step_pp = _opendss_shunt_max_step_to_pp(max_step_electrisim, zero_based)
         if use_characteristic:
@@ -4117,6 +4129,30 @@ def _opendss_any_bus_isc_ready(dss_mod, min_amp=1.0):
     return False
 
 
+def _opendss_flag(value):
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ('true', '1', 'yes', 'on'):
+        return True
+    return False
+
+
+def _opendss_error_response(message, opendss_commands=None, export_commands=False, **extra):
+    """Error JSON that still carries the OpenDSS script when export was requested."""
+    text = " ".join(str(message).split())
+    payload = {"error": text}
+    payload.update(extra)
+    if _opendss_flag(export_commands) and opendss_commands:
+        note = (
+            "! Electrisim study did not finish successfully.\n"
+            "! " + text + "\n"
+            "! The commands below rebuild the circuit so it can be debugged in OpenDSS.\n\n"
+        )
+        payload["opendss_commands"] = note + "\n".join(opendss_commands)
+        payload["error"] = text + " OpenDSS commands were exported anyway."
+    return json.dumps(payload)
+
+
 def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_results=False, export_commands=False,
                  fault_bus_mode='all', fault_bus_ids=None, fault_bus_names=None):
     """OpenDSS fault study / short circuit analysis.
@@ -4229,8 +4265,9 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             except Exception:
                 pass
             execute_dss_command('clear')
-            execute_dss_command(_new_circuit_command(ext_scan))
+            # Base frequency must be set before New Circuit, or the source is created at 60 Hz.
             execute_dss_command(f'set DefaultBaseFrequency={f}')
+            execute_dss_command(_new_circuit_command(ext_scan))
 
             try:
                 BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
@@ -4243,9 +4280,10 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
                     in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
                     export_commands, opendss_commands, execute_dss_command)
             except ValueError as ve:
-                return json.dumps({"error": str(ve)})
+                return _opendss_error_response(str(ve), opendss_commands, export_commands)
             except Exception as e:
-                return json.dumps({"error": f"Error creating network elements: {str(e)}"})
+                return _opendss_error_response(
+                    f"Error creating network elements: {str(e)}", opendss_commands, export_commands)
 
             try:
                 vb_list = _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage)
@@ -4256,12 +4294,21 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
             except Exception:
                 pass
 
+            # OpenDSS FaultStudy crashes ("Access violation") on a Storage element in
+            # CHARGING or IDLING state. The fault contribution does not depend on the
+            # dispatch state, so put every Storage in DISCHARGING for the fault study.
+            for storage_name in (StoragesDict or {}).values():
+                try:
+                    execute_dss_command(f'Storage.{storage_name}.State=DISCHARGING')
+                except Exception:
+                    pass
+
             # Snapshot then FaultStudy twice. A cold multi-winding circuit still leaves
             # Voc=0 / Isc≈0; the next full rebuild in this process fills them.
             try:
                 _opendss_run_fault_study_solves(execute_dss_command)
             except RuntimeError as e:
-                return json.dumps({"error": str(e)})
+                return _opendss_error_response(str(e), opendss_commands, export_commands)
 
             BusbarsDict = {}
             nBusbar = 0
@@ -4287,15 +4334,17 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     bus_rows = [vars(b) for b in busbarList]
     if mode == "selection":
         if not collect_fault_bus_refs(sc_params):
-            raise ValueError(
+            return _opendss_error_response(
                 "Fault location is User Selection, but no busbars were selected. "
-                "Select one or more busbars on the diagram or in the Short Circuit dialog."
+                "Select one or more busbars on the diagram or in the Short Circuit dialog.",
+                opendss_commands, export_commands,
             )
         bus_rows = filter_bus_result_rows(bus_rows, sc_params)
         if not bus_rows:
-            raise ValueError(
+            return _opendss_error_response(
                 "Fault location is User Selection, but none of the selected busbars "
-                "could be matched to the OpenDSS circuit."
+                "could be matched to the OpenDSS circuit.",
+                opendss_commands, export_commands,
             )
 
     result = {
@@ -4513,8 +4562,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 monte_carlo_converged_count = 0
 
         execute_dss_command('clear')
-        execute_dss_command(_new_circuit_command(ext_scan))
+        # Base frequency must be set before New Circuit: otherwise OpenDSS creates the
+        # source at its 60 Hz default, a 50 Hz solve sees 0 V everywhere, and the
+        # exported script cannot be run on its own.
         execute_dss_command(f'set DefaultBaseFrequency={f}')
+        execute_dss_command(_new_circuit_command(ext_scan))
         execute_dss_command(f'set Mode={mode}')
         execute_dss_command(f"set Algorithm={plan['algorithm']}")
         execute_dss_command(f'set LoadModel={loadmodel}')
@@ -4537,11 +4589,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
                 export_commands, opendss_commands, execute_dss_command)
         except ValueError as ve:
-            error_response = {"error": str(ve)}
-            return json.dumps(error_response)
+            return _opendss_error_response(str(ve), opendss_commands, export_commands)
         except Exception as e:
-            error_response = {"error": f"Error creating network elements: {str(e)}"}
-            return json.dumps(error_response)
+            return _opendss_error_response(
+                f"Error creating network elements: {str(e)}", opendss_commands, export_commands)
 
         try:
             print("[OpenDSS] solve")
@@ -4625,7 +4676,9 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             break
 
     if element_dicts is None:
-        return json.dumps({"error": "Error creating network elements: circuit build failed"})
+        return _opendss_error_response(
+            "Error creating network elements: circuit build failed",
+            opendss_commands, export_commands)
     (LinesDict, LinesDictId, LoadsDict, LoadsDictId, TransformersDict, TransformersDictId,
      Transformers3WDict, Transformers3WDictId,
      ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId, GeneratorsDict, GeneratorsDictId,
@@ -4639,14 +4692,13 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 iters = dss.Solution.Iterations()
             except Exception:
                 pass
-            return json.dumps({
-                "error": (
-                    "OpenDSS load flow did not converge "
-                    f"(iterations={iters}). Check generator P/Q, transformer ratings, "
-                    "and slack short-circuit power. Try Algorithm=Newton in the OpenDSS "
-                    "load-flow dialog, or compare with pandapower on the same case."
-                )
-            })
+            return _opendss_error_response(
+                "OpenDSS load flow did not converge "
+                f"(iterations={iters}). Check generator P/Q, transformer ratings, "
+                "and slack short-circuit power. Try Algorithm=Newton in the OpenDSS "
+                "load-flow dialog, or compare with pandapower on the same case.",
+                opendss_commands, export_commands,
+            )
         try:
             if not dss.Solution.Converged():
                 print(
@@ -4669,12 +4721,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 iters = dss.Solution.Iterations()
             except Exception:
                 pass
-            return json.dumps({
-                "error": (
-                    "OpenDSS load flow lost convergence after shunt control "
-                    f"(iterations={iters})."
-                )
-            })
+            return _opendss_error_response(
+                "OpenDSS load flow lost convergence after shunt control "
+                f"(iterations={iters}).",
+                opendss_commands, export_commands,
+            )
 
     # Process results using the new output classes
     
@@ -5855,7 +5906,8 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         
         return response
     except Exception as json_error:
-        return json.dumps({"error": "JSON serialization failed", "message": str(json_error)}, separators=(',', ':'))
+        return _opendss_error_response(
+            "JSON serialization failed", opendss_commands, export_commands, message=str(json_error))
         
         #U[pu],angle[degree]
         #print(dss.Bus.puVmagAngle())    
@@ -5932,8 +5984,9 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
 
     f = frequency
     execute_dss_command('clear')
-    execute_dss_command('New Circuit.OpenDSS_Circuit')
+    # Base frequency must be set before New Circuit, or the source is created at 60 Hz.
     execute_dss_command(f'set DefaultBaseFrequency={f}')
+    execute_dss_command('New Circuit.OpenDSS_Circuit')
     execute_dss_command(f'set Mode={mode}')
     execute_dss_command(f'set Algorithm={algorithm}')
     execute_dss_command(f'set LoadModel={loadmodel}')
@@ -5956,7 +6009,8 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
             in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
             export_commands, opendss_commands, execute_dss_command)
     except Exception as e:
-        return json.dumps({"error": f"Error creating harmonic circuit: {str(e)}"})
+        return _opendss_error_response(
+            f"Error creating harmonic circuit: {str(e)}", opendss_commands, export_commands)
 
     # Add monitors BEFORE solving so they are part of the initial circuit
     def _find_line_buses(line_key):
@@ -6506,14 +6560,13 @@ def _dg_build_and_solve(in_data, frequency, controlmode='Time'):
         pass
 
     f = float(frequency or 50)
-    ext_scan = None
-    for _k, el in work.items():
-        if isinstance(el, dict) and str(el.get('typ', '')).startswith('External Grid'):
-            ext_scan = el
-            break
+    # _new_circuit_command needs the pre-scanned source (bus, basekv, pu, ...), not the
+    # raw External Grid element (that raised KeyError 'basekv').
+    ext_scan = _prescan_external_grid(work)
     try:
-        execute_dss_command(_new_circuit_command(ext_scan) if ext_scan else 'New Circuit.ElectrisimDG basefreq={}'.format(f))
+        # Base frequency must be set before New Circuit, or the source is created at 60 Hz.
         execute_dss_command(f'set DefaultBaseFrequency={f}')
+        execute_dss_command(_new_circuit_command(ext_scan) if ext_scan else 'New Circuit.ElectrisimDG basefreq={}'.format(f))
         BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(work, dss, False, opendss_commands)
         element_dicts = create_other_elements(
             work, dss, BusbarsDictVoltage, BusbarsDictConnectionToName, False, opendss_commands, execute_dss_command)

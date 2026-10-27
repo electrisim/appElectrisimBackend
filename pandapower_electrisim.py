@@ -31,6 +31,10 @@ from converter_sc_electrisim import (
     sgen_k_export_lines,
 )
 import zero_sequence_dialog
+try:
+    from pandapower.control.controller.station_control import BinarySearchControl
+except ImportError:  # older pandapower: no park controller support
+    BinarySearchControl = ()
 
 zero_sequence_dialog.install()
 
@@ -1688,6 +1692,48 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     
     return '\n'.join(lines)
 
+
+def _export_python_requested(flag):
+    if flag is True or flag == 1:
+        return True
+    if isinstance(flag, str) and flag.strip().lower() in ('true', '1', 'yes', 'on'):
+        return True
+    return False
+
+
+def _attach_pandapower_python_export(payload, net, in_data, Busbars, algorithm, calculate_voltage_angles, init,
+                                      study='powerflow', sc_in_data=None, failure_note=None):
+    """Add the downloadable pandapower script when the study itself did not finish."""
+    if not in_data or Busbars is None or net is None:
+        payload['pandapower_python_error'] = 'Network was not available for Python export.'
+        return
+    try:
+        python_code = generate_pandapower_python_code(
+            net, in_data, Busbars, algorithm, calculate_voltage_angles, init,
+            study=study, sc_in_data=sc_in_data,
+        )
+        if failure_note:
+            note = " ".join(str(failure_note).split())
+            if len(note) > 500:
+                note = note[:500] + "..."
+            python_code = (
+                "# Electrisim study did not finish successfully.\n"
+                f"# {note}\n"
+                "# The script below rebuilds the same network so it can be debugged locally.\n\n"
+                + (python_code or "")
+            )
+        if python_code and python_code.strip():
+            payload['pandapower_python'] = python_code
+            base = payload.get('message') or ''
+            if 'Python code was exported' not in base:
+                payload['message'] = (base + " Pandapower Python code was exported anyway.").strip()
+        else:
+            payload['pandapower_python_error'] = 'Python export produced an empty script.'
+    except Exception as py_err:
+        print(f"pandapower Python export failed: {py_err}")
+        payload['pandapower_python_error'] = str(py_err)
+
+
 def create_busbars(in_data, net):
     Busbars = {}
     # Store user-friendly names mapping for later use
@@ -2824,8 +2870,10 @@ def _electrisim_shunt_nominals_for_step(rows, step_val, p_fallback, q_fallback):
 
 def _electrisim_shunt_uses_zero_based(electrisim_step, characteristic_rows, lf_bands):
     """
-    Electrisim tap indices are 0..max_step; pandapower uses 1..max_step and treats step=0 as off.
-    When step 0 appears in the diagram payload, shift +1 for pandapower and map back on export.
+    Characteristic-table indices are 0..max_step. Pandapower treats step=0 as switched off and
+    cannot look up that row, so those indices are stored as 1..max_step+1 and mapped back
+    on the results. Call this only when the characteristic table is actually applied.
+    With the table off, step is a multiplier and step 0 must stay off.
     """
     try:
         if int(round(float(electrisim_step))) == 0:
@@ -2854,7 +2902,7 @@ def _electrisim_shunt_step_to_pp(step_val, zero_based):
         s = 1
     if zero_based:
         return max(1, s + 1)
-    return max(1, s)
+    return max(0, s)
 
 
 def _electrisim_shunt_step_from_pp(step_val, zero_based):
@@ -2875,7 +2923,7 @@ def _electrisim_shunt_max_step_to_pp(max_step, zero_based):
         m = int(round(float(max_step)))
     except (TypeError, ValueError):
         m = 1
-    return max(1, m + 1) if zero_based else max(1, m)
+    return max(1, m + 1) if zero_based else max(0, m)
 
 
 def _electrisim_shift_shunt_characteristic_rows_pp(rows, zero_based):
@@ -3097,6 +3145,25 @@ def _electrisim_line_flow_pick_step(bands, p_mw):
             if lo <= pv < hi:
                 return st
     return int(bands[-1]["step"])
+
+
+def _electrisim_disable_shunt_step_controllers(net):
+    """Turn off controllers that write net.shunt.step. Leaves park and tap controllers alone."""
+    ctrl = getattr(net, 'controller', None)
+    if ctrl is None or getattr(ctrl, 'empty', True):
+        return 0
+    disabled = 0
+    for idx, row in ctrl.iterrows():
+        obj = row['object'] if 'object' in row.index else None
+        cls = type(obj).__name__ if obj is not None else ''
+        output_element = getattr(obj, 'output_element', None)
+        if cls == 'DiscreteShuntController' or (cls == 'CharacteristicControl' and output_element == 'shunt'):
+            try:
+                ctrl.at[idx, 'in_service'] = False
+                disabled += 1
+            except Exception:
+                pass
+    return disabled
 
 
 def _electrisim_attach_line_flow_shunt_controllers(net):
@@ -3920,6 +3987,7 @@ def create_other_elements(in_data,net,x, Busbars):
             if not hasattr(net, 'user_friendly_names'):
                 net.user_friendly_names = {}
             net.user_friendly_names[trafo3w_name] = user_friendly_name
+            _electrisim_check_trafo3w_winding_order(net, trafo3w_idx)
 
             # DiscreteTapControl for 3-winding transformers (pandapower: element="trafo3w", side hv|mv|lv)
             discrete_tap_3w = in_data[x].get('discrete_tap_control')
@@ -3954,7 +4022,12 @@ def create_other_elements(in_data,net,x, Busbars):
             st_raw = safe_float(in_data[x].get('step', 1))
             step_electrisim = st_raw if st_raw is not None else in_data[x].get('step', 1)
             max_step_electrisim = safe_float(in_data[x].get('max_step', 1)) or 1
-            zero_based_steps = _electrisim_shunt_uses_zero_based(step_electrisim, characteristic_rows, lf_rows_preview)
+            # Shift 0..N table indices only while the characteristic table is applied.
+            # Otherwise step is pandapower's multiplier, and step 0 leaves the reactor off.
+            zero_based_steps = (
+                _electrisim_shunt_uses_zero_based(step_electrisim, characteristic_rows, lf_rows_preview)
+                if use_characteristic and characteristic_rows else False
+            )
             id_characteristic_table = None
             step_dependency_table = False
             if use_characteristic and characteristic_rows:
@@ -4866,10 +4939,91 @@ def _park_cosphi_p_points(park, branch):
     return _park_parse_json_list(park.get('cosphi_p_characteristic_json'))
 
 
-def _park_measure_p_q_at(net, element_name):
-    """Return (p_mw, q_mvar) at a named bus, line (from-side), or trafo (HV), or (None, None)."""
+def _park_bus_feed_terms(net, bus_idx, sgen_idxs):
+    """
+    Branch ends through which the park's machines feed the busbar ``bus_idx``.
+
+    Returns [(res_table, p_column, q_column, index, sign)]: summing sign * res value gives the
+    P / Q flowing from the park into the busbar (generator convention, + = export into busbar).
+    Buses joined to ``bus_idx`` by closed bus–bus switches count as the same busbar. Only
+    branches whose far side reaches one of the park machines without crossing the busbar
+    are kept, so feeders to the grid or to other plants are left out.
+    """
+    try:
+        import networkx as nx
+    except ImportError:
+        return []
+    bus_idx = int(bus_idx)
+    group = {bus_idx}
+    if hasattr(net, 'switch') and net.switch is not None and not net.switch.empty:
+        bb = net.switch[(net.switch.et == 'b') & (net.switch.closed.astype(bool))]
+        changed = True
+        while changed:
+            changed = False
+            for _i, sw in bb.iterrows():
+                a, b = int(sw['bus']), int(sw['element'])
+                if (a in group) != (b in group):
+                    group.update((a, b))
+                    changed = True
+    park_buses = set()
+    for si in sgen_idxs or []:
+        try:
+            park_buses.add(int(net.sgen.at[si, 'bus']))
+        except Exception:
+            continue
+    if not park_buses or park_buses & group:
+        return []
+    try:
+        g = top.create_nxgraph(net, respect_switches=True, include_out_of_service=False)
+    except Exception:
+        return []
+    g.remove_nodes_from([b for b in group if b in g])
+    park_side = set()
+    for comp in nx.connected_components(g):
+        if comp & park_buses:
+            park_side |= comp
+
+    terms = []
+    branch_ends = (
+        ('line', 'res_line', (('from_bus', 'p_from_mw', 'q_from_mvar'), ('to_bus', 'p_to_mw', 'q_to_mvar'))),
+        ('trafo', 'res_trafo', (('hv_bus', 'p_hv_mw', 'q_hv_mvar'), ('lv_bus', 'p_lv_mw', 'q_lv_mvar'))),
+        ('trafo3w', 'res_trafo3w', (('hv_bus', 'p_hv_mw', 'q_hv_mvar'), ('mv_bus', 'p_mv_mw', 'q_mv_mvar'),
+                                    ('lv_bus', 'p_lv_mw', 'q_lv_mvar'))),
+        ('impedance', 'res_impedance', (('from_bus', 'p_from_mw', 'q_from_mvar'), ('to_bus', 'p_to_mw', 'q_to_mvar'))),
+    )
+    for table, res_table, ends in branch_ends:
+        df = getattr(net, table, None)
+        if df is None or df.empty:
+            continue
+        for idx in df.index:
+            if 'in_service' in df.columns and not bool(df.at[idx, 'in_service']):
+                continue
+            buses = [int(df.at[idx, col]) for col, _p, _q in ends]
+            if not any(b in park_side for b in buses):
+                continue
+            for (col, pcol, qcol), b in zip(ends, buses):
+                if b in group:
+                    # pandapower branch results are flows into the branch; negate for flow into the bus.
+                    terms.append((res_table, pcol, qcol, int(idx), -1))
+    return terms
+
+
+def _park_measure_p_q_at(net, element_name, sgen_idxs=None):
+    """Return (p_mw, q_mvar) at a named bus, line (from-side), or trafo (HV), or (None, None).
+
+    For a busbar with known park machines, this is the P/Q the park feeds into the busbar.
+    """
     ufn = getattr(net, 'user_friendly_names', {}) or {}
     bi = _park_find_by_name(net.bus, element_name, ufn)
+    if bi is not None and sgen_idxs:
+        terms = _park_bus_feed_terms(net, bi, sgen_idxs)
+        if terms:
+            try:
+                p = sum(s * float(net[t].at[i, pc]) for t, pc, _qc, i, s in terms)
+                q = sum(s * float(net[t].at[i, qc]) for t, _pc, qc, i, s in terms)
+                return p, q
+            except Exception:
+                pass
     if bi is not None and hasattr(net, 'res_bus') and not net.res_bus.empty and bi in net.res_bus.index:
         return float(net.res_bus.at[bi, 'p_mw']), float(net.res_bus.at[bi, 'q_mvar'])
     li = _park_find_by_name(net.line, element_name, ufn)
@@ -4881,19 +5035,29 @@ def _park_measure_p_q_at(net, element_name):
     return None, None
 
 
-def _park_resolve_control_q_at(net, boundary):
-    """Resolve Control Q at name to (input_element, input_variable, index) or (None, None, None)."""
+def _park_resolve_control_q_at(net, boundary, sgen_idxs=None):
+    """Resolve Control Q at name to (input_element, input_variable, index, q_terms).
+
+    For a busbar the controller measures the Q the park feeds into it (``q_terms``: branch ends
+    between park and busbar). ``res_bus.q_mvar`` is only the Q of elements connected directly to
+    the bus, which the park cannot move. Returns (None, None, None, None) when not found.
+    """
     ufn = getattr(net, 'user_friendly_names', {}) or {}
     bi = _park_find_by_name(net.bus, boundary, ufn)
     if bi is not None:
-        return 'res_bus', 'q_mvar', bi
+        terms = _park_bus_feed_terms(net, bi, sgen_idxs) if sgen_idxs else []
+        if terms:
+            return 'res_bus', 'q_mvar', bi, [(t, qc, i, s) for t, _pc, qc, i, s in terms]
+        print(f"[ParkController] Control Q at bus '{boundary}': no branch from the park into this bus; "
+              "measuring res_bus.q_mvar (Q of elements on the bus only)")
+        return 'res_bus', 'q_mvar', bi, None
     li = _park_find_by_name(net.line, boundary, ufn)
     if li is not None:
-        return 'res_line', 'q_from_mvar', li
+        return 'res_line', 'q_from_mvar', li, None
     ti = _park_find_by_name(net.trafo, boundary, ufn)
     if ti is not None:
-        return 'res_trafo', 'q_hv_mvar', ti
-    return None, None, None
+        return 'res_trafo', 'q_hv_mvar', ti, None
+    return None, None, None, None
 
 
 def _park_machine_q_limits(net, sgen_idx):
@@ -4956,21 +5120,56 @@ def _park_apply_machine_q_capability_limits(net, sgen_indices):
     return updated
 
 
+def _park_take_sgen(net, machine, used, user_friendly_names=None):
+    """First unused sgen for this park machine. Prefer diagram cell id; duplicate names stay distinct."""
+    if net is None or not hasattr(net, 'sgen') or net.sgen is None or net.sgen.empty:
+        return None
+    mid = machine.get('id')
+    if mid not in (None, '') and 'id' in net.sgen.columns:
+        want = str(mid).strip()
+        for idx in net.sgen.index:
+            if idx in used:
+                continue
+            sid = net.sgen.at[idx, 'id']
+            if sid is None or (isinstance(sid, float) and np.isnan(sid)):
+                continue
+            if str(sid).strip() == want:
+                return idx
+    name = machine.get('name')
+    if not name or 'name' not in net.sgen.columns:
+        return None
+    target = str(name).strip()
+    friendly = user_friendly_names or {}
+    rev = {str(v): str(k) for k, v in friendly.items()}
+    tech = rev.get(target, target)
+    for idx in net.sgen.index:
+        if idx in used:
+            continue
+        n = net.sgen.at[idx, 'name']
+        if n is None or (isinstance(n, float) and np.isnan(n)):
+            continue
+        ns = str(n)
+        if ns == target or ns == tech or friendly.get(ns) == target:
+            return idx
+    return None
+
+
 def _park_resolve_sgen_indices(net, machines, distribution_method=None):
-    """machines: list of {name, connected, q_percent}. Returns (indices, in_service, distribution, gen_Q_response).
+    """machines: list of {id, name, connected, q_percent}. Returns (indices, in_service, distribution, gen_Q_response).
 
     distribution_method (optional) recomputes weights from the live network for non-Individual modes.
     """
     ufn = getattr(net, 'user_friendly_names', {}) or {}
     idxs, insvc, user_pct, resp = [], [], [], []
+    used = set()
     for m in machines or []:
         if not m or not _park_truthy(m.get('connected', True), True):
             continue
-        name = m.get('name')
-        si = _park_find_by_name(net.sgen, name, ufn)
+        si = _park_take_sgen(net, m, used, ufn)
         if si is None:
             # Generators (sync) are net.gen — BinarySearchControl Q supports sgen primarily
             continue
+        used.add(si)
         idxs.append(si)
         insvc.append(bool(net.sgen.at[si, 'in_service']) if 'in_service' in net.sgen.columns else True)
         user_pct.append(max(0.0, float(m.get('q_percent') or 0.0)))
@@ -5090,7 +5289,7 @@ def _electrisim_build_park_controller_results(net, in_data):
     if hasattr(net, 'controller') and net.controller is not None and not net.controller.empty:
         for _ci, row in net.controller.iterrows():
             obj = row['object']
-            if type(obj).__name__ == 'BinarySearchControl':
+            if isinstance(obj, BinarySearchControl):
                 bsc_by_name[str(getattr(obj, 'name', '') or '')] = obj
     for park in parks:
         name = str(park.get('name') or 'ParkController')
@@ -5138,6 +5337,7 @@ def _electrisim_build_park_controller_results(net, in_data):
             'set_point': float(bsc.set_point) if bsc is not None else None,
             'voltage_ctrl': bool(getattr(bsc, 'voltage_ctrl', mode == 'Voltage Control')) if bsc is not None else (mode == 'Voltage Control'),
             'attached': bsc is not None,
+            'at_q_limit': bool(getattr(bsc, 'at_q_limit', False)) if bsc is not None else False,
         })
     return results
 
@@ -5214,14 +5414,26 @@ def _export_tap_side(val):
     return _normalize_tap_side(val)
 
 
+def _append_park_q_control_source(lines):
+    """Inline park_q_control.py so the exported script runs without the Electrisim backend."""
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'park_q_control.py')
+    lines.append("from pandapower.control.controller.station_control import BinarySearchControl, DroopControl")
+    lines.append("")
+    lines.append("# --- ParkQControl (Electrisim park_q_control.py) ---")
+    with open(path, encoding='utf-8') as fh:
+        lines.extend(fh.read().rstrip().splitlines())
+    lines.append("# --- end ParkQControl ---")
+    lines.append("")
+
+
 def _append_electrisim_park_specs_python(lines, net, parks):
-    """Emit BinarySearchControl (+ Droop) from post-LF export snapshot."""
+    """Emit ParkQControl (+ Droop) from post-LF export snapshot."""
     park_specs = getattr(net, '_electrisim_export_park_specs', None) or []
     if not park_specs:
         return False
 
-    lines.append("from pandapower.control.controller.station_control import BinarySearchControl, DroopControl")
-    lines.append("")
+    _append_park_q_control_source(lines)
     for spec in park_specs:
         cname = str(spec.get('name') or 'ParkController')
         park_meta = next((p for p in parks if str(p.get('name') or '') == cname), None)
@@ -5259,13 +5471,19 @@ def _append_electrisim_park_specs_python(lines, net, parks):
         if ci is None:
             ci = 0
 
+        q_terms = spec.get('q_terms')
+        if q_terms:
+            lines.append("# Q is measured as the Q the park feeds into the busbar: sum of sign * res value")
+            lines.append("# over the (res table, column, index, sign) branch ends between park and busbar.")
+        q_terms_py = _export_py_literal([list(t) for t in q_terms]) if q_terms else 'None'
         lines.append(
-            f"_park_ctrl_{ci} = BinarySearchControl(\n"
+            f"_park_ctrl_{ci} = ParkQControl(\n"
             f"    net, True, 'sgen', 'q_mvar',\n"
             f"    {_export_py_literal(idxs)}, {_export_py_literal(insvc)}, {_export_py_literal(dist)},\n"
             f"    {in_el!r}, {in_var!r}, {_export_py_literal(in_idx)}, {set_point}, {voltage_ctrl},\n"
             f"    name={cname!r}, gen_Q_response={_export_py_literal(gen_q)},\n"
-            f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0)"
+            f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0,\n"
+            f"    q_terms={q_terms_py})"
         )
         lines.append(f"_park_ctrl_idx_{ci} = net.controller.index[-1]")
 
@@ -5344,14 +5562,13 @@ def _append_electrisim_controllers_to_python(lines, net, in_data, algorithm, cal
             for spec in (getattr(net, '_electrisim_export_park_specs', None) or []):
                 emitted_names.add(str(spec.get('name') or 'ParkController'))
         else:
-            lines.append("from pandapower.control.controller.station_control import BinarySearchControl, DroopControl")
-            lines.append("")
+            _append_park_q_control_source(lines)
             # Prefer emitting controllers already attached on net (post-LF) so setpoints match Electrisim
             if hasattr(net, 'controller') and net.controller is not None and not net.controller.empty:
                 for ci, row in net.controller.iterrows():
                     obj = row['object']
                     cls = type(obj).__name__
-                    if cls != 'BinarySearchControl':
+                    if not isinstance(obj, BinarySearchControl):
                         continue
                     cname = str(getattr(obj, 'name', '') or f'ParkController_{ci}')
                     # Match Electrisim park metadata for comments
@@ -5418,13 +5635,16 @@ def _append_electrisim_controllers_to_python(lines, net, in_data, algorithm, cal
                     out_var = getattr(obj, 'output_variable', 'q_mvar')
                     if isinstance(out_var, list):
                         out_var = out_var[0] if out_var else 'q_mvar'
+                    obj_terms = getattr(obj, 'q_terms', None)
+                    obj_terms_py = _export_py_literal([list(t) for t in obj_terms]) if obj_terms else 'None'
                     lines.append(
-                        f"_park_ctrl_{ci} = BinarySearchControl(\n"
+                        f"_park_ctrl_{ci} = ParkQControl(\n"
                         f"    net, True, {getattr(obj, 'output_element', 'sgen')!r}, {out_var!r},\n"
                         f"    {_export_py_literal(out_idx)}, {_export_py_literal(out_insvc)}, {_export_py_literal(dist_list)},\n"
                         f"    {in_el!r}, {in_var!r}, {_export_py_literal(in_idx)}, {set_point}, {voltage_ctrl},\n"
                         f"    name={cname!r}, gen_Q_response={_export_py_literal(gen_q)},\n"
-                        f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0)"
+                        f"    bus_idx={bus_idx!r}, tol=0.001, in_service=True, order=0, level=0,\n"
+                        f"    q_terms={obj_terms_py})"
                     )
                     lines.append(f"_park_ctrl_idx_{ci} = net.controller.index[-1]")
                     # Droop linked to this BSC
@@ -5482,6 +5702,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
 
     try:
         from pandapower.control.controller.station_control import BinarySearchControl, DroopControl
+        from park_q_control import ParkQControl
     except ImportError:
         print('[ParkController] pandapower station_control not available; skipping')
         return 0
@@ -5542,6 +5763,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
         input_element = 'res_bus'
         input_variable = 'vm_pu'
         input_element_index = None
+        q_terms = None
         bus_idx = None
 
         if mode == 'Voltage Control':
@@ -5569,7 +5791,8 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
         elif mode == 'Reactive Power Control':
             voltage_ctrl = False
             boundary = park.get('control_q_at') or ''
-            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
+                net, boundary, idxs)
             if input_element is None:
                 print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
                 continue
@@ -5586,7 +5809,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                 if set_point is None:
                     set_point = 0.0
             else:  # Q(P)
-                p_m, _q_m = _park_measure_p_q_at(net, boundary)
+                p_m, _q_m = _park_measure_p_q_at(net, boundary, idxs)
                 set_point = _park_interp_xy(_park_parse_json_list(park.get('qp_characteristic_json')),
                                            'p_mw', 'q_mvar', p_m if p_m is not None else 0.0)
                 if set_point is None:
@@ -5595,11 +5818,12 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
         elif mode == 'Power Factor Control':
             voltage_ctrl = False
             boundary = park.get('control_q_at') or ''
-            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
+                net, boundary, idxs)
             if input_element is None:
                 print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
                 continue
-            p_m, q_m = _park_measure_p_q_at(net, boundary)
+            p_m, q_m = _park_measure_p_q_at(net, boundary, idxs)
             p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
             pf_type = str(park.get('pf_control_type') or 'Const. cosphi')
             if pf_type == 'Const. cosphi':
@@ -5632,11 +5856,12 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
         elif mode == 'tan(phi) Control':
             voltage_ctrl = False
             boundary = park.get('control_q_at') or ''
-            input_element, input_variable, input_element_index = _park_resolve_control_q_at(net, boundary)
+            input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
+                net, boundary, idxs)
             if input_element is None:
                 print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
                 continue
-            p_m, _q_m = _park_measure_p_q_at(net, boundary)
+            p_m, _q_m = _park_measure_p_q_at(net, boundary, idxs)
             p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
             set_point = float(p_use) * safe_float(park.get('tan_phi'), 0.0)
         else:
@@ -5665,7 +5890,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                     )
 
         try:
-            bsc = BinarySearchControl(
+            bsc = ParkQControl(
                 net,
                 True,
                 'sgen',
@@ -5685,6 +5910,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                 in_service=True,
                 order=0,
                 level=0,
+                q_terms=q_terms,
             )
             # Locate controller index for droop chaining
             ctrl_idx = None
@@ -5733,6 +5959,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                 'input_element': str(input_element),
                 'input_variable': str(input_variable),
                 'input_element_index': input_element_index,
+                'q_terms': [list(t) for t in q_terms] if q_terms else None,
                 'set_point': float(set_point),
                 'voltage_ctrl': bool(voltage_ctrl),
                 'gen_Q_response': [int(x) for x in gen_Q_response],
@@ -5786,8 +6013,24 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 rcs = bool(run_control_shunt)
                 tc2_list = getattr(net, 'trafo_discrete_tap_controllers', None) or []
                 tc3_list = getattr(net, 'trafo3w_discrete_tap_controllers', None) or []
-                shunt_ctrl_list = getattr(net, 'shunt_discrete_controllers', None) or []
-                lf_shunt_list = getattr(net, 'line_flow_shunt_controllers', None) or []
+                shunt_ctrl_list = list(getattr(net, 'shunt_discrete_controllers', None) or [])
+                lf_shunt_list = list(getattr(net, 'line_flow_shunt_controllers', None) or [])
+                # The shunt dialog can enable DiscreteShuntController and Line P→step.
+                # Neither may move the tap unless Load Flow "Shunt reactor tap changer" is ticked.
+                if not rcs and (shunt_ctrl_list or lf_shunt_list):
+                    try:
+                        sys.__stderr__.write(
+                            "Shunt reactor tap changer is off: ignoring "
+                            f"{len(shunt_ctrl_list)} discrete and {len(lf_shunt_list)} "
+                            "Line P→step controller(s) from the shunt dialog.\n"
+                        )
+                        sys.__stderr__.flush()
+                    except Exception:
+                        pass
+                    shunt_ctrl_list = []
+                    lf_shunt_list = []
+                    net.shunt_discrete_controllers = []
+                    net.line_flow_shunt_controllers = []
                 attach_2w = rc2 and bool(tc2_list)
                 attach_3w = rc3 and bool(tc3_list)
                 attach_sh_disc = rcs and bool(shunt_ctrl_list)
@@ -6018,9 +6261,19 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                          {'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 100}, False)
                     )
 
+                diagram_shunt_steps = {}
+                if not rcs and hasattr(net, 'shunt') and not net.shunt.empty and 'step' in net.shunt.columns:
+                    _electrisim_disable_shunt_step_controllers(net)
+                    for _si in net.shunt.index:
+                        try:
+                            diagram_shunt_steps[int(_si)] = float(net.shunt.at[_si, 'step'])
+                        except Exception:
+                            pass
+
                 pf_plan_used = None
                 pf_last_error = None
                 pf_attempt_log = []
+                successful_kwargs = None
                 for plan_label, plan_kwargs, plan_run_control in solve_plans:
                     if not plan_run_control and run_pp_control:
                         _restore_controller_setpoints()
@@ -6033,6 +6286,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         electrisim_runpp(net, calculate_voltage_angles=calculate_voltage_angles,
                                  run_control=plan_run_control, **plan_kwargs, **pf_kwargs)
                         pf_plan_used = plan_label
+                        successful_kwargs = plan_kwargs
                         break
                     except Exception as plan_err:
                         pf_last_error = plan_err
@@ -6061,6 +6315,33 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             (" " + ssc_diag if ssc_diag else "")
                         ) from pf_last_error
                     raise pf_last_error
+
+                if diagram_shunt_steps:
+                    shunt_step_moved = False
+                    for _si, _s0 in diagram_shunt_steps.items():
+                        try:
+                            _s1 = float(net.shunt.at[_si, 'step'])
+                        except Exception:
+                            continue
+                        if abs(_s1 - _s0) > 1e-6:
+                            net.shunt.at[_si, 'step'] = _s0
+                            shunt_step_moved = True
+                            try:
+                                sys.__stderr__.write(
+                                    f"Shunt reactor tap changer is off: shunt {_si} step {_s1} restored to diagram step {_s0}.\n"
+                                )
+                                sys.__stderr__.flush()
+                            except Exception:
+                                pass
+                    if shunt_step_moved and successful_kwargs is not None:
+                        _electrisim_disable_shunt_step_controllers(net)
+                        electrisim_runpp(
+                            net,
+                            calculate_voltage_angles=calculate_voltage_angles,
+                            run_control=bool(park_attached),
+                            **successful_kwargs,
+                            **pf_kwargs,
+                        )
 
                 # A park controller that never settled leaves machines outside their capability
                 # curve; report it instead of returning those values as a valid operating point.
@@ -6583,6 +6864,14 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         return [convert_numpy_types(item) for item in obj]
                     return obj
                 
+                if _export_python_requested(export_python):
+                    _attach_pandapower_python_export(
+                        diagnostic_response, net, in_data, Busbars,
+                        algorithm, calculate_voltage_angles, init,
+                        study='powerflow',
+                        failure_note=str(e),
+                    )
+
                 # Convert any remaining numpy types
                 diagnostic_response = convert_numpy_types(diagnostic_response)
                 return json.dumps(
@@ -7839,8 +8128,27 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
     if len(isolated_buses) > 0:
         isolated_refs = resolve_element_refs(net, 'bus', isolated_buses)
         isolated_names = [r.get('name') or r.get('id') or str(r.get('index')) for r in isolated_refs]
-        raise ValueError(
+        message = (
             f"Isolated buses found: {', '.join(isolated_names)}. Check your network connectivity."
+        )
+        diagnostic_response = {
+            "error": True,
+            "message": message,
+            "exception": message,
+            "diagnostic": {
+                "isolated_buses": isolated_refs,
+                "num_isolated_buses": len(isolated_refs),
+            },
+        }
+        if _export_python_requested(export_python):
+            _attach_pandapower_python_export(
+                diagnostic_response, net, in_data_full, Busbars,
+                algorithm='nr', calculate_voltage_angles=True, init='auto',
+                study='shortcircuit', sc_in_data=in_data,
+                failure_note=message,
+            )
+        return json.dumps(
+            diagnostic_response, default=_json_serialize_default, separators=(',', ':')
         )
     
     pp.diagnostic(net)
@@ -7999,8 +8307,17 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 }
             }
         }
+        if _export_python_requested(export_python):
+            _attach_pandapower_python_export(
+                diagnostic_response, net, in_data_full, Busbars,
+                algorithm='nr', calculate_voltage_angles=True, init='auto',
+                study='shortcircuit', sc_in_data=in_data,
+                failure_note=str(e),
+            )
         # OPTIMIZED: Compact JSON for faster transfer
-        return json.dumps(diagnostic_response, separators=(',', ':'))
+        return json.dumps(
+            diagnostic_response, default=_json_serialize_default, separators=(',', ':')
+        )
     #print(net.res_line_sc) # nie uwzględniam ze względu na: Branch results are in beta mode and might not always be reliable, especially for transformers
                 
     #wyrzuciłem skss_mw bo wyskakiwał błąd przy zwarciu jednofazowym
@@ -12474,6 +12791,52 @@ def _rpc_serialize_solved_net(net):
                 })
             result['switches'] = sw_list
 
+        res_storage = getattr(net, 'res_storage', None)
+        storage_tbl = getattr(net, 'storage', None)
+        if (
+            res_storage is not None and not getattr(res_storage, 'empty', True)
+            and storage_tbl is not None and not getattr(storage_tbl, 'empty', True)
+        ):
+            storages_list = []
+            for index, row in res_storage.iterrows():
+                if index not in storage_tbl.index:
+                    continue
+                name = storage_tbl.at[index, 'name'] if 'name' in storage_tbl.columns else index
+                el_id = storage_tbl.at[index, 'id'] if 'id' in storage_tbl.columns else index
+                entry = {
+                    'name': str(name),
+                    'id': str(el_id),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw'] if 'p_mw' in row.index else None),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar'] if 'q_mvar' in row.index else None),
+                }
+                if 'loading_percent' in row.index:
+                    entry['loading_percent'] = _rpc_clean_pf_val(row['loading_percent'])
+                storages_list.append(entry)
+            if storages_list:
+                result['storages'] = storages_list
+
+        res_svc = getattr(net, 'res_svc', None)
+        svc_tbl = getattr(net, 'svc', None)
+        if (
+            res_svc is not None and not getattr(res_svc, 'empty', True)
+            and svc_tbl is not None and not getattr(svc_tbl, 'empty', True)
+        ):
+            svc_list = []
+            for index, row in res_svc.iterrows():
+                if index not in svc_tbl.index:
+                    continue
+                name = svc_tbl.at[index, 'name'] if 'name' in svc_tbl.columns else index
+                el_id = svc_tbl.at[index, 'id'] if 'id' in svc_tbl.columns else index
+                svc_list.append({
+                    'name': str(name),
+                    'id': str(el_id),
+                    'p_mw': _rpc_clean_pf_val(row['p_mw'] if 'p_mw' in row.index else None),
+                    'q_mvar': _rpc_clean_pf_val(row['q_mvar'] if 'q_mvar' in row.index else None),
+                    'vm_pu': _rpc_clean_pf_val(row['vm_pu'] if 'vm_pu' in row.index else None),
+                })
+            if svc_list:
+                result['svcs'] = svc_list
+
         tap_rows = _electrisim_tap_control_snapshot(net)
         if tap_rows:
             result['tap_control_results'] = tap_rows
@@ -12953,13 +13316,86 @@ def reactive_power_capability(net, rpc_params):
         return json.dumps({'error': f'RPC analysis failed: {str(e)}'}, separators=(',', ':'))
 
 
+def _electrisim_add_warning(net, message):
+    """Add a warning once; the load-flow response returns net.warnings to the diagram."""
+    if getattr(net, 'warnings', None) is None:
+        net.warnings = []
+    if message not in net.warnings:
+        net.warnings.append(message)
+    print(f"WARNING: {message}")
+
+
+def _electrisim_display_name(net, element, idx):
+    """Name the user sees on the diagram for a row of net[element]."""
+    try:
+        name = str(net[element].at[idx, 'name'])
+    except Exception:
+        return f"{element} {idx}"
+    return str((getattr(net, 'user_friendly_names', None) or {}).get(name, name))
+
+
+def _electrisim_bus_label(net, bus_idx):
+    try:
+        return f"'{_electrisim_display_name(net, 'bus', bus_idx)}' ({float(net.bus.at[bus_idx, 'vn_kv']):g} kV)"
+    except Exception:
+        return f"bus {bus_idx}"
+
+
+def _electrisim_check_trafo3w_winding_order(net, t3_idx):
+    """Warn when the HV/MV/LV terminals are not wired to busbars of falling rated voltage."""
+    try:
+        buses = {s: int(net.trafo3w.at[t3_idx, f'{s}_bus']) for s in ('hv', 'mv', 'lv')}
+        vn = {s: float(net.bus.at[b, 'vn_kv']) for s, b in buses.items()}
+    except Exception:
+        return
+    problems = [
+        (high, low) for high, low in (('hv', 'mv'), ('hv', 'lv'), ('mv', 'lv'))
+        if vn[high] < vn[low] - 1e-9
+    ]
+    if not problems:
+        return
+    pairs = '; '.join(
+        f"{high.upper()} terminal on {_electrisim_bus_label(net, buses[high])} is below "
+        f"{low.upper()} terminal on {_electrisim_bus_label(net, buses[low])}"
+        for high, low in problems
+    )
+    _electrisim_add_warning(
+        net,
+        f"Three Winding Transformer '{_electrisim_display_name(net, 'trafo3w', t3_idx)}': "
+        f"the windings look swapped ({pairs}). pandapower treats the bus on the HV terminal as the "
+        f"high-voltage winding, so the turns ratios and the tap/control sides refer to those busbars. "
+        f"Connect the highest-voltage busbar to the HV terminal and the lowest to the LV terminal."
+    )
+
+
 def _electrisim_attach_discrete_tap_controllers(net, attach_trafo=True, attach_trafo3w=True):
     """
     Register pandapower DiscreteTapControl for 2-winding (element trafo) and 3-winding (trafo3w)
     entries from create_other_elements.
     Safe on a fresh or deep-copied net before runpp(..., run_control=True).
     """
+    label = {'trafo': 'Transformer', 'trafo3w': 'Three Winding Transformer'}
+
+    def _warn_if_grid_fixes_control_bus(element, element_index, control_side):
+        # pandapower skips a tap controller whose control bus has an in-service external grid.
+        try:
+            bus = int(net[element].at[element_index, f'{control_side}_bus'])
+            ext = net.ext_grid
+            if ext.empty or not ((ext['bus'] == bus) & ext['in_service'].astype(bool)).any():
+                return
+        except Exception:
+            return
+        _electrisim_add_warning(
+            net,
+            f"{label[element]} '{_electrisim_display_name(net, element, element_index)}': "
+            f"tap control does nothing because its control side ({control_side.upper()}) is "
+            f"{_electrisim_bus_label(net, bus)}, which has an External Grid holding its voltage. "
+            f"Choose a control side whose busbar has no External Grid."
+        )
+
     def _attach_one(element, element_index, control_side, vm_lower_pu, vm_upper_pu):
+        _warn_if_grid_fixes_control_bus(element, element_index, control_side)
+        rows_before = set(net.controller.index)
         try:
             try:
                 control.DiscreteTapControl(
@@ -12990,8 +13426,18 @@ def _electrisim_attach_discrete_tap_controllers(net, attach_trafo=True, attach_t
                         vm_lower_pu=vm_lower_pu,
                         vm_upper_pu=vm_upper_pu,
                     )
-        except Exception:
-            pass
+        except Exception as ex:
+            # pandapower registers the controller before validating it; drop the half-built row
+            # so it cannot break the power flow.
+            added = [i for i in net.controller.index if i not in rows_before]
+            if added:
+                net.controller.drop(index=added, inplace=True)
+            _electrisim_add_warning(
+                net,
+                f"{label[element]} '{_electrisim_display_name(net, element, element_index)}': "
+                f"tap control was not added, so its tap stays at its starting position. "
+                f"pandapower said: {ex}"
+            )
 
     if attach_trafo:
         for row in getattr(net, 'trafo_discrete_tap_controllers', None) or []:

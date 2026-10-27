@@ -10,10 +10,14 @@ sgen gets a local Q setpoint.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import json
 import math
+import os
 import sys
+import threading
+import time
 import traceback
 
 import numpy as np
@@ -595,6 +599,63 @@ def _pq_pin_taps(net, bound, band_pu=0.005):
         'trafo3w', getattr(net, 'trafo3w_discrete_tap_controllers', None))
 
 
+def _pq_shunt_is_selected(net, idx, selected):
+    """True when this shunt was ticked under Additional shunts."""
+    if not selected:
+        return False
+    name = str(net.shunt.at[idx, 'name']) if 'name' in net.shunt.columns else ''
+    if name in selected or str(idx) in selected:
+        return True
+    if 'id' in net.shunt.columns and str(net.shunt.at[idx, 'id']) in selected:
+        return True
+    friendly = str((getattr(net, 'user_friendly_names', None) or {}).get(name, '') or '')
+    return bool(friendly) and friendly in selected
+
+
+def _pq_apply_shunt_selection(net, shunt_names):
+    """Unticked additional shunts do not operate in this P-Q study."""
+    if not hasattr(net, 'shunt') or net.shunt is None or getattr(net.shunt, 'empty', True):
+        return []
+    selected = {str(n) for n in (shunt_names or []) if n not in (None, '')}
+    switched_off = []
+    off_idx = set()
+    for idx in list(net.shunt.index):
+        if _pq_shunt_is_selected(net, idx, selected):
+            continue
+        name = str(net.shunt.at[idx, 'name']) if 'name' in net.shunt.columns else str(idx)
+        friendly = str((getattr(net, 'user_friendly_names', None) or {}).get(name, '') or '')
+        if 'in_service' in net.shunt.columns:
+            net.shunt.at[idx, 'in_service'] = False
+        if 'q_mvar' in net.shunt.columns:
+            net.shunt.at[idx, 'q_mvar'] = 0.0
+        if 'p_mw' in net.shunt.columns:
+            net.shunt.at[idx, 'p_mw'] = 0.0
+        if 'step' in net.shunt.columns:
+            net.shunt.at[idx, 'step'] = 0.0
+        off_idx.add(idx)
+        switched_off.append(friendly or name)
+    if off_idx:
+        specs = getattr(net, 'shunt_discrete_controllers', None) or []
+        if isinstance(specs, list):
+            net.shunt_discrete_controllers = [
+                row for row in specs
+                if not (isinstance(row, dict) and row.get('shunt_index') in off_idx)
+            ]
+        pending = getattr(net, '_electrisim_pending_line_flow_shunts', None) or []
+        if isinstance(pending, list):
+            net._electrisim_pending_line_flow_shunts = [
+                row for row in pending
+                if not (isinstance(row, dict) and row.get('shunt_index') in off_idx)
+            ]
+        attached = getattr(net, 'line_flow_shunt_controllers', None) or []
+        if isinstance(attached, list):
+            net.line_flow_shunt_controllers = [
+                row for row in attached
+                if not (isinstance(row, dict) and row.get('shunt_index') in off_idx)
+            ]
+    return switched_off
+
+
 def _pq_shunt_in_selection(net, idx, shunt_names):
     if not shunt_names:
         return True
@@ -786,7 +847,7 @@ def _pq_set_controller_in_service(net, tap=None, park=None):
         obj = net.controller.at[ci, 'object']
         name = type(obj).__name__
         is_tap = name in ('DiscreteTapControl', 'ContinuousTapControl')
-        is_park = name in ('BinarySearchControl', 'DroopControl')
+        is_park = name in ('BinarySearchControl', 'ParkQControl', 'DroopControl')
         try:
             if tap is not None and is_tap:
                 net.controller.at[ci, 'in_service'] = bool(tap)
@@ -842,17 +903,135 @@ def _pq_restore_solved(net, snap):
             setattr(net, name, tbl)
 
 
-def _pq_try_runpp(net_pf, init, max_iteration, run_control, q_kw):
+def _pq_try_runpp(net_pf, init, max_iteration, run_control, q_kw, algorithm='nr', recycle=False):
+    runner = pp_el.electrisim_runpp if algorithm == 'nr' else pp.runpp
+    extra = {}
+    if recycle and algorithm == 'nr' and not run_control and getattr(net_pf, '_ppc', None) is not None:
+        # Topology is unchanged between P-Q trials. Reuse the admittance matrix
+        # and only refresh injections (the time-series path in pandapower).
+        extra['recycle'] = {'bus_pq': True, 'trafo': False, 'gen': True}
+        extra['check_connectivity'] = False
     try:
-        pp.runpp(
-            net_pf, algorithm='nr', calculate_voltage_angles=True,
+        runner(
+            net_pf, algorithm=algorithm, calculate_voltage_angles=True,
             init=init, max_iteration=max_iteration,
-            run_control=run_control, **q_kw)
+            run_control=run_control, **q_kw, **extra)
         return True
     except GridCodePqCancelled:
         raise
     except Exception:
+        if extra:
+            try:
+                del net_pf._ppc
+            except Exception:
+                net_pf._ppc = None
+            return _pq_try_runpp(
+                net_pf, 'auto', max(int(max_iteration or 40), 40), run_control, q_kw,
+                algorithm=algorithm, recycle=False)
         return False
+
+
+def _pq_has_voltage_seed(net):
+    res = getattr(net, 'res_bus', None)
+    if res is None or getattr(res, 'empty', True):
+        return False
+    if 'vm_pu' not in res.columns or 'va_degree' not in res.columns:
+        return False
+    try:
+        return bool(res['vm_pu'].notna().all()) and len(res) == len(net.bus)
+    except Exception:
+        return False
+
+
+def _pq_apply_vm_seed(net, seed):
+    """Copy a previous voltage solution so the next Newton start is warm."""
+    if not seed or not hasattr(net, 'bus') or net.bus is None or net.bus.empty:
+        return
+    vm, va = seed
+    try:
+        if list(net.bus.index) != list(vm.index):
+            return
+        res = getattr(net, 'res_bus', None)
+        if res is None or getattr(res, 'empty', True) or len(res) != len(vm):
+            net.res_bus = pd.DataFrame(index=net.bus.index)
+        net.res_bus['vm_pu'] = vm.to_numpy()
+        net.res_bus['va_degree'] = va.to_numpy()
+    except Exception:
+        return
+
+
+_PQ_BASELINE_COLUMNS = (
+    ('ext_grid', ('vm_pu',)),
+    ('sgen', ('p_mw', 'q_mvar')),
+    ('storage', ('p_mw', 'q_mvar')),
+    ('shunt', ('p_mw', 'q_mvar', 'step')),
+    ('trafo', ('tap_pos',)),
+    ('trafo3w', ('tap_pos',)),
+    ('gen', ('p_mw', 'vm_pu', 'q_mvar')),
+)
+_PQ_BASELINE_ATTRS = (
+    'trafo_discrete_tap_controllers',
+    'trafo3w_discrete_tap_controllers',
+    'shunt_discrete_controllers',
+    'line_flow_shunt_controllers',
+)
+
+
+def _pq_input_baseline(net):
+    """Setpoints a trial changes, so the same net can be reused instead of copied."""
+    tables = {}
+    for name, cols in _PQ_BASELINE_COLUMNS:
+        df = getattr(net, name, None)
+        if df is None or getattr(df, 'empty', True):
+            continue
+        saved = {}
+        for col in cols:
+            if col in df.columns:
+                saved[col] = df[col].copy()
+        if saved:
+            tables[name] = saved
+    attrs = {}
+    for name in _PQ_BASELINE_ATTRS:
+        val = getattr(net, name, None)
+        if isinstance(val, list):
+            attrs[name] = list(val)
+    return {'tables': tables, 'attrs': attrs}
+
+
+def _pq_restore_baseline(net, baseline):
+    if not baseline:
+        return
+    for name, cols in (baseline.get('tables') or {}).items():
+        df = getattr(net, name, None)
+        if df is None:
+            continue
+        for col, series in cols.items():
+            try:
+                df[col] = series.copy()
+            except Exception:
+                pass
+    for name, val in (baseline.get('attrs') or {}).items():
+        setattr(net, name, list(val))
+
+
+def _pq_acquire_work_net(ctx, base_net):
+    """One copied network per voltage. Later trials restore setpoints onto it."""
+    if ctx.get('_work_net') is None:
+        ctx['_work_net'] = deepcopy(base_net)
+        ctx['_work_baseline'] = _pq_input_baseline(ctx['_work_net'])
+    else:
+        _pq_restore_baseline(ctx['_work_net'], ctx.get('_work_baseline'))
+    return ctx['_work_net']
+
+
+def _pq_capture_vm_seed(net):
+    try:
+        res = net.res_bus
+        if res is None or res.empty:
+            return None
+        return (res['vm_pu'].copy(), res['va_degree'].copy())
+    except Exception:
+        return None
 
 
 def _pq_try_inits(net_pf, q_kw, inits, max_iteration):
@@ -894,7 +1073,7 @@ def _pq_run_pf(net_pf, verbose_iwamoto=False, rc2=False, rc3=False, rcs=False, f
     has_tap = attach_2w or attach_3w
     has_park = bool(force_control)
     rc = has_park or has_tap or attach_sh or attach_lf
-    inits = ('auto', 'dc', 'flat')
+    inits = ('results', 'auto', 'flat') if _pq_has_voltage_seed(net_pf) else ('auto', 'flat')
     net_pf._pq_pf_stage = None
 
     if has_tap and has_park:
@@ -927,15 +1106,23 @@ def _pq_run_pf(net_pf, verbose_iwamoto=False, rc2=False, rc3=False, rcs=False, f
         net_pf._pq_pf_stage = 'ctrl' if ok else 'div:ctrl'
         return ok
 
-    strategies = [
-        {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 50},
-        {'algorithm': 'nr', 'init': 'dc', 'max_iteration': 80},
-        {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 80},
-        {'algorithm': 'iwamoto_nr', 'init': 'dc', 'max_iteration': 80},
-    ]
+    strategies = []
+    if _pq_has_voltage_seed(net_pf):
+        strategies.append({'algorithm': 'nr', 'init': 'results', 'max_iteration': 20})
+    strategies.extend([
+        {'algorithm': 'nr', 'init': 'auto', 'max_iteration': 40},
+        {'algorithm': 'nr', 'init': 'flat', 'max_iteration': 60},
+        {'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 40},
+    ])
     for s in strategies:
         algo = s['algorithm']
         try:
+            if algo == 'nr':
+                if _pq_try_runpp(
+                        net_pf, s['init'], s['max_iteration'], False, q_kw, algorithm='nr',
+                        recycle=(s['init'] == 'results')):
+                    return True
+                continue
             if algo == 'iwamoto_nr' and not verbose_iwamoto:
                 buf = io.StringIO()
                 old_out, old_err = sys.stdout, sys.stderr
@@ -1021,12 +1208,18 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
     One load-flow trial. frac_or_q is capability fraction (local) or plant Q setpoint (park).
     Returns dict: converged, overloaded, volt_viol, q_pcc, p_pcc, net.
     """
-    net_try = deepcopy(base_net)
+    inplace = ctx.get('_inplace_net') is base_net
+    if inplace:
+        net_try = base_net
+        _pq_restore_baseline(net_try, ctx.get('_trial_baseline'))
+    else:
+        net_try = deepcopy(base_net)
     _pq_clear_controllers(net_try)
     _pq_apply_tap_family_filter(net_try, ctx)
     if tap_bound:
         _pq_pin_taps(net_try, tap_bound)
     net_try.ext_grid.at[ctx['ext_grid_idx'], 'vm_pu'] = float(ctx['v_applied'])
+    _pq_apply_vm_seed(net_try, ctx.get('vm_seed'))
     _pq_dispatch_p(net_try, ctx['gen_info'], p_val, ctx['exclude_names'])
 
     force_ctrl = False
@@ -1064,6 +1257,9 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
     volt_viol = ctx['lim_q_uprot'] and _pq_voltage_violation(
         net_try, ctx['gen_info'], ctx['u_min_prot'], ctx['u_max_prot'])
 
+    seed = _pq_capture_vm_seed(net_try)
+    if seed is not None:
+        ctx['vm_seed'] = seed
     q_pcc = pp_el._rpc_pcc_q_for_chart(net_try, ctx['pcc_bus_idx'], ctx['ext_grid_idx'])
     reason = None
     unphysical = False
@@ -1114,6 +1310,111 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
     return _pq_fill_diag(r, ctx)
 
 
+_pq_serialize_lock = threading.Lock()
+
+
+def _pq_serialize_point(net):
+    """Snapshot for the diagram without the per-bus branch scan used by a full load flow."""
+    def _fast_branch(_solved, _bus_idx):
+        return 0.0, 0.0
+
+    def _fast_nodal(solved, bus_idx):
+        try:
+            return (
+                float(solved.res_bus.at[bus_idx, 'p_mw']),
+                float(solved.res_bus.at[bus_idx, 'q_mvar']),
+            )
+        except Exception:
+            return 0.0, 0.0
+
+    with _pq_serialize_lock:
+        orig_br = pp_el._electrisim_bus_branch_p_q_sum
+        orig_nd = pp_el._electrisim_bus_nodal_p_q_sum
+        pp_el._electrisim_bus_branch_p_q_sum = _fast_branch
+        pp_el._electrisim_bus_nodal_p_q_sum = _fast_nodal
+        try:
+            snap = pp_el._rpc_serialize_solved_net(net)
+        finally:
+            pp_el._electrisim_bus_branch_p_q_sum = orig_br
+            pp_el._electrisim_bus_nodal_p_q_sum = orig_nd
+    return _pq_omit_out_of_service_shunts(snap, net)
+
+
+def _pq_omit_out_of_service_shunts(snap, net):
+    if not snap or not hasattr(net, 'shunt') or net.shunt is None or getattr(net.shunt, 'empty', True):
+        return snap
+    if 'in_service' not in net.shunt.columns:
+        return snap
+    off = set()
+    for idx in net.shunt.index:
+        try:
+            if bool(net.shunt.at[idx, 'in_service']):
+                continue
+            off.add(str(net.shunt.at[idx, 'name']))
+            if 'id' in net.shunt.columns:
+                off.add(str(net.shunt.at[idx, 'id']))
+        except Exception:
+            continue
+    if not off:
+        return snap
+    for key in ('shunts', 'capacitors'):
+        rows = snap.get(key)
+        if not isinstance(rows, list):
+            continue
+        kept = [
+            row for row in rows
+            if str(row.get('name')) not in off and str(row.get('id')) not in off
+        ]
+        if kept:
+            snap[key] = kept
+        else:
+            snap.pop(key, None)
+    return snap
+
+
+def _pq_hold_solved(net):
+    """Cheap copy of the solved state so a later trial can reuse the same network."""
+    res = {}
+    for name in (
+        'res_bus', 'res_line', 'res_trafo', 'res_trafo3w', 'res_sgen', 'res_storage',
+        'res_gen', 'res_ext_grid', 'res_load', 'res_shunt', 'res_switch', 'res_svc',
+    ):
+        tbl = getattr(net, name, None)
+        if tbl is not None and not getattr(tbl, 'empty', True):
+            try:
+                res[name] = tbl.copy()
+            except Exception:
+                pass
+    return {'res': res, 'setpoints': _pq_input_baseline(net)}
+
+
+def _pq_apply_hold(net, hold):
+    if not hold:
+        return
+    _pq_restore_baseline(net, hold.get('setpoints'))
+    for name, tbl in (hold.get('res') or {}).items():
+        setattr(net, name, tbl.copy())
+
+
+def _pq_finalize_kept(r, work, ctx):
+    """Build the diagram snapshot once, for the operating point that is kept."""
+    if not r:
+        return r
+    if r.get('_hold'):
+        _pq_apply_hold(work, r.pop('_hold'))
+    if r.get('lf_snap') is None and work is not None:
+        try:
+            r['lf_snap'] = _pq_serialize_point(work)
+        except Exception:
+            r['lf_snap'] = None
+        if not r.get('unphysical'):
+            summary = ctx.get('summary')
+            if summary is not None:
+                _pq_update_summary(summary, work, ctx.get('gen_info') or [])
+    r['net'] = None
+    return r
+
+
 def _pq_feasible(r):
     return (
         bool(r.get('converged'))
@@ -1123,17 +1424,34 @@ def _pq_feasible(r):
     )
 
 
-def _pq_bisect_q(work, ctx, p_val, direction, use_park, tap_bound, x_fail, q_cap, reason):
-    """Largest feasible |Q| between 0 and the failed capability trial, within q_step."""
+def _pq_q_hint(ctx, direction, tap_bound):
+    return (ctx.get('q_frac_hint') or {}).get((direction, tap_bound))
+
+
+def _pq_remember_q_hint(ctx, direction, tap_bound, x):
+    try:
+        ctx.setdefault('q_frac_hint', {})[(direction, tap_bound)] = float(x)
+    except (TypeError, ValueError):
+        pass
+
+
+def _pq_bisect_q(work, ctx, p_val, direction, use_park, tap_bound, x_fail, q_cap, reason,
+                 x_lo=0.0, r_lo=None):
+    """Largest feasible |Q| between x_lo and the failed trial, within q_step."""
     dq = max(abs(float(ctx['q_step_mw'])), 1e-6)
-    tol = dq if use_park else dq / max(abs(float(q_cap)), 1e-9)
-    x_lo = 0.0
-    r_ok = _pq_eval_trial(
-        work, ctx, p_val, direction, x_lo, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
-    if not _pq_feasible(r_ok):
-        return r_ok, x_lo, r_ok.get('limit_reason') or reason
-    x_hi = x_fail
-    best_r, best_x = r_ok, x_lo
+    tol = dq if use_park else dq / max(abs(float(q_cap or 0.0)) or 1.0, 1e-9)
+    x_lo = float(x_lo)
+    x_hi = float(x_fail)
+    if r_lo is not None and _pq_feasible(r_lo):
+        best_r, best_x = r_lo, x_lo
+        best_r['_hold'] = _pq_hold_solved(work)
+    else:
+        r_ok = _pq_eval_trial(
+            work, ctx, p_val, direction, x_lo, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
+        if not _pq_feasible(r_ok):
+            return r_ok, x_lo, r_ok.get('limit_reason') or reason
+        best_r, best_x = r_ok, x_lo
+        best_r['_hold'] = _pq_hold_solved(work)
     guard = 0
     while abs(x_hi - x_lo) > tol + 1e-12 and guard < 40:
         guard += 1
@@ -1143,6 +1461,7 @@ def _pq_bisect_q(work, ctx, p_val, direction, use_park, tap_bound, x_fail, q_cap
         if _pq_feasible(r):
             x_lo = x_mid
             best_r, best_x = r, x_mid
+            best_r['_hold'] = _pq_hold_solved(work)
         else:
             x_hi = x_mid
             reason = r.get('limit_reason') or reason
@@ -1164,7 +1483,7 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
     q_pos, q_neg = _pq_plant_q_caps(
         base_net, ctx['gen_info'], p_val, ctx['q_mode'], ctx['exclude_names'], ctx.get('in_data'))
     q_cap = q_pos if direction == 'max' else q_neg
-    work = deepcopy(base_net)
+    work = _pq_acquire_work_net(ctx, base_net)
     _pq_clear_controllers(work)
     if use_park:
         sign = 1.0 if direction == 'max' else -1.0
@@ -1189,11 +1508,14 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
                     f'    P={p_val:.2f} MW tap={tap_bound}: tap warm-start failed; using diagram tap_pos',
                     ctx, progress=False)
 
+        ctx['_inplace_net'] = work
+        ctx['_trial_baseline'] = _pq_input_baseline(work)
         r = _pq_eval_trial(
             work, ctx, p_val, direction, x, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
         _pq_log_trial(ctx, p_val, tap_bound, direction, r, x, q_cap, 'cap')
         if _pq_feasible(r):
-            return r, x, None, q_cap
+            _pq_remember_q_hint(ctx, direction, tap_bound, x)
+            return _pq_finalize_kept(r, work, ctx), x, None, q_cap
 
         reason = r.get('limit_reason') or 'divergence'
         if ctx['shnt_ctrl'] and ctx['limit_overloads'] and r.get('overloaded'):
@@ -1202,26 +1524,44 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
             while r.get('overloaded') and guard < 200:
                 if not _pq_reduce_compensation_one_step(work, ctx['shunt_names'], direction):
                     break
+                ctx['_trial_baseline'] = _pq_input_baseline(work)
                 r = _pq_eval_trial(
                     work, ctx, p_val, direction, x, tap_bound=tap_bound, use_park=use_park,
                     q_cap=q_cap)
                 guard += 1
                 if _pq_feasible(r):
                     _pq_log_trial(ctx, p_val, tap_bound, direction, r, x, q_cap, 'after shunt')
-                    return r, x, 'shunt', q_cap
+                    _pq_remember_q_hint(ctx, direction, tap_bound, x)
+                    return _pq_finalize_kept(r, work, ctx), x, 'shunt', q_cap
                 reason = r.get('limit_reason') or reason
 
-        r, x, reason = _pq_bisect_q(
-            work, ctx, p_val, direction, use_park, tap_bound, x, q_cap, reason)
+        hint = _pq_q_hint(ctx, direction, tap_bound)
+        if hint is not None and abs(float(hint) - float(x)) > 1e-6:
+            r_hint = _pq_eval_trial(
+                work, ctx, p_val, direction, float(hint), tap_bound=tap_bound,
+                use_park=use_park, q_cap=q_cap)
+            if _pq_feasible(r_hint):
+                r, x, reason = _pq_bisect_q(
+                    work, ctx, p_val, direction, use_park, tap_bound, x, q_cap, reason,
+                    x_lo=float(hint), r_lo=r_hint)
+            else:
+                r, x, reason = _pq_bisect_q(
+                    work, ctx, p_val, direction, use_park, tap_bound, float(hint), q_cap, reason)
+        else:
+            r, x, reason = _pq_bisect_q(
+                work, ctx, p_val, direction, use_park, tap_bound, x, q_cap, reason)
         _pq_log_trial(ctx, p_val, tap_bound, direction, r, x, q_cap, 'bisect')
         if _pq_feasible(r):
-            return r, x, reason, q_cap
+            _pq_remember_q_hint(ctx, direction, tap_bound, x)
+            return _pq_finalize_kept(r, work, ctx), x, reason, q_cap
     finally:
+        if ctx.get('_inplace_net') is work:
+            ctx['_inplace_net'] = None
         ctx['rcs'] = rcs_saved
         ctx['rc2'], ctx['rc3'] = rc2_saved, rc3_saved
 
     if r and r.get('converged') and not r.get('unphysical'):
-        return r, x, reason, q_cap
+        return _pq_finalize_kept(r, work, ctx), x, reason, q_cap
     return None, None, reason, q_cap
 
 
@@ -1480,6 +1820,267 @@ def _pq_output_table(voltage_levels, curves, pn, generator_oriented):
     return rows
 
 
+def _pq_blank_summary():
+    return {
+        'maxloading_cbl': 0.0,
+        'maxloading_trf': 0.0,
+        'umax_tot': 0.0,
+        'umin_tot': 99.0,
+        'ugenmax_tot': 0.0,
+        'ugenmin_tot': 99.0,
+        'ushntmax_tot': 0.0,
+        'ushntmin_tot': 99.0,
+        'trf_tap_max': -1e9,
+        'trf_tap_min': 1e9,
+    }
+
+
+def _pq_merge_summary(dst, src):
+    if not src:
+        return
+    for key in ('maxloading_cbl', 'maxloading_trf', 'umax_tot', 'ugenmax_tot', 'ushntmax_tot', 'trf_tap_max'):
+        val = src.get(key)
+        if isinstance(val, (int, float)):
+            dst[key] = max(dst.get(key, val), val)
+    for key in ('umin_tot', 'ugenmin_tot', 'ushntmin_tot', 'trf_tap_min'):
+        val = src.get(key)
+        if isinstance(val, (int, float)):
+            dst[key] = min(dst.get(key, val), val)
+
+
+def _pq_merge_tap_health(dst, src):
+    if not src:
+        return
+    dst['points'] = (dst.get('points') or 0) + (src.get('points') or 0)
+    dst['out_points'] = (dst.get('out_points') or 0) + (src.get('out_points') or 0)
+    by = dst.setdefault('by_trafo', {})
+    for name, entry in (src.get('by_trafo') or {}).items():
+        cur = by.get(name)
+        if cur is None:
+            by[name] = dict(entry)
+            continue
+        cur['points'] = (cur.get('points') or 0) + (entry.get('points') or 0)
+        cur['out_points'] = (cur.get('out_points') or 0) + (entry.get('out_points') or 0)
+        cur['at_limit_points'] = (cur.get('at_limit_points') or 0) + (entry.get('at_limit_points') or 0)
+        if abs(entry.get('worst_deviation_pu') or 0) > abs(cur.get('worst_deviation_pu') or 0):
+            for key in ('worst_vm_pu', 'worst_deviation_pu', 'worst_p_mw', 'worst_case'):
+                cur[key] = entry.get(key)
+
+
+def _pq_file_prepared_snap(point_loadflows, v_key, side, snap, *p_vals):
+    if not snap:
+        return
+    if v_key not in point_loadflows:
+        point_loadflows[v_key] = {'q_max': {}, 'q_min': {}}
+    side_map = point_loadflows[v_key].setdefault(side, {})
+    for p_val in p_vals:
+        if p_val is None:
+            continue
+        side_map[f"{float(p_val):.4f}"] = snap
+
+
+def _pq_store_point_keys(point_loadflows, v_key, side, net_pf, *p_vals):
+    """Serialize a solved net once and file it under every P key for that side."""
+    snap = pp_el._rpc_serialize_solved_net(net_pf)
+    if not snap:
+        return
+    if v_key not in point_loadflows:
+        point_loadflows[v_key] = {'q_max': {}, 'q_min': {}}
+    side_map = point_loadflows[v_key].setdefault(side, {})
+    for p_val in p_vals:
+        if p_val is None:
+            continue
+        side_map[f"{float(p_val):.4f}"] = snap
+
+
+def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sign_out,
+                      requirements, scale_requirement_to_pcc, pn, rc2, rc3, gen_info):
+    """One PCC voltage: every P step, Q max and Q min. Safe to run beside other voltages."""
+    local = dict(ctx)
+    local['iLDF'] = [0]
+    local['q_frac_hint'] = {}
+    local['vm_seed'] = None
+    local['tap_health'] = {'points': 0, 'out_points': 0, 'by_trafo': {}}
+    local['v_applied'] = float(v_pu) * float(u_scale)
+    summary = _pq_blank_summary()
+    local['summary'] = summary
+    warnings = []
+    point_loadflows = {}
+    v_key = f"{float(v_pu):.4f}"
+    _pq_emit(
+        f'  Voltage {v_pu} pu (applied {local["v_applied"]:.4f} pu)',
+        local, progress=True)
+
+    p_result, p_max_result, p_min_result, p_disp_result = [], [], [], []
+    q_max_result, q_min_result = [], []
+    cos_over, cos_under = [], []
+    limit_max_result, limit_min_result = [], []
+
+    for p_val in p_points:
+        _pq_check_cancel(local)
+        qmax_cands = []
+        qmin_cands = []
+        max_rs = []
+        min_rs = []
+        reasons_max = []
+        reasons_min = []
+        for bound in tap_bounds:
+            rmax, _xmax, rsn_max, _ = _pq_search_one_side(
+                net, local, p_val, 'max', i_park, bound)
+            rmin, _xmin, rsn_min, _ = _pq_search_one_side(
+                net, local, p_val, 'min', i_park, bound)
+            qmax_cands.append(None if rmax is None else rmax.get('q_pcc'))
+            qmin_cands.append(None if rmin is None else rmin.get('q_pcc'))
+            max_rs.append(rmax)
+            min_rs.append(rmin)
+            if rsn_max:
+                reasons_max.append(rsn_max)
+            if rsn_min:
+                reasons_min.append(rsn_min)
+            if rmax and not rmax.get('unphysical') and (rmax.get('lf_snap') or rmax.get('net') is not None):
+                if rmax.get('net') is not None:
+                    _pq_update_summary(summary, rmax['net'], gen_info)
+                _pq_update_tap_health(local, rmax.get('tap_recs'), p_val, bound, 'max')
+            if rmin and not rmin.get('unphysical') and (rmin.get('lf_snap') or rmin.get('net') is not None):
+                if rmin.get('net') is not None:
+                    _pq_update_summary(summary, rmin['net'], gen_info)
+                _pq_update_tap_health(local, rmin.get('tap_recs'), p_val, bound, 'min')
+
+        q_max_pcc = qmax_cands[0]
+        q_min_pcc = qmin_cands[0]
+        if (rc2 or rc3) and len(qmax_cands) > 1:
+            q_max_pcc = _pq_restrictive_qmax(qmax_cands[0], qmax_cands[1])
+            q_min_pcc = _pq_restrictive_qmin(qmin_cands[0], qmin_cands[1])
+            _pq_emit(
+                f'    P={p_val:.2f} MW tap bounds: '
+                f'Qmax [{_pq_fmt(qmax_cands[0])} | {_pq_fmt(qmax_cands[1])}] → {_pq_fmt(q_max_pcc)}  '
+                f'Qmin [{_pq_fmt(qmin_cands[0])} | {_pq_fmt(qmin_cands[1])}] → {_pq_fmt(q_min_pcc)}',
+                local, progress=True)
+        r_max_used = _pq_r_matching_q(max_rs, q_max_pcc)
+        r_min_used = _pq_r_matching_q(min_rs, q_min_pcc)
+
+        if q_max_pcc is None:
+            why = ', '.join(sorted(set(x for x in reasons_max if x))) or 'no converged load flow'
+            _pq_emit(f'    Q_max failed at P={p_val:.2f} MW ({why})', local, progress=True)
+        if q_min_pcc is None:
+            why = ', '.join(sorted(set(x for x in reasons_min if x))) or 'no converged load flow'
+            _pq_emit(f'    Q_min failed at P={p_val:.2f} MW ({why})', local, progress=True)
+        if q_max_pcc is not None and q_max_pcc < -1e-3:
+            _pq_emit(
+                f'    WARNING: Q_max={q_max_pcc:.2f} Mvar is negative at P={p_val:.2f} MW '
+                f'(overexcited plant Q should be ≥ 0 in generator convention).',
+                local, progress=True)
+
+        for rsn, side in ((reasons_max, 'max'), (reasons_min, 'min')):
+            uniq = [x for x in rsn if x]
+            if uniq:
+                warnings.append(
+                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_{side} limited "
+                    f"({', '.join(sorted(set(uniq)))})"
+                )
+
+        p_disp_plot = sign_out * float(p_val)
+        p_plot_max = None
+        p_plot_min = None
+        if r_max_used and r_max_used.get('p_pcc') is not None:
+            p_plot_max = float(sign_out) * float(r_max_used['p_pcc'])
+        elif r_max_used and r_max_used.get('net') is not None:
+            p_plot_max = _pq_pcc_plot_from_net(r_max_used['net'], local, sign_out)
+        if r_min_used and r_min_used.get('p_pcc') is not None:
+            p_plot_min = float(sign_out) * float(r_min_used['p_pcc'])
+        elif r_min_used and r_min_used.get('net') is not None:
+            p_plot_min = _pq_pcc_plot_from_net(r_min_used['net'], local, sign_out)
+        if p_plot_max is None:
+            p_plot_max = p_disp_plot
+        if p_plot_min is None:
+            p_plot_min = p_disp_plot
+
+        qmax_plot = None if q_max_pcc is None else sign_out * float(q_max_pcc)
+        qmin_plot = None if q_min_pcc is None else sign_out * float(q_min_pcc)
+
+        p_max_r = round(float(p_plot_max), 4)
+        p_min_r = round(float(p_plot_min), 4)
+
+        snap_max = None if not r_max_used else r_max_used.get('lf_snap')
+        snap_min = None if not r_min_used else r_min_used.get('lf_snap')
+        if snap_max is not None:
+            _pq_file_prepared_snap(point_loadflows, v_key, 'q_max', snap_max, p_val, p_max_r)
+        elif r_max_used and r_max_used.get('net') is not None:
+            _pq_store_point_keys(point_loadflows, v_key, 'q_max', r_max_used['net'], p_val, p_max_r)
+        if snap_min is not None:
+            _pq_file_prepared_snap(point_loadflows, v_key, 'q_min', snap_min, p_val, p_min_r)
+        elif r_min_used and r_min_used.get('net') is not None:
+            _pq_store_point_keys(point_loadflows, v_key, 'q_min', r_min_used['net'], p_val, p_min_r)
+
+        p_pcc_log = p_plot_max / sign_out if sign_out else p_plot_max
+        _pq_emit(
+            f'    → P_disp={p_val:.2f} MW  P_PCC={_pq_fmt(p_pcc_log)} MW '
+            f'envelope: Q_max={_pq_fmt(q_max_pcc)} Mvar, '
+            f'Q_min={_pq_fmt(q_min_pcc)} Mvar  (LF={local["iLDF"][0]})',
+            local, progress=True)
+        p_max_result.append(p_max_r)
+        p_min_result.append(p_min_r)
+        p_result.append(p_max_r)
+        p_disp_result.append(round(p_disp_plot, 4))
+        q_max_result.append(None if qmax_plot is None else round(qmax_plot, 4))
+        q_min_result.append(None if qmin_plot is None else round(qmin_plot, 4))
+        cos_over.append(None if qmax_plot is None else round(_pq_cosphi(p_max_r, qmax_plot), 4))
+        cos_under.append(None if qmin_plot is None else round(_pq_cosphi(p_min_r, qmin_plot), 4))
+        limit_max_result.append(_pq_limit_payload(_pq_r_matching_q(max_rs, q_max_pcc)))
+        limit_min_result.append(_pq_limit_payload(_pq_r_matching_q(min_rs, q_min_pcc)))
+
+    curve = {
+        'p_mw': p_result,
+        'p_max_mw': p_max_result,
+        'p_min_mw': p_min_result,
+        'p_dispatch_mw': p_disp_result,
+        'q_max_mvar': q_max_result,
+        'q_min_mvar': q_min_result,
+        'cosphi_over': cos_over,
+        'cosphi_under': cos_under,
+        'limit_max': limit_max_result,
+        'limit_min': limit_min_result,
+    }
+    pmax_pcc = _pq_pmax_pcc_for_req(curve)
+    v_req = requirements.get(v_key) if requirements else None
+    if (
+        scale_requirement_to_pcc
+        and v_req and pn > 0 and pmax_pcc and pmax_pcc > 0
+    ):
+        k = float(pmax_pcc) / float(pn)
+        v_req = _pq_scale_requirement(v_req, k)
+        requirements[v_key] = v_req
+        _pq_emit(
+            f'  Grid-code envelope: Pmax at PCC={pmax_pcc:.3f} MW '
+            f'(Pn={pn:.3f} MW, scale={k:.4f})',
+            local, progress=True)
+    elif v_req and pn > 0:
+        _pq_emit(
+            f'  Grid-code envelope: requirement held at Pn={pn:.3f} MW '
+            f'(Pmax at PCC={_pq_fmt(pmax_pcc)} MW, not used as Pn)',
+            local, progress=True)
+    if v_req:
+        pmax_cmp = [sign_out * p for p in p_max_result]
+        pmin_cmp = [sign_out * p for p in p_min_result]
+        qmax_cmp = [None if q is None else sign_out * q for q in q_max_result]
+        qmin_cmp = [None if q is None else sign_out * q for q in q_min_result]
+        compliance_val = _pq_check_compliance(
+            pmax_cmp, qmax_cmp, pmin_cmp, qmin_cmp, v_req)
+    else:
+        compliance_val = None
+
+    return {
+        'v_key': v_key,
+        'curve': curve,
+        'compliance': compliance_val,
+        'point_loadflows': point_loadflows.get(v_key) or {'q_max': {}, 'q_min': {}},
+        'warnings': warnings,
+        'summary': summary,
+        'tap_health': local['tap_health'],
+        'lf_count': local['iLDF'][0],
+    }
+
+
 def grid_code_pq_capability(net, pq_params, in_data=None):
     """
     P-Q capability at the PoC. Returns JSON string:
@@ -1491,6 +2092,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
         generator_names = pq_params.get('generator_names') or []
         exclude_names = pq_params.get('exclude_generator_names') or []
         shunt_names = pq_params.get('shunt_names') or []
+        shunts_off = _pq_apply_shunt_selection(net, shunt_names)
         voltage_levels = list(pq_params.get('voltage_levels') or [1.0])
         q_mode = pq_params.get('q_capability_mode') or 'from_rating'
         i_park = _pq_bool(pq_params.get('i_park_ctrl'), False)
@@ -1750,6 +2352,12 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
 
         ufn_all = getattr(net, 'user_friendly_names', None) or {}
         _pq_emit('=== Grid Code Compliance (P-Q) ===', ctx, progress=True)
+        if shunts_off:
+            _pq_emit(
+                '  Additional shunts out of service (not ticked): ' + ', '.join(shunts_off),
+                ctx, progress=True)
+        else:
+            _pq_emit('  Additional shunts: all ticked shunts stay in service', ctx, progress=True)
         _pq_emit(
             f'  PCC={pcc_bus_friendly}  ExtGrid={ext_grid_name}  Pn={pn:.3f} MW  '
             f'Qstep={q_step_mw:.4f} Mvar ({q_step_pct:g}% Pn)  units={len(gen_info)}',
@@ -1817,167 +2425,51 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             'trf_tap_min': 1e9,
         }
 
-        for v_pu in voltage_levels:
-            v_key = f"{float(v_pu):.4f}"
-            ctx['v_applied'] = float(v_pu) * u_scale
+        t_sweep = time.perf_counter()
+
+        def _run_voltage(v_pu, net_v):
+            return _pq_sweep_voltage(
+                net_v, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sign_out,
+                requirements, scale_requirement_to_pcc, pn, rc2, rc3, gen_info)
+
+        n_v = len(voltage_levels)
+        workers = 1 if n_v < 2 else min(n_v, os.cpu_count() or 2, 4)
+        if workers == 1:
+            swept = [_run_voltage(v, net) for v in voltage_levels]
+        else:
             _pq_emit(
-                f'  Voltage {v_pu} pu (applied {ctx["v_applied"]:.4f} pu)',
+                f'  Running {n_v} voltage levels in parallel ({workers} workers)',
                 ctx, progress=True)
+            nets = [deepcopy(net) for _v in voltage_levels]
+            swept_by_i = {}
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                fut_map = {
+                    pool.submit(_run_voltage, voltage_levels[i], nets[i]): i
+                    for i in range(n_v)
+                }
+                try:
+                    for fut in as_completed(fut_map):
+                        swept_by_i[fut_map[fut]] = fut.result()
+                except GridCodePqCancelled:
+                    ev = ctx.get('cancel_event')
+                    if ev is not None and hasattr(ev, 'set'):
+                        ev.set()
+                    raise
+            swept = [swept_by_i[i] for i in range(n_v)]
 
-            p_result, p_max_result, p_min_result, p_disp_result = [], [], [], []
-            q_max_result, q_min_result = [], []
-            cos_over, cos_under = [], []
-            limit_max_result, limit_min_result = [], []
-
-            for p_val in p_points:
-                _pq_check_cancel(ctx)
-                qmax_cands = []
-                qmin_cands = []
-                max_pairs = []
-                min_pairs = []
-                max_rs = []
-                min_rs = []
-                reasons_max = []
-                reasons_min = []
-                for bound in tap_bounds:
-                    rmax, xmax, rsn_max, _ = _pq_search_one_side(
-                        net, ctx, p_val, 'max', i_park, bound)
-                    rmin, xmin, rsn_min, _ = _pq_search_one_side(
-                        net, ctx, p_val, 'min', i_park, bound)
-                    qmax_cands.append(None if rmax is None else rmax.get('q_pcc'))
-                    qmin_cands.append(None if rmin is None else rmin.get('q_pcc'))
-                    max_pairs.append((
-                        None if rmax is None else rmax.get('q_pcc'),
-                        None if rmax is None else rmax.get('net'),
-                    ))
-                    min_pairs.append((
-                        None if rmin is None else rmin.get('q_pcc'),
-                        None if rmin is None else rmin.get('net'),
-                    ))
-                    max_rs.append(rmax)
-                    min_rs.append(rmin)
-                    if rsn_max:
-                        reasons_max.append(rsn_max)
-                    if rsn_min:
-                        reasons_min.append(rsn_min)
-                    if rmax and rmax.get('net') is not None and not rmax.get('unphysical'):
-                        _pq_update_summary(summary, rmax['net'], gen_info)
-                        _pq_update_tap_health(ctx, rmax.get('tap_recs'), p_val, bound, 'max')
-                    if rmin and rmin.get('net') is not None and not rmin.get('unphysical'):
-                        _pq_update_summary(summary, rmin['net'], gen_info)
-                        _pq_update_tap_health(ctx, rmin.get('tap_recs'), p_val, bound, 'min')
-
-                q_max_pcc = qmax_cands[0]
-                q_min_pcc = qmin_cands[0]
-                if (rc2 or rc3) and len(qmax_cands) > 1:
-                    q_max_pcc = _pq_restrictive_qmax(qmax_cands[0], qmax_cands[1])
-                    q_min_pcc = _pq_restrictive_qmin(qmin_cands[0], qmin_cands[1])
-                    _pq_emit(
-                        f'    P={p_val:.2f} MW tap bounds: '
-                        f'Qmax [{_pq_fmt(qmax_cands[0])} | {_pq_fmt(qmax_cands[1])}] → {_pq_fmt(q_max_pcc)}  '
-                        f'Qmin [{_pq_fmt(qmin_cands[0])} | {_pq_fmt(qmin_cands[1])}] → {_pq_fmt(q_min_pcc)}',
-                        ctx, progress=True)
-                snap_max = _pq_net_matching_q(max_pairs, q_max_pcc)
-                snap_min = _pq_net_matching_q(min_pairs, q_min_pcc)
-
-                if q_max_pcc is None:
-                    why = ', '.join(sorted(set(x for x in reasons_max if x))) or 'no converged load flow'
-                    _pq_emit(f'    Q_max failed at P={p_val:.2f} MW ({why})', ctx, progress=True)
-                if q_min_pcc is None:
-                    why = ', '.join(sorted(set(x for x in reasons_min if x))) or 'no converged load flow'
-                    _pq_emit(f'    Q_min failed at P={p_val:.2f} MW ({why})', ctx, progress=True)
-                if q_max_pcc is not None and q_max_pcc < -1e-3:
-                    _pq_emit(
-                        f'    WARNING: Q_max={q_max_pcc:.2f} Mvar is negative at P={p_val:.2f} MW '
-                        f'(overexcited plant Q should be ≥ 0 in generator convention).',
-                        ctx, progress=True)
-
-                for rsn, side in ((reasons_max, 'max'), (reasons_min, 'min')):
-                    uniq = [x for x in rsn if x]
-                    if uniq:
-                        warnings_list.append(
-                            f"V={v_pu}pu, P={p_val:.1f}MW: Q_{side} limited "
-                            f"({', '.join(sorted(set(uniq)))})"
-                        )
-
-                p_disp_plot = sign_out * float(p_val)
-                p_plot_max = _pq_pcc_plot_from_net(snap_max, ctx, sign_out)
-                p_plot_min = _pq_pcc_plot_from_net(snap_min, ctx, sign_out)
-                if p_plot_max is None:
-                    p_plot_max = p_disp_plot
-                if p_plot_min is None:
-                    p_plot_min = p_disp_plot
-
-                qmax_plot = None if q_max_pcc is None else sign_out * float(q_max_pcc)
-                qmin_plot = None if q_min_pcc is None else sign_out * float(q_min_pcc)
-
-                p_max_r = round(float(p_plot_max), 4)
-                p_min_r = round(float(p_plot_min), 4)
-
-                if snap_max is not None:
-                    pp_el._rpc_store_point_snapshot(point_loadflows, v_key, 'q_max', p_val, snap_max)
-                    pp_el._rpc_store_point_snapshot(point_loadflows, v_key, 'q_max', p_max_r, snap_max)
-                if snap_min is not None:
-                    pp_el._rpc_store_point_snapshot(point_loadflows, v_key, 'q_min', p_val, snap_min)
-                    pp_el._rpc_store_point_snapshot(point_loadflows, v_key, 'q_min', p_min_r, snap_min)
-
-                p_pcc_log = p_plot_max / sign_out if sign_out else p_plot_max
-                _pq_emit(
-                    f'    → P_disp={p_val:.2f} MW  P_PCC={_pq_fmt(p_pcc_log)} MW '
-                    f'envelope: Q_max={_pq_fmt(q_max_pcc)} Mvar, '
-                    f'Q_min={_pq_fmt(q_min_pcc)} Mvar  (LF={ctx["iLDF"][0]})',
-                    ctx, progress=True)
-                p_max_result.append(p_max_r)
-                p_min_result.append(p_min_r)
-                p_result.append(p_max_r)
-                p_disp_result.append(round(p_disp_plot, 4))
-                q_max_result.append(None if qmax_plot is None else round(qmax_plot, 4))
-                q_min_result.append(None if qmin_plot is None else round(qmin_plot, 4))
-                cos_over.append(None if qmax_plot is None else round(_pq_cosphi(p_max_r, qmax_plot), 4))
-                cos_under.append(None if qmin_plot is None else round(_pq_cosphi(p_min_r, qmin_plot), 4))
-                limit_max_result.append(_pq_limit_payload(_pq_r_matching_q(max_rs, q_max_pcc)))
-                limit_min_result.append(_pq_limit_payload(_pq_r_matching_q(min_rs, q_min_pcc)))
-
-            curves[v_key] = {
-                'p_mw': p_result,
-                'p_max_mw': p_max_result,
-                'p_min_mw': p_min_result,
-                'p_dispatch_mw': p_disp_result,
-                'q_max_mvar': q_max_result,
-                'q_min_mvar': q_min_result,
-                'cosphi_over': cos_over,
-                'cosphi_under': cos_under,
-                'limit_max': limit_max_result,
-                'limit_min': limit_min_result,
-            }
-            pmax_pcc = _pq_pmax_pcc_for_req(curves[v_key])
-            v_req = requirements.get(v_key) if requirements else None
-            if (
-                scale_requirement_to_pcc
-                and v_req and pn > 0 and pmax_pcc and pmax_pcc > 0
-            ):
-                k = float(pmax_pcc) / float(pn)
-                v_req = _pq_scale_requirement(v_req, k)
-                requirements[v_key] = v_req
-                _pq_emit(
-                    f'  Grid-code envelope: Pmax at PCC={pmax_pcc:.3f} MW '
-                    f'(Pn={pn:.3f} MW, scale={k:.4f})',
-                    ctx, progress=True)
-            elif v_req and pn > 0:
-                _pq_emit(
-                    f'  Grid-code envelope: requirement held at Pn={pn:.3f} MW '
-                    f'(Pmax at PCC={_pq_fmt(pmax_pcc)} MW, not used as Pn)',
-                    ctx, progress=True)
-            if v_req:
-                # Compare in generator-oriented MW/Mvar (requirements are always generator-oriented)
-                pmax_cmp = [sign_out * p for p in p_max_result]
-                pmin_cmp = [sign_out * p for p in p_min_result]
-                qmax_cmp = [None if q is None else sign_out * q for q in q_max_result]
-                qmin_cmp = [None if q is None else sign_out * q for q in q_min_result]
-                compliance[v_key] = _pq_check_compliance(
-                    pmax_cmp, qmax_cmp, pmin_cmp, qmin_cmp, v_req)
-            else:
-                compliance[v_key] = None
+        for item in swept:
+            v_key = item['v_key']
+            curves[v_key] = item['curve']
+            compliance[v_key] = item['compliance']
+            point_loadflows[v_key] = item['point_loadflows']
+            warnings_list.extend(item['warnings'])
+            _pq_merge_summary(summary, item['summary'])
+            _pq_merge_tap_health(ctx['tap_health'], item['tap_health'])
+            iLDF[0] += item['lf_count']
+        elapsed_s = round(time.perf_counter() - t_sweep, 1)
+        _pq_emit(
+            f'  P-Q sweep finished in {elapsed_s:.1f} s ({iLDF[0]} load flows)',
+            ctx, progress=True)
 
         pq0 = None
         if i_show_pq0:
@@ -2078,6 +2570,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 'pq0': pq0,
                 'summary': summary,
                 'load_flow_count': iLDF[0],
+                'elapsed_s': elapsed_s,
                 'tap_changer_control': {
                     'run_control_requested': bool(rc2 or rc3 or rcs or shnt_ctrl),
                     'controllers_applied': bool(has_applicable),

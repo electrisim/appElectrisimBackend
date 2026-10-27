@@ -20,9 +20,10 @@ except ImportError:
 
 _OPENDER_AVAILABLE = False
 try:
-    from opender import DER_BESS
+    from opender import DER, DER_BESS
     _OPENDER_AVAILABLE = True
 except ImportError:
+    DER = None
     DER_BESS = None
 
 
@@ -63,11 +64,14 @@ def _p_at_time(t, pre_hold_s, ramp_s, post_hold_s, p_start_mw, p_end_mw):
     return p_end_mw
 
 
-def _electrisim_p_to_opender_p_dem_pu(p_mw, p_max_mw):
-    """OpenDER BESS: negative p_dem_pu = charge, positive = discharge."""
-    if p_max_mw <= 0:
+def _electrisim_p_to_opender_p_dem_pu(p_mw, p_base_mw):
+    """OpenDER BESS: negative p_dem_pu = charge, positive = discharge.
+
+    p_base_mw must be OpenDER's NP_P_MAX in MW: OpenDER turns p_dem_pu back into
+    watts with NP_P_MAX, so any other base scales the demanded power."""
+    if p_base_mw <= 0:
         return 0.0
-    return -float(p_mw) / float(p_max_mw)
+    return -float(p_mw) / float(p_base_mw)
 
 
 def _electrisim_q_from_opender_kvar(q_kvar):
@@ -91,13 +95,23 @@ def _freq_scale_kwargs(frequency_hz):
     }
 
 
-def _pf_excitation(lagging):
-    """OpenDER CONST_PF_EXCITATION: INJ = leading/capacitive, ABS = lagging/inductive."""
-    return 'ABS' if lagging else 'INJ'
+def _pf_excitation(lagging, charging=False):
+    """OpenDER CONST_PF_EXCITATION for an Electrisim PF direction.
+
+    OpenDER computes Q = P_desired * tan(phi) with signed P (negative while charging),
+    so 'INJ' injects only while discharging. While charging the excitation is flipped,
+    so Electrisim leading = inject and lagging = absorb in both directions."""
+    excitation = 'ABS' if lagging else 'INJ'
+    if charging:
+        excitation = 'INJ' if excitation == 'ABS' else 'ABS'
+    return excitation
 
 
 def _configure_opender_from_storage(storage_el, frequency_hz, olrt_s):
-    """Build OpenDER DER_BESS kwargs from Electrisim Storage attributes."""
+    """Build OpenDER DER_BESS kwargs from Electrisim Storage attributes.
+
+    Returns (kwargs, p_base_mw), where p_base_mw is NP_P_MAX in MW: the base to use
+    for p_dem_pu."""
     sn_mva = _sf(storage_el.get('sn_mva'), 0.0)
     p_max_mw = abs(_sf(storage_el.get('p_mw'), sn_mva)) or sn_mva or 1.0
     if sn_mva <= 0:
@@ -177,7 +191,7 @@ def _configure_opender_from_storage(storage_el, frequency_hz, olrt_s):
         kwargs['CONST_Q'] = _sf(storage_el.get('q_mvar'), 0.0) * 1e6 / max(va_max_w, 1.0)
         kwargs['CONST_Q_RT'] = olrt
 
-    return kwargs, p_max_mw
+    return kwargs, p_max_w / 1e6
 
 
 def _update_opender_pf_modes(der, storage_el, p_mw):
@@ -198,7 +212,7 @@ def _update_opender_pf_modes(der, storage_el, p_mw):
     pf_mag = max(0.5, min(1.0, pf_mag))
     lagging = str(mode).lower() != 'leading'
     der.der_file.CONST_PF = pf_mag
-    der.der_file.CONST_PF_EXCITATION = _pf_excitation(lagging)
+    der.der_file.CONST_PF_EXCITATION = _pf_excitation(lagging, charging)
 
 
 def _resolve_bus_name(poc_ref, bus_map):
@@ -411,6 +425,9 @@ def _build_circuit(in_data, frequency_hz):
 
     ext_scan = ods._prescan_external_grid(work)
 
+    # Must come before New Circuit: OpenDSS keeps this setting between runs, and a
+    # circuit created at the 60 Hz default would solve 50 Hz impedances at 60 Hz.
+    execute_dss_command(f'set DefaultBaseFrequency={frequency_hz}')
     circuit_cmd = (
         ods._new_circuit_command(ext_scan) if ext_scan else f'New Circuit.ElectrisimBESS'
     )
@@ -424,8 +441,39 @@ def _build_circuit(in_data, frequency_hz):
     return execute_dss_command, BusbarsDictConnectionToName, StoragesDictId
 
 
+def _set_opender_time_step(dt):
+    """Set OpenDER's simulation step; returns the previous values for restoring.
+
+    DER.run() advances time with type(der).t_s, but OpenDER's low-pass filters
+    (open-loop response time) read DER.t_s on the base class. Setting only
+    DER_BESS.t_s left the base at its 100000 s snapshot default, so every response
+    time was skipped."""
+    previous = {cls: cls.__dict__.get('t_s') for cls in (DER, DER_BESS) if cls is not None}
+    for cls in previous:
+        cls.t_s = dt
+    return previous
+
+
+def _restore_opender_time_step(previous):
+    for cls, value in (previous or {}).items():
+        if value is None:
+            if 't_s' in cls.__dict__:
+                delattr(cls, 't_s')
+        else:
+            cls.t_s = value
+
+
 def bess_dispatch_reversal(in_data, params):
     """Time-domain BESS P ramp with POC voltage tracking."""
+    previous_t_s = {}
+    try:
+        return _run_bess_dispatch_reversal(in_data, params, previous_t_s)
+    finally:
+        # Keep OpenDER's snapshot default for any other caller in this process.
+        _restore_opender_time_step(previous_t_s)
+
+
+def _run_bess_dispatch_reversal(in_data, params, previous_t_s):
     if dss is None:
         return json.dumps({'error': True, 'message': 'OpenDSS (opendssdirect) is not installed on the server.'})
 
@@ -498,6 +546,18 @@ def bess_dispatch_reversal(in_data, params):
     except Exception as exc:
         return json.dumps({'error': True, 'message': f'Failed to build OpenDSS circuit: {exc}'})
 
+    # The Storage is built from the start setpoint, so OpenDSS would cap the other
+    # direction at |P start| (e.g. 24.2 MW charge -> 24.6 MW discharge stopped at 24.2).
+    kw_rated = max(abs(p_start_mw), abs(p_end_mw)) * 1000.0
+    if kw_rated > 0:
+        execute_dss_command(f'Storage.{storage_name}.kWRated={kw_rated}')
+    # kvarMax/kvarMaxAbs were taken from the P-Q envelope at the start P only. Q is
+    # already clipped to the envelope at every step below, so open OpenDSS up to the kVA.
+    sn_kva = abs(_sf(study_storage.get('sn_mva'), 0.0)) * 1000.0
+    if sn_kva > 0:
+        execute_dss_command(f'Storage.{storage_name}.kvarMax={sn_kva}')
+        execute_dss_command(f'Storage.{storage_name}.kvarMaxAbs={sn_kva}')
+
     poc_bus_name = _resolve_bus_name(poc_bus_id, bus_map)
     if not poc_bus_name:
         for _n, bid in (storages_id_map or {}).items():
@@ -512,9 +572,10 @@ def bess_dispatch_reversal(in_data, params):
     if engine == 'opender':
         der_kwargs, p_max_mw = _configure_opender_from_storage(
             opender_inv_settings, frequency_hz, olrt_s)
-        DER_BESS.t_s = dt
+        previous_t_s.update(_set_opender_time_step(dt))
+        # No der.reinitialize(): in OpenDER 2.2 it swaps the BESS active-power model
+        # for the PV one, so P (and fixed-PF Q) ignore the demand and sit at full output.
         der = DER_BESS(**der_kwargs)
-        der.reinitialize()
 
     _ensure_snapshot_voltages(execute_dss_command)
     v_init = _read_bus_v_pu(poc_bus_name)
@@ -529,7 +590,8 @@ def bess_dispatch_reversal(in_data, params):
         })
 
     if engine == 'opender' and der is not None:
-        warmup_steps = max(5, int(math.ceil(max(olrt_s, 1.0) / dt)))
+        # Three response times, so the response-time filter has settled before t = 0.
+        warmup_steps = max(5, int(math.ceil(3.0 * max(olrt_s, 1.0) / dt)))
         _set_storage_dispatch(
             storage_name,
             _electrisim_p_to_opendss_kw(p_start_mw),
