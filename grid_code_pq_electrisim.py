@@ -612,6 +612,25 @@ def _pq_shunt_is_selected(net, idx, selected):
     return bool(friendly) and friendly in selected
 
 
+def _pq_apply_ssc_selection(net, ssc_names, in_data=None):
+    """STATCOMs (SSC) not ticked in the P-Q dialog are out of service for this study."""
+    df = getattr(net, 'ssc', None)
+    if df is None or getattr(df, 'empty', True) or ssc_names is None:
+        return []
+    selected = {str(n) for n in ssc_names if n not in (None, '')}
+    ufn = getattr(net, 'user_friendly_names', None) or {}
+    off = []
+    for idx in list(df.index):
+        name = str(df.at[idx, 'name'])
+        sid = str(df.at[idx, 'id']) if 'id' in df.columns else ''
+        if name in selected or sid in selected or str(ufn.get(name, '')) in selected:
+            continue
+        if 'in_service' in df.columns and bool(df.at[idx, 'in_service']):
+            df.at[idx, 'in_service'] = False
+            off.append(_pq_statcom_display_name(net, idx, in_data, ufn))
+    return off
+
+
 def _pq_apply_shunt_selection(net, shunt_names):
     """Unticked additional shunts do not operate in this P-Q study."""
     if not hasattr(net, 'shunt') or net.shunt is None or getattr(net.shunt, 'empty', True):
@@ -847,7 +866,7 @@ def _pq_set_controller_in_service(net, tap=None, park=None):
         obj = net.controller.at[ci, 'object']
         name = type(obj).__name__
         is_tap = name in ('DiscreteTapControl', 'ContinuousTapControl')
-        is_park = name in ('BinarySearchControl', 'ParkQControl', 'DroopControl')
+        is_park = name in ('BinarySearchControl', 'ParkQControl', 'DroopControl', 'PlantSupervisoryControl')
         try:
             if tap is not None and is_tap:
                 net.controller.at[ci, 'in_service'] = bool(tap)
@@ -903,9 +922,90 @@ def _pq_restore_solved(net, snap):
             setattr(net, name, tbl)
 
 
+def _pq_step_positions(net):
+    """Transformer tap positions and shunt steps, to see whether a control pass moved them."""
+    out = []
+    for table, col in (('trafo', 'tap_pos'), ('trafo3w', 'tap_pos'), ('shunt', 'step')):
+        df = getattr(net, table, None)
+        if df is None or df.empty or col not in df.columns:
+            continue
+        out.extend((table, int(i), float(v)) for i, v in df[col].items() if v == v)
+    return out
+
+
+def _pq_tap_positions(net):
+    """Transformer tap positions only (shunt steps follow P or voltage on their own)."""
+    out = {}
+    for table in ('trafo', 'trafo3w'):
+        df = getattr(net, table, None)
+        if df is None or df.empty or 'tap_pos' not in df.columns:
+            continue
+        out[table] = {int(i): float(v) for i, v in df['tap_pos'].items() if v == v}
+    return out
+
+
+def _pq_apply_tap_positions(net, positions):
+    """Start a trial from tap positions solved at a nearby point (warm start for tap control)."""
+    for table, taps in (positions or {}).items():
+        df = getattr(net, table, None)
+        if df is None or df.empty or 'tap_pos' not in df.columns:
+            continue
+        for idx, pos in taps.items():
+            if idx in df.index:
+                df.at[idx, 'tap_pos'] = pos
+
+
+def _pq_has_psc(net):
+    ctrl = getattr(net, 'controller', None)
+    if ctrl is None or getattr(ctrl, 'empty', True):
+        return False
+    try:
+        return any(type(o).__name__ == 'PlantSupervisoryControl' and bool(on)
+                   for o, on in zip(ctrl['object'], ctrl['in_service']))
+    except Exception:
+        return False
+
+
+def _pq_psc_reactors(net, in_data):
+    """{shunt index: (steps, {step: Mvar absorbed at 1 p.u.})} of reactors led by a Plant Supervisory Controller."""
+    out = {}
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+    for psc in pp_el._electrisim_collect_psc_payloads(in_data):
+        for r_idx, _name in pp_el._psc_find_rows(getattr(net, 'shunt', None),
+                                                 pp_el._park_parse_json_list(psc.get('reactors_json')), ufn):
+            steps, qmap = pp_el._psc_reactor_steps(net, r_idx)
+            if len(steps) >= 2:
+                out[int(r_idx)] = (steps, qmap)
+    return out
+
+
+def _pq_detach_psc(net):
+    """Remove the helper sources a Plant Supervisory Controller added for one trial."""
+    sgen_of = getattr(net, '_electrisim_ssc_sgen', None) or {}
+    drop = [g for g in sgen_of.values() if g in net.sgen.index]
+    try:
+        if drop:
+            net.sgen.drop(index=drop, inplace=True)
+            if hasattr(net, 'res_sgen') and net.res_sgen is not None:
+                net.res_sgen.drop(index=[g for g in drop if g in net.res_sgen.index], inplace=True, errors='ignore')
+    except Exception:
+        pass
+    for s_idx in sgen_of:
+        try:
+            net.ssc.at[s_idx, 'in_service'] = True
+        except Exception:
+            pass
+    net._electrisim_ssc_sgen = {}
+    net._electrisim_ssc_equiv = {}
+    net._electrisim_ssc_info = {}
+    net._electrisim_psc_reactors = set()
+
+
 def _pq_try_runpp(net_pf, init, max_iteration, run_control, q_kw, algorithm='nr', recycle=False):
     runner = pp_el.electrisim_runpp if algorithm == 'nr' else pp.runpp
     extra = {}
+    if run_control and _pq_has_psc(net_pf):
+        extra['max_iter'] = 80
     if recycle and algorithm == 'nr' and not run_control and getattr(net_pf, '_ppc', None) is not None:
         # Topology is unchanged between P-Q trials. Reuse the admittance matrix
         # and only refresh injections (the time-series path in pandapower).
@@ -920,7 +1020,9 @@ def _pq_try_runpp(net_pf, init, max_iteration, run_control, q_kw, algorithm='nr'
     except GridCodePqCancelled:
         raise
     except Exception:
-        if extra:
+        # Retry once without recycling. Only a recycled (cached-matrix) solve is retried:
+        # retrying on any extra option (e.g. max_iter) would repeat a failed solve forever.
+        if 'recycle' in extra:
             try:
                 del net_pf._ppc
             except Exception:
@@ -1098,7 +1200,35 @@ def _pq_run_pf(net_pf, verbose_iwamoto=False, rc2=False, rc3=False, rcs=False, f
             _pq_set_controller_in_service(net_pf, tap=False, park=False)
             net_pf._pq_pf_stage = 'park_only'
             return True
-        net_pf._pq_pf_stage = 'park+tap'
+        # A tap move after the park pass shifts plant Q away from the park setpoint.
+        # Alternate park and tap passes until the taps stop moving, so the kept
+        # operating point meets the park setpoint with taps inside their band.
+        stage = 'park+tap'
+        for _round in range(4):
+            taps_before = _pq_step_positions(net_pf)
+            _pq_set_controller_in_service(net_pf, tap=False, park=True)
+            snap = _pq_snapshot_solved(net_pf)
+            if not _pq_try_runpp(net_pf, 'results', 100, True, q_kw):
+                _pq_restore_solved(net_pf, snap)
+                stage = 'park+tap (park re-run failed)'
+                break
+            _pq_set_controller_in_service(net_pf, tap=True, park=False)
+            snap = _pq_snapshot_solved(net_pf)
+            if not _pq_try_runpp(net_pf, 'results', 80, True, q_kw):
+                _pq_restore_solved(net_pf, snap)
+                stage = 'park+tap (retap failed, park setpoint kept)'
+                break
+            if _pq_step_positions(net_pf) == taps_before:
+                break
+        else:
+            # Taps still moving: finish on the park setpoint.
+            _pq_set_controller_in_service(net_pf, tap=False, park=True)
+            snap = _pq_snapshot_solved(net_pf)
+            if not _pq_try_runpp(net_pf, 'results', 100, True, q_kw):
+                _pq_restore_solved(net_pf, snap)
+            stage = 'park+tap (taps still moving)'
+        _pq_set_controller_in_service(net_pf, tap=False, park=False)
+        net_pf._pq_pf_stage = stage
         return True
 
     if rc:
@@ -1216,6 +1346,14 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
         net_try = deepcopy(base_net)
     _pq_clear_controllers(net_try)
     _pq_apply_tap_family_filter(net_try, ctx)
+    # Park as configured: start the taps where the previous P point on the same edge settled.
+    # From the diagram's tap positions a heavy point (e.g. full P with the STATCOM at its
+    # inductive rating) can have no load-flow solution at all, so tap control never starts.
+    tap_seed_key = None
+    if use_park and ctx.get('park_configured') and not tap_bound:
+        tap_seed_key = ctx.get('_statcom_force') or 'op'
+        seeds = ctx.get('_pq_tap_seed') or {}
+        _pq_apply_tap_positions(net_try, seeds.get(tap_seed_key) or seeds.get('op'))
     if tap_bound:
         _pq_pin_taps(net_try, tap_bound)
     net_try.ext_grid.at[ctx['ext_grid_idx'], 'vm_pu'] = float(ctx['v_applied'])
@@ -1224,10 +1362,16 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
 
     force_ctrl = False
     if use_park:
-        q_set = float(frac_or_q)
-        filtered = _pq_filter_in_data(
-            ctx['in_data'], ctx['park_name'], ctx['park_id'],
-            q_set=q_set, force_const_q=True, pcc_bus_name=ctx['pcc_bus_name'])
+        if ctx.get('park_configured'):
+            # Run the Park Controller exactly as configured on the diagram.
+            filtered = _pq_filter_in_data(
+                ctx['in_data'], ctx['park_name'], ctx['park_id'],
+                q_set=None, force_const_q=False, pcc_bus_name=ctx['pcc_bus_name'])
+        else:
+            q_set = float(frac_or_q)
+            filtered = _pq_filter_in_data(
+                ctx['in_data'], ctx['park_name'], ctx['park_id'],
+                q_set=q_set, force_const_q=True, pcc_bus_name=ctx['pcc_bus_name'])
         attached = pp_el._electrisim_attach_park_controllers(net_try, filtered, quiet=True)
         force_ctrl = attached > 0
         if attached <= 0:
@@ -1235,10 +1379,30 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
                 'converged': False, 'overloaded': False, 'volt_viol': False,
                 'q_pcc': None, 'p_pcc': None, 'net': None, 'limit_reason': 'park_attach',
             }
+        side = ctx.get('_statcom_force')
+        if ctx.get('park_configured') and ctx.get('psc_reactors') is not None:
+            if side in ('max', 'min'):
+                # Capability edge: the supervisory controller's reactors at their extreme step
+                # (least absorption for the capacitive edge, most for the inductive edge).
+                psc_reactors = ctx.get('psc_reactors') or {}
+                pp_el._psc_release_reactors(net_try, list(psc_reactors))
+                for r_idx, (steps, qmap) in psc_reactors.items():
+                    pick = min if side == 'max' else max
+                    net_try.shunt.at[r_idx, 'step'] = pick(steps, key=lambda st: qmap.get(st, 0.0))
+            elif ctx.get('has_psc'):
+                # Operating point: the Plant Supervisory Controller leads its STATCOMs and reactors.
+                n_psc = pp_el._electrisim_attach_plant_supervisory_controllers(net_try, ctx['in_data'], quiet=True)
+                force_ctrl = force_ctrl or n_psc > 0
     else:
         _pq_apply_local_q(
             net_try, ctx['gen_info'], p_val, ctx['q_mode'], direction, float(frac_or_q),
             ctx['exclude_names'], ctx.get('in_data'))
+
+    if ctx.get('_statcom_force') and ctx.get('statcoms'):
+        led = getattr(net_try, '_electrisim_ssc_sgen', None) or {}
+        to_force = [st for st in ctx['statcoms'] if st[0] not in led]
+        if to_force:
+            ctx['_statcom_undo'] = _pq_force_statcoms(net_try, ctx['_statcom_force'], to_force)
 
     ctx['iLDF'][0] += 1
     _pq_check_cancel(ctx)
@@ -1253,6 +1417,9 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
             'pf_stage': pf_stage,
         }
 
+    if tap_seed_key:
+        ctx.setdefault('_pq_tap_seed', {})[tap_seed_key] = _pq_tap_positions(net_try)
+
     overloaded = ctx['limit_overloads'] and _pq_overloaded(net_try, ctx['max_loading'])
     volt_viol = ctx['lim_q_uprot'] and _pq_voltage_violation(
         net_try, ctx['gen_info'], ctx['u_min_prot'], ctx['u_max_prot'])
@@ -1260,7 +1427,7 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
     seed = _pq_capture_vm_seed(net_try)
     if seed is not None:
         ctx['vm_seed'] = seed
-    q_pcc = pp_el._rpc_pcc_q_for_chart(net_try, ctx['pcc_bus_idx'], ctx['ext_grid_idx'])
+    q_pcc = _pq_pcc_q(net_try, ctx)
     reason = None
     unphysical = False
     if overloaded:
@@ -1788,6 +1955,330 @@ def _pq_check_compliance(p_max_result, q_max_result, p_min_result, q_min_result,
     return True
 
 
+def _pq_statcom_display_name(net, idx, in_data, ufn):
+    """Dialog name of a STATCOM (userFriendlyName from the payload), else its network name."""
+    tech = str(net.ssc.at[idx, 'name'])
+    sid = str(net.ssc.at[idx, 'id']) if 'id' in net.ssc.columns else None
+    for el in (in_data or {}).values():
+        if not isinstance(el, dict) or not str(el.get('typ') or '').startswith('SSC'):
+            continue
+        if str(el.get('name')) == tech or (sid and str(el.get('id')) == sid):
+            friendly = el.get('userFriendlyName')
+            if friendly:
+                return str(friendly)
+    return str((ufn or {}).get(tech, tech))
+
+
+def _pq_statcom_q_on_bus(net, bus_idx):
+    """
+    Q (Mvar, generator convention: + = supplied) that STATCOMs inject directly on ``bus_idx``:
+    in-service SSC results plus the helper injections that stand in for them in a trial.
+    """
+    total = 0.0
+    try:
+        bus_idx = int(bus_idx)
+    except (TypeError, ValueError):
+        return 0.0
+    df = getattr(net, 'ssc', None)
+    res = getattr(net, 'res_ssc', None)
+    if df is not None and not df.empty and res is not None and not res.empty:
+        for idx in df.index:
+            try:
+                if int(df.at[idx, 'bus']) != bus_idx or not bool(df.at[idx, 'in_service']):
+                    continue
+                q = float(res.at[idx, 'q_mvar'])
+                if q == q:
+                    total -= q  # pandapower SSC results are load convention
+            except Exception:
+                continue
+    for table, res_name in (('sgen', 'res_sgen'), ('gen', 'res_gen')):
+        tab = getattr(net, table, None)
+        rtab = getattr(net, res_name, None)
+        if tab is None or tab.empty or rtab is None or rtab.empty or 'name' not in tab.columns:
+            continue
+        for idx in tab.index:
+            try:
+                if not str(tab.at[idx, 'name']).startswith((_PQ_STATCOM_SGEN_PREFIX, pp_el._SSC_EQUIV_PREFIX)):
+                    continue
+                if int(tab.at[idx, 'bus']) != bus_idx or idx not in rtab.index:
+                    continue
+                q = float(rtab.at[idx, 'q_mvar'])
+                if q == q:
+                    total += q
+            except Exception:
+                continue
+    return total
+
+
+def _pq_pcc_q(net, ctx_or_pcc, ext_grid_idx=None):
+    """
+    Plant Q at the PCC for the chart. When the PCC is the external grid's bus, the base
+    measurement only sees branch flows from the plant, so STATCOMs sitting on that bus are
+    added (they belong to the plant side of the connection point).
+    """
+    if isinstance(ctx_or_pcc, dict):
+        pcc_bus_idx = ctx_or_pcc['pcc_bus_idx']
+        ext_grid_idx = ctx_or_pcc['ext_grid_idx']
+    else:
+        pcc_bus_idx = ctx_or_pcc
+    q = pp_el._rpc_pcc_q_for_chart(net, pcc_bus_idx, ext_grid_idx)
+    try:
+        eg_bus = int(net.ext_grid.at[ext_grid_idx, 'bus']) if ext_grid_idx is not None else None
+    except Exception:
+        eg_bus = None
+    if eg_bus is not None and int(pcc_bus_idx) == eg_bus:
+        q += _pq_statcom_q_on_bus(net, pcc_bus_idx)
+    return q
+
+
+def _pq_rated_statcoms(net):
+    """In-service STATCOMs with a Q rating: [(ssc_idx, bus, q_max_mvar, q_min_mvar)]."""
+    out = []
+    df = getattr(net, 'ssc', None)
+    if df is None or df.empty:
+        return out
+    for idx in df.index:
+        try:
+            if 'in_service' in df.columns and not bool(df.at[idx, 'in_service']):
+                continue
+            if not pp_el._electrisim_ssc_controllable(df.loc[idx]):
+                continue  # Controllable unticked: the STATCOM does not regulate, so it is not swept
+            q_max = float(df.at[idx, 'q_max_mvar']) if 'q_max_mvar' in df.columns else float('nan')
+            q_min = float(df.at[idx, 'q_min_mvar']) if 'q_min_mvar' in df.columns else float('nan')
+        except (TypeError, ValueError):
+            continue
+        q_max = q_max if q_max == q_max else 0.0
+        q_min = q_min if q_min == q_min else 0.0
+        q_max = abs(q_max)
+        q_min = -abs(q_min)
+        if q_max > 1e-9 or q_min < -1e-9:
+            out.append((int(idx), int(df.at[idx, 'bus']), q_max, q_min))
+    return out
+
+
+_PQ_STATCOM_SGEN_PREFIX = '_pq_statcom_'
+
+
+def _pq_force_statcoms(net, side, statcoms):
+    """
+    Replace each rated STATCOM for one trial (pandapower's own SSC model often does not
+    converge in plant models with three-winding transformers):
+
+    - side 'max' / 'min': constant-Q injection at its capacitive / inductive rating.
+    - side 'op': voltage control as configured, modelled as a P = 0 generator holding the
+      STATCOM's voltage setpoint with Q limited to its rating (Q limits enforced).
+
+    Returns undo info.
+    """
+    undo = {'sgens': [], 'gens': [], 'ssc_on': [], 'forced': {}, 'gen_of': {},
+            'q_lims_flag': getattr(net, '_electrisim_enforce_q_lims', None)}
+    slack_buses = set()
+    try:
+        for eg in net.ext_grid.index:
+            if bool(net.ext_grid.at[eg, 'in_service']):
+                slack_buses.add(int(net.ext_grid.at[eg, 'bus']))
+    except Exception:
+        pass
+    for idx, bus, q_max, q_min in statcoms:
+        undo['ssc_on'].append(idx)
+        net.ssc.at[idx, 'in_service'] = False
+        if side == 'op' and int(bus) in slack_buses:
+            sg = pp.create_sgen(net, bus=bus, p_mw=0.0, q_mvar=0.0,
+                                name=f'{_PQ_STATCOM_SGEN_PREFIX}{idx}', in_service=True)
+            undo['sgens'].append(sg)
+            undo['forced'][idx] = 0.0
+            continue
+        if side == 'op':
+            try:
+                vm = float(net.ssc.at[idx, 'set_vm_pu'])
+            except (TypeError, ValueError, KeyError):
+                vm = 1.0
+            if not vm == vm or vm <= 0:
+                vm = 1.0
+            g = pp.create_gen(net, bus=bus, p_mw=0.0, vm_pu=vm, min_q_mvar=float(q_min),
+                              max_q_mvar=float(q_max), name=f'{_PQ_STATCOM_SGEN_PREFIX}{idx}',
+                              in_service=True)
+            undo['gens'].append(g)
+            undo['gen_of'][idx] = g
+            net._electrisim_enforce_q_lims = True
+            continue
+        q = q_max if side == 'max' else q_min
+        sg = pp.create_sgen(net, bus=bus, p_mw=0.0, q_mvar=float(q),
+                            name=f'{_PQ_STATCOM_SGEN_PREFIX}{idx}', in_service=True)
+        undo['sgens'].append(sg)
+        undo['forced'][idx] = float(q)
+    return undo
+
+
+def _pq_unforce_statcoms(net, undo):
+    if not undo:
+        return
+    try:
+        if undo.get('sgens'):
+            net.sgen.drop(index=[i for i in undo['sgens'] if i in net.sgen.index], inplace=True)
+            if hasattr(net, 'res_sgen') and net.res_sgen is not None:
+                net.res_sgen.drop(index=[i for i in undo['sgens'] if i in net.res_sgen.index],
+                                  inplace=True, errors='ignore')
+    except Exception:
+        pass
+    try:
+        if undo.get('gens'):
+            net.gen.drop(index=[i for i in undo['gens'] if i in net.gen.index], inplace=True)
+            if hasattr(net, 'res_gen') and net.res_gen is not None:
+                net.res_gen.drop(index=[i for i in undo['gens'] if i in net.res_gen.index],
+                                 inplace=True, errors='ignore')
+    except Exception:
+        pass
+    if 'q_lims_flag' in undo:
+        if undo['q_lims_flag'] is None:
+            try:
+                del net._electrisim_enforce_q_lims
+            except AttributeError:
+                pass
+        else:
+            net._electrisim_enforce_q_lims = undo['q_lims_flag']
+    for idx in undo.get('ssc_on') or []:
+        try:
+            net.ssc.at[idx, 'in_service'] = True
+        except Exception:
+            pass
+
+
+def _pq_snap_with_statcoms(snap, net, forced=None, gen_of=None):
+    """
+    Add STATCOM rows to a point snapshot (q_mvar in pandapower load convention, as in a normal
+    load flow: negative = supplying Q) and hide the helper injections used to force them.
+    """
+    if not snap:
+        return snap
+    df = getattr(net, 'ssc', None)
+    if df is None or df.empty:
+        return snap
+    for key in ('staticgenerators', 'generators'):
+        rows = snap.get(key)
+        if isinstance(rows, list):
+            kept = [r for r in rows if not str(r.get('name') or '').startswith(
+                (_PQ_STATCOM_SGEN_PREFIX, pp_el._SSC_EQUIV_PREFIX))]
+            if kept:
+                snap[key] = kept
+            else:
+                snap.pop(key, None)
+    forced = forced or {}
+    gen_of = gen_of or {}
+    psc_of = getattr(net, '_electrisim_ssc_sgen', None) or {}
+    psc_info = getattr(net, '_electrisim_ssc_info', None) or {}
+    res = getattr(net, 'res_ssc', None)
+    out = []
+    for idx in df.index:
+        row = {
+            'name': str(df.at[idx, 'name']),
+            'id': str(df.at[idx, 'id']) if 'id' in df.columns else str(idx),
+        }
+        bus = int(df.at[idx, 'bus'])
+        try:
+            row['vm_pu'] = float(net.res_bus.at[bus, 'vm_pu'])
+            row['va_degree'] = float(net.res_bus.at[bus, 'va_degree'])
+        except Exception:
+            pass
+        if idx in psc_of:
+            try:
+                row['q_mvar'] = -float(net.res_sgen.at[psc_of[idx], 'q_mvar'])
+            except Exception:
+                continue
+            row['controller'] = (psc_info.get(idx) or {}).get('controller')
+        elif idx in forced:
+            row['q_mvar'] = -float(forced[idx])
+            row['forced_to_rating'] = True
+        elif idx in gen_of:
+            try:
+                row['q_mvar'] = -float(net.res_gen.at[gen_of[idx], 'q_mvar'])
+            except Exception:
+                continue
+        elif res is not None and idx in res.index and bool(df.at[idx, 'in_service']):
+            try:
+                row['q_mvar'] = float(res.at[idx, 'q_mvar'])
+                row['vm_internal_pu'] = float(res.at[idx, 'vm_internal_pu'])
+                row['va_internal_degree'] = float(res.at[idx, 'va_internal_degree'])
+            except Exception:
+                continue
+        else:
+            continue
+        out.append({k: (None if isinstance(v, float) and v != v else v) for k, v in row.items()})
+    if out:
+        snap['sscs'] = out
+    return snap
+
+
+def _pq_operating_point(base_net, ctx, p_val, statcom_side=None):
+    """
+    Park Controller as configured: one load flow at this P with the controller's own mode,
+    setpoint, Control Q at and characteristics. Tap / shunt controllers stay active as ticked.
+    Returns (result, reason). The result is kept even when it breaks a loading or voltage
+    limit, because it is the plant's actual operating point.
+    """
+    work = _pq_acquire_work_net(ctx, base_net)
+    _pq_clear_controllers(work)
+    ctx['_statcom_force'] = statcom_side
+    ctx['_statcom_undo'] = None
+    try:
+        ctx['_inplace_net'] = work
+        ctx['_trial_baseline'] = _pq_input_baseline(work)
+        r = _pq_eval_trial(work, ctx, p_val, 'max', 0.0, tap_bound=None, use_park=True)
+        if not r or not r.get('converged'):
+            return None, (r or {}).get('limit_reason') or 'divergence'
+        r = _pq_finalize_kept(r, work, ctx)
+        undo = ctx.get('_statcom_undo') or {}
+        r['lf_snap'] = _pq_snap_with_statcoms(r.get('lf_snap'), work, undo.get('forced'), undo.get('gen_of'))
+        return r, r.get('limit_reason')
+    finally:
+        _pq_unforce_statcoms(work, ctx.get('_statcom_undo'))
+        _pq_detach_psc(work)
+        ctx['_statcom_undo'] = None
+        ctx['_statcom_force'] = None
+        if ctx.get('_inplace_net') is work:
+            ctx['_inplace_net'] = None
+
+
+def _pq_check_operating_compliance(p_result, q_result, v_req):
+    """
+    True when every operating point inside the required P span lies between the
+    required Qmin and Qmax at that P. None when there is no requirement.
+    """
+    if not v_req:
+        return None
+    req_p = v_req.get('p_mw', [])
+    req_q_max = v_req.get('q_req_max_mvar', [])
+    req_q_min = v_req.get('q_req_min_mvar', [])
+    n = min(len(req_p), len(req_q_max), len(req_q_min))
+    if n < 1:
+        return False
+    try:
+        order = np.argsort([float(req_p[i]) for i in range(n)])
+        rp = np.array([float(req_p[i]) for i in order], dtype=float)
+        rmax = np.array([float(req_q_max[i]) for i in order], dtype=float)
+        rmin = np.array([float(req_q_min[i]) for i in order], dtype=float)
+    except (TypeError, ValueError):
+        return False
+    tol_mvar = 1e-4
+    checked = 0
+    for p_val, q_val in zip(p_result or [], q_result or []):
+        try:
+            pf = float(p_val)
+        except (TypeError, ValueError):
+            continue
+        if pf < rp[0] - tol_mvar or pf > rp[-1] + tol_mvar:
+            continue
+        if q_val is None:
+            return False
+        qf = float(q_val)
+        req_max_v = float(np.interp(pf, rp, rmax))
+        req_min_v = float(np.interp(pf, rp, rmin))
+        if qf > req_max_v + tol_mvar or qf < req_min_v - tol_mvar:
+            return False
+        checked += 1
+    return True if checked else False
+
+
 def _pq_output_table(voltage_levels, curves, pn, generator_oriented):
     rows = []
     if pn <= 0:
@@ -1913,6 +2404,7 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
 
     p_result, p_max_result, p_min_result, p_disp_result = [], [], [], []
     q_max_result, q_min_result = [], []
+    op_p_result, op_q_result = [], []
     cos_over, cos_under = [], []
     limit_max_result, limit_min_result = [], []
 
@@ -1924,7 +2416,32 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
         min_rs = []
         reasons_max = []
         reasons_min = []
-        for bound in tap_bounds:
+        configured = bool(local.get('park_configured'))
+        statcom_env = configured and bool(local.get('statcoms'))
+        r_op = None
+        for bound in ((None,) if configured else tap_bounds):
+            if configured:
+                r_op, rsn_op = _pq_operating_point(
+                    net, local, p_val, statcom_side='op' if statcom_env else None)
+                if rsn_op:
+                    reasons_max.append(rsn_op)
+                if r_op and r_op.get('lf_snap') is not None:
+                    _pq_update_tap_health(local, r_op.get('tap_recs'), p_val, bound, 'max')
+                if statcom_env:
+                    # Edges: STATCOMs at their capacitive / inductive rating, park as configured.
+                    r_hi, rsn_hi = _pq_operating_point(net, local, p_val, statcom_side='max')
+                    r_lo, rsn_lo = _pq_operating_point(net, local, p_val, statcom_side='min')
+                    if rsn_hi:
+                        reasons_max.append(rsn_hi)
+                    if rsn_lo:
+                        reasons_min.append(rsn_lo)
+                else:
+                    r_hi, r_lo = r_op, r_op
+                qmax_cands.append(None if r_hi is None else r_hi.get('q_pcc'))
+                qmin_cands.append(None if r_lo is None else r_lo.get('q_pcc'))
+                max_rs.append(r_hi)
+                min_rs.append(r_lo)
+                continue
             rmax, _xmax, rsn_max, _ = _pq_search_one_side(
                 net, local, p_val, 'max', i_park, bound)
             rmin, _xmin, rsn_min, _ = _pq_search_one_side(
@@ -1959,13 +2476,16 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
         r_max_used = _pq_r_matching_q(max_rs, q_max_pcc)
         r_min_used = _pq_r_matching_q(min_rs, q_min_pcc)
 
-        if q_max_pcc is None:
+        if configured and not statcom_env and q_max_pcc is None:
+            why = ', '.join(sorted(set(x for x in reasons_max if x))) or 'no converged load flow'
+            _pq_emit(f'    Operating point failed at P={p_val:.2f} MW ({why})', local, progress=True)
+        elif q_max_pcc is None:
             why = ', '.join(sorted(set(x for x in reasons_max if x))) or 'no converged load flow'
             _pq_emit(f'    Q_max failed at P={p_val:.2f} MW ({why})', local, progress=True)
-        if q_min_pcc is None:
+        if q_min_pcc is None and (statcom_env or not configured):
             why = ', '.join(sorted(set(x for x in reasons_min if x))) or 'no converged load flow'
             _pq_emit(f'    Q_min failed at P={p_val:.2f} MW ({why})', local, progress=True)
-        if q_max_pcc is not None and q_max_pcc < -1e-3:
+        if q_max_pcc is not None and q_max_pcc < -1e-3 and not configured:
             _pq_emit(
                 f'    WARNING: Q_max={q_max_pcc:.2f} Mvar is negative at P={p_val:.2f} MW '
                 f'(overexcited plant Q should be ≥ 0 in generator convention).',
@@ -1973,7 +2493,12 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
 
         for rsn, side in ((reasons_max, 'max'), (reasons_min, 'min')):
             uniq = [x for x in rsn if x]
-            if uniq:
+            if uniq and configured and not statcom_env:
+                warnings.append(
+                    f"V={v_pu}pu, P={p_val:.1f}MW: operating point breaks a limit "
+                    f"({', '.join(sorted(set(uniq)))})"
+                )
+            elif uniq:
                 warnings.append(
                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_{side} limited "
                     f"({', '.join(sorted(set(uniq)))})"
@@ -2012,12 +2537,33 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
         elif r_min_used and r_min_used.get('net') is not None:
             _pq_store_point_keys(point_loadflows, v_key, 'q_min', r_min_used['net'], p_val, p_min_r)
 
+        if statcom_env:
+            q_op = None if (r_op is None or r_op.get('q_pcc') is None) else sign_out * float(r_op['q_pcc'])
+            p_op = p_disp_plot
+            if r_op and r_op.get('p_pcc') is not None:
+                p_op = float(sign_out) * float(r_op['p_pcc'])
+            op_p_result.append(round(float(p_op), 4))
+            op_q_result.append(None if q_op is None else round(q_op, 4))
+            if r_op and r_op.get('lf_snap') is not None:
+                _pq_file_prepared_snap(point_loadflows, v_key, 'q_op', r_op['lf_snap'], p_val, round(float(p_op), 4))
+            _pq_emit(
+                f'    → P_disp={p_val:.2f} MW  operating point: Q={_pq_fmt(None if q_op is None else q_op / sign_out)} Mvar; '
+                f'STATCOM range at PCC: {_pq_fmt(q_min_pcc)} … {_pq_fmt(q_max_pcc)} Mvar  (LF={local["iLDF"][0]})',
+                local, progress=True)
         p_pcc_log = p_plot_max / sign_out if sign_out else p_plot_max
-        _pq_emit(
-            f'    → P_disp={p_val:.2f} MW  P_PCC={_pq_fmt(p_pcc_log)} MW '
-            f'envelope: Q_max={_pq_fmt(q_max_pcc)} Mvar, '
-            f'Q_min={_pq_fmt(q_min_pcc)} Mvar  (LF={local["iLDF"][0]})',
-            local, progress=True)
+        if configured and statcom_env:
+            pass
+        elif configured:
+            _pq_emit(
+                f'    → P_disp={p_val:.2f} MW  P_PCC={_pq_fmt(p_pcc_log)} MW '
+                f'operating point: Q={_pq_fmt(q_max_pcc)} Mvar  (LF={local["iLDF"][0]})',
+                local, progress=True)
+        else:
+            _pq_emit(
+                f'    → P_disp={p_val:.2f} MW  P_PCC={_pq_fmt(p_pcc_log)} MW '
+                f'envelope: Q_max={_pq_fmt(q_max_pcc)} Mvar, '
+                f'Q_min={_pq_fmt(q_min_pcc)} Mvar  (LF={local["iLDF"][0]})',
+                local, progress=True)
         p_max_result.append(p_max_r)
         p_min_result.append(p_min_r)
         p_result.append(p_max_r)
@@ -2041,6 +2587,13 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
         'limit_max': limit_max_result,
         'limit_min': limit_min_result,
     }
+    if local.get('park_configured') and local.get('statcoms'):
+        # Envelope: STATCOMs at their ratings. The configured operating point is drawn on top.
+        curve['statcom_envelope'] = True
+        curve['operating_line'] = {'p_mw': op_p_result, 'q_mvar': op_q_result}
+    elif local.get('park_configured'):
+        # Q_max and Q_min hold the same operating point in this mode.
+        curve['operating'] = True
     pmax_pcc = _pq_pmax_pcc_for_req(curve)
     v_req = requirements.get(v_key) if requirements else None
     if (
@@ -2064,8 +2617,11 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
         pmin_cmp = [sign_out * p for p in p_min_result]
         qmax_cmp = [None if q is None else sign_out * q for q in q_max_result]
         qmin_cmp = [None if q is None else sign_out * q for q in q_min_result]
-        compliance_val = _pq_check_compliance(
-            pmax_cmp, qmax_cmp, pmin_cmp, qmin_cmp, v_req)
+        if local.get('park_configured') and not local.get('statcoms'):
+            compliance_val = _pq_check_operating_compliance(pmax_cmp, qmax_cmp, v_req)
+        else:
+            compliance_val = _pq_check_compliance(
+                pmax_cmp, qmax_cmp, pmin_cmp, qmin_cmp, v_req)
     else:
         compliance_val = None
 
@@ -2086,6 +2642,14 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
     P-Q capability at the PoC. Returns JSON string:
       { "grid_code_pq_results": { ... same curve/compliance shape as RPC, plus summary } }
     """
+    # Plant Supervisory Controller picked in the dialog: keep only that one ('' = none).
+    if isinstance(in_data, dict) and 'psc_cell_id' in (pq_params or {}):
+        _sel = str(pq_params.get('psc_cell_id') or '')
+        in_data = {
+            k: v for k, v in in_data.items()
+            if not (isinstance(v, dict) and str(v.get('typ') or '').startswith('PlantSupervisoryController')
+                    and str(v.get('cell_id') or v.get('id') or '') != _sel)
+        }
     try:
         pcc_bus_name = pq_params.get('pcc_bus_name')
         ext_grid_name = pq_params.get('ext_grid_name')
@@ -2093,9 +2657,14 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
         exclude_names = pq_params.get('exclude_generator_names') or []
         shunt_names = pq_params.get('shunt_names') or []
         shunts_off = _pq_apply_shunt_selection(net, shunt_names)
+        # Older dialogs send no ssc_names: keep every STATCOM as on the diagram.
+        sscs_off = _pq_apply_ssc_selection(net, pq_params.get('ssc_names'), in_data)
         voltage_levels = list(pq_params.get('voltage_levels') or [1.0])
         q_mode = pq_params.get('q_capability_mode') or 'from_rating'
         i_park = _pq_bool(pq_params.get('i_park_ctrl'), False)
+        park_configured = str(pq_params.get('q_dispatch_mode') or '') == 'park_configured'
+        if park_configured:
+            i_park = True
         park_name = pq_params.get('park_controller_name')
         park_id = pq_params.get('park_controller_id')
         i_trf = _pq_bool(pq_params.get('i_trf_ctrl'), False)
@@ -2330,6 +2899,10 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             'in_data': in_data or {},
             'park_name': park_name,
             'park_id': park_id,
+            'park_configured': park_configured,
+            'statcoms': _pq_rated_statcoms(net) if park_configured else [],
+            'has_psc': bool(park_configured and pp_el._electrisim_collect_psc_payloads(in_data)),
+            'psc_reactors': _pq_psc_reactors(net, in_data) if park_configured else None,
             'verbose': verbose,
             'rc2': rc2,
             'rc3': rc3,
@@ -2358,6 +2931,29 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 ctx, progress=True)
         else:
             _pq_emit('  Additional shunts: all ticked shunts stay in service', ctx, progress=True)
+        if sscs_off:
+            _pq_emit('  STATCOMs out of service (not ticked): ' + ', '.join(sscs_off), ctx, progress=True)
+        if ctx.get('statcoms'):
+            try:
+                slack_buses = {int(net.ext_grid.at[eg, 'bus']) for eg in net.ext_grid.index}
+            except Exception:
+                slack_buses = set()
+            on_slack = [
+                _pq_statcom_display_name(net, i, in_data, ufn_all)
+                for i, b, _qx, _qn in ctx['statcoms'] if int(b) in slack_buses
+            ]
+            if on_slack:
+                warnings_list.append(
+                    'STATCOM on the external grid bus (' + ', '.join(on_slack) + '): the external grid fixes '
+                    'that bus voltage, so the STATCOM cannot regulate it. Its Q at the PCC is counted, the '
+                    'red edges use its Q rating, and the operating point holds it at 0 Mvar. Connect it to a '
+                    'plant-side bus for voltage control.'
+                )
+            _pq_emit(
+                '  STATCOMs swept to their Q rating: ' + ', '.join(
+                    f'{_pq_statcom_display_name(net, i, in_data, ufn_all)} [{qn:g} … +{qx:g} Mvar]'
+                    for i, _b, qx, qn in ctx['statcoms']),
+                ctx, progress=True)
         _pq_emit(
             f'  PCC={pcc_bus_friendly}  ExtGrid={ext_grid_name}  Pn={pn:.3f} MW  '
             f'Qstep={q_step_mw:.4f} Mvar ({q_step_pct:g}% Pn)  units={len(gen_info)}',
@@ -2380,7 +2976,8 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             shunt_bits.append('controllers=OFF')
         shunt_bits.append('on/off=' + ('ON' if shnt_ctrl else 'OFF'))
         _pq_emit(
-            f'  Q dispatch={"Park" if i_park else "Local"} {park_name or "—"}  '
+            f'  Q dispatch={"Park as configured" if park_configured else ("Park" if i_park else "Local")} '
+            f'{park_name or "—"}  '
             f'tap {" ".join(tap_bits)}  shunt {" ".join(shunt_bits)}',
             ctx, progress=True)
         q0p, q0n = _pq_plant_q_caps(net, gen_info, 0.0, q_mode, exclude_names, in_data)
@@ -2479,12 +3076,15 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             for g in gen_info:
                 _pq_set_gen_pq(net0, g, 0.0, 0.0)
             net0.ext_grid.at[ext_grid_idx, 'vm_pu'] = float(voltage_levels[0]) * u_scale if voltage_levels else 1.0
+            if ctx.get('statcoms'):
+                # Same STATCOM model as the operating points (pandapower's SSC often diverges here).
+                _pq_force_statcoms(net0, 'op', ctx['statcoms'])
             iLDF[0] += 1
             if _pq_run_pf(
                     net0, verbose, rc2, rc3, rcs, force_control=False,
                     cancel_event=ctx.get('cancel_event')):
                 p0 = _pq_pcc_p(net0, pcc_bus_idx, ext_grid_idx)
-                q0 = pp_el._rpc_pcc_q_for_chart(net0, pcc_bus_idx, ext_grid_idx)
+                q0 = _pq_pcc_q(net0, pcc_bus_idx, ext_grid_idx)
                 # Residual exchange at the PCC with plant units off. This is not the
                 # P=0 capability on the red envelope (units still supplying Q there).
                 pq0 = {
@@ -2560,7 +3160,12 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                 'grid_code_template_key': pq_params.get('grid_code_template_key'),
                 'q_capability_mode': q_mode,
                 'i_park_ctrl': i_park,
-                'q_dispatch_mode': 'park' if i_park else 'local',
+                'q_dispatch_mode': 'park_configured' if park_configured else ('park' if i_park else 'local'),
+                'statcom_envelope': bool(ctx.get('statcoms')),
+                'statcom_names': [
+                    _pq_statcom_display_name(net, i, in_data, ufn_all)
+                    for i, _b, _qx, _qn in (ctx.get('statcoms') or [])
+                ],
                 'park_controller_name': park_name,
                 'i_curve_mw': i_curve_mw,
                 'i_curve_mvar': i_curve_mvar,
@@ -2596,6 +3201,9 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
                     'Blue: grid-code envelope in p.u. of Pmax at the PCC '
                     '(measured net P, not generator Pn). '
                     + (
+                        'Plant Q follows the Park Controller exactly as configured on the diagram; '
+                        'each point is the operating point at that P, not a capability limit.'
+                        if park_configured else
                         'Plant Q is dispatched as constant Q at the point of connection '
                         'via the Park Controller (BinarySearchControl).'
                         if i_park else

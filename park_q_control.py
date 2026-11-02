@@ -137,7 +137,8 @@ class ParkQControl(BinarySearchControl):
         total = float(np.sum(q_now))
         max_step = self._max_step(net, q_min, q_max)
         # Direction that raises the measurement, before any slope is known.
-        resp = 1.0 if (not self.gen_Q_response or self.gen_Q_response[0] >= 0) else -1.0
+        gen_resp = getattr(self, 'gen_Q_response', None)
+        resp = 1.0 if (not gen_resp or gen_resp[0] >= 0) else -1.0
         guess_sign = self._slope_sign if self._slope_sign is not None else resp
 
         if self.output_values_old is None or self.diff_old is None:

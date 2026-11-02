@@ -1246,10 +1246,12 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     if not net.gen.empty:
         lines.append("# Create generators")
         for idx, row in net.gen.iterrows():
+            name = row['name'] if 'name' in row else f"Gen_{idx}"
+            if str(name).startswith(_SSC_EQUIV_PREFIX):
+                continue  # STATCOM equivalent: exported with the SSC below
             bus = row['bus']
             p_mw = row['p_mw']
             vm_pu = row['vm_pu']
-            name = row['name'] if 'name' in row else f"Gen_{idx}"
             lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw={p_mw}, vm_pu={vm_pu}, name='{name}')")
         lines.append("")
     
@@ -1475,6 +1477,10 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     # Create SSC elements
     if hasattr(net, 'ssc') and not net.ssc.empty:
         lines.append("# Create SSC (Static Synchronous Compensator) elements")
+        _psc_led = {int(k) for spec in (getattr(net, '_electrisim_psc_specs', None) or [])
+                    for k in (spec.get('statcom_sgens') or {})}
+        if _psc_led:
+            lines.append("_psc_ssc_sgen = {}  # STATCOMs led by a Plant Supervisory Controller (PQ sources)")
         for idx, row in net.ssc.iterrows():
             bus = row['bus']
             name = row['name'] if 'name' in row else f"SSC_{idx}"
@@ -1484,11 +1490,37 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             vm_internal_pu = row.get('vm_internal_pu', 1.0)
             va_internal_degree = row.get('va_internal_degree', 0.0)
             controllable = row.get('controllable', True)
-            in_service = row.get('in_service', True)
+            in_service = bool(row.get('in_service', True)) or int(idx) in (getattr(net, '_electrisim_ssc_equiv', None) or {})
+            q_max, q_min = _electrisim_ssc_q_limits(row)
+            q_max = 1e6 if q_max is None else q_max
+            q_min = -1e6 if q_min is None else q_min
+            if int(idx) in _psc_led:
+                lines.append(f"# STATCOM '{name}' is led by a Plant Supervisory Controller: a PQ source whose Q "
+                             f"the controller sets within {q_min} … {q_max} Mvar.")
+                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+                             f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
+                             f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
+                             f"controllable={controllable}, in_service=False)")
+                lines.append(f"_psc_ssc_sgen[{int(idx)}] = pp.create_sgen(net, bus=bus_{bus}, p_mw=0.0, q_mvar=0.0, "
+                             f"name='{name} (STATCOM, led by Plant Supervisory Controller)')")
+                continue
+            if not _electrisim_ssc_controllable(row):
+                lines.append(f"# STATCOM '{name}': Controllable is unticked, so it does not regulate and exchanges no Q.")
+                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+                             f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
+                             f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
+                             f"controllable={controllable}, in_service=False)")
+                continue
+            lines.append(f"# STATCOM '{name}' is solved as an equivalent voltage-controlled source: P = 0, holds "
+                         f"set_vm_pu, Q within its rating. pandapower's own SSC model has no Q limits and does not")
+            lines.append("# converge when the network has a transformer phase shift. The SSC is kept for reference, out of service.")
             lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
                         f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
                         f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
-                        f"controllable={controllable}, in_service={in_service})")
+                        f"controllable={controllable}, in_service=False)")
+            lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw=0.0, vm_pu={set_vm_pu}, "
+                         f"min_q_mvar={q_min}, max_q_mvar={q_max}, name='{name} (STATCOM equivalent)', "
+                         f"in_service={in_service})")
         lines.append("")
     
     # Create load DC elements
@@ -1646,11 +1678,18 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     run_control = _append_electrisim_controllers_to_python(
         lines, net, in_data, algorithm, calculate_voltage_angles, init
     )
+    psc_exported = _append_psc_to_python(lines, net)
+    run_control = run_control or psc_exported
 
     # Run power flow (seed LF for cosphi(P)/Q(V) parks, then final LF with controllers)
     cva_str = repr(calculate_voltage_angles)
     need_seed = bool(getattr(net, '_electrisim_export_park_need_seed', False))
     enforce_q = bool(getattr(net, '_electrisim_enforce_q_lims', False))
+    try:
+        if hasattr(net, 'ssc') and not net.ssc.empty:
+            enforce_q = True  # STATCOM equivalents carry their Q rating as generator limits
+    except Exception:
+        pass
 
     ls_export = _electrisim_lightsim2grid_kwargs(net, algorithm)
     if ls_export.get('lightsim2grid'):
@@ -1674,6 +1713,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     ]
     if run_control:
         run_kwargs.append("run_control=True")
+        if psc_exported:
+            run_kwargs.append("max_iter=80")
     if enforce_q:
         run_kwargs.append("enforce_q_lims=True")
     run_kwargs.extend(ls_export_bits)
@@ -2699,16 +2740,6 @@ def _electrisim_validate_ssc(net):
             pass
         if not in_service:
             continue
-        if abs(x_ohm) < 1e-9 and abs(r_ohm) < 1e-9:
-            problems.append(
-                f"SSC '{name}': coupling impedance is 0 Ω (r_ohm={r_ohm}, x_ohm={x_ohm}). "
-                "Set the coupling reactance x_ohm above 0. Pandapower divides by r + jx, "
-                "so 0 Ω makes the STATCOM admittance infinite and Newton-Raphson cannot converge."
-            )
-        elif abs(x_ohm) < 1e-9:
-            problems.append(
-                f"SSC '{name}': coupling reactance x_ohm is 0. Set x_ohm above 0 Ω."
-            )
         if set_vm <= 0:
             problems.append(
                 f"SSC '{name}': voltage setpoint set_vm_pu is {set_vm}. "
@@ -2725,13 +2756,13 @@ def _electrisim_validate_ssc(net):
         if bus is not None and bus in ext_buses:
             problems.append(
                 f"SSC '{name}' is connected to external-grid bus '{bus_name or bus}'. "
-                "Pandapower cannot voltage-control a slack bus. Connect the STATCOM to a load or collector bus."
+                "The external grid already fixes that bus voltage, so a STATCOM there cannot regulate it. "
+                "Connect the STATCOM to a bus inside the plant."
             )
         elif bus is not None and bus in gen_buses:
             problems.append(
                 f"SSC '{name}' is connected to generator bus '{bus_name or bus}'. "
-                "Pandapower cannot put a STATCOM on a bus that already has a generator voltage setpoint. "
-                "Connect it to a PQ bus."
+                "That bus already has a generator voltage setpoint. Connect the STATCOM to another bus."
             )
     if problems:
         raise ValueError("STATCOM (SSC) cannot be solved. " + " ".join(problems))
@@ -2780,6 +2811,188 @@ def _electrisim_diagnose_ssc_failure(net, calculate_voltage_angles=True):
     except Exception:
         pass
     return msg
+
+
+_SSC_EQUIV_PREFIX = '_ssc_equiv_'
+
+
+def _electrisim_ssc_float(row, col):
+    try:
+        v = float(row.get(col))
+        return v if v == v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _electrisim_ssc_q_limits(row):
+    """STATCOM Q range (generator convention) from its rating fields.
+
+    Empty = no limit on that side; 0 = no capability on that side. Both 0 (the old dialog
+    default) is read as "no rating entered", i.e. no limit.
+    """
+    q_max = _electrisim_ssc_float(row, 'q_max_mvar')
+    q_min = _electrisim_ssc_float(row, 'q_min_mvar')
+    if q_max is not None and q_min is not None and abs(q_max) < 1e-9 and abs(q_min) < 1e-9:
+        q_max = q_min = None
+    return (None if q_max is None else abs(q_max)), (None if q_min is None else -abs(q_min))
+
+
+def _electrisim_ssc_controllable(row):
+    v = row.get('controllable', True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ('false', '0', 'no', 'off', '')
+    try:
+        return bool(v) if v == v else True
+    except Exception:
+        return True
+
+
+def _electrisim_ssc_to_equivalent_gens(net):
+    """Replace each in-service STATCOM by a P = 0 generator that holds the STATCOM's voltage
+    setpoint, limited to its Q rating (q_max_mvar / q_min_mvar, unlimited when not set).
+
+    Used only when pandapower's own SSC model does not converge but the network does without
+    it. Steady state is the same: a STATCOM is a voltage-controlled reactive source.
+    Returns {ssc index: gen index}.
+    """
+    mapping = dict(getattr(net, '_electrisim_ssc_equiv', None) or {})
+    ssc = getattr(net, 'ssc', None)
+    if ssc is None or ssc.empty:
+        return mapping
+    for idx, row in ssc.iterrows():
+        try:
+            if 'in_service' in ssc.columns and not bool(row['in_service']):
+                continue
+            bus = int(row['bus'])
+            set_vm = _electrisim_ssc_float(row, 'set_vm_pu') or 1.0
+            q_max, q_min = _electrisim_ssc_q_limits(row)
+            info = getattr(net, '_electrisim_ssc_info', None) or {}
+            net.ssc.at[idx, 'in_service'] = False
+            if not _electrisim_ssc_controllable(row):
+                # Controllable unticked: the STATCOM does not regulate and exchanges no Q.
+                mapping[int(idx)] = None
+                info[int(idx)] = {'model': 'idle', 'set_vm_pu': set_vm, 'q_max_mvar': q_max,
+                                  'q_min_mvar': q_min, 'at_q_limit': None}
+                net._electrisim_ssc_info = info
+                continue
+            g = pp.create_gen(net, bus=bus, p_mw=0.0, vm_pu=set_vm,
+                              min_q_mvar=-1e6 if q_min is None else q_min,
+                              max_q_mvar=1e6 if q_max is None else q_max,
+                              name=f'{_SSC_EQUIV_PREFIX}{idx}', in_service=True)
+            mapping[int(idx)] = int(g)
+            info[int(idx)] = {
+                'model': 'voltage_source',
+                'set_vm_pu': set_vm,
+                'q_max_mvar': q_max,
+                'q_min_mvar': q_min,
+                'at_q_limit': None,
+            }
+            net._electrisim_ssc_info = info
+        except Exception as ex:
+            print(f"SSC {idx}: could not build the equivalent voltage source ({ex})")
+    net._electrisim_ssc_equiv = mapping
+    return mapping
+
+
+def _electrisim_ssc_enforce_limits(net, rerun, tol=1e-3, rounds=3):
+    """Hold a STATCOM at its rating when the solved Q lies outside it, then re-solve."""
+    mapping = getattr(net, '_electrisim_ssc_equiv', None) or {}
+    info = getattr(net, '_electrisim_ssc_info', None) or {}
+    for _ in range(rounds):
+        changed = False
+        for s_idx, g_idx in mapping.items():
+            if g_idx is None or g_idx not in net.gen.index or not bool(net.gen.at[g_idx, 'in_service']):
+                continue
+            try:
+                q = float(net.res_gen.at[g_idx, 'q_mvar'])
+            except Exception:
+                continue
+            meta = info.get(int(s_idx)) or {}
+            q_max, q_min = meta.get('q_max_mvar'), meta.get('q_min_mvar')
+            if q_max is not None and q > q_max + tol:
+                lim = q_max
+            elif q_min is not None and q < q_min - tol:
+                lim = q_min
+            else:
+                continue
+            net.gen.at[g_idx, 'in_service'] = False
+            sg = pp.create_sgen(net, bus=int(net.gen.at[g_idx, 'bus']), p_mw=0.0, q_mvar=lim,
+                                name=f'{_SSC_EQUIV_PREFIX}{s_idx}_at_rating', in_service=True)
+            clamped = getattr(net, '_electrisim_ssc_clamped', None) or {}
+            clamped[int(s_idx)] = int(sg)
+            net._electrisim_ssc_clamped = clamped
+            changed = True
+        if not changed:
+            return
+        rerun()
+
+
+def _electrisim_undo_ssc_equivalent(net):
+    mapping = getattr(net, '_electrisim_ssc_equiv', None) or {}
+    for s_idx, g_idx in mapping.items():
+        try:
+            net.ssc.at[s_idx, 'in_service'] = True
+        except Exception:
+            pass
+        try:
+            if g_idx is not None:
+                net.gen.drop(index=g_idx, inplace=True)
+        except Exception:
+            pass
+    net._electrisim_ssc_equiv = {}
+
+
+def _electrisim_ssc_equivalent_results(net):
+    """Write the equivalent generators' results into res_ssc (pandapower's load convention:
+    + = STATCOM absorbs Q) and remove the helper generators so they are not reported."""
+    mapping = getattr(net, '_electrisim_ssc_equiv', None) or {}
+    if not mapping:
+        return
+    cols = ['q_mvar', 'vm_internal_pu', 'va_internal_degree', 'vm_pu', 'va_degree']
+    res = getattr(net, 'res_ssc', None)
+    if res is None or res.empty or any(c not in res.columns for c in cols):
+        res = pd.DataFrame(index=net.ssc.index, columns=cols, dtype=float)
+    res = res.reindex(net.ssc.index)
+    clamped = getattr(net, '_electrisim_ssc_clamped', None) or {}
+    supervised = getattr(net, '_electrisim_ssc_sgen', None) or {}
+    for s_idx, g_idx in mapping.items():
+        try:
+            if s_idx in supervised:
+                q_gen = float(net.res_sgen.at[supervised[s_idx], 'q_mvar'])
+            elif s_idx in clamped:
+                q_gen = float(net.sgen.at[clamped[s_idx], 'q_mvar'])
+            elif g_idx is None:
+                q_gen = 0.0
+            else:
+                q_gen = float(net.res_gen.at[g_idx, 'q_mvar'])
+            bus = int(net.ssc.at[s_idx, 'bus'])
+            vm = float(net.res_bus.at[bus, 'vm_pu'])
+            va = float(net.res_bus.at[bus, 'va_degree'])
+            res.loc[s_idx, cols] = [-q_gen, vm, va, vm, va]
+            net.ssc.at[s_idx, 'in_service'] = True
+            info = (getattr(net, '_electrisim_ssc_info', None) or {}).get(int(s_idx))
+            if info is not None and info.get('model') in ('voltage_source', 'supervised'):
+                tol = 1e-3
+                if info['q_max_mvar'] is not None and q_gen >= info['q_max_mvar'] - tol:
+                    info['at_q_limit'] = 'max'
+                elif info['q_min_mvar'] is not None and q_gen <= info['q_min_mvar'] + tol:
+                    info['at_q_limit'] = 'min'
+        except Exception as ex:
+            print(f"SSC {s_idx}: could not read the equivalent source result ({ex})")
+    net.res_ssc = res
+    drop = [g for g in mapping.values() if g is not None and g in net.gen.index]
+    if drop:
+        net.gen.drop(index=drop, inplace=True)
+        if hasattr(net, 'res_gen') and not net.res_gen.empty:
+            net.res_gen.drop(index=[g for g in drop if g in net.res_gen.index], inplace=True)
+    sg_drop = [g for g in list(clamped.values()) + list(supervised.values()) if g in net.sgen.index]
+    if sg_drop:
+        net.sgen.drop(index=sg_drop, inplace=True)
+        if hasattr(net, 'res_sgen') and not net.res_sgen.empty:
+            net.res_sgen.drop(index=[g for g in sg_drop if g in net.res_sgen.index], inplace=True)
+    net._electrisim_ssc_equiv = {}
+    net._electrisim_ssc_clamped = {}
+    net._electrisim_ssc_sgen = {}
 
 
 def _ensure_shunt_characteristic_table(net):
@@ -4263,7 +4476,13 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=in_data[x]['controllable'], in_service=in_service)
+            ssc_idx = pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=_electrisim_boolish(in_data[x].get('controllable') if in_data[x].get('controllable') not in ('', None) else True, True), in_service=in_service)
+            # Q rating from the STATCOM dialog (generator convention: max >= 0 capacitive,
+            # min <= 0 inductive). Used by Grid Code P-Q to push the STATCOM to its limits.
+            for _col in ('q_max_mvar', 'q_min_mvar'):
+                if _col not in net.ssc.columns:
+                    net.ssc[_col] = float('nan')
+                net.ssc.at[ssc_idx, _col] = safe_float(in_data[x].get(_col), float('nan'))
         
 
         if (in_data[x]['typ'].startswith("Storage")):
@@ -4880,9 +5099,10 @@ def _park_find_by_name(df, name, user_friendly_names=None):
     if df is None or getattr(df, 'empty', True) or not name:
         return None
     target = str(name).strip()
-    friendly = user_friendly_names or {}
+    # Compare names without surrounding spaces: diagram names often end in a stray space.
+    friendly = {str(k).strip(): str(v).strip() for k, v in (user_friendly_names or {}).items()}
     # reverse friendly map: friendly -> technical
-    rev = {str(v): str(k) for k, v in friendly.items()}
+    rev = {v: k for k, v in friendly.items()}
     tech = rev.get(target, target)
     if 'name' not in df.columns:
         return None
@@ -4890,7 +5110,7 @@ def _park_find_by_name(df, name, user_friendly_names=None):
         n = df.at[idx, 'name']
         if n is None or (isinstance(n, float) and np.isnan(n)):
             continue
-        ns = str(n)
+        ns = str(n).strip()
         if ns == target or ns == tech or friendly.get(ns) == target:
             return idx
     return None
@@ -4939,7 +5159,23 @@ def _park_cosphi_p_points(park, branch):
     return _park_parse_json_list(park.get('cosphi_p_characteristic_json'))
 
 
-def _park_bus_feed_terms(net, bus_idx, sgen_idxs):
+def _bus_switch_group(net, bus_idx):
+    """``bus_idx`` plus every bus joined to it by closed bus-bus switches (one busbar)."""
+    group = {int(bus_idx)}
+    if hasattr(net, 'switch') and net.switch is not None and not net.switch.empty:
+        bb = net.switch[(net.switch.et == 'b') & (net.switch.closed.astype(bool))]
+        changed = True
+        while changed:
+            changed = False
+            for _i, sw in bb.iterrows():
+                a, b = int(sw['bus']), int(sw['element'])
+                if (a in group) != (b in group):
+                    group.update((a, b))
+                    changed = True
+    return group
+
+
+def _park_bus_feed_terms(net, bus_idx, sgen_idxs, plant_buses=None):
     """
     Branch ends through which the park's machines feed the busbar ``bus_idx``.
 
@@ -4971,7 +5207,13 @@ def _park_bus_feed_terms(net, bus_idx, sgen_idxs):
             park_buses.add(int(net.sgen.at[si, 'bus']))
         except Exception:
             continue
-    if not park_buses or park_buses & group:
+    if plant_buses is not None:
+        # Plant Supervisory Controller: devices on the busbar itself are measured directly.
+        park_buses |= {int(b) for b in plant_buses}
+        park_buses -= group
+    elif park_buses & group:
+        return []
+    if not park_buses:
         return []
     try:
         g = top.create_nxgraph(net, respect_switches=True, include_out_of_service=False)
@@ -5279,6 +5521,341 @@ def _electrisim_find_in_data_by_sgen(in_data, sgen_name, sgen_id=None):
     return None
 
 
+def _electrisim_collect_psc_payloads(in_data):
+    out = []
+    if not isinstance(in_data, dict):
+        return out
+    for _k, el in in_data.items():
+        if not isinstance(el, dict):
+            continue
+        if str(el.get('typ') or '').startswith('PlantSupervisoryController') and \
+                _park_truthy(el.get('enabled', True), True):
+            out.append(el)
+    return out
+
+
+def _psc_find_rows(df, refs, ufn):
+    """[(index, display name)] of rows matching [{'id', 'name'}] refs: by id, then by name."""
+    out = []
+    if df is None or getattr(df, 'empty', True):
+        return out
+    for ref in refs or []:
+        if not isinstance(ref, dict):
+            continue
+        rid = str(ref.get('id') or '')
+        rname = str(ref.get('name') or '')
+        idx = None
+        if rid and 'id' in df.columns:
+            hit = df.index[df['id'].astype(str) == rid]
+            if len(hit):
+                idx = int(hit[0])
+        if idx is None and rname:
+            idx = _park_find_by_name(df, rname, ufn)
+        if idx is not None and all(idx != o[0] for o in out):
+            out.append((int(idx), rname or str(df.at[idx, 'name'])))
+    return out
+
+
+def _psc_reactor_steps(net, si):
+    """(steps, {step: Mvar absorbed at 1 p.u.}) of a shunt reactor, in pandapower step numbering."""
+    sh = net.shunt.loc[si]
+    tab = getattr(net, 'shunt_characteristic_table', None)
+    use_table = bool(sh.get('step_dependency_table', False))
+    id_char = sh.get('id_characteristic_table', None)
+    qmap = {}
+    if use_table and tab is not None and not tab.empty and id_char is not None and id_char == id_char:
+        rows = tab[tab['id_characteristic'].astype(int) == int(id_char)]
+        for _i, r in rows.iterrows():
+            qmap[int(r['step'])] = float(r['q_mvar'])
+    else:
+        try:
+            max_step = int(round(float(sh.get('max_step', 1))))
+        except (TypeError, ValueError):
+            max_step = 1
+        q1 = float(sh.get('q_mvar', 0.0))
+        for st in range(0, max(max_step, 0) + 1):
+            qmap[st] = q1 * st
+    return sorted(qmap), qmap
+
+
+def _psc_release_reactors(net, shunt_idxs):
+    """Reactors led by the Plant Supervisory Controller leave their own step controllers."""
+    sset = {int(x) for x in shunt_idxs}
+    if not sset:
+        return
+    for attr in ('shunt_discrete_controllers', 'line_flow_shunt_controllers'):
+        lst = getattr(net, attr, None)
+        if isinstance(lst, list):
+            setattr(net, attr, [sp for sp in lst if int(sp.get('shunt_index', -1)) not in sset])
+    ctrl = getattr(net, 'controller', None)
+    if ctrl is not None and not getattr(ctrl, 'empty', True):
+        for ci in ctrl.index:
+            obj = ctrl.at[ci, 'object']
+            idx = getattr(obj, 'shunt_index', None)
+            if idx is None and getattr(obj, 'output_element', None) == 'shunt':
+                idx = getattr(obj, 'output_element_index', None)
+            try:
+                idxs = {int(i) for i in (idx if isinstance(idx, (list, tuple, np.ndarray)) else [idx])}
+            except (TypeError, ValueError):
+                continue
+            if idxs & sset:
+                ctrl.at[ci, 'in_service'] = False
+    net._electrisim_psc_reactors = set(getattr(net, '_electrisim_psc_reactors', set()) or set()) | sset
+
+
+_PSC_MODE_LABELS = {
+    'Q': 'Q control', 'V': 'Voltage control', 'V_droop': 'Voltage control with Q-V droop',
+    'cosphi': 'cos φ control', 'QP': 'Q(P) characteristic',
+}
+
+
+def _electrisim_attach_plant_supervisory_controllers(net, in_data, quiet=False):
+    """Attach a PlantSupervisoryControl for each enabled Plant Supervisory Controller on the diagram.
+
+    Its STATCOMs become PQ sources (helper sgens) whose Q the controller sets within their
+    rating; its shunt reactors leave their own step controllers. Returns the number attached.
+    """
+    pscs = _electrisim_collect_psc_payloads(in_data)
+    net._electrisim_psc_skip_reasons = {}
+    net._electrisim_psc_specs = []
+    if not pscs:
+        return 0
+    try:
+        from plant_supervisory_control import PlantSupervisoryControl, PSC_MODES
+    except ImportError as ex:
+        print(f'[PlantSupervisoryController] controller module not available ({ex}); skipped')
+        return 0
+    ufn = getattr(net, 'user_friendly_names', {}) or {}
+    ext_buses = set()
+    try:
+        eg = net.ext_grid[net.ext_grid.in_service.astype(bool)]
+        ext_buses = {int(b) for b in eg.bus.values}
+    except Exception:
+        pass
+    attached = 0
+    for psc in pscs:
+        pname = str(psc.get('name') or 'Plant Supervisory Controller')
+
+        def _skip(reason, _n=pname):
+            print(f"[PlantSupervisoryController] '{_n}': {reason}; skipped")
+            net._electrisim_psc_skip_reasons[_n] = reason
+
+        bus_name = str(psc.get('control_bus') or '')
+        bus = _park_find_by_name(net.bus, bus_name, ufn) if bus_name else None
+        if bus is None:
+            _skip(f"controlled bus '{bus_name}' was not found in the network" if bus_name
+                  else 'no controlled bus is selected')
+            continue
+        bus = int(bus)
+        mode = str(psc.get('control_mode') or 'Q')
+        if mode not in PSC_MODES:
+            _skip(f'unknown control mode {mode!r}')
+            continue
+        if mode == 'V' and bus in ext_buses:
+            _skip("the external grid holds this bus's voltage, so voltage control cannot move it. "
+                  "Use Q-V droop, Q, cos φ or Q(P) at this bus, or pick a bus inside the plant")
+            continue
+
+        # STATCOMs: need a Q rating and Controllable ticked.
+        stat_rows, notes = [], []
+        for s_idx, s_name in _psc_find_rows(getattr(net, 'ssc', None),
+                                            _park_parse_json_list(psc.get('statcoms_json')), ufn):
+            row = net.ssc.loc[s_idx]
+            already = s_idx in (getattr(net, '_electrisim_ssc_sgen', None) or {})
+            if not already and 'in_service' in net.ssc.columns and not bool(row['in_service']):
+                continue
+            if already:
+                notes.append(f"STATCOM '{s_name}' is already led by another Plant Supervisory Controller")
+                continue
+            if not _electrisim_ssc_controllable(row):
+                notes.append(f"STATCOM '{s_name}' has Controllable unticked")
+                continue
+            q_max, q_min = _electrisim_ssc_q_limits(row)
+            if q_max is None or q_min is None:
+                notes.append(f"STATCOM '{s_name}' has no Q rating (set both ratings in its dialog)")
+                continue
+            stat_rows.append((s_idx, s_name, q_min, q_max))
+        reactor_rows = []
+        for r_idx, r_name in _psc_find_rows(getattr(net, 'shunt', None),
+                                            _park_parse_json_list(psc.get('reactors_json')), ufn):
+            if 'in_service' in net.shunt.columns and not bool(net.shunt.at[r_idx, 'in_service']):
+                continue
+            steps, qmap = _psc_reactor_steps(net, r_idx)
+            if len(steps) < 2:
+                notes.append(f"shunt reactor '{r_name}' has only one step, so it cannot be switched")
+                continue
+            reactor_rows.append((r_idx, r_name, steps, qmap))
+        if not stat_rows and not reactor_rows:
+            _skip('none of its STATCOMs or shunt reactors can be used' + (': ' + '; '.join(notes) if notes else ''))
+            continue
+        for n in notes:
+            print(f"[PlantSupervisoryController] '{pname}': {n}; left out")
+
+        # STATCOMs become PQ sources led by the controller.
+        sgen_map = dict(getattr(net, '_electrisim_ssc_sgen', None) or {})
+        equiv = dict(getattr(net, '_electrisim_ssc_equiv', None) or {})
+        info = dict(getattr(net, '_electrisim_ssc_info', None) or {})
+        stat_sgens = []
+        for s_idx, s_name, q_min, q_max in stat_rows:
+            q0 = min(max(0.0, q_min), q_max)
+            sg = pp.create_sgen(net, bus=int(net.ssc.at[s_idx, 'bus']), p_mw=0.0, q_mvar=q0,
+                                name=f'{_SSC_EQUIV_PREFIX}{s_idx}', in_service=True)
+            net.ssc.at[s_idx, 'in_service'] = False
+            sgen_map[s_idx] = int(sg)
+            equiv[s_idx] = None
+            info[s_idx] = {'model': 'supervised', 'set_vm_pu': None, 'q_max_mvar': q_max,
+                           'q_min_mvar': q_min, 'at_q_limit': None, 'controller': pname}
+            stat_sgens.append(int(sg))
+        net._electrisim_ssc_sgen, net._electrisim_ssc_equiv, net._electrisim_ssc_info = sgen_map, equiv, info
+
+        reactor_specs = []
+        for r_idx, _r_name, steps, qmap in reactor_rows:
+            if int(round(float(net.shunt.at[r_idx, 'step']))) not in steps:
+                net.shunt.at[r_idx, 'step'] = steps[0]
+            reactor_specs.append({'shunt': int(r_idx), 'steps': steps, 'q_mvar': qmap})
+        _psc_release_reactors(net, [r['shunt'] for r in reactor_specs])
+
+        # What the controller measures: P and Q the plant feeds into the busbar.
+        group = _bus_switch_group(net, bus)
+        dev_buses = {int(net.sgen.at[g, 'bus']) for g in stat_sgens} | \
+                    {int(net.shunt.at[r['shunt'], 'bus']) for r in reactor_specs}
+        live_sgens = [int(i) for i in net.sgen.index
+                      if 'in_service' not in net.sgen.columns or bool(net.sgen.at[i, 'in_service'])]
+        feed = _park_bus_feed_terms(net, bus, live_sgens, plant_buses=dev_buses)
+        q_terms = [(t, qc, int(i), sg_) for t, _pc, qc, i, sg_ in feed]
+        p_terms = [(t, pc, int(i), sg_) for t, pc, _qc, i, sg_ in feed]
+        for i in live_sgens:
+            if int(net.sgen.at[i, 'bus']) in group:
+                q_terms.append(('res_sgen', 'q_mvar', i, 1))
+                p_terms.append(('res_sgen', 'p_mw', i, 1))
+        for i in net.shunt.index if hasattr(net, 'shunt') else []:
+            if int(net.shunt.at[i, 'bus']) in group and bool(net.shunt.at[i, 'in_service']):
+                q_terms.append(('res_shunt', 'q_mvar', int(i), -1))
+                p_terms.append(('res_shunt', 'p_mw', int(i), -1))
+        if not q_terms and mode != 'V':
+            _skip('no plant element feeds the controlled bus')
+            continue
+
+        qp = []
+        for pt in _park_parse_json_list(psc.get('qp_characteristic_json')):
+            try:
+                qp.append((float(pt['p_mw']), float(pt['q_mvar'])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        params = {
+            'q_set_mvar': safe_float(psc.get('q_set_mvar'), 0.0),
+            'vm_set_pu': safe_float(psc.get('vm_set_pu'), 1.0),
+            'droop_percent': safe_float(psc.get('droop_percent'), 4.0),
+            'q_ref_mvar': safe_float(psc.get('q_ref_mvar'), 0.0),
+            'cos_phi': safe_float(psc.get('cos_phi'), 1.0),
+            'overexcited': not str(psc.get('excitation') or 'Overexcited').lower().startswith('under'),
+            'qp_points': qp,
+            'statcom_band': safe_float(psc.get('statcom_band_percent'), 50.0) / 100.0,
+        }
+        if mode == 'V_droop' and (params['droop_percent'] <= 0 or params['q_ref_mvar'] <= 0):
+            _skip('Q-V droop needs a droop above 0 % and a reference Q above 0 Mvar')
+            continue
+        try:
+            ctrl = PlantSupervisoryControl(
+                net, bus, mode=mode, statcom_sgens=stat_sgens,
+                statcom_q_min=[r[2] for r in stat_rows], statcom_q_max=[r[3] for r in stat_rows],
+                reactors=reactor_specs, q_terms=q_terms, p_terms=p_terms, name=pname,
+                order=1, level=0, **params)
+        except Exception as ex:
+            _skip(f'controller could not be created ({ex})')
+            continue
+        ctrl._electrisim_meta = {
+            'id': psc.get('cell_id') or psc.get('id'),
+            'bus_name': ufn.get(str(net.bus.at[bus, 'name']), str(net.bus.at[bus, 'name'])),
+            'statcoms': [(sg, r[0], r[1]) for sg, r in zip(stat_sgens, stat_rows)],
+            'reactors': [(r[0], r[1]) for r in reactor_rows],
+            'notes': notes,
+        }
+        net._electrisim_psc_specs.append({
+            'name': pname, 'bus': bus, 'mode': mode, 'params': params,
+            'statcoms': [(r[0], r[2], r[3]) for r in stat_rows],
+            'reactors': reactor_specs,
+            'q_terms': [list(t) for t in q_terms], 'p_terms': [list(t) for t in p_terms],
+            'statcom_sgens': {int(r[0]): int(sg) for sg, r in zip(stat_sgens, stat_rows)},
+        })
+        attached += 1
+        if not quiet:
+            print(f"[PlantSupervisoryController] attached '{pname}' mode={mode} bus={bus} "
+                  f"STATCOMs={[r[1] for r in stat_rows]} reactors={[r[1] for r in reactor_rows]}")
+    return attached
+
+
+def _electrisim_build_psc_results(net):
+    """Plant Supervisory Controller results; call before the STATCOM helper sgens are removed."""
+    out = []
+    try:
+        from plant_supervisory_control import PlantSupervisoryControl
+    except ImportError:
+        return out
+    ctrl = getattr(net, 'controller', None)
+    if ctrl is None or getattr(ctrl, 'empty', True):
+        return out
+    for ci in ctrl.index:
+        obj = ctrl.at[ci, 'object']
+        if not isinstance(obj, PlantSupervisoryControl):
+            continue
+        meta = getattr(obj, '_electrisim_meta', None) or {}
+        try:
+            obj._error(net)  # refresh measurements from the final load flow
+        except Exception:
+            pass
+        statcoms = []
+        for sg, s_idx, s_name in meta.get('statcoms', []):
+            q = None
+            try:
+                q = float(net.res_sgen.at[sg, 'q_mvar'])
+            except Exception:
+                pass
+            statcoms.append({'name': s_name, 'q_mvar': q})
+        reactors = []
+        for r_idx, r_name in meta.get('reactors', []):
+            row = {'name': r_name}
+            try:
+                st_pp = net.shunt.at[r_idx, 'step']
+                row['step'] = _electrisim_shunt_step_from_pp(st_pp, _electrisim_shunt_is_zero_based(net, r_idx))
+                row['q_mvar'] = float(net.res_shunt.at[r_idx, 'q_mvar'])
+            except Exception:
+                pass
+            reactors.append(row)
+        err = None
+        try:
+            err = (obj.target - (obj.vm_meas if obj.mode == 'V' else obj.q_meas))
+        except Exception:
+            pass
+        tol = obj.tol_vm if obj.mode == 'V' else obj.tol_mvar
+        try:
+            applied = bool(ctrl.at[ci, 'in_service'])
+        except Exception:
+            applied = True
+        out.append({
+            'applied': applied,
+            'vm_min_pu': obj.vm_min,
+            'vm_max_pu': obj.vm_max,
+            'name': obj.name,
+            'id': meta.get('id'),
+            'mode': obj.mode,
+            'mode_label': _PSC_MODE_LABELS.get(obj.mode, obj.mode),
+            'bus': meta.get('bus_name'),
+            'target': obj.target,
+            'target_unit': 'pu' if obj.mode == 'V' else 'Mvar',
+            'p_mw': obj.p_meas,
+            'q_mvar': obj.q_meas,
+            'vm_pu': obj.vm_meas,
+            'on_target': applied and err is not None and abs(err) < 10 * tol,
+            'at_limit': obj.at_limit if applied else None,
+            'switching': obj.switching,
+            'statcoms': statcoms,
+            'reactors': reactors,
+            'notes': meta.get('notes') or [],
+        })
+    return out
+
+
 def _electrisim_build_park_controller_results(net, in_data):
     """Summaries for results .txt / UI after load flow."""
     results = []
@@ -5338,6 +5915,7 @@ def _electrisim_build_park_controller_results(net, in_data):
             'voltage_ctrl': bool(getattr(bsc, 'voltage_ctrl', mode == 'Voltage Control')) if bsc is not None else (mode == 'Voltage Control'),
             'attached': bsc is not None,
             'at_q_limit': bool(getattr(bsc, 'at_q_limit', False)) if bsc is not None else False,
+            'skip_reason': (getattr(net, '_electrisim_park_skip_reasons', None) or {}).get(name),
         })
     return results
 
@@ -5412,6 +5990,47 @@ def _electrisim_build_wtc_controller_results(in_data):
 def _export_tap_side(val):
     """Normalize tap_side for exported pandapower scripts."""
     return _normalize_tap_side(val)
+
+
+def _append_psc_to_python(lines, net):
+    """Emit PlantSupervisoryControl (inlined source + one controller per spec). True if emitted."""
+    import os
+    specs = getattr(net, '_electrisim_psc_specs', None) or []
+    if not specs:
+        return False
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plant_supervisory_control.py')
+    lines.append("# --- PlantSupervisoryControl (Electrisim plant_supervisory_control.py) ---")
+    with open(path, encoding='utf-8') as fh:
+        lines.extend(fh.read().rstrip().splitlines())
+    lines.append("# --- end PlantSupervisoryControl ---")
+    lines.append("")
+    for k, spec in enumerate(specs):
+        inv = {int(v): int(sk) for sk, v in (spec.get('statcom_sgens') or {}).items()}
+
+        def _term(t):
+            table, col, idx, sign = t
+            if table == 'res_sgen' and int(idx) in inv:
+                return f"('res_sgen', '{col}', _psc_ssc_sgen[{inv[int(idx)]}], {int(sign)})"
+            return repr((str(table), str(col), int(idx), int(sign)))
+
+        stat = spec.get('statcoms') or []
+        params = dict(spec.get('params') or {})
+        lines.append(f"# Plant Supervisory Controller '{spec.get('name')}': mode={spec.get('mode')!r}. Its STATCOMs "
+                     "supply the exact Q; its shunt reactors switch steps to keep the STATCOMs near mid-range.")
+        lines.append(f"_psc_{k} = PlantSupervisoryControl(")
+        lines.append(f"    net, {int(spec['bus'])}, mode={spec.get('mode')!r},")
+        lines.append(f"    statcom_sgens=[{', '.join(f'_psc_ssc_sgen[{int(s[0])}]' for s in stat)}],")
+        lines.append(f"    statcom_q_min={[float(s[1]) for s in stat]!r}, statcom_q_max={[float(s[2]) for s in stat]!r},")
+        lines.append(f"    reactors={spec.get('reactors')!r},")
+        lines.append(f"    q_terms=[{', '.join(_term(t) for t in spec.get('q_terms') or [])}],")
+        lines.append(f"    p_terms=[{', '.join(_term(t) for t in spec.get('p_terms') or [])}],")
+        for key in ('q_set_mvar', 'vm_set_pu', 'droop_percent', 'q_ref_mvar', 'cos_phi', 'overexcited',
+                    'qp_points', 'statcom_band'):
+            if key in params:
+                lines.append(f"    {key}={params[key]!r},")
+        lines.append(f"    name={str(spec.get('name'))!r}, order=1, level=0)")
+        lines.append("")
+    return True
 
 
 def _append_park_q_control_source(lines):
@@ -5733,13 +6352,20 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
 
     attached = 0
     ufn = getattr(net, 'user_friendly_names', {}) or {}
+    net._electrisim_park_skip_reasons = {}
+
+    def _skip(park, reason):
+        """Remember why a park controller was not attached, so the load flow can warn about it."""
+        pname = str(park.get('name') or 'ParkController')
+        print(f"[ParkController] '{pname}': {reason}; skipped")
+        net._electrisim_park_skip_reasons[pname] = reason
 
     for park in parks:
         machines = _park_parse_json_list(park.get('machines_json'))
         idxs, insvc, dist, resp = _park_resolve_sgen_indices(
             net, machines, park.get('distribution_method'))
         if not idxs:
-            print(f"[ParkController] '{park.get('name')}': no connected sgen machines resolved; skipped")
+            _skip(park, 'none of its machines were found in the network (check the Machines tab)')
             continue
 
         use_q_cap = _park_truthy(park.get('use_q_capability', True), True)
@@ -5778,7 +6404,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
                 except Exception:
                     bus_idx = idxs and int(net.sgen.at[idxs[0], 'bus'])
             if bus_idx is None:
-                print(f"[ParkController] '{park.get('name')}': controlled bus not found; skipped")
+                _skip(park, f"controlled bus '{bus_name or ''}' was not found in the network")
                 continue
             input_element = 'res_bus'
             input_variable = 'vm_pu'
@@ -5794,7 +6420,8 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
             input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
                 net, boundary, idxs)
             if input_element is None:
-                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                _skip(park, f"Control Q at '{boundary}' was not found in the network"
+                            if boundary else 'Control Q at is not set')
                 continue
             q_type = str(park.get('q_control_type') or 'Const. Q')
             if q_type == 'Const. Q':
@@ -5821,7 +6448,8 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
             input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
                 net, boundary, idxs)
             if input_element is None:
-                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                _skip(park, f"Control Q at '{boundary}' was not found in the network"
+                            if boundary else 'Control Q at is not set')
                 continue
             p_m, q_m = _park_measure_p_q_at(net, boundary, idxs)
             p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
@@ -5859,13 +6487,14 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
             input_element, input_variable, input_element_index, q_terms = _park_resolve_control_q_at(
                 net, boundary, idxs)
             if input_element is None:
-                print(f"[ParkController] '{park.get('name')}': Control Q at '{boundary}' not found; skipped")
+                _skip(park, f"Control Q at '{boundary}' was not found in the network"
+                            if boundary else 'Control Q at is not set')
                 continue
             p_m, _q_m = _park_measure_p_q_at(net, boundary, idxs)
             p_use = p_m if p_m is not None else sum(float(net.sgen.at[i, 'p_mw']) for i in idxs)
             set_point = float(p_use) * safe_float(park.get('tan_phi'), 0.0)
         else:
-            print(f"[ParkController] '{park.get('name')}': unknown mode {mode!r}; skipped")
+            _skip(park, f'unknown control mode {mode!r}')
             continue
 
         # Clamp plant Q setpoint to sum of machine P–Q capability at current P
@@ -5970,7 +6599,7 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
             attached += 1
             _plog(f"[ParkController] attached '{park.get('name')}' mode={mode} setpoint={set_point} sgens={idxs}")
         except Exception as ex:
-            print(f"[ParkController] attach failed for '{park.get('name')}': {ex}")
+            _skip(park, f'controller could not be created ({ex})')
 
     return attached
 
@@ -6070,6 +6699,17 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     except Exception as park_ex:
                         print(f"[ParkController] attach error: {park_ex}")
                         park_attached = 0
+                psc_attached = 0
+                if not controllers_already:
+                    try:
+                        psc_attached = _electrisim_attach_plant_supervisory_controllers(net, in_data)
+                    except Exception as psc_ex:
+                        print(f"[PlantSupervisoryController] attach error: {psc_ex}")
+                        psc_attached = 0
+                    if psc_attached:
+                        attach_sh_disc = attach_sh_disc and bool(getattr(net, 'shunt_discrete_controllers', None))
+                        attach_lf_sh = attach_lf_sh and bool(getattr(net, 'line_flow_shunt_controllers', None))
+                        park_attached = int(park_attached or 0) + int(psc_attached)
                 run_pp_control = attach_2w or attach_3w or attach_sh_disc or attach_lf_sh or bool(park_attached) or controllers_already
                 if run_pp_control:
                     print(
@@ -6218,20 +6858,28 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             pass
 
                 pf_kwargs = _electrisim_enforce_q_lims_kw(net)
+                # The Plant Supervisory Controller settles together with the Park Controller and
+                # the tap changers, which takes more than pandapower's default 30 control iterations.
+                ctrl_kwargs = {'max_iter': 80} if psc_attached else {}
                 _ls_backend = _electrisim_lightsim2grid_kwargs(net, algorithm)
                 print(
                     "AC load-flow backend: lightsim2grid"
                     if _ls_backend.get('lightsim2grid')
                     else "AC load-flow backend: pandapower"
                 )
+                # STATCOMs are solved as an equivalent voltage-controlled source (P = 0, holds its
+                # voltage setpoint, Q within its rating). pandapower's own SSC model has no Q limits
+                # and does not converge when the network has a transformer phase shift; in steady
+                # state both give the same result.
+                if _electrisim_net_has_facts(net):
+                    _electrisim_validate_ssc(net)
+                    _electrisim_ssc_to_equivalent_gens(net)
                 facts_present = _electrisim_net_has_facts(net)
                 if facts_present and str(algorithm) != 'nr':
                     raise NotImplementedError(
-                        "The STATCOM (SSC) and other FACTS devices require the Newton-Raphson algorithm. "
+                        "SVC, TCSC and other FACTS devices require the Newton-Raphson algorithm. "
                         f"Selected algorithm: '{algorithm}'."
                     )
-                if facts_present:
-                    _electrisim_validate_ssc(net)
 
                 # A heavily compensated cable network needs more than the 10 Newton iterations
                 # pandapower allows by default, so work through progressively more robust solver
@@ -6265,6 +6913,8 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 if not rcs and hasattr(net, 'shunt') and not net.shunt.empty and 'step' in net.shunt.columns:
                     _electrisim_disable_shunt_step_controllers(net)
                     for _si in net.shunt.index:
+                        if int(_si) in (getattr(net, '_electrisim_psc_reactors', None) or set()):
+                            continue  # stepped by the Plant Supervisory Controller
                         try:
                             diagram_shunt_steps[int(_si)] = float(net.shunt.at[_si, 'step'])
                         except Exception:
@@ -6274,6 +6924,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 pf_last_error = None
                 pf_attempt_log = []
                 successful_kwargs = None
+                successful_run_control = False
                 for plan_label, plan_kwargs, plan_run_control in solve_plans:
                     if not plan_run_control and run_pp_control:
                         _restore_controller_setpoints()
@@ -6284,9 +6935,11 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                                 pass
                     try:
                         electrisim_runpp(net, calculate_voltage_angles=calculate_voltage_angles,
-                                 run_control=plan_run_control, **plan_kwargs, **pf_kwargs)
+                                 run_control=plan_run_control, **plan_kwargs, **pf_kwargs,
+                                 **(ctrl_kwargs if plan_run_control else {}))
                         pf_plan_used = plan_label
                         successful_kwargs = plan_kwargs
+                        successful_run_control = plan_run_control
                         break
                     except Exception as plan_err:
                         pf_last_error = plan_err
@@ -6316,6 +6969,14 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                         ) from pf_last_error
                     raise pf_last_error
 
+                if getattr(net, '_electrisim_ssc_equiv', None):
+                    _electrisim_ssc_enforce_limits(
+                        net,
+                        lambda: electrisim_runpp(
+                            net, calculate_voltage_angles=calculate_voltage_angles,
+                            run_control=successful_run_control, **successful_kwargs, **pf_kwargs,
+                            **(ctrl_kwargs if successful_run_control else {})))
+
                 if diagram_shunt_steps:
                     shunt_step_moved = False
                     for _si, _s0 in diagram_shunt_steps.items():
@@ -6341,6 +7002,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             run_control=bool(park_attached),
                             **successful_kwargs,
                             **pf_kwargs,
+                            **(ctrl_kwargs if park_attached else {}),
                         )
 
                 # A park controller that never settled leaves machines outside their capability
@@ -7407,6 +8069,12 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                             externalgrids = ExternalGridsOut(externalgrids = externalgridsList) 
                         result = {**result, **externalgrids.__dict__}          
                              
+                try:
+                    net._electrisim_psc_results = _electrisim_build_psc_results(net)
+                except Exception as _psc_ex:
+                    print(f"[PlantSupervisoryController] results error: {_psc_ex}")
+                    net._electrisim_psc_results = []
+                _electrisim_ssc_equivalent_results(net)
                 #Generator         
                 if(net.res_gen.empty):
                     pass
@@ -7860,6 +8528,15 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 else:                    
                     for index, row in net.res_ssc.iterrows():    
                         ssc = SSCOut(name=net.ssc._get_value(index, 'name'), id = net.ssc._get_value(index, 'id'), q_mvar=row['q_mvar'], vm_internal_pu=row['vm_internal_pu'], va_internal_degree=row['va_internal_degree'], vm_pu=row['vm_pu'], va_degree=row['va_degree'])        
+                        _ssc_info = (getattr(net, '_electrisim_ssc_info', None) or {}).get(int(index))
+                        if _ssc_info:
+                            ssc.model = _ssc_info.get('model')
+                            ssc.set_vm_pu = _ssc_info.get('set_vm_pu')
+                            ssc.q_max_mvar = _ssc_info.get('q_max_mvar')
+                            ssc.q_min_mvar = _ssc_info.get('q_min_mvar')
+                            ssc.at_q_limit = _ssc_info.get('at_q_limit')
+                            if _ssc_info.get('controller'):
+                                ssc.controller = _ssc_info.get('controller')
                         sscsList.append(ssc) 
                         sscs = SSCsOut(sscs = sscsList) 
                     result = {**result, **sscs.__dict__}                    
@@ -8013,6 +8690,44 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # Add any vm_pu validation warnings to the response
                 if hasattr(net, 'warnings') and net.warnings:
                     result['warnings'] = net.warnings
+                psc_results = getattr(net, '_electrisim_psc_results', None) or []
+                if psc_results:
+                    result['plant_supervisory_results'] = psc_results
+                psc_msgs = [
+                    f"Plant Supervisory Controller '{pname}' was not applied: {reason}."
+                    for pname, reason in (getattr(net, '_electrisim_psc_skip_reasons', None) or {}).items()
+                ]
+                for pr in psc_results:
+                    lim = pr.get('at_limit')
+                    if not pr.get('applied', True):
+                        psc_msgs.append(
+                            f"Plant Supervisory Controller '{pr['name']}' was not applied: the load flow with "
+                            "controllers did not converge, so these results are without it.")
+                    elif lim in ('max', 'min'):
+                        side = 'maximum (capacitive)' if lim == 'max' else 'minimum (inductive)'
+                        psc_msgs.append(
+                            f"Plant Supervisory Controller '{pr['name']}' cannot reach its target at "
+                            f"'{pr.get('bus')}': its STATCOMs and reactors are at their {side}.")
+                    elif lim in ('v_low', 'v_high'):
+                        what = ('absorbing more reactive power would pull its STATCOM / reactor buses below '
+                                f"{pr.get('vm_min_pu', 0.9):.2f} pu") if lim == 'v_low' else (
+                               'supplying more reactive power would push its STATCOM / reactor buses above '
+                               f"{pr.get('vm_max_pu', 1.1):.2f} pu")
+                        psc_msgs.append(
+                            f"Plant Supervisory Controller '{pr['name']}' cannot reach its target at "
+                            f"'{pr.get('bus')}': {what}.")
+                    for note in pr.get('notes') or []:
+                        psc_msgs.append(f"Plant Supervisory Controller '{pr['name']}': {note}; left out.")
+                if psc_msgs:
+                    result['warnings'] = list(result.get('warnings') or []) + psc_msgs
+                park_skips = getattr(net, '_electrisim_park_skip_reasons', None) or {}
+                if park_skips:
+                    park_msgs = [
+                        f"Park Controller '{pname}' was not applied: {reason}. "
+                        "Machines kept their own Q setpoints."
+                        for pname, reason in park_skips.items()
+                    ]
+                    result['warnings'] = list(result.get('warnings') or []) + park_msgs
                 
                 #json.dumps - convert a subset of Python objects into a json string
                 #default: If specified, default should be a function that gets called for objects that can't otherwise be serialized. It should return a JSON encodable version of the object or raise a TypeError. If not specified, TypeError is raised. 
