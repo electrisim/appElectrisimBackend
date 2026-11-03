@@ -121,6 +121,17 @@ def _symmetry_factor_s(cp_cycles: float, freq_hz: float = 60.0) -> float:
     return math.sqrt(1.0 + 2.0 * dc * dc)
 
 
+def _interrupting_multiplier_symm(xr: float, cp_cycles: float, freq_hz: float = 60.0) -> float:
+    """Interrupting multiplier for a symmetrically rated breaker.
+
+    A symmetrically rated breaker already withstands the X/R = 17 test
+    asymmetry, so only the excess counts; never credit below 1.0.
+    """
+    mf_int = _interrupting_multiplier_remote(xr, cp_cycles, freq_hz)
+    s_factor = _symmetry_factor_s(cp_cycles, freq_hz)
+    return max(1.0, mf_int / s_factor) if s_factor > 0 else mf_int
+
+
 def _lv_test_xr(device_class: str) -> float:
     if device_class == "mccb_ul_489":
         return 4.9
@@ -621,8 +632,18 @@ def _compute_device_duties(
         xr_int = br.get("xr_interrupting", xr_fc) or xr_fc
         i_fc_sym = br.get("i_first_sym_ka", 0.0) or 0.0
         i_fc_peak = br.get("i_first_peak_ka", 0.0) or 0.0
-        i_int = br.get("i_interrupting_ka", 0.0) or 0.0
         i_30 = br.get("i_steady_ka", 0.0) or 0.0
+
+        # The interrupting duty depends on when this breaker's contacts part,
+        # so apply the multiplier at the device's own time, not the study time.
+        dev_cp = _f(sw.get("contact_parting_cycles"), cp_cycles)
+        if dev_cp <= 0:
+            dev_cp = cp_cycles
+        i_int_sym = br.get("i_interrupting_sym_ka")
+        if i_int_sym is None:
+            i_int = br.get("i_interrupting_ka", 0.0) or 0.0
+        else:
+            i_int = i_int_sym * _interrupting_multiplier_symm(xr_int, dev_cp, freq_hz)
 
         duty_int = i_int
         duty_mom = i_fc_peak
@@ -663,7 +684,7 @@ def _compute_device_duties(
             "margin_interrupting_ka": _clean(margin_int),
             "margin_momentary_ka": _clean(margin_mom),
             "xr_interrupting": _clean(xr_int),
-            "contact_parting_cycles": _clean(_f(sw.get("contact_parting_cycles"), cp_cycles)),
+            "contact_parting_cycles": _clean(dev_cp),
         })
     return duties
 
@@ -833,11 +854,7 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
         xr_int = _xr_ratio(r_i, x_i)
 
         mf_peak = _peak_multiplier_remote(xr_fc, freq_hz)
-        mf_int = _interrupting_multiplier_remote(xr_int, cp_cycles, freq_hz)
-        s_factor = _symmetry_factor_s(cp_cycles, freq_hz)
-        # A symmetrically rated breaker already withstands the X/R = 17 test
-        # asymmetry, so only the excess counts; never credit below 1.0.
-        mf_int_symm = max(1.0, mf_int / s_factor) if s_factor > 0 else mf_int
+        mf_int_symm = _interrupting_multiplier_symm(xr_int, cp_cycles, freq_hz)
 
         i_fc_peak = i_fc_sym * mf_peak
         i_interrupting = i_fc_int_sym * mf_int_symm
@@ -847,6 +864,7 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
             "i_first_sym_ka": i_fc_sym,
             "i_first_peak_ka": i_fc_peak,
             "i_interrupting_ka": i_interrupting,
+            "i_interrupting_sym_ka": i_fc_int_sym,
             "i_steady_ka": i_steady,
             "xr_first": xr_fc,
             "xr_interrupting": xr_int,
