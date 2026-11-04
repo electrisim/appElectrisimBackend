@@ -1398,11 +1398,17 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
             net_try, ctx['gen_info'], p_val, ctx['q_mode'], direction, float(frac_or_q),
             ctx['exclude_names'], ctx.get('in_data'))
 
+    local_statcom_q = None
+    if ctx.get('local_statcoms') and not ctx.get('park_configured'):
+        local_statcom_q = _pq_set_local_statcoms(
+            net_try, ctx, direction, frac=None if use_park else frac_or_q)
+
     if ctx.get('_statcom_force') and ctx.get('statcoms'):
         led = getattr(net_try, '_electrisim_ssc_sgen', None) or {}
         to_force = [st for st in ctx['statcoms'] if st[0] not in led]
         if to_force:
-            ctx['_statcom_undo'] = _pq_force_statcoms(net_try, ctx['_statcom_force'], to_force)
+            ctx['_statcom_undo'] = _pq_force_statcoms(
+                net_try, ctx['_statcom_force'], to_force, frac=ctx.get('_statcom_frac'))
 
     ctx['iLDF'][0] += 1
     _pq_check_cancel(ctx)
@@ -1434,7 +1440,7 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
         reason = 'overload'
     elif volt_viol:
         reason = 'voltage'
-    elif q_cap is not None and _pq_q_unphysical(q_pcc, q_cap, direction, ctx):
+    elif q_cap is not None and not ctx.get('_pq_cross_walk') and _pq_q_unphysical(q_pcc, q_cap, direction, ctx):
         unphysical = True
         reason = 'unphysical_q'
 
@@ -1474,6 +1480,8 @@ def _pq_eval_trial(base_net, ctx, p_val, direction, frac_or_q, tap_bound=None, u
         'limiting_element': limiting_element,
         'pf_stage': pf_stage,
     }
+    if local_statcom_q:
+        r['_statcom_q'] = local_statcom_q
     return _pq_fill_diag(r, ctx)
 
 
@@ -1574,10 +1582,17 @@ def _pq_finalize_kept(r, work, ctx):
             r['lf_snap'] = _pq_serialize_point(work)
         except Exception:
             r['lf_snap'] = None
+        statcom_q = r.pop('_statcom_q', None)
+        if statcom_q and r.get('lf_snap'):
+            r['lf_snap'] = _pq_snap_with_statcoms(r['lf_snap'], work, forced=statcom_q)
         if not r.get('unphysical'):
             summary = ctx.get('summary')
             if summary is not None:
                 _pq_update_summary(summary, work, ctx.get('gen_info') or [])
+    try:
+        ctx['_last_kept_state'] = (_pq_tap_positions(work), _pq_voltages_of_result(None, work))
+    except Exception:
+        ctx['_last_kept_state'] = None
     r['net'] = None
     return r
 
@@ -1635,7 +1650,169 @@ def _pq_bisect_q(work, ctx, p_val, direction, use_park, tap_bound, x_fail, q_cap
     return best_r, best_x, reason
 
 
+def _pq_taps_of_result(r, work):
+    """Tap positions of a kept trial: from its held state, or from the net when it was the last trial."""
+    hold = (r or {}).get('_hold')
+    tables = ((hold or {}).get('setpoints') or {}).get('tables') or {}
+    if hold:
+        out = {}
+        for table in ('trafo', 'trafo3w'):
+            col = (tables.get(table) or {}).get('tap_pos')
+            if col is not None:
+                out[table] = {int(i): float(v) for i, v in col.items() if v == v}
+        return out
+    return _pq_tap_positions(work)
+
+
+def _pq_voltages_of_result(r, work):
+    """Bus voltages of a kept trial, as a Newton warm start (vm, va) or None."""
+    hold = (r or {}).get('_hold')
+    res_bus = ((hold or {}).get('res') or {}).get('res_bus') if hold else getattr(work, 'res_bus', None)
+    try:
+        if res_bus is None or res_bus.empty or res_bus['vm_pu'].isna().any():
+            return None
+        return res_bus['vm_pu'].copy(), res_bus['va_degree'].copy()
+    except Exception:
+        return None
+
+
+def _pq_seed_baseline_taps(baseline, taps):
+    """Make the next trials start from these tap positions."""
+    tables = (baseline or {}).get('tables') or {}
+    for table, pos in (taps or {}).items():
+        col = (tables.get(table) or {}).get('tap_pos')
+        if col is None:
+            continue
+        for idx, v in pos.items():
+            if idx in col.index:
+                col.at[idx] = v
+
+
+def _pq_continue_after_divergence(work, ctx, p_val, direction, use_park, tap_bound,
+                                  x_ok, r_ok, x_cap, q_cap):
+    """
+    The trial at full capability did not converge, which is not a network limit: tap changers
+    started from their Q = 0 positions, too far from the solution. Walk from the last solved
+    point toward the capability, each trial starting from the taps solved at the previous one,
+    and halve the step when a trial diverges. A converged trial that breaks a loading or voltage
+    limit is a real limit: refine between the two points with the usual bisection.
+    Returns (r, x, reason).
+    """
+    best_x, best_r = float(x_ok), r_ok
+    taps = _pq_taps_of_result(best_r, work)
+    vm_seed_saved = ctx.get('vm_seed')
+    seed = _pq_voltages_of_result(best_r, work)
+    try:
+        return _pq_continue_steps(work, ctx, p_val, direction, use_park, tap_bound,
+                                  best_x, best_r, taps, seed, x_cap, q_cap, x_ok, r_ok)
+    finally:
+        ctx['vm_seed'] = vm_seed_saved
+
+
+def _pq_continue_steps(work, ctx, p_val, direction, use_park, tap_bound,
+                       best_x, best_r, taps, seed, x_cap, q_cap, x_ok, r_ok):
+    dq = max(abs(float(ctx['q_step_mw'])), 1e-6)
+    tol = dq if use_park else dq / max(abs(float(q_cap or 0.0)) or 1.0, 1e-9)
+    gap = float(x_cap) - best_x
+    # Start with a step about the size of the part that already solved, then grow it after
+    # each solved trial and halve it after each diverged one.
+    step = gap if abs(best_x) <= tol else math.copysign(min(abs(gap), max(abs(best_x), tol)), gap)
+    reason = 'divergence'
+    for _ in range(30):
+        if abs(step) <= tol:
+            break
+        x_try = best_x + step
+        if (x_try - float(x_cap)) * math.copysign(1.0, gap) > 0:
+            x_try = float(x_cap)
+        _pq_seed_baseline_taps(ctx.get('_trial_baseline'), taps)
+        if seed is not None:
+            ctx['vm_seed'] = seed
+        r = _pq_eval_trial(
+            work, ctx, p_val, direction, x_try, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
+        _pq_log_trial(ctx, p_val, tap_bound, direction, r, x_try, q_cap, 'continue')
+        if _pq_feasible(r):
+            r['_hold'] = _pq_hold_solved(work)
+            best_x, best_r = x_try, r
+            taps = _pq_tap_positions(work)
+            seed = _pq_voltages_of_result(None, work) or seed
+            reason = None
+            if abs(float(x_cap) - best_x) <= tol:
+                break
+            step *= 1.5
+            continue
+        if r and r.get('converged') and not r.get('unphysical'):
+            reason = r.get('limit_reason') or 'limit'
+            _pq_seed_baseline_taps(ctx.get('_trial_baseline'), taps)
+            rb, xb, rsn = _pq_bisect_q(
+                work, ctx, p_val, direction, use_park, tap_bound, x_try, q_cap, reason,
+                x_lo=best_x, r_lo=best_r)
+            if _pq_feasible(rb):
+                return rb, xb, rsn
+            break
+        step /= 2.0
+    if best_r is r_ok:
+        return r_ok, float(x_ok), 'divergence'
+    # Stopped short of the capability on a divergence: report it as such.
+    reached = abs(float(x_cap) - best_x) <= tol
+    return best_r, best_x, (None if reached else (reason or 'divergence'))
+
+
 def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
+    """Search one edge; file its solved taps and voltages so the opposite edge can start there."""
+    ctx['_last_kept_state'] = None
+    out = _pq_search_one_side_inner(base_net, ctx, p_val, direction, use_park, tap_bound)
+    if out and out[0] is not None and out[1] is not None and ctx.get('_last_kept_state'):
+        taps, volts = ctx['_last_kept_state']
+        ctx.setdefault('_edge_seed', {})[(round(float(p_val), 6), tap_bound, direction)] = (
+            taps, volts, float(out[1]), abs(float(out[3] or 0.0)))
+    return out
+
+
+def _pq_retry_from_other_edge(work, ctx, p_val, direction, use_park, tap_bound, x_cap, q_cap):
+    """
+    Nothing solved on this edge, not even Q = 0. Start from the operating point solved on the
+    opposite edge at the same P (same taps, voltages and plant Q) and walk toward this edge's
+    capability. Example: at a low grid voltage and full P the plant may only solve while it
+    supplies Q; the lowest Q it can then reach is still capacitive, and that is its Q_min.
+    """
+    other = 'max' if direction == 'min' else 'min'
+    seed = (ctx.get('_edge_seed') or {}).get((round(float(p_val), 6), tap_bound, other))
+    if not seed:
+        return None, None, None
+    taps, volts, x_other, cap_other = seed
+    if use_park:
+        x0 = x_other  # plant Q setpoint at the PCC, same value on both edges
+    else:
+        # Same unit Q expressed as a fraction of this edge's capability (negative = other side).
+        cap_this = abs(float(q_cap or 0.0)) or 1.0
+        x0 = -float(x_other) * (float(cap_other or cap_this) / cap_this)
+        x0 = max(-1.0, min(1.0, x0))
+    vm_seed_saved = ctx.get('vm_seed')
+    # The walk starts on the other side of Q = 0, so the per-edge Q sanity check only applies
+    # to the point it ends on.
+    ctx['_pq_cross_walk'] = True
+    try:
+        _pq_seed_baseline_taps(ctx.get('_trial_baseline'), taps)
+        if volts is not None:
+            ctx['vm_seed'] = volts
+        r0 = _pq_eval_trial(
+            work, ctx, p_val, direction, x0, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
+        _pq_log_trial(ctx, p_val, tap_bound, direction, r0, x0, q_cap, f'from Q_{other}')
+        if not _pq_feasible(r0):
+            return None, None, None
+        r, x, reason = _pq_continue_after_divergence(
+            work, ctx, p_val, direction, use_park, tap_bound, x0, r0, x_cap, q_cap)
+    finally:
+        ctx['vm_seed'] = vm_seed_saved
+        ctx['_pq_cross_walk'] = False
+    if r is None or abs(float(x) - float(x0)) < 1e-9:
+        return None, None, None  # never moved off the other edge's point
+    if _pq_q_unphysical(r.get('q_pcc'), q_cap, direction, ctx):
+        return None, None, None
+    return r, x, reason or 'divergence'
+
+
+def _pq_search_one_side_inner(base_net, ctx, p_val, direction, use_park, tap_bound):
     """
     Find feasible Q for one P and one Q extreme:
 
@@ -1680,6 +1857,8 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
         r = _pq_eval_trial(
             work, ctx, p_val, direction, x, tap_bound=tap_bound, use_park=use_park, q_cap=q_cap)
         _pq_log_trial(ctx, p_val, tap_bound, direction, r, x, q_cap, 'cap')
+        x_cap = x
+        cap_diverged = not (r and r.get('converged'))
         if _pq_feasible(r):
             _pq_remember_q_hint(ctx, direction, tap_bound, x)
             return _pq_finalize_kept(r, work, ctx), x, None, q_cap
@@ -1718,6 +1897,15 @@ def _pq_search_one_side(base_net, ctx, p_val, direction, use_park, tap_bound):
             r, x, reason = _pq_bisect_q(
                 work, ctx, p_val, direction, use_park, tap_bound, x, q_cap, reason)
         _pq_log_trial(ctx, p_val, tap_bound, direction, r, x, q_cap, 'bisect')
+        if (cap_diverged and _pq_feasible(r) and x is not None
+                and abs(float(x)) < abs(float(x_cap)) * (1.0 - 1e-6)):
+            r, x, reason = _pq_continue_after_divergence(
+                work, ctx, p_val, direction, use_park, tap_bound, x, r, x_cap, q_cap)
+        if cap_diverged and not _pq_feasible(r):
+            r2, x2, reason2 = _pq_retry_from_other_edge(
+                work, ctx, p_val, direction, use_park, tap_bound, x_cap, q_cap)
+            if r2 is not None and _pq_feasible(r2):
+                r, x, reason = r2, x2, reason2
         if _pq_feasible(r):
             _pq_remember_q_hint(ctx, direction, tap_bound, x)
             return _pq_finalize_kept(r, work, ctx), x, reason, q_cap
@@ -2059,7 +2247,66 @@ def _pq_rated_statcoms(net):
 _PQ_STATCOM_SGEN_PREFIX = '_pq_statcom_'
 
 
-def _pq_force_statcoms(net, side, statcoms):
+def _pq_idle_uncontrollable_statcoms(net):
+    """STATCOMs with Controllable unticked do not regulate (Q = 0), as in load flow.
+
+    Taking them out of service avoids pandapower's own SSC model, which often does not
+    converge in plant models with phase-shifting (e.g. three-winding) transformers.
+    """
+    df = getattr(net, 'ssc', None)
+    if df is None or df.empty:
+        return []
+    idled = []
+    for idx in df.index:
+        try:
+            if 'in_service' in df.columns and not bool(df.at[idx, 'in_service']):
+                continue
+            if pp_el._electrisim_ssc_controllable(df.loc[idx]):
+                continue
+            df.at[idx, 'in_service'] = False
+            idled.append(int(idx))
+        except Exception:
+            continue
+    return idled
+
+
+def _pq_prepare_local_statcoms(net):
+    """
+    Local Q (and park constant-Q) dispatch: each rated STATCOM becomes a fixed-Q injection
+    that every trial sets on its own edge (capacitive rating on Q max, inductive rating on
+    Q min), like the STATCOM envelope of the configured Park Controller. Without this the
+    network keeps pandapower's SSC model, which does not converge in many plant models.
+    Returns [(ssc_idx, sgen_idx, q_max_mvar, q_min_mvar)].
+    """
+    out = []
+    for idx, bus, q_max, q_min in _pq_rated_statcoms(net):
+        try:
+            net.ssc.at[idx, 'in_service'] = False
+            sg = pp.create_sgen(net, bus=bus, p_mw=0.0, q_mvar=0.0,
+                                name=f'{_PQ_STATCOM_SGEN_PREFIX}{idx}', in_service=True)
+            out.append((int(idx), int(sg), float(q_max), float(q_min)))
+        except Exception:
+            continue
+    return out
+
+
+def _pq_set_local_statcoms(net, ctx, direction, frac=None):
+    """Put the local-mode STATCOM injections on this trial's edge. Returns {ssc_idx: q_mvar}."""
+    q_of = {}
+    for idx, sg, q_max, q_min in ctx.get('local_statcoms') or []:
+        if sg not in net.sgen.index:
+            continue
+        q = q_max if direction == 'max' else q_min
+        if frac is not None:
+            # Local Q search: the STATCOM follows the same fraction as the units (a negative
+            # fraction crosses Q = 0 toward the opposite side, as the units do).
+            q *= max(-1.0, min(1.0, float(frac)))
+        net.sgen.at[sg, 'q_mvar'] = float(q)
+        q_of[idx] = float(q)
+    return q_of
+
+
+def _pq_force_statcoms(net, side, statcoms, frac=None):
     """
     Replace each rated STATCOM for one trial (pandapower's own SSC model often does not
     converge in plant models with three-winding transformers):
@@ -2103,6 +2350,8 @@ def _pq_force_statcoms(net, side, statcoms):
             net._electrisim_enforce_q_lims = True
             continue
         q = q_max if side == 'max' else q_min
+        if frac is not None:
+            q *= max(0.0, min(1.0, float(frac)))  # part of the rating while ramping toward an edge
         sg = pp.create_sgen(net, bus=bus, p_mw=0.0, q_mvar=float(q),
                             name=f'{_PQ_STATCOM_SGEN_PREFIX}{idx}', in_service=True)
         undo['sgens'].append(sg)
@@ -2237,6 +2486,44 @@ def _pq_operating_point(base_net, ctx, p_val, statcom_side=None):
         ctx['_statcom_force'] = None
         if ctx.get('_inplace_net') is work:
             ctx['_inplace_net'] = None
+
+
+def _pq_edge_operating_point(base_net, ctx, p_val, side):
+    """
+    Capability edge with the Park Controller as configured: STATCOMs at their capacitive ('max')
+    or inductive ('min') rating. When that load flow has no solution from the taps of the
+    operating point (e.g. a single-P U-Q study, where no neighbouring P point has solved this
+    edge yet), ramp the STATCOMs from 0 toward the rating. Each solved step files its tap
+    positions for this edge, so the next step starts there. Returns (result, reason); the reason
+    is 'divergence' when the full rating was not reached.
+    """
+    r, rsn = _pq_operating_point(base_net, ctx, p_val, statcom_side=side)
+    if r is not None or (rsn or 'divergence') != 'divergence':
+        return r, rsn
+    best, best_frac, step = None, 0.0, 0.5
+    try:
+        for _ in range(16):
+            if step < 0.02:
+                break
+            frac = min(1.0, best_frac + step)
+            ctx['_statcom_frac'] = frac
+            r_try, rsn_try = _pq_operating_point(base_net, ctx, p_val, statcom_side=side)
+            _pq_emit(
+                f'    P={p_val:.2f} MW STATCOM {side} ramp {frac:.0%}: '
+                + ('solved' if r_try is not None else 'no solution'),
+                ctx, progress=False)
+            if r_try is not None:
+                best, best_frac, rsn = r_try, frac, rsn_try
+                if frac >= 1.0:
+                    break
+                step *= 1.5
+            else:
+                step /= 2.0
+    finally:
+        ctx['_statcom_frac'] = None
+    if best is None:
+        return None, 'divergence'
+    return best, (rsn if best_frac >= 1.0 else 'divergence')
 
 
 def _pq_check_operating_compliance(p_result, q_result, v_req):
@@ -2429,8 +2716,8 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
                     _pq_update_tap_health(local, r_op.get('tap_recs'), p_val, bound, 'max')
                 if statcom_env:
                     # Edges: STATCOMs at their capacitive / inductive rating, park as configured.
-                    r_hi, rsn_hi = _pq_operating_point(net, local, p_val, statcom_side='max')
-                    r_lo, rsn_lo = _pq_operating_point(net, local, p_val, statcom_side='min')
+                    r_hi, rsn_hi = _pq_edge_operating_point(net, local, p_val, 'max')
+                    r_lo, rsn_lo = _pq_edge_operating_point(net, local, p_val, 'min')
                     if rsn_hi:
                         reasons_max.append(rsn_hi)
                     if rsn_lo:
@@ -2499,9 +2786,13 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
                     f"({', '.join(sorted(set(uniq)))})"
                 )
             elif uniq:
+                words = {
+                    'divergence': 'no load-flow solution beyond this Q: plant voltages collapse '
+                                  '(full unit and STATCOM Q is not reachable at this grid voltage)',
+                }
                 warnings.append(
                     f"V={v_pu}pu, P={p_val:.1f}MW: Q_{side} limited "
-                    f"({', '.join(sorted(set(uniq)))})"
+                    f"({', '.join(words.get(x, x) for x in sorted(set(uniq)))})"
                 )
 
         p_disp_plot = sign_out * float(p_val)
@@ -2888,6 +3179,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             )
 
         iLDF = [0]
+        _pq_idle_uncontrollable_statcoms(net)
         ctx = {
             'ext_grid_idx': ext_grid_idx,
             'pcc_bus_idx': pcc_bus_idx,
@@ -2901,6 +3193,7 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             'park_id': park_id,
             'park_configured': park_configured,
             'statcoms': _pq_rated_statcoms(net) if park_configured else [],
+            'local_statcoms': [] if park_configured else _pq_prepare_local_statcoms(net),
             'has_psc': bool(park_configured and pp_el._electrisim_collect_psc_payloads(in_data)),
             'psc_reactors': _pq_psc_reactors(net, in_data) if park_configured else None,
             'verbose': verbose,
@@ -3079,6 +3372,9 @@ def grid_code_pq_capability(net, pq_params, in_data=None):
             if ctx.get('statcoms'):
                 # Same STATCOM model as the operating points (pandapower's SSC often diverges here).
                 _pq_force_statcoms(net0, 'op', ctx['statcoms'])
+            for _i, sg, _qx, _qn in ctx.get('local_statcoms') or []:
+                if sg in net0.sgen.index:
+                    net0.sgen.at[sg, 'q_mvar'] = 0.0
             iLDF[0] += 1
             if _pq_run_pf(
                     net0, verbose, rc2, rc3, rcs, force_control=False,

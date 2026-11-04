@@ -128,6 +128,8 @@ def grid_code_vq_capability(net, vq_params, in_data=None):
                 'q_capability_mode': pq_results.get('q_capability_mode'),
                 'i_park_ctrl': i_park,
                 'q_dispatch_mode': pq_results.get('q_dispatch_mode'),
+                'statcom_envelope': pq_results.get('statcom_envelope'),
+                'statcom_names': pq_results.get('statcom_names'),
                 'park_controller_name': pq_results.get('park_controller_name'),
                 'generator_oriented': pq_results.get('generator_oriented', True),
                 'summary': pq_results.get('summary') or {},
@@ -139,6 +141,11 @@ def grid_code_vq_capability(net, vq_params, in_data=None):
                     'Blue: U-Q/Pmax grid-code envelope in Q/Pmax × Pn (registered Pmax), '
                     'not scaled by collector losses. '
                     + (
+                        ('Red edges: the Park Controller runs exactly as configured and the STATCOMs are '
+                         'at their capacitive (Q_max) / inductive (Q_min) rating'
+                         + (' (shunt reactors led by the Plant Supervisory Controller at their extreme steps).'
+                            if pq_results.get('statcom_envelope') else '.'))
+                        if pq_results.get('q_dispatch_mode') == 'park_configured' else
                         'Plant Q is constant Q at the point of connection via the Park Controller.'
                         if i_park else
                         'Plant Q is set locally on each unit from its P–Q capability.'
