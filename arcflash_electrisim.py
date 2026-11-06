@@ -201,6 +201,9 @@ def arcflash(net, in_data, in_data_full=None):
     if clearing_time_min_s <= 0:
         clearing_time_min_s = clearing_time_s
 
+    # Generators left without short-circuit data would make calc_sc fail (before k: k needs Sn).
+    from pandapower_electrisim import ensure_gen_short_circuit_data
+    sc_data_notes = ensure_gen_short_circuit_data(net, in_data_full)
     # Three-phase converter contribution. Ik" wins, then the dialog k, then 1.1.
     apply_converter_short_circuit_k(net, "3ph")
 
@@ -230,7 +233,7 @@ def arcflash(net, in_data, in_data_full=None):
         })
 
     results: List[Dict[str, Any]] = []
-    warnings: List[str] = []
+    warnings: List[str] = list(sc_data_notes)
 
     for bus_idx, bus_row in net.bus.iterrows():
         if bus_idx not in net.res_bus_sc.index:

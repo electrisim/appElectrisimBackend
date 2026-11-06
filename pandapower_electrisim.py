@@ -40,6 +40,37 @@ except ImportError:  # older pandapower: no park controller support
 zero_sequence_dialog.install()
 
 
+def _install_switch_sc_results_fix():
+    """Stop short circuit failing with KeyError 'ikss_ka' on diagrams whose only switches are
+    closed bus-bus switches without impedance (bus couplers).
+
+    pandapower 3.2 writes no switch current for those (the two buses are merged), then reads
+    res_switch_sc['ikss_ka'] to compute loading_percent. The current is left unknown (NaN).
+    """
+    from pandapower.shortcircuit import results as sc_results
+    original = sc_results._get_switch_results
+    if getattr(original, "_electrisim_fixed", False):
+        return
+
+    def get_switch_results(net, ppc):
+        try:
+            return original(net, ppc)
+        except KeyError as exc:
+            if exc.args != ("ikss_ka",):
+                raise
+            res = net.res_switch_sc.reindex(net.switch.index)
+            res["ikss_ka"] = np.nan
+            if "in_ka" in net.switch.columns:
+                res["loading_percent"] = np.nan
+            net.res_switch_sc = res
+
+    get_switch_results._electrisim_fixed = True
+    sc_results._get_switch_results = get_switch_results
+
+
+_install_switch_sc_results_fix()
+
+
 Busbars = {}
 
 
@@ -132,6 +163,204 @@ def _ext_grid_zero_seq_min(data, min_key, max_value):
     if _blank_numeric(raw):
         return max_value
     return safe_float(raw, max_value)
+
+
+def _ensure_sgen_short_circuit_data(net, in_data_full=None):
+    """
+    Static generators for IEC 60909. The palette creates them as "async" with lrc_pu = 0 and
+    no rating, which pandapower cannot model ("nan value detected in Ybus"). Without the
+    induction-machine data they are treated as converters (current source); a converter
+    without a rating uses Sn = |P|. Returns messages (the caller adds them to net.warnings).
+    """
+    sgen = getattr(net, 'sgen', None)
+    if sgen is None or sgen.empty:
+        return []
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and _is_static_generator_like(row.get("typ"))}
+    messages = []
+    for idx in sgen.index:
+        if not bool(net.sgen.at[idx, 'in_service']):
+            continue
+        raw = net.sgen.at[idx, 'name']
+        label = friendly.get(raw) or raw or f"sgen {idx}"
+        sn = safe_float(net.sgen.at[idx, 'sn_mva'], 0.0) if 'sn_mva' in net.sgen.columns else 0.0
+        gtype = str(net.sgen.at[idx, 'generator_type'] if 'generator_type' in net.sgen.columns else '').lower()
+        if gtype in ('async', 'async_doubly_fed'):
+            lrc = safe_float(net.sgen.at[idx, 'lrc_pu'], 0.0) if 'lrc_pu' in net.sgen.columns else 0.0
+            if gtype == 'async' and (lrc > 0 and sn > 0):
+                continue
+            if gtype == 'async_doubly_fed' and sn > 0 and safe_float(net.sgen.at[idx, 'max_ik_ka'], 0.0) > 0:
+                continue
+            net.sgen.at[idx, 'generator_type'] = 'current_source'
+            net.sgen.at[idx, 'current_source'] = True
+            messages.append(f"Static Generator '{label}': induction-machine short-circuit data (rated power, "
+                            f"locked-rotor current) not set, so it is treated as a converter (current source).")
+        elif gtype not in ('current_source', '', 'none', 'nan'):
+            continue
+        if not (sn > 0):
+            p = abs(safe_float(net.sgen.at[idx, 'p_mw'], 0.0))
+            if p > 0:
+                net.sgen.at[idx, 'sn_mva'] = p
+                messages.append(f"Static Generator '{label}': rated power not set, used Sn = |P| = {p:g} MVA "
+                                f"for its short-circuit contribution.")
+    return messages
+
+
+def ensure_gen_short_circuit_data(net, in_data_full=None):
+    """
+    IEC 60909 needs vn_kv, sn_mva, xdss_pu, rdss_ohm and cos_phi for every synchronous
+    generator. The diagram often leaves them at 0, and the builder then omits them (so the
+    load flow keeps pandapower's defaults), which made calc_sc fail with
+    "'DataFrame' object has no attribute 'vn_kv'". Fill the gaps with typical values and
+    say so in net.warnings. Returns the list of messages.
+    """
+    messages = _ensure_sgen_short_circuit_data(net, in_data_full)
+    gen = getattr(net, 'gen', None)
+    if gen is None or gen.empty:
+        if messages:
+            if not hasattr(net, 'warnings') or net.warnings is None:
+                net.warnings = []
+            net.warnings.extend(messages)
+        return messages
+    xdpp_by_name = {}
+    for row in (in_data_full or {}).values():
+        if isinstance(row, dict) and str(row.get('typ', '')).startswith('Generator'):
+            xdpp_by_name[row.get('name')] = (safe_float(row.get('Xdpp'), 0.0), row.get('userFriendlyName'))
+
+    def _missing(col, idx):
+        if col not in net.gen.columns:
+            return True
+        v = net.gen.at[idx, col]
+        try:
+            return v is None or not np.isfinite(float(v)) or float(v) <= 0
+        except (TypeError, ValueError):
+            return True
+
+    for col in ('vn_kv', 'sn_mva', 'xdss_pu', 'rdss_ohm', 'cos_phi'):
+        if col not in net.gen.columns:
+            net.gen[col] = np.nan
+    for idx in net.gen.index:
+        if not bool(net.gen.at[idx, 'in_service']):
+            continue
+        name = net.gen.at[idx, 'name']
+        xdpp, friendly = xdpp_by_name.get(name, (0.0, None))
+        label = friendly or name or f"gen {idx}"
+        filled = []
+        bus_vn = float(net.bus.at[net.gen.at[idx, 'bus'], 'vn_kv'])
+        if _missing('vn_kv', idx):
+            net.gen.at[idx, 'vn_kv'] = bus_vn
+            filled.append(f"Vn={bus_vn:g} kV (bus)")
+        if _missing('cos_phi', idx):
+            net.gen.at[idx, 'cos_phi'] = 0.85
+            filled.append("cos phi=0.85")
+        if _missing('sn_mva', idx):
+            p = abs(safe_float(net.gen.at[idx, 'p_mw'], 0.0))
+            sn = max(round(p / float(net.gen.at[idx, 'cos_phi']), 3), 0.1)
+            net.gen.at[idx, 'sn_mva'] = sn
+            filled.append(f"Sn={sn:g} MVA (P/cos phi)")
+        if _missing('xdss_pu', idx):
+            xd = xdpp if xdpp > 0 else 0.2
+            net.gen.at[idx, 'xdss_pu'] = xd
+            filled.append(f"X''d={xd:g} pu" + (" (ANSI X''d field)" if xdpp > 0 else ""))
+        if _missing('rdss_ohm', idx):
+            # IEC 60909-0 fictitious resistance: 0.05 X''d (HV, Sn >= 100 MVA), 0.07 X''d (HV, Sn < 100 MVA),
+            # 0.15 X''d (LV, <= 1 kV).
+            vn = float(net.gen.at[idx, 'vn_kv'])
+            sn = float(net.gen.at[idx, 'sn_mva'])
+            ratio = 0.15 if vn <= 1.0 else (0.05 if sn >= 100 else 0.07)
+            r = ratio * float(net.gen.at[idx, 'xdss_pu']) * vn ** 2 / sn
+            net.gen.at[idx, 'rdss_ohm'] = r
+            filled.append(f"R''={r:.4g} ohm (IEC 60909 {ratio:g} X''d)")
+        if filled:
+            messages.append(f"Generator '{label}': short-circuit data not set, used " + ", ".join(filled) + ".")
+    if messages:
+        if not hasattr(net, 'warnings') or net.warnings is None:
+            net.warnings = []
+        net.warnings.extend(messages)
+    return messages
+
+
+def ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data_full=None):
+    """
+    A single-phase fault needs the grid's X0/X. The External Grid dialog starts at 0, which
+    gives a zero zero-sequence impedance and "nan value detected in Ybus". Use the typical
+    X0/X = 1 (R0/X0 = 0.1 when also unset) and say so in net.warnings.
+    """
+    if fault_type != '1ph':
+        return []
+    eg = getattr(net, 'ext_grid', None)
+    if eg is None or getattr(eg, 'empty', True):
+        return []
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and str(row.get('typ', '')).startswith('External Grid')}
+    messages = []
+    for idx in eg.index:
+        fixed = []
+        for suffix in ('max', 'min'):
+            x_col, r_col = f'x0x_{suffix}', f'r0x0_{suffix}'
+            x = safe_float(net.ext_grid.at[idx, x_col], 0.0) if x_col in net.ext_grid.columns else 0.0
+            if not (x > 0):
+                net.ext_grid.at[idx, x_col] = 1.0
+                fixed.append(f"X0/X {suffix}=1")
+                r = safe_float(net.ext_grid.at[idx, r_col], 0.0) if r_col in net.ext_grid.columns else 0.0
+                if not (r > 0):
+                    net.ext_grid.at[idx, r_col] = 0.1
+                    fixed.append(f"R0/X0 {suffix}=0.1")
+        if fixed:
+            raw = net.ext_grid.at[idx, 'name'] if 'name' in net.ext_grid.columns else idx
+            label = friendly.get(raw) or raw
+            messages.append(f"External Grid '{label}': zero-sequence ratios not set, used "
+                            + ", ".join(fixed) + " for the single-phase fault.")
+    if messages:
+        if not hasattr(net, 'warnings') or net.warnings is None:
+            net.warnings = []
+        net.warnings.extend(messages)
+    return messages
+
+
+def warn_unrealistic_ext_grid_sc_power(net, case='max', in_data_full=None, limit_ka=150.0):
+    """
+    Flag an External Grid whose short-circuit power alone gives a current no real switchgear
+    carries (above ~150 kA). Imported cases often use 1,000,000 MVA as "infinite grid", which
+    makes every nearby fault current meaningless. The study still runs; the user is told.
+    """
+    eg = getattr(net, 'ext_grid', None)
+    if eg is None or getattr(eg, 'empty', True):
+        return []
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and str(row.get('typ', '')).startswith('External Grid')}
+    bus_friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                    if isinstance(row, dict) and str(row.get('typ', '')).startswith('Bus')}
+    col = 's_sc_min_mva' if case == 'min' else 's_sc_max_mva'
+    messages = []
+    for idx in eg.index:
+        if not bool(eg.at[idx, 'in_service']) or col not in eg.columns:
+            continue
+        s_mva = safe_float(eg.at[idx, col], 0.0) or 0.0
+        try:
+            vn_kv = float(net.bus.at[int(eg.at[idx, 'bus']), 'vn_kv'])
+        except Exception:
+            continue
+        if not (s_mva > 0 and vn_kv > 0):
+            continue
+        i_ka = s_mva / (math.sqrt(3) * vn_kv)
+        if i_ka > limit_ka:
+            raw = eg.at[idx, 'name'] if 'name' in eg.columns else idx
+            label = friendly.get(raw)
+            if label:
+                label = f"External Grid '{label}'"
+            else:
+                bus_name = net.bus.at[int(eg.at[idx, 'bus']), 'name'] if 'name' in net.bus.columns else None
+                label = f"External Grid at bus '{bus_friendly.get(bus_name) or bus_name}'"
+            messages.append(
+                f"{label}: short-circuit power {s_mva:,.0f} MVA at {vn_kv:g} kV means "
+                f"{i_ka:,.0f} kA from the grid alone. Real grids rarely exceed {limit_ka:.0f} kA, so "
+                f"currents near this bus are not realistic; enter the grid's actual short-circuit power.")
+    if messages:
+        if not hasattr(net, 'warnings') or net.warnings is None:
+            net.warnings = []
+        net.warnings.extend(messages)
+    return messages
 
 
 def ensure_ext_grid_zero_sequence_min(net):
@@ -1707,7 +1936,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         lines.append(f"    r_fault_ohm={r_fault_ohm},")
         lines.append(f"    x_fault_ohm={x_fault_ohm},")
         lines.append(f"    lv_tol_percent={sc_lv_tol_percent(sc)},")
-        lines.append("    check_connectivity=False,")
+        lines.append("    check_connectivity=True,")
         lines.append("    branch_results=True,")
         lines.append("    return_all_currents=False,")
         lines.append(")")
@@ -3714,6 +3943,14 @@ def create_other_elements(in_data,net,x, Busbars):
                     
          
             except Exception as e:
+                # Keep the study running without this line, but say so: a line that is not
+                # attached at both ends used to vanish from the results without a word.
+                line_label = in_data[x].get('userFriendlyName') or in_data[x].get('name') or x
+                if not hasattr(net, 'warnings') or net.warnings is None:
+                    net.warnings = []
+                net.warnings.append(
+                    f"Line '{line_label}' is not connected to a bus at both ends and was left out of the study."
+                )
                 continue
                 
             # Create a base parameters dict with required parameters
@@ -3724,8 +3961,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 "id": in_data[x]['id'],
                 "r_ohm_per_km": float(in_data[x]['r_ohm_per_km']),
                 "x_ohm_per_km": float(in_data[x]['x_ohm_per_km']),
-                "c_nf_per_km": float(in_data[x]['c_nf_per_km']),
-                "g_us_per_km": float(in_data[x]['g_us_per_km']),
+                # Capacitance and conductance are optional: diagrams built by templates or the
+                # map editor may omit them (sent as null).
+                "c_nf_per_km": safe_float(in_data[x].get('c_nf_per_km'), 0.0),
+                "g_us_per_km": safe_float(in_data[x].get('g_us_per_km'), 0.0),
                 "max_i_ka": float(in_data[x]['max_i_ka']),
                 "type": in_data[x]['type'],
                 "length_km": float(in_data[x]['length_km'])
@@ -4570,7 +4809,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_asymmetric_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=in_data[x]['p_a_mw'],p_b_mw=in_data[x]['p_b_mw'],p_c_mw=in_data[x]['p_c_mw'],q_a_mvar=in_data[x]['q_a_mvar'], q_b_mvar=in_data[x]['q_b_mvar'], q_c_mvar=in_data[x]['q_c_mvar'], sn_mva=in_data[x]['sn_mva'], scaling=in_data[x]['scaling'],type=in_data[x]['type'], in_service=in_service)         
+            pp.create_asymmetric_load(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=safe_float(in_data[x].get('p_a_mw')), p_b_mw=safe_float(in_data[x].get('p_b_mw')), p_c_mw=safe_float(in_data[x].get('p_c_mw')), q_a_mvar=safe_float(in_data[x].get('q_a_mvar')), q_b_mvar=safe_float(in_data[x].get('q_b_mvar')), q_c_mvar=safe_float(in_data[x].get('q_c_mvar')), sn_mva=safe_float(in_data[x].get('sn_mva')), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x].get('type') or 'wye', in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Impedance")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
@@ -6812,6 +7051,9 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
 
 def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None,
               run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False, reuse_model=False):
+            not_ready = _network_not_ready_error(net, "Power flow")
+            if not_ready:
+                return not_ready
             #pandapower - rozpływ mocy
             # A cached large-grid solve always starts from the previous voltages.
             if reuse_model:
@@ -7653,7 +7895,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                     try:
                         # Call diagnostic without report_style to get full text output
                         # The default call prints the detailed diagnostic tool output
-                        diag_result_dict = pp.diagnostic(net)
+                        diag_result_dict = pp.diagnostic(deepcopy(net))
                     except Exception as diag_ex:
                         captured_output.write(f"\nDiagnostic error: {str(diag_ex)}\n")
                     
@@ -8961,7 +9203,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 return response  
 
 
-def analyze_shortcircuit_input_data(in_data):
+def analyze_shortcircuit_input_data(in_data, case=None):
     """
     Analyze input data for invalid short-circuit parameters that cause Ybus NaN.
     Returns a list of specific recommendations: [{element_type, name, param, message}, ...]
@@ -8996,12 +9238,13 @@ def analyze_shortcircuit_input_data(in_data):
                     'message': 'Set to a positive value (e.g. 10000 or 1000000 MVA). Right-click → Edit data → Short circuit parameters.'
                 })
             s_sc_min = _safe_float(elem.get('s_sc_min_mva'))
-            if s_sc_min is not None and s_sc_min <= 0:
+            # Only the "min" calculation uses the minimum short-circuit power.
+            if case != 'max' and s_sc_min is not None and s_sc_min <= 0:
                 recommendations.append({
                     'element_type': 'External Grid',
                     'name': name,
                     'param': 's_sc_min_mva',
-                    'message': 'Set to a positive value. Right-click → Edit data → Short circuit parameters.'
+                    'message': 'The minimum short-circuit calculation needs the grid minimum short-circuit power. Set it to a positive value (it is usually below the maximum). Right-click → Edit data → Short circuit parameters.'
                 })
 
         # Static Generator / Wind Turbine with async/async_doubly_fed: sn_mva must be > 0
@@ -9027,8 +9270,31 @@ def _drop_dc_grid_for_sc(net):
             net[table].drop(net[table].index, inplace=True)
 
 
+def _network_not_ready_error(net, study):
+    """Plain-language error when the diagram has nothing to calculate, or None.
+
+    Without this an empty network fails deep inside pandapower with messages such as
+    "'ikss_ka'" or "has no attribute '_is_elements_final'".
+    """
+    if net.bus.empty:
+        return json.dumps({"error": True, "message": (
+            f"{study} calculation failed: the diagram has no buses. Add at least one Bus, connect "
+            "the elements to it and try again.")})
+    if study == "Short circuit":
+        sources = sum(int(net[t].in_service.sum()) for t in ("ext_grid", "gen", "sgen", "ward", "xward")
+                      if t in net and not net[t].empty)
+        if sources == 0:
+            return json.dumps({"error": True, "message": (
+                "Short circuit calculation failed: the diagram has no in-service source. Add an External "
+                "Grid, a Generator or a Static Generator connected to a bus.")})
+    return None
+
+
 def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=None):
     _drop_dc_grid_for_sc(net)
+    not_ready = _network_not_ready_error(net, "Short circuit")
+    if not_ready:
+        return not_ready
     
     # Add diagnostic prints
     # Print key parameters
@@ -9087,8 +9353,9 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         return json.dumps(
             diagnostic_response, default=_json_serialize_default, separators=(',', ':')
         )
-    
-    pp.diagnostic(net)
+
+    # No pandapower diagnostic here: its report only reached the server log and it ran several
+    # load flows on every study. The failure path below runs it (on a copy) for the error report.
     
     
     # Validate network before running calculations
@@ -9139,6 +9406,9 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         #       return_all_currents=True gives results per (branch, fault_bus) combination (MultiIndex).
         #       For UI display, we want max/min per branch, so keep return_all_currents=False.
         ensure_ext_grid_zero_sequence_min(net)
+        ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data_full)
+        ensure_gen_short_circuit_data(net, in_data_full)
+        warn_unrealistic_ext_grid_sc_power(net, fault_location, in_data_full)
         apply_converter_short_circuit_k(net, fault_type)
         sc.calc_sc(
             net,
@@ -9151,7 +9421,10 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             kappa_method='C',
             r_fault_ohm=r_fault_ohm,
             x_fault_ohm=x_fault_ohm,
-            check_connectivity=False,
+            # True sets up pandapower's element bookkeeping (_is_elements_final); with False,
+            # any Generator failed unless something had run a load flow on this net first.
+            # Isolated buses were already rejected above, so the results are the same.
+            check_connectivity=True,
             branch_results=True,
             return_all_currents=False,  # Changed: False gives max/min per branch with simple index
             lv_tol_percent=lv_tol_percent,
@@ -9206,7 +9479,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         
         try:
             # Run diagnostic again to capture the output
-            pp.diagnostic(net)
+            pp.diagnostic(deepcopy(net))
         except Exception:
             pass
         
@@ -9221,7 +9494,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         invalid_params = []
         err_str = str(e).lower()
         if ('nan' in err_str and ('ybus' in err_str or 'calculation parameters' in err_str)) and in_data_full:
-            invalid_params = analyze_shortcircuit_input_data(in_data_full)
+            invalid_params = analyze_shortcircuit_input_data(in_data_full, case=fault_location)
         
         # Return a diagnostic response with both raw and processed data
         diagnostic_response = {
@@ -9483,6 +9756,8 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
 
     result['study'] = 'shortcircuit'
     result['engine'] = 'pandapower'
+    if getattr(net, 'warnings', None):
+        result['warnings'] = list(dict.fromkeys(list(result.get('warnings') or []) + list(net.warnings)))
     result['study_params'] = {
         'fault_type': fault_type,
         'fault_location': fault_location,
@@ -9706,7 +9981,30 @@ def contingency_analysis(net, contingency_params):
                 
                 # Check for violations
                 case_violations = []
-                
+
+                # Buses cut off by the outage get no voltage (NaN), so the limit checks below
+                # never see them. Report them, with the load and generation they take with them.
+                islanded = [b for b in net_cont.res_bus.index[net_cont.res_bus.vm_pu.isna()]
+                            if bool(net_cont.bus.at[b, 'in_service'])]
+                if islanded:
+                    isl = set(islanded)
+                    def _lost(table):
+                        if table.empty:
+                            return 0.0
+                        rows = table[table.bus.isin(isl) & table.in_service.astype(bool)]
+                        return float((rows.p_mw * rows.scaling).sum()) if 'scaling' in rows else float(rows.p_mw.sum())
+                    lost_load = _lost(net_cont.load)
+                    lost_gen = _lost(net_cont.gen) + _lost(net_cont.sgen)
+                    names = [_contingency_friendly_name(net, net_cont.bus.at[b, 'name']) for b in islanded]
+                    shown = ', '.join(names[:10]) + (f" (+{len(names) - 10} more)" if len(names) > 10 else '')
+                    case_violations.append({
+                        'type': 'islanding',
+                        'element': 'System',
+                        'description': (f"{len(islanded)} bus(es) disconnected: {shown}; "
+                                        f"{lost_load:.1f} MW load and {lost_gen:.1f} MW generation lost"),
+                        'severity': 'high',
+                    })
+
                 # Check voltage violations
                 if voltage_limits:
                     voltage_violations = net_cont.res_bus[
@@ -10487,7 +10785,7 @@ def optimalPowerFlow(net, opf_params):
         
         # Try to get diagnostic information
         try:
-            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            diag_result_dict = pp.diagnostic(deepcopy(net), report_style='detailed')
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -11974,7 +12272,7 @@ def controller_simulation(net, controller_params):
         
         # Try to get diagnostic information
         try:
-            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            diag_result_dict = pp.diagnostic(deepcopy(net), report_style='detailed')
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -12420,7 +12718,7 @@ def time_series_simulation(net, timeseries_params):
         
         # Try to get diagnostic information
         try:
-            diag_result_dict = pp.diagnostic(net, report_style='detailed')
+            diag_result_dict = pp.diagnostic(deepcopy(net), report_style='detailed')
             
             # Check for isolated buses
             isolated_buses = pp.topology.unsupplied_buses(net)
@@ -16271,6 +16569,10 @@ def protection_coordination(net, prot_params, in_data):
         # create_sc_bus and time_grading do not raise on missing coordinates.
         _prot_ensure_bus_geodata(net)
 
+        # Dialog-default zeros (generator short-circuit data, grid X0/X) would make calc_sc fail.
+        sc_data_notes = ensure_gen_short_circuit_data(net, in_data)
+        sc_data_notes += ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data)
+
         attach_summaries = _attach_protection_devices(net, specs, grading_mode)
         attached_count = sum(1 for s in attach_summaries if s.get('attached'))
         not_computed_count = sum(1 for s in attach_summaries if s.get('not_computed'))
@@ -16362,6 +16664,8 @@ def protection_coordination(net, prot_params, in_data):
         }
         if scenario_warning:
             response['warning'] = scenario_warning
+        if sc_data_notes:
+            response['warnings'] = sc_data_notes
         return json.dumps(
             _prot_to_jsonable(response),
             default=_json_serialize_default,

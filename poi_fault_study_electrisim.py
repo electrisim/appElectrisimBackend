@@ -225,10 +225,16 @@ def _iec_bus_sc(
 ) -> dict:
     work = copy.deepcopy(net)
     apply_ngr_to_net(work)
-    apply_converter_short_circuit_k(work, fault)
-    from pandapower_electrisim import ensure_ext_grid_zero_sequence_min
+    from pandapower_electrisim import (
+        ensure_ext_grid_zero_sequence_min,
+        ensure_ext_grid_zero_sequence_ratios,
+        ensure_gen_short_circuit_data,
+    )
 
+    ensure_gen_short_circuit_data(work)  # before k: k from Ik" needs the rating
+    apply_converter_short_circuit_k(work, fault)
     ensure_ext_grid_zero_sequence_min(work)
+    ensure_ext_grid_zero_sequence_ratios(work, fault)
     try:
         sc.calc_sc(
             work,
@@ -239,13 +245,21 @@ def _iec_bus_sc(
             ith=True,
             tk_s=tk_s,
             kappa_method="C",
-            check_connectivity=False,
+            # pandapower only builds its element masks (needed for generators) when it checks
+            # connectivity; with False, any network with a Generator failed here.
+            check_connectivity=True,
             branch_results=False,
             return_all_currents=False,
         )
         apply_negative_sequence_ikss(work, fault=fault, case=case, bus=int(bus_idx))
     except Exception as e:
-        return {"error": str(e), "ikss_ka": None, "ip_ka": None, "ith_ka": None}
+        message = str(e)
+        if case == "min" and "nan" in message.lower() and not work.ext_grid.empty and (
+                (work.ext_grid.get("s_sc_min_mva", 0).fillna(0) <= 0).any()):
+            message = ("The minimum short-circuit calculation needs the External Grid minimum "
+                       "short-circuit power (s_sc_min_mva), which is 0. Set it in Edit data -> "
+                       "Short circuit parameters.")
+        return {"error": message, "ikss_ka": None, "ip_ka": None, "ith_ka": None}
     row = work.res_bus_sc.loc[bus_idx]
     return {
         "ikss_ka": _clean(row.get("ikss_ka")),
@@ -347,6 +361,9 @@ def run_poi_fault_study(net, in_data: dict, in_data_full=None) -> str:
     pre_ansi = json.loads(ansi_sc.shortcircuit_ansi(net_pre, ansi_params))
 
     breaker_duties = _merge_duty_pre_post(pre_ansi, post_ansi)
+    # The IEC coordination currents fill in missing generator data (see _iec_bus_sc); report it once.
+    from pandapower_electrisim import ensure_gen_short_circuit_data
+    iec_notes = ensure_gen_short_circuit_data(copy.deepcopy(net), in_data_full)
     sources = _source_contributions(net, poi_idx, freq_hz)
     grounding = _grounding_rows(net, slg_target_a, freq_hz)
     coordination = _coordination_table(net, close_in, remote)
@@ -369,6 +386,7 @@ def run_poi_fault_study(net, in_data: dict, in_data_full=None) -> str:
         "grounding": grounding,
         "coordination": coordination,
         "ansi_post_busbars": post_ansi.get("busbars", []),
+        **({"warnings": iec_notes} if iec_notes else {}),
         "disclaimer": (
             "POI fault study combines ANSI C37 breaker duty (beta) with IEC 60909 coordination "
             "currents. Verify results against utility requirements."
