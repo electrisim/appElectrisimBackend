@@ -85,18 +85,31 @@ _GOVERNOR_DEFAULTS: Dict[str, Dict[str, float]] = {
     "HYGOV": {"R": 0.05, "T1": 0.5, "T2": 1.0, "T3": 1.0, "VMAX": 1.2, "VMIN": 0.0},
 }
 
-_PSS_DEFAULTS = {"IEEEST": {"A1": 0.1, "A2": 0.1, "A3": 0.1, "A4": 0.1, "A5": 0.1, "A6": 0.1}}
+# MODE (input signal) is mandatory in ANDES. 1 = rotor speed, as in the ANDES Kundur IEEEST
+# example; it needs no extra frequency-measurement bus. Override with dyn_pss_MODE.
+_PSS_DEFAULTS = {"IEEEST": {"MODE": 1.0, "A1": 0.1, "A2": 0.1, "A3": 0.1, "A4": 0.1, "A5": 0.1, "A6": 0.1}}
 
 _RENEWABLE_DEFAULTS: Dict[str, Dict[str, float]] = {
     "REGCA1": {"Tg": 0.02, "Lvplsw": 1.0, "Volim": 1.2, "Lvpnt0": 0.4, "Iolim": -1.5},
-    "REECA1": {"Vref0": 1.0, "dbd1": -0.02, "dbd2": 0.02},
-    "REPCA1": {"dbd1": -0.02, "dbd2": 0.02},
+    # PFFLAG/VFLAG/QFLAG/PFLAG/PQFLAG have no ANDES default and are mandatory: without them
+    # REECA1 is silently dropped. Defaults keep the power-flow reactive power (QFLAG 0, PFFLAG 0:
+    # constant Q, or the REPCA1 plant-controller Q when present), no speed dependency (PFLAG 0)
+    # and reactive-current priority (PQFLAG 0). Override per element with dyn_ree_<FLAG>.
+    "REECA1": {"PFFLAG": 0.0, "VFLAG": 0.0, "QFLAG": 0.0, "PFLAG": 0.0, "PQFLAG": 0.0,
+               "Vref0": 1.0, "dbd1": -0.02, "dbd2": 0.02},
+    # VCFlag/RefFlag/Fflag are mandatory in ANDES (no default). Defaults: droop with PF control,
+    # Q control, frequency control off. Kp is listed so the dialog's dyn_repca_Kp is honoured
+    # (only keys listed here are read from the element); 1.0 is the ANDES default.
+    "REPCA1": {"VCFlag": 0.0, "RefFlag": 0.0, "Fflag": 0.0, "Kp": 1.0, "dbd1": -0.02, "dbd2": 0.02},
     "WTDTA1": {"H": 3.0, "DAMP": 0.0, "Htfrac": 0.5, "Freq1": 1.0, "Dshaft": 1.0},
     "WTARA1": {},
     "WTPTA1": {},
-    "WTTQA1": {},
-    "PVD1": {},
-    "ESD1": {},
+    # Tflag is mandatory in ANDES (0 = speed-error, 1 = power-error torque control).
+    "WTTQA1": {"Tflag": 0.0},
+    # pqflag has no ANDES default and is mandatory: without it PVD1/ESD1 are never added.
+    # 0 = reactive-current priority, as for REECA1 PQFLAG. Override with dyn_dg_pqflag.
+    "PVD1": {"pqflag": 0.0},
+    "ESD1": {"pqflag": 0.0},
 }
 
 
@@ -128,11 +141,67 @@ def _dyn_value(el: Dict[str, Any], key: str, default: float) -> float:
     return _sf(value, default)
 
 
+def tds_has_output(ss: Any) -> bool:
+    """True when the last ``ss.TDS.run()`` recorded at least one time step."""
+    try:
+        return len(np.asarray(ss.dae.ts.t)) > 0
+    except Exception:
+        return False
+
+
+def tds_values(ss: Any, var: Any) -> np.ndarray:
+    """Recorded time series of an ANDES variable: shape (n_steps, n_devices).
+
+    Read straight from ``ss.dae.ts``: states (v_code "x") live in ``ts.x`` and
+    algebraic variables in ``ts.y``, both indexed by the variable address ``var.a``.
+    The plotter route (``ss.TDS.plt.get_values(var.a)``) is wrong twice over: ANDES
+    only creates the plotter in notebooks, and its columns start with time and put
+    the algebraic block after all states, so a raw address selects another variable.
+    """
+    addrs = np.asarray(var.a, dtype=int)
+    block = ss.dae.ts.x if getattr(var, "v_code", "y") == "x" else ss.dae.ts.y
+    return np.asarray(block, dtype=float)[:, addrs]
+
+
+def _repca_measured_line(ss: Any, el: Dict[str, Any]) -> Optional[str]:
+    """ANDES idx of the Line named by ``dyn_repca_line``, or None if there is no such line.
+
+    Accepts the line's displayed name (as typed in the dialog) or its diagram id.
+    """
+    wanted = str(el.get("dyn_repca_line") or "").strip()
+    if not wanted or wanted.lower() in ("none", "null"):
+        return None
+    line_model = getattr(ss, "Line", None)
+    if line_model is None or not line_model.n:
+        return None
+    idxs = [str(i) for i in line_model.idx.v]
+    for candidate in (wanted, f"Line_{wanted}"):
+        if candidate in idxs:
+            return candidate
+    by_name = [idx for idx, name in zip(idxs, line_model.name.v)
+               if str(name).strip().lower() == wanted.lower()]
+    return by_name[0] if len(by_name) == 1 else None
+
+
 def _add_model_safe(ss: Any, model: str, defaults_applied: List[str], label: str, **kwargs: Any) -> Optional[str]:
     """
     Add an optional ANDES model without making a diagram unusable on another ANDES
     release. ANDES validates both model availability and parameter names in ss.add().
     """
+    # ANDES checks mandatory parameters only after it has started appending the device, so a
+    # failed add leaves a half-built device that later crashes System.setup(). Check first.
+    mdl = getattr(ss, "models", {}).get(model)
+    if mdl is not None:
+        missing = [
+            key for key, par in mdl.params.items()
+            if (getattr(par, "property", None) or {}).get("mandatory") and kwargs.get(key) is None
+        ]
+        if missing:
+            defaults_applied.append(
+                f"{label}: could not add {model} (missing {', '.join(missing)}); "
+                "continuing without that optional dynamic model."
+            )
+            return None
     try:
         ss.add(model, **kwargs)
         return str(kwargs["idx"])
@@ -443,6 +512,7 @@ def build_system(
 
     # --- External grids → Slack (no SynGen) ---
     slack_count = 0
+    ext_grid_slacks: List[Tuple[str, Any, float, Dict[str, Any]]] = []  # (slack idx, bus, Vn, element)
     for _, el, typ in _iter_elements(in_data):
         if not (typ.startswith("External Grid") or typ.startswith("ExternalGrid")):
             continue
@@ -472,6 +542,7 @@ def build_system(
             a0=va * math.pi / 180.0,
             p0=0.0,
         )
+        ext_grid_slacks.append((idx, bus, bus_vn.get(bus, 110.0), el))
 
     # --- Generators → PV/Slack + SynGen + Exciter + Governor ---
     gen_count = 0
@@ -547,9 +618,16 @@ def build_system(
 
         def _dyn(key: str, default: float, aliases: Tuple[str, ...] = ()) -> float:
             nonlocal used_defaults
+            # Reactances, time constants and inertia must be positive. The Generator dialog
+            # holds 0 in xdss_pu (an alias of xd2 / xd1) until it is filled in, and a zero
+            # xd2 makes GENROU initialisation fail with NaN, so 0 is read as "not set".
+            must_be_positive = key.startswith(("dyn_x", "dyn_T", "dyn_M"))
             for k in (key,) + aliases:
                 if el.get(k) is not None and str(el.get(k)).strip() not in ("", "none", "null"):
-                    return _sf(el.get(k), default)
+                    value = _sf(el.get(k), default)
+                    if must_be_positive and not value > 0:
+                        continue
+                    return value
             used_defaults = True
             return default
 
@@ -647,10 +725,15 @@ def build_system(
 
         pss_model = (el.get("dyn_pss_model") or "NONE").strip().upper()
         pss_idx = None
-        if pss_model == "IEEEST":
+        if pss_model == "IEEEST" and not exc_idx:
+            defaults_applied.append(
+                f"Generator '{ufname}': IEEEST stabilizer needs an exciter to act on; PSS omitted."
+            )
+        elif pss_model == "IEEEST":
+            # IEEEST attaches to the exciter (avr), not to the machine.
             pss_idx = _add_model_safe(
                 ss, "IEEEST", defaults_applied, f"Generator '{ufname}'",
-                idx=f"IEEEST_{gen_count}", name=f"IEEEST_{ufname}", syn=syn_idx,
+                idx=f"IEEEST_{gen_count}", name=f"IEEEST_{ufname}", avr=exc_idx,
                 **_model_kwargs(el, "dyn_pss_", _PSS_DEFAULTS["IEEEST"]),
             )
         elif pss_model not in ("", "NONE", "OFF"):
@@ -748,11 +831,24 @@ def build_system(
                 )
                 model_ids["ree_idx"] = ree_idx
                 if ree_idx:
-                    model_ids["repca_idx"] = _add_model_safe(
-                        ss, "REPCA1", defaults_applied, f"Static Generator '{ufname}'",
-                        idx=f"REPCA1_{static_count}", name=f"REPCA1_{ufname}", ree=ree_idx,
-                        **_model_kwargs(el, "dyn_repca_", _RENEWABLE_DEFAULTS["REPCA1"]),
-                    )
+                    # REPCA1 reads a measured line (ExtParam), so it can only exist when that line does.
+                    repca_line = _repca_measured_line(ss, el)
+                    if repca_line is None:
+                        model_ids["repca_idx"] = None
+                        asked = str(el.get("dyn_repca_line") or "").strip()
+                        defaults_applied.append(
+                            f"Static Generator '{ufname}': plant controller REPCA1 not modelled; "
+                            + (f"measured line '{asked}' was not found among the diagram's lines."
+                               if asked and asked.lower() not in ("none", "null") else
+                               "set 'REPCA1 measured line' to the name of the Line from this plant to include it.")
+                        )
+                    else:
+                        model_ids["repca_idx"] = _add_model_safe(
+                            ss, "REPCA1", defaults_applied, f"Static Generator '{ufname}'",
+                            idx=f"REPCA1_{static_count}", name=f"REPCA1_{ufname}", ree=ree_idx,
+                            line=repca_line,
+                            **_model_kwargs(el, "dyn_repca_", _RENEWABLE_DEFAULTS["REPCA1"]),
+                        )
                     if plant_kind == "WIND":
                         wt_idx = _add_model_safe(
                             ss, "WTDTA1", defaults_applied, f"Static Generator '{ufname}'",
@@ -782,10 +878,19 @@ def build_system(
                                     )
         else:
             dg_model = plant_kind
+            dg_kwargs = _model_kwargs(el, "dyn_dg_", _RENEWABLE_DEFAULTS[dg_model])
+            # The dialog's "DG Tg" is the converter current-lag time constant, which PVD1/ESD1
+            # call tip (active) and tiq (reactive). Blank keeps the ANDES default of 0.02 s.
+            dg_tg = _dyn_value(el, "dyn_dg_Tg", 0.0)
+            if dg_tg > 0:
+                dg_kwargs.setdefault("tip", dg_tg)
+                dg_kwargs.setdefault("tiq", dg_tg)
             model_ids["dg_idx"] = _add_model_safe(
                 ss, dg_model, defaults_applied, f"Static Generator '{ufname}'",
                 idx=f"{dg_model}_{static_count}", name=f"{dg_model}_{ufname}", bus=bus, gen=static_idx, Sn=sn_mva,
-                **_model_kwargs(el, "dyn_dg_", _RENEWABLE_DEFAULTS[dg_model]),
+                # PVD1/ESD1 default to 60 Hz; their frequency droop must use the network frequency.
+                fn=freq,
+                **dg_kwargs,
             )
 
         if any(model_ids.values()):
@@ -794,6 +899,38 @@ def build_system(
             "static_idx": static_idx, "syn_idx": None, "plant_kind": plant_kind,
             "name": ufname, "bus": bus, **model_ids,
         }
+
+    if renewable_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0:
+        # With no synchronous machine ANDES fails at the first switching event (fault, toggle)
+        # with "list index out of range" in its island bookkeeping. Put a classical source
+        # behind each External Grid: reactance from its short-circuit power, very large
+        # inertia, so it behaves like the stiff grid the Slack represents in power flow.
+        for slack_idx, eg_bus, eg_vn, eg_el in ext_grid_slacks:
+            s_sc = _sf(eg_el.get("s_sc_max_mva"), 0.0)
+            used_default_ssc = s_sc <= 0
+            if used_default_ssc:
+                s_sc = 10000.0
+            xd1 = min(max(sn_base / s_sc, 1e-4), 1.0)  # on the source's own base Sn = sn_base
+            ss.add(
+                "GENCLS",
+                idx=f"GENCLS_EG_{slack_idx}",
+                name=f"{eg_el.get('userFriendlyName') or eg_el.get('name') or slack_idx} (grid source)",
+                bus=eg_bus,
+                gen=slack_idx,
+                Sn=sn_base,
+                Vn=eg_vn,
+                fn=freq,
+                M=2.0 * 1000.0,
+                D=0.0,
+                ra=0.0,
+                xd1=xd1,
+            )
+            ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
+            defaults_applied.append(
+                f"External Grid '{ufname}': modelled as a stiff source (H=1000 s, "
+                f"S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}) because the network "
+                "has no synchronous generator."
+            )
 
     if gen_count + renewable_count == 0:
         raise ValueError(
@@ -844,7 +981,9 @@ def build_system(
                     lidx = lid
                     break
         if lidx is not None:
-            ss.add("Toggle", idx="Toggle_1", model="Line", dev=lidx, t=toggle_t)
+            # Toggle has a parameter named "model", which clashes with System.add(model, ...)
+            # as a keyword, so its parameters go in param_dict.
+            ss.add("Toggle", {"idx": "Toggle_1", "model": "Line", "dev": lidx, "t": toggle_t})
         else:
             warnings.append(f"Line outage target '{toggle_line}' not found; no Toggle applied.")
 
@@ -861,7 +1000,7 @@ def build_system(
                     syn_dev = ginfo.get("syn_idx")
                     break
         if syn_dev:
-            ss.add("Toggle", idx="Toggle_Gen_1", model="SynGen", dev=syn_dev, t=toggle_gen_t)
+            ss.add("Toggle", {"idx": "Toggle_Gen_1", "model": "SynGen", "dev": syn_dev, "t": toggle_gen_t})
         else:
             warnings.append(f"Generator trip target '{toggle_gen}' not found; no Toggle applied.")
 
@@ -894,7 +1033,7 @@ def _extract_syn_series(ss, model_name: str, var_name: str, names: List[str]) ->
     if not addrs:
         return []
     try:
-        values = np.asarray(ss.TDS.plt.get_values(addrs), dtype=float)
+        values = tds_values(ss, var)
     except Exception:
         return []
     series = []
@@ -962,7 +1101,34 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             except Exception:
                 pass
 
-        tds_ok = bool(ss.TDS.run())
+        try:
+            tds_ok = bool(ss.TDS.run())
+        except IndexError:
+            # ANDES re-checks connectivity at each switching event and fails with a bare
+            # IndexError when a Toggle leaves part of the network without a slack bus.
+            if params.get("toggle_line") or params.get("line_outage") or params.get("toggle_gen")                     or params.get("generator_trip"):
+                return json.dumps({
+                    "error": True,
+                    "message": "The line outage or generator trip splits the network into an island "
+                               "that ANDES cannot simulate (no slack/reference in that part). "
+                               "Choose an element whose outage keeps the network connected.",
+                    "exception": traceback.format_exc(),
+                    "defaults_applied": meta["defaults_applied"],
+                    "warnings": meta["warnings"],
+                })
+            raise
+        # A run that stopped early (e.g. the system went unstable) still has the series up to
+        # that point; they are returned with converged=False so the user can see what happened.
+        if not tds_has_output(ss):
+            return json.dumps({
+                "error": True,
+                "message": "Transient simulation produced no output (ANDES did not complete the run). "
+                           "Check the fault timing, the disturbance settings and the network data.",
+                "converged": False,
+                "power_flow_converged": pf_ok,
+                "defaults_applied": meta["defaults_applied"],
+                "warnings": meta["warnings"],
+            })
         t = np.asarray(ss.dae.ts.t, dtype=float)
         max_pts = int(_sf(params.get("max_points"), 800))
         t_ds = _downsample(t, max_pts)
@@ -978,10 +1144,11 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             model = getattr(ss, model_name)
             if model.n == 0 or not hasattr(model, var_name):
                 return []
-            addrs = list(getattr(model, var_name).a)
+            var = getattr(model, var_name)
+            addrs = list(var.a)
             if not addrs:
                 return []
-            values = np.asarray(ss.TDS.plt.get_values(addrs), dtype=float)
+            values = tds_values(ss, var)
             out = []
             for i in range(len(addrs)):
                 col = values[:, i] if values.ndim == 2 else values
@@ -1007,7 +1174,7 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
         bus_v = []
         if ss.Bus.n > 0 and hasattr(ss.Bus, "v"):
             addrs = list(ss.Bus.v.a)
-            values = np.asarray(ss.TDS.plt.get_values(addrs), dtype=float)
+            values = tds_values(ss, ss.Bus.v)
             for i in range(len(addrs)):
                 col = values[:, i] if values.ndim == 2 else values
                 col = col[idx]

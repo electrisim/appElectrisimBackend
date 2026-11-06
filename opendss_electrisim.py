@@ -839,6 +839,28 @@ def _opendss_ckt_pq_mw(powers, terminal_index=0):
     return p_mw, q_mvar
 
 
+# DC-side elements (DC buses, DC loads/sources, converters and DC cables) have no OpenDSS
+# model. Their type names contain "Bus" / "Line" / "Load", which the builders below would
+# otherwise read as AC buses, lines and loads, so they are removed before building.
+_DC_ONLY_PREFIXES = ("DC Bus", "DC Line", "Load DC", "Source DC", "VSC", "B2B VSC")
+
+
+def _without_dc_elements(in_data):
+    if not isinstance(in_data, dict):
+        return in_data
+    kept = {}
+    dropped = []
+    for key, elem in in_data.items():
+        typ = elem.get('typ', '') if isinstance(elem, dict) else ''
+        if isinstance(typ, str) and typ.startswith(_DC_ONLY_PREFIXES):
+            dropped.append(elem.get('userFriendlyName') or elem.get('name') or typ)
+            continue
+        kept[key] = elem
+    if dropped:
+        print(f"OpenDSS: DC elements are not modelled and were left out: {', '.join(map(str, dropped))}")
+    return kept
+
+
 def _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage):
     """Build OpenDSS voltagebases list from buses and equipment rated voltages."""
     levels = set()
@@ -1707,7 +1729,7 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
             created_elements.add(element_name)
             
         except Exception as e:
-            pass
+            print(f"Warning: OpenDSS element '{element_name}' not created: {e}")
     else:
         pass
 
@@ -2115,7 +2137,7 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
             created_elements.add(element_name)
             
         except Exception as e:
-            pass
+            print(f"Warning: OpenDSS element '{element_name}' not created: {e}")
     else:
         pass
 def create_static_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
@@ -2193,8 +2215,8 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
                 q_mvar_raw = element_data.get('q_mvar')
 
             # Convert to float
-            p_mw = float(p_mw_raw)
-            q_mvar = float(q_mvar_raw)
+            p_mw = _dss_float(p_mw_raw)
+            q_mvar = _dss_float(q_mvar_raw)
             
             # Convert to kW and kVar
             p_kw = p_mw * 1000
@@ -2264,6 +2286,18 @@ def create_static_generator_element(dss, element_data, element_name, element_id,
             pass
     else:
         pass
+_DSS_EMPTY = {'', 'null', 'none', 'undefined', 'nan'}
+
+
+def _dss_float(value, default=0.0):
+    """Number from a diagram field; blank or "null" text (sent for unset fields) gives the default."""
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip().lower() in _DSS_EMPTY:
+        return default
+    return float(value)
+
+
 def create_generator_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, GeneratorsDict, GeneratorsDictId, created_elements, execute_dss_command=None):
     """Create a generator element in OpenDSS"""
     
@@ -2292,10 +2326,10 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
         cos_phi_raw = element_data.get('cos_phi', 0.85)
 
         # Convert to float
-        p_mw = float(p_mw_raw)
-        q_mvar = float(q_mvar_raw)
-        vm_pu = float(vm_pu_raw)
-        cos_phi = float(cos_phi_raw)
+        p_mw = _dss_float(p_mw_raw)
+        q_mvar = _dss_float(q_mvar_raw)
+        vm_pu = _dss_float(vm_pu_raw, 1.0)
+        cos_phi = _dss_float(cos_phi_raw, 0.85)
         
         # Convert to kW and kVar
         p_kw = p_mw * 1000
@@ -2323,9 +2357,9 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             sn_mva_raw = element_data.get('sn_mva')
             
             # Convert to float safely
-            xdss_pu = float(xdss_pu_raw) if xdss_pu_raw is not None else 0.0
-            rdss_ohm = float(rdss_ohm_raw) if rdss_ohm_raw is not None else 0.0
-            sn_mva = float(sn_mva_raw) if sn_mva_raw is not None else 0.0
+            xdss_pu = _dss_float(xdss_pu_raw, 0.0)
+            rdss_ohm = _dss_float(rdss_ohm_raw, 0.0)
+            sn_mva = _dss_float(sn_mva_raw, 0.0)
             
             # kVA rating - only add if meaningful (non-zero)
             if sn_mva > 0:
@@ -2390,7 +2424,7 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
             created_elements.add(element_name)
             
         except Exception as e:
-            pass
+            print(f"Warning: OpenDSS element '{element_name}' not created: {e}")
     else:
         pass
 
@@ -3411,8 +3445,8 @@ def create_storage_element(dss, element_data, element_name, element_id, BusbarsD
             p_mw_raw = element_data.get('p_mw')
             q_mvar_raw = element_data.get('q_mvar')           
             # Convert to float
-            p_mw = float(p_mw_raw) if p_mw_raw is not None else 0.0
-            q_mvar = float(q_mvar_raw) if q_mvar_raw is not None else 0.0
+            p_mw = _dss_float(p_mw_raw, 0.0)
+            q_mvar = _dss_float(q_mvar_raw, 0.0)
 
             # P–Q capability curve, setpoint mode, and kVA priority (Electrisim convention)
             try:
@@ -3749,14 +3783,14 @@ def create_pvsystem_element(dss, element_data, element_name, element_id, Busbars
             cutout_raw = element_data.get('cutout')
 
             # Convert basic parameters with defaults
-            irradiance = float(irradiance_raw) if irradiance_raw is not None else 1.0
-            pmpp = float(pmpp_raw) if pmpp_raw is not None else 100.0  # kW
-            temperature = float(temperature_raw) if temperature_raw is not None else 25.0
+            irradiance = _dss_float(irradiance_raw, 1.0)
+            pmpp = _dss_float(pmpp_raw, 100.0)  # kW
+            temperature = _dss_float(temperature_raw, 25.0)
             phases = int(phases_raw) if phases_raw is not None else 3
-            kv = float(kv_raw) if kv_raw is not None else float(bus_voltage)
-            pf = float(pf_raw) if pf_raw is not None else 1.0
-            kvar = float(kvar_raw) if kvar_raw is not None else 0.0
-            kva = float(kva_raw) if kva_raw is not None else pmpp * 1.2  # Default 20% above Pmpp
+            kv = _dss_float(kv_raw, float(bus_voltage))
+            pf = _dss_float(pf_raw, 1.0)
+            kvar = _dss_float(kvar_raw, 0.0)
+            kva = _dss_float(kva_raw, pmpp * 1.2)  # Default 20% above Pmpp
 
             try:
                 # Create PVSystem command string with ONLY VALIDATED OpenDSS parameters
@@ -3949,7 +3983,7 @@ def create_external_grid_element(dss, element_data, element_name, element_id, Bu
             created_elements.add(element_name)
             
         except Exception as e:
-            pass
+            print(f"Warning: OpenDSS element '{element_name}' not created: {e}")
     else:
         pass
 
@@ -4164,6 +4198,7 @@ def shortcircuit(in_data, frequency=50, fault_type='3ph', export_open_dss_result
     Reference: https://opendss.epri.com/OpenDSSFaultStudyMode.html
     OpenDSSDirect.py: dss.Solution.Mode(4) for FaultStudy, dss.Bus.Isc(), dss.Bus.Zsc1()
     """
+    in_data = _without_dc_elements(in_data)
     opendss_commands = []
 
     def execute_dss_command(command):
@@ -4490,6 +4525,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
         tolerance: Convergence tolerance
         controlmode: Control mode (Static, Event, Time)
     """
+    in_data = _without_dc_elements(in_data)
     
     # OpenDSSDirect.py is already imported as dss at the module level
 
@@ -5053,7 +5089,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     loading_percent=0.0
                 )
                 linesList.append(line)
-            except:
+            except Exception:
                 pass
     
     
@@ -5136,7 +5172,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                 frontend_id = LoadsDictId[key]
                 load = LoadOut(name=frontend_name, id=frontend_id, p_mw=0.0, q_mvar=0.0)
                 loadsList.append(load)
-            except:
+            except Exception:
                 pass
     
     
@@ -5229,7 +5265,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     vm_pu=1.0
                 )
                 generatorsList.append(generator)
-            except:
+            except Exception:
                 pass
     
     
@@ -5350,7 +5386,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     # Get number of phases from transformer properties
                     try:
                         num_phases = dss.Transformers.Phases()
-                    except:
+                    except Exception:
                         # Fallback: assume 3-phase if not available
                         num_phases = 3
                     
@@ -5424,7 +5460,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                     ql_mvar=0.0
                 )
                 transformersList.append(transformer)
-            except:
+            except Exception:
                 pass
 
     # Process 3-winding transformer results
@@ -5472,7 +5508,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             try:
                 transformers3wList.append(Transformer3WOut(name=key, id=Transformers3WDictId.get(key, key),
                                                          i_hv_ka=0.0, i_mv_ka=0.0, i_lv_ka=0.0, loading_percent=0.0))
-            except:
+            except Exception:
                 pass
 
     # Process capacitor results
@@ -5935,6 +5971,7 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
        already knows (busbars, lines, etc.) plus a new
        ``harmonic_analysis`` block with per-element detail.
     """    # ---- Parse harmonic orders ------------------------------------------------
+    in_data = _without_dc_elements(in_data)
     harmonic_orders = []
     if isinstance(harmonics, str):
         for token in harmonics.replace(';', ',').split(','):
@@ -6607,6 +6644,7 @@ def dg_interconnection_screening(in_data, params):
       run_hosting_capacity (bool), hc_max_kw, hc_tol_kw,
       compare_invcontrol (bool)
     """
+    in_data = _without_dc_elements(in_data)
     import copy
 
     poc_bus_id = params.get('poc_bus_id') or params.get('pocBusId') or ''

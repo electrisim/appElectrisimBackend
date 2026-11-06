@@ -9,6 +9,7 @@ from pandapower.diagnostic import diagnostic
 import pandapower.topology as top
 from typing import List
 import math
+import traceback
 import json
 import numpy as np
 import pandas as pd
@@ -975,6 +976,36 @@ def _electrisim_find_in_data_by_ext_grid(in_data, ext_name, ext_id=None):
     return None
 
 
+def _py_str(value):
+    """A Python string literal for ``value`` in generated code; quotes and backslashes are escaped."""
+    return repr(str(value))
+
+
+def _dc_elem_id(table, index):
+    """Diagram id of a DC element row, or its index when the table has no id column."""
+    if 'id' in table.columns:
+        value = table._get_value(index, 'id')
+        if value is not None and value == value:
+            return value
+    return str(index)
+
+
+def sc_lv_tol_percent(in_data):
+    """LV voltage tolerance for IEC 60909 (6 or 10 %), from the Short Circuit dialog.
+
+    The dialog's "Voltage tolerance in low voltage grids" arrives as ``fault_impedance``
+    (``lv_tol_percent`` is also accepted). It sets the voltage factor c for buses below 1 kV
+    (cmax 1.05/1.10, cmin 0.95/0.90). Anything else falls back to pandapower's default, 10.
+    """
+    data = in_data or {}
+    raw = data.get('lv_tol_percent', data.get('fault_impedance'))
+    try:
+        value = int(float(str(raw).strip().rstrip('%')))
+    except (TypeError, ValueError):
+        return 10
+    return value if value in (6, 10) else 10
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init,
                                     study='powerflow', sc_in_data=None):
     """Generate Python code to recreate the pandapower network (load flow or short circuit)."""
@@ -1012,7 +1043,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     for idx, row in net.bus.iterrows():
         name = row['name'] if 'name' in row else f"Bus_{idx}"
         vn_kv = row['vn_kv']
-        lines.append(f"bus_{idx} = pp.create_bus(net, vn_kv={vn_kv}, name='{name}')")
+        lines.append(f"bus_{idx} = pp.create_bus(net, vn_kv={vn_kv}, name={_py_str(name)})")
     lines.append("")
     
     # Create external grids
@@ -1028,7 +1059,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             sc_kwargs = _ext_grid_sc_kwargs_for_export(row, in_elem)
             lines.append(
                 f"pp.create_ext_grid(net, bus=bus_{bus}, vm_pu={vm_pu}, va_degree={va_degree}, "
-                f"name='{name}'{sc_kwargs})"
+                f"name={_py_str(name)}{sc_kwargs})"
             )
         lines.append("")
     
@@ -1060,7 +1091,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             line_code = (f"pp.create_line_from_parameters(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, "
                         f"length_km={length_km}, r_ohm_per_km={r_ohm_per_km}, x_ohm_per_km={x_ohm_per_km}, "
                         f"c_nf_per_km={c_nf_per_km}, g_us_per_km={g_us_per_km}, max_i_ka={max_i_ka}, "
-                        f"type='{line_type}', parallel={parallel}, df={df}, name='{name}')")
+                        f"type={_py_str(line_type)}, parallel={parallel}, df={df}, name={_py_str(name)})")
             lines.append(line_code)
         lines.append("")
     
@@ -1113,14 +1144,14 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                          f"vkr_percent={vkr_percent}, vk_percent={vk_percent}, "
                          f"pfe_kw={pfe_kw}, i0_percent={i0_percent}, "
                          f"parallel={parallel}, shift_degree={shift_degree}, "
-                         f"tap_side='{tap_side}', tap_pos={tap_pos}, tap_neutral={tap_neutral}, "
+                         f"tap_side={_py_str(tap_side)}, tap_pos={tap_pos}, tap_neutral={tap_neutral}, "
                          f"tap_max={tap_max}, tap_min={tap_min}, "
                          f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, "
-                         f"tap_changer_type='{tap_changer_type}', "
-                         f"vector_group='{vector_group}', "
+                         f"tap_changer_type={_py_str(tap_changer_type)}, "
+                         f"vector_group={_py_str(vector_group)}, "
                          f"vk0_percent={vk0_percent}, vkr0_percent={vkr0_percent}, "
                          f"mag0_percent={mag0_percent}, mag0_rx={mag0_rx}, "
-                         f"si0_hv_partial={si0_hv_partial}, name='{name}')")
+                         f"si0_hv_partial={si0_hv_partial}, name={_py_str(name)})")
             lines.append(trafo_code)
         lines.append("")
     
@@ -1185,12 +1216,12 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                            f"vkr_hv_percent={vkr_hv_percent}, vkr_mv_percent={vkr_mv_percent}, vkr_lv_percent={vkr_lv_percent}, "
                            f"pfe_kw={pfe_kw}, i0_percent={i0_percent}, "
                            f"shift_mv_degree={shift_mv_degree}, shift_lv_degree={shift_lv_degree}, "
-                           f"tap_side='{tap_side}', tap_neutral={tap_neutral}, tap_pos={tap_pos}, tap_min={tap_min}, tap_max={tap_max}, "
-                           f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, tap_changer_type='{tap_changer_type_3w}', "
-                           f"vector_group='{vector_group}', "
+                           f"tap_side={_py_str(tap_side)}, tap_neutral={tap_neutral}, tap_pos={tap_pos}, tap_min={tap_min}, tap_max={tap_max}, "
+                           f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, tap_changer_type={_py_str(tap_changer_type_3w)}, "
+                           f"vector_group={_py_str(vector_group)}, "
                            f"vk0_hv_percent={vk0_hv_percent}, vk0_mv_percent={vk0_mv_percent}, vk0_lv_percent={vk0_lv_percent}, "
                            f"vkr0_hv_percent={vkr0_hv_percent}, vkr0_mv_percent={vkr0_mv_percent}, vkr0_lv_percent={vkr0_lv_percent}, "
-                           f"name='{name}')")
+                           f"name={_py_str(name)})")
             lines.append(trafo3w_code)
         lines.append("")
     
@@ -1202,7 +1233,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             p_mw = row['p_mw']
             q_mvar = row['q_mvar']
             name = row['name'] if 'name' in row else f"Load_{idx}"
-            lines.append(f"pp.create_load(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}')")
+            lines.append(f"pp.create_load(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name={_py_str(name)})")
         lines.append("")
     
     # Create static generators
@@ -1237,7 +1268,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                 if st is not None and str(st).strip():
                     type_part = f", type={str(st)!r}"
             lines.append(
-                f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name='{name}'"
+                f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name={_py_str(name)}"
                 f"{sn_part}{scale_part}{type_part})"
             )
         lines.append("")
@@ -1252,7 +1283,24 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             bus = row['bus']
             p_mw = row['p_mw']
             vm_pu = row['vm_pu']
-            lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw={p_mw}, vm_pu={vm_pu}, name='{name}')")
+            extra = ""
+            # A slack generator is the reference bus; without it the script has no slack.
+            if bool(row.get('slack', False)):
+                extra += ", slack=True"
+            if 'in_service' in row and not bool(row['in_service']):
+                extra += ", in_service=False"
+            for col in ('scaling', 'sn_mva', 'min_q_mvar', 'max_q_mvar', 'min_p_mw', 'max_p_mw'):
+                val = row.get(col)
+                if val is None:
+                    continue
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(fval) or (col == 'scaling' and fval == 1.0):
+                    continue
+                extra += f", {col}={fval}"
+            lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw={p_mw}, vm_pu={vm_pu}, name={_py_str(name)}{extra})")
         lines.append("")
     
     # Create shunts
@@ -1263,7 +1311,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             q_mvar = row['q_mvar']
             p_mw = row['p_mw']
             name = row['name'] if 'name' in row else f"Shunt_{idx}"
-            lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name='{name}')")
+            lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name={_py_str(name)})")
         lines.append("")
     
     # Create storage elements
@@ -1288,9 +1336,9 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             min_q_mvar = row.get('min_q_mvar')
             
             # Build the create_storage call with all parameters
-            storage_code = (f"pp.create_storage(net, bus=bus_{bus}, name='{name}', "
+            storage_code = (f"pp.create_storage(net, bus=bus_{bus}, name={_py_str(name)}, "
                           f"p_mw={p_mw}, q_mvar={q_mvar}, sn_mva={sn_mva}, "
-                          f"scaling={scaling}, type='{storage_type}', "
+                          f"scaling={scaling}, type={_py_str(storage_type)}, "
                           f"max_e_mwh={max_e_mwh}, min_e_mwh={min_e_mwh}, "
                           f"soc_percent={soc_percent}, in_service={in_service}, "
                           f"controllable={controllable}")
@@ -1314,7 +1362,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             name = row['name'] if 'name' in row else f"BusDC_{idx}"
             vn_kv = row.get('vn_kv', 0.0)
             in_service = row.get('in_service', True)
-            lines.append(f"bus_dc_{idx} = pp.create_dc_bus(net, vn_kv={vn_kv}, name='{name}', in_service={in_service})")
+            lines.append(f"bus_dc_{idx} = pp.create_dc_bus(net, vn_kv={vn_kv}, name={_py_str(name)}, in_service={in_service})")
         lines.append("")
     
     # Create asymmetric static generators
@@ -1333,10 +1381,10 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             scaling = row.get('scaling', 1.0)
             sgen_type = row.get('type', 'current_source')
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_asymmetric_sgen(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_asymmetric_sgen(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"p_a_mw={p_a_mw}, p_b_mw={p_b_mw}, p_c_mw={p_c_mw}, "
                         f"q_a_mvar={q_a_mvar}, q_b_mvar={q_b_mvar}, q_c_mvar={q_c_mvar}, "
-                        f"sn_mva={sn_mva}, scaling={scaling}, type='{sgen_type}', in_service={in_service})")
+                        f"sn_mva={sn_mva}, scaling={scaling}, type={_py_str(sgen_type)}, in_service={in_service})")
         lines.append("")
     
     # Create asymmetric loads
@@ -1355,10 +1403,10 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             scaling = row.get('scaling', 1.0)
             load_type = row.get('type', 'wye')
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_asymmetric_load(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_asymmetric_load(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"p_a_mw={p_a_mw}, p_b_mw={p_b_mw}, p_c_mw={p_c_mw}, "
                         f"q_a_mvar={q_a_mvar}, q_b_mvar={q_b_mvar}, q_c_mvar={q_c_mvar}, "
-                        f"sn_mva={sn_mva}, scaling={scaling}, type='{load_type}', in_service={in_service})")
+                        f"sn_mva={sn_mva}, scaling={scaling}, type={_py_str(load_type)}, in_service={in_service})")
         lines.append("")
     
     # Create impedance elements
@@ -1373,7 +1421,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             sn_mva = row.get('sn_mva', 1.0)
             in_service = row.get('in_service', True)
             lines.append(f"pp.create_impedance(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, "
-                        f"name='{name}', rft_pu={rft_pu}, xft_pu={xft_pu}, sn_mva={sn_mva}, in_service={in_service})")
+                        f"name={_py_str(name)}, rft_pu={rft_pu}, xft_pu={xft_pu}, sn_mva={sn_mva}, in_service={in_service})")
         lines.append("")
     
     # Create ward elements
@@ -1387,7 +1435,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             pz_mw = row.get('pz_mw', 0.0)
             qz_mvar = row.get('qz_mvar', 0.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_ward(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_ward(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"ps_mw={ps_mw}, qs_mvar={qs_mvar}, pz_mw={pz_mw}, qz_mvar={qz_mvar}, in_service={in_service})")
         lines.append("")
     
@@ -1405,7 +1453,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             x_ohm = row.get('x_ohm', 0.0)
             vm_pu = row.get('vm_pu', 1.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_xward(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_xward(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"ps_mw={ps_mw}, qs_mvar={qs_mvar}, pz_mw={pz_mw}, qz_mvar={qz_mvar}, "
                         f"r_ohm={r_ohm}, x_ohm={x_ohm}, vm_pu={vm_pu}, in_service={in_service})")
         lines.append("")
@@ -1427,7 +1475,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             scaling = row.get('scaling', 1.0)
             in_service = row.get('in_service', True)
             lrc_param = f"lrc_pu={lrc_pu}" if lrc_pu is not None else "lrc_pu=None"
-            lines.append(f"pp.create_motor(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_motor(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"pn_mech_mw={pn_mech_mw}, cos_phi={cos_phi}, efficiency_n_percent={efficiency_n_percent}, "
                         f"{lrc_param}, rx={rx}, vn_kv={vn_kv}, efficiency_percent={efficiency_percent}, "
                         f"loading_percent={loading_percent}, scaling={scaling}, in_service={in_service})")
@@ -1447,7 +1495,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             min_angle_degree = row.get('min_angle_degree', 90.0)
             max_angle_degree = row.get('max_angle_degree', 180.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_svc(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_svc(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"x_l_ohm={x_l_ohm}, x_cvar_ohm={x_cvar_ohm}, set_vm_pu={set_vm_pu}, "
                         f"thyristor_firing_angle_degree={thyristor_firing_angle_degree}, controllable={controllable}, "
                         f"min_angle_degree={min_angle_degree}, max_angle_degree={max_angle_degree}, in_service={in_service})")
@@ -1468,7 +1516,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             min_angle_degree = row.get('min_angle_degree', 90.0)
             max_angle_degree = row.get('max_angle_degree', 180.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_tcsc(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name='{name}', "
+            lines.append(f"pp.create_tcsc(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name={_py_str(name)}, "
                         f"x_l_ohm={x_l_ohm}, x_cvar_ohm={x_cvar_ohm}, set_p_to_mw={set_p_to_mw}, "
                         f"thyristor_firing_angle_degree={thyristor_firing_angle_degree}, controllable={controllable}, "
                         f"min_angle_degree={min_angle_degree}, max_angle_degree={max_angle_degree}, in_service={in_service})")
@@ -1497,16 +1545,16 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             if int(idx) in _psc_led:
                 lines.append(f"# STATCOM '{name}' is led by a Plant Supervisory Controller: a PQ source whose Q "
                              f"the controller sets within {q_min} … {q_max} Mvar.")
-                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name={_py_str(name)}, "
                              f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
                              f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
                              f"controllable={controllable}, in_service=False)")
                 lines.append(f"_psc_ssc_sgen[{int(idx)}] = pp.create_sgen(net, bus=bus_{bus}, p_mw=0.0, q_mvar=0.0, "
-                             f"name='{name} (STATCOM, led by Plant Supervisory Controller)')")
+                             f"name={_py_str(str(name) + ' (STATCOM, led by Plant Supervisory Controller)')})")
                 continue
             if not _electrisim_ssc_controllable(row):
                 lines.append(f"# STATCOM '{name}': Controllable is unticked, so it does not regulate and exchanges no Q.")
-                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+                lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name={_py_str(name)}, "
                              f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
                              f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
                              f"controllable={controllable}, in_service=False)")
@@ -1514,12 +1562,12 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             lines.append(f"# STATCOM '{name}' is solved as an equivalent voltage-controlled source: P = 0, holds "
                          f"set_vm_pu, Q within its rating. pandapower's own SSC model has no Q limits and does not")
             lines.append("# converge when the network has a transformer phase shift. The SSC is kept for reference, out of service.")
-            lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name='{name}', "
+            lines.append(f"pp.create_ssc(net, bus=bus_{bus}, name={_py_str(name)}, "
                         f"r_ohm={r_ohm}, x_ohm={x_ohm}, set_vm_pu={set_vm_pu}, "
                         f"vm_internal_pu={vm_internal_pu}, va_internal_degree={va_internal_degree}, "
                         f"controllable={controllable}, in_service=False)")
             lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw=0.0, vm_pu={set_vm_pu}, "
-                         f"min_q_mvar={q_min}, max_q_mvar={q_max}, name='{name} (STATCOM equivalent)', "
+                         f"min_q_mvar={q_min}, max_q_mvar={q_max}, name={_py_str(str(name) + ' (STATCOM equivalent)')}, "
                          f"in_service={in_service})")
         lines.append("")
     
@@ -1531,7 +1579,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             name = row['name'] if 'name' in row else f"LoadDC_{idx}"
             p_mw = row.get('p_mw', 0.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_load_dc(net, bus=bus_{bus}, name='{name}', p_mw={p_mw}, in_service={in_service})")
+            lines.append(f"pp.create_load_dc(net, bus=bus_{bus}, name={_py_str(name)}, p_mw={p_mw}, in_service={in_service})")
         lines.append("")
     
     # Create source DC elements
@@ -1542,7 +1590,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             name = row['name'] if 'name' in row else f"SourceDC_{idx}"
             vm_pu = row.get('vm_pu', 1.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_source_dc(net, bus=bus_{bus}, name='{name}', vm_pu={vm_pu}, in_service={in_service})")
+            lines.append(f"pp.create_source_dc(net, bus=bus_{bus}, name={_py_str(name)}, vm_pu={vm_pu}, in_service={in_service})")
         lines.append("")
     
     # Create switch elements (no in_service - Switch is always in service)
@@ -1557,8 +1605,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             switch_type = row.get('type', 'CB')
             z_ohm = row.get('z_ohm', 0.0)
             in_ka = row.get('in_ka', 0.0)
-            lines.append(f"pp.create_switch(net, bus=bus_{bus}, element={element}, et='{et}', name='{name}', "
-                        f"closed={closed}, type='{switch_type}', z_ohm={z_ohm}, in_ka={in_ka})")
+            lines.append(f"pp.create_switch(net, bus=bus_{bus}, element={element}, et={_py_str(et)}, name={_py_str(name)}, "
+                        f"closed={closed}, type={_py_str(switch_type)}, z_ohm={z_ohm}, in_ka={in_ka})")
         lines.append("")
     
     # Create VSC elements
@@ -1576,7 +1624,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             in_service = row.get('in_service', True)
             # bus_dc refers to a DC bus index, so use bus_dc_{bus_dc} variable name
             bus_dc_var = f"bus_dc_{bus_dc}" if bus_dc is not None else "None"
-            lines.append(f"pp.create_vsc(net, bus=bus_{bus}, bus_dc={bus_dc_var}, name='{name}', "
+            lines.append(f"pp.create_vsc(net, bus=bus_{bus}, bus_dc={bus_dc_var}, name={_py_str(name)}, "
                         f"p_mw={p_mw}, vm_pu={vm_pu}, sn_mva={sn_mva}, rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
         lines.append("")
     
@@ -1594,7 +1642,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             rx = row.get('rx', 0.1)
             max_ik_ka = row.get('max_ik_ka', 0.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_b2b_vsc(net, bus1=bus_{bus1}, bus2=bus_{bus2}, name='{name}', "
+            lines.append(f"pp.create_b2b_vsc(net, bus1=bus_{bus1}, bus2=bus_{bus2}, name={_py_str(name)}, "
                         f"p_mw={p_mw}, vm1_pu={vm1_pu}, vm2_pu={vm2_pu}, sn_mva={sn_mva}, "
                         f"rx={rx}, max_ik_ka={max_ik_ka}, in_service={in_service})")
         lines.append("")
@@ -1612,7 +1660,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             vm_from_pu = row.get('vm_from_pu', 1.0)
             vm_to_pu = row.get('vm_to_pu', 1.0)
             in_service = row.get('in_service', True)
-            lines.append(f"pp.create_dcline(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name='{name}', "
+            lines.append(f"pp.create_dcline(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, name={_py_str(name)}, "
                         f"p_mw={p_mw}, loss_percent={loss_percent}, loss_mw={loss_mw}, "
                         f"vm_from_pu={vm_from_pu}, vm_to_pu={vm_to_pu}, in_service={in_service})")
         lines.append("")
@@ -1658,6 +1706,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         lines.append("    kappa_method='C',")
         lines.append(f"    r_fault_ohm={r_fault_ohm},")
         lines.append(f"    x_fault_ohm={x_fault_ohm},")
+        lines.append(f"    lv_tol_percent={sc_lv_tol_percent(sc)},")
         lines.append("    check_connectivity=False,")
         lines.append("    branch_results=True,")
         lines.append("    return_all_currents=False,")
@@ -1700,16 +1749,16 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     if need_seed:
         lines.append("# Seed load flow (park cosphi(P)/Q(V) measurements)")
         lines.append(
-            f"pp.runpp(net, algorithm='{algorithm}', calculate_voltage_angles={cva_str}, "
-            f"init='{init}', run_control=False, {', '.join(ls_export_bits)})"
+            f"pp.runpp(net, algorithm={_py_str(algorithm)}, calculate_voltage_angles={cva_str}, "
+            f"init={_py_str(init)}, run_control=False, {', '.join(ls_export_bits)})"
         )
         lines.append("")
 
     lines.append("# Run power flow")
     run_kwargs = [
-        f"algorithm='{algorithm}'",
+        f"algorithm={_py_str(algorithm)}",
         f"calculate_voltage_angles={cva_str}",
-        f"init='{init}'",
+        f"init={_py_str(init)}",
     ]
     if run_control:
         run_kwargs.append("run_control=True")
@@ -1809,8 +1858,14 @@ def create_busbars(in_data, net):
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             
+            dc_vn_kv = safe_float(in_data[x].get('vn_kv', 0.0), 0.0)
+            if not dc_vn_kv or dc_vn_kv <= 0:
+                raise ValueError(
+                    f"DC Bus '{user_friendly_name}' has no rated voltage. Open the DC Bus and set "
+                    f"its voltage (kV) to the DC system voltage, for example 150 or 320."
+                )
             dc_kw = dict(
-                vn_kv=float(in_data[x].get('vn_kv', 0.0) or 0.0),
+                vn_kv=dc_vn_kv,
                 name=dc_bus_name,
                 in_service=in_service,
             )
@@ -2639,6 +2694,89 @@ def electrisim_runpp(net, **kwargs):
         return pp.runpp(net, **merged)
 
 
+def _gen_q_limits_from_dialog(element):
+    """(min_q_mvar, max_q_mvar) from a Generator element, or None when not set.
+
+    Both blank, or both 0 (the dialog default), means "not set". Limits with max below min
+    are ignored rather than passed on to fail the power flow.
+    """
+    def _num(key):
+        raw = (element or {}).get(key)
+        if raw is None or str(raw).strip().lower() in ('', 'null', 'none', 'nan'):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    q_min, q_max = _num('min_q_mvar'), _num('max_q_mvar')
+    if q_min is None or q_max is None:
+        return None
+    if q_min == 0 and q_max == 0:
+        return None
+    if q_max < q_min:
+        return None
+    return q_min, q_max
+
+
+def apply_enforce_q_lims_choice(net, params):
+    """Honour the Load Flow dialog's "Enforce Q Limits" tick (sent as ``enforce_q_lims``).
+
+    Q capability curves and Park Controller limits switch Q limits on by themselves; the
+    tick can only add to that. The model's own setting is remembered on first use so a
+    cached (warm) model re-applies the user's current choice instead of a previous one.
+    """
+    if not hasattr(net, '_electrisim_q_lims_from_model'):
+        net._electrisim_q_lims_from_model = bool(getattr(net, '_electrisim_enforce_q_lims', False))
+    raw = (params or {}).get('enforce_q_lims')
+    wanted = raw is True or str(raw).strip().lower() in ('true', '1', 'yes', 'on')
+    net._electrisim_enforce_q_lims = bool(net._electrisim_q_lims_from_model) or wanted
+    return net._electrisim_enforce_q_lims
+
+
+# pandapower's own max_iteration defaults; the dialog value never lowers them.
+_PP_DEFAULT_MAX_ITERATION = {'nr': 10, 'iwamoto_nr': 10, 'fdbx': 30, 'fdxb': 30, 'bfsw': 100, 'gs': 1000, 'dc': 1}
+
+
+def apply_load_flow_dialog_settings(net, params):
+    """Apply the Load Flow dialog's solver settings to ``net`` before ``powerflow``.
+
+    - "Enforce Q Limits" (``enforce_q_lims``): see ``apply_enforce_q_lims_choice``.
+    - "Max Iterations" (``max_iteration``): used for the first, as-requested solve attempt,
+      but never below pandapower's default for the algorithm (Gauss-Seidel needs 1000).
+    - "Tolerance" (``tolerance_mva``): power mismatch in MVA, used for every attempt.
+    Blank or invalid values keep pandapower's defaults.
+    """
+    params = params or {}
+    apply_enforce_q_lims_choice(net, params)
+
+    def _positive(key, cast):
+        raw = params.get(key)
+        if raw is None or str(raw).strip().lower() in ('', 'none', 'null', 'nan'):
+            return None
+        try:
+            value = cast(float(raw))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 and math.isfinite(float(value)) else None
+
+    net._electrisim_lf_max_iteration = _positive('max_iteration', int)
+    net._electrisim_lf_tolerance_mva = _positive('tolerance_mva', float)
+
+
+def _electrisim_lf_solver_kwargs(net, algorithm, first_attempt):
+    """runpp keyword arguments from ``apply_load_flow_dialog_settings`` (empty when unset)."""
+    kw = {}
+    tol = getattr(net, '_electrisim_lf_tolerance_mva', None)
+    if tol:
+        kw['tolerance_mva'] = float(tol)
+    max_it = getattr(net, '_electrisim_lf_max_iteration', None)
+    if first_attempt and max_it:
+        kw['max_iteration'] = max(int(max_it), _PP_DEFAULT_MAX_ITERATION.get(str(algorithm), 10))
+    return kw
+
+
 def _electrisim_enforce_q_lims_kw(net):
     """Keyword args for pp.runpp when static generator Q capability curves are present."""
     return {'enforce_q_lims': bool(getattr(net, '_electrisim_enforce_q_lims', False))}
@@ -3441,6 +3579,49 @@ def _electrisim_attach_line_flow_shunt_controllers(net):
             print(f"Warning: Line-flow shunt controller registration failed for spec {spec!r}: {ex}")
 
 
+def _drop_dc_islands_without_converter(net):
+    """Remove DC buses (with their DC loads, sources and cables) that no VSC links to the AC grid.
+
+    Diagrams often draw a battery's DC side next to the AC Storage element that already models
+    the PCS. Such a DC island cannot exchange power with the AC network, and pandapower's load
+    flow fails on it ("matrix - rhs dimension mismatch"), so it is left out of AC studies.
+    """
+    if 'bus_dc' not in net or not len(net.bus_dc):
+        return []
+    parent = {int(b): int(b) for b in net.bus_dc.index}
+
+    def find(b):
+        while parent[b] != b:
+            parent[b] = parent[parent[b]]
+            b = parent[b]
+        return b
+
+    if 'line_dc' in net:
+        for _, row in net.line_dc.iterrows():
+            f, t = int(row['from_bus_dc']), int(row['to_bus_dc'])
+            if f in parent and t in parent:
+                parent[find(f)] = find(t)
+    linked = set()
+    if 'vsc' in net:
+        for _, row in net.vsc.iterrows():
+            b = int(row['bus_dc'])
+            if b in parent and bool(row.get('in_service', True)):
+                linked.add(find(b))
+    orphan = [b for b in parent if find(b) not in linked]
+    if not orphan:
+        return []
+    names = [str(net.bus_dc.at[b, 'name']) for b in orphan]
+    for table, col in (('load_dc', 'bus_dc'), ('source_dc', 'bus_dc')):
+        if table in net and len(net[table]):
+            net[table].drop(net[table].index[net[table][col].isin(orphan)], inplace=True)
+    if 'line_dc' in net and len(net.line_dc):
+        mask = net.line_dc['from_bus_dc'].isin(orphan) | net.line_dc['to_bus_dc'].isin(orphan)
+        net.line_dc.drop(net.line_dc.index[mask], inplace=True)
+    net.bus_dc.drop(orphan, inplace=True)
+    print(f"Note: DC buses not linked to the AC grid by a VSC were left out of the study: {', '.join(names)}")
+    return names
+
+
 def create_other_elements(in_data,net,x, Busbars):
 
     #tworzymy zmienne ktorych nazwa odpowiada modelowi z js - np.Hwap0ntfbV98zYtkLMVm-8
@@ -3495,6 +3676,9 @@ def create_other_elements(in_data,net,x, Busbars):
        
     for x in _ordered_keys:
         if not isinstance(in_data[x], dict) or not isinstance(in_data[x].get('typ'), str):
+            continue
+        # Study settings are not elements ("MotorStartingPandaPower Parameters" starts with "Motor").
+        if in_data[x]['typ'].endswith(' Parameters'):
             continue
       
         #eval - rozwiazuje problem z wartosciami NaN
@@ -3872,6 +4056,11 @@ def create_other_elements(in_data,net,x, Busbars):
                 gen_kw['min_p_mw'] = safe_float(in_data[x]['min_p_mw'], 0.0)
             if in_data[x].get('max_p_mw') is not None and str(in_data[x].get('max_p_mw')).lower() not in ('null', 'none', ''):
                 gen_kw['max_p_mw'] = safe_float(in_data[x]['max_p_mw'], safe_float(in_data[x]['p_mw']) * 1.2)
+            # Reactive limits from the dialog: used by OPF, and by the load flow when Q limits are
+            # enforced. The dialog default 0/0 means "not set", not "no reactive power".
+            q_limits = _gen_q_limits_from_dialog(in_data[x])
+            if q_limits is not None:
+                gen_kw['min_q_mvar'], gen_kw['max_q_mvar'] = q_limits
             pp.create_gen(net, **gen_kw)
             gen_idx = net.gen.index[-1]
             ansi_mt = in_data[x].get('ansi_machine_type')
@@ -4322,7 +4511,8 @@ def create_other_elements(in_data,net,x, Busbars):
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
             pp.create_shunt_as_capacitor(net, typ="capacitor", bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], q_mvar=safe_float(in_data[x]['q_mvar']), loss_factor=safe_float(in_data[x]['loss_factor']), vn_kv=safe_float(in_data[x]['vn_kv']), step=float(safe_float(in_data[x].get('step', 1)) or 1), max_step=float(safe_float(in_data[x].get('max_step', 1)) or 1), in_service=in_service)        
         
-        if (in_data[x]['typ'].startswith("Load")):
+        # "Load DC" elements sit on DC buses and are created further down.
+        if in_data[x]['typ'].startswith("Load") and not in_data[x]['typ'].startswith("Load DC"):
             bus_idx = Busbars.get(in_data[x]['bus'])
             if bus_idx is None:
                 element_name = in_data[x].get('userFriendlyName', in_data[x].get('name', 'Unknown'))
@@ -4393,7 +4583,15 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_impedance(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], rft_pu=in_data[x]['rft_pu'],xft_pu=in_data[x]['xft_pu'],sn_mva=in_data[x]['sn_mva'], in_service=in_service)         
+            # The diagram stores r_pu/x_pu; older payloads send rft_pu/xft_pu.
+            def _imp_value(primary, fallback):
+                raw = in_data[x].get(primary)
+                if raw is None or str(raw).strip().lower() in ('', 'none', 'null'):
+                    raw = in_data[x].get(fallback)
+                return raw
+            pp.create_impedance(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'],
+                                rft_pu=_imp_value('rft_pu', 'r_pu'), xft_pu=_imp_value('xft_pu', 'x_pu'),
+                                sn_mva=in_data[x]['sn_mva'], in_service=in_service)         
          
         if (in_data[x]['typ'].startswith("Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -4432,14 +4630,20 @@ def create_other_elements(in_data,net,x, Busbars):
             else:
                 lrc_pu_value = safe_float_local(lrc_pu_value, None)
             
+            # A new motor's dialog holds 0 for these fields. Zero efficiency or power factor is not a
+            # real machine (it makes the motor draw infinite power), so it is read as "not set".
+            def _motor_positive(key, default):
+                v = safe_float_local(in_data[x].get(key), default)
+                return v if v and v > 0 else default
+            motor_vn_kv = _motor_positive('vn_kv', float(net.bus.at[bus_idx, 'vn_kv']))
             pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
                             pn_mech_mw=safe_float_local(in_data[x].get('pn_mech_mw'), 0.0),
-                            cos_phi=safe_float_local(in_data[x].get('cos_phi'), 0.85),
-                            efficiency_n_percent=safe_float_local(in_data[x].get('efficiency_n_percent'), 90.0),
+                            cos_phi=_motor_positive('cos_phi', 0.85),
+                            efficiency_n_percent=_motor_positive('efficiency_n_percent', 90.0),
                             lrc_pu=lrc_pu_value,
                             rx=safe_float_local(in_data[x].get('rx'), 0.0),
-                            vn_kv=safe_float_local(in_data[x].get('vn_kv'), 0.4),
-                            efficiency_percent=safe_float_local(in_data[x].get('efficiency_percent'), 90.0),
+                            vn_kv=motor_vn_kv,
+                            efficiency_percent=_motor_positive('efficiency_percent', 90.0),
                             loading_percent=safe_float_local(in_data[x].get('loading_percent'), 100.0),
                             scaling=safe_float_local(in_data[x].get('scaling'), 1.0),
                             in_service=in_service)         
@@ -4985,6 +5189,7 @@ def create_other_elements(in_data,net,x, Busbars):
             net.user_friendly_names[dcline_name] = element_name
 
     _electrisim_finalize_pending_line_flow_shunts(net)
+    _drop_dc_islands_without_converter(net)
     apply_sgen_q_capability_curves(net, in_data)
     apply_sgen_q_setpoint_from_curve(net, in_data)
     try:
@@ -6887,10 +7092,16 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 # drop the controllers: DiscreteTapControl on this farm often cannot reach 0.99 pu
                 # on 0.69 kV buses (tap range too small) and then Newton-Raphson diverges.
                 requested_label = f"{algorithm}, init={init}"
-                solve_plans = [(requested_label, {'algorithm': algorithm, 'init': init}, run_pp_control)]
+                # Max Iterations / Tolerance from the dialog shape the as-requested attempts;
+                # the fallback ladder below keeps its own iteration counts.
+                requested_kwargs = {'algorithm': algorithm, 'init': init,
+                                    **_electrisim_lf_solver_kwargs(net, algorithm, first_attempt=True)}
+                if 'max_iteration' in requested_kwargs:
+                    requested_label += f", max_iteration={requested_kwargs['max_iteration']}"
+                solve_plans = [(requested_label, requested_kwargs, run_pp_control)]
                 if run_pp_control:
                     solve_plans.append(
-                        (f"{requested_label}, no controllers", {'algorithm': algorithm, 'init': init}, False)
+                        (f"{requested_label}, no controllers", dict(requested_kwargs), False)
                     )
                 solve_plans.append(
                     (f"{algorithm}, init={init}, max_iteration=50",
@@ -6925,7 +7136,9 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 pf_attempt_log = []
                 successful_kwargs = None
                 successful_run_control = False
+                _fallback_tol = _electrisim_lf_solver_kwargs(net, algorithm, first_attempt=False)
                 for plan_label, plan_kwargs, plan_run_control in solve_plans:
+                    plan_kwargs = {**_fallback_tol, **plan_kwargs}
                     if not plan_run_control and run_pp_control:
                         _restore_controller_setpoints()
                         if hasattr(net, 'controller') and not net.controller.empty:
@@ -8543,9 +8756,10 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                        
                                         
                 #DC Bus
-                if(hasattr(net, 'res_dc_bus') and not net.res_dc_bus.empty):
-                    for index, row in net.res_dc_bus.iterrows():    
-                        dcbus = DcBusOut(name=net.dc_bus._get_value(index, 'name'), id = net.dc_bus._get_value(index, 'id'), vm_pu=row['vm_pu'], p_mw=row['p_mw'])        
+                # pandapower names the DC bus tables bus_dc / res_bus_dc.
+                if(hasattr(net, 'res_bus_dc') and not net.res_bus_dc.empty):
+                    for index, row in net.res_bus_dc.iterrows():    
+                        dcbus = DcBusOut(name=net.bus_dc._get_value(index, 'name'), id=_dc_elem_id(net.bus_dc, index), vm_pu=row['vm_pu'], p_mw=row['p_mw'])        
                         dcbusesList.append(dcbus) 
                         dcbuses = DcBusesOut(dcbuses = dcbusesList) 
                     result = {**result, **dcbuses.__dict__}
@@ -8553,7 +8767,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #Load DC
                 if(hasattr(net, 'res_load_dc') and not net.res_load_dc.empty):
                     for index, row in net.res_load_dc.iterrows():    
-                        loaddc = LoadDcOut(name=net.load_dc._get_value(index, 'name'), id = net.load_dc._get_value(index, 'id'), p_mw=row['p_mw'])        
+                        loaddc = LoadDcOut(name=net.load_dc._get_value(index, 'name'), id=_dc_elem_id(net.load_dc, index), p_mw=row['p_dc_mw'])        
                         loadsdcList.append(loaddc) 
                         loadsdc = LoadsDcOut(loadsdc = loadsdcList) 
                     result = {**result, **loadsdc.__dict__}
@@ -8561,7 +8775,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
                 #Source DC
                 if(hasattr(net, 'res_source_dc') and not net.res_source_dc.empty):
                     for index, row in net.res_source_dc.iterrows():    
-                        sourcedc = SourceDcOut(name=net.source_dc._get_value(index, 'name'), id = net.source_dc._get_value(index, 'id'), vm_pu=row['vm_pu'], p_mw=row['p_mw'])        
+                        sourcedc = SourceDcOut(name=net.source_dc._get_value(index, 'name'), id=_dc_elem_id(net.source_dc, index), vm_pu=net.source_dc._get_value(index, 'vm_pu'), p_mw=row['p_dc_mw'])        
                         sourcesdcList.append(sourcedc) 
                         sourcesdc = SourcesDcOut(sourcesdc = sourcesdcList) 
                     result = {**result, **sourcesdc.__dict__}
@@ -8806,7 +9020,15 @@ def analyze_shortcircuit_input_data(in_data):
     return recommendations
 
 
+def _drop_dc_grid_for_sc(net):
+    """pandapower's IEC short circuit ignores the DC grid but crashes on 1ph faults when it is present."""
+    for table in ("vsc", "line_dc", "load_dc", "source_dc", "bus_dc"):
+        if table in net and len(net[table]):
+            net[table].drop(net[table].index, inplace=True)
+
+
 def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=None):
+    _drop_dc_grid_for_sc(net)
     
     # Add diagnostic prints
     # Print key parameters
@@ -8884,7 +9106,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         bus = bus[0]
     
     # Get other parameters
-    lv_tol_percent = int(in_data.get('fault_impedance', 10))  # Frontend 'fault_impedance' becomes 'lv_tol_percent'
+    lv_tol_percent = sc_lv_tol_percent(in_data)
     ip = True
     ith = True
     topology = in_data.get('topology', 'radial')
@@ -8932,14 +9154,14 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             check_connectivity=False,
             branch_results=True,
             return_all_currents=False,  # Changed: False gives max/min per branch with simple index
+            lv_tol_percent=lv_tol_percent,
         )
-        # calc_sc above keeps pandapower's default lv_tol_percent (10). The r2/x2
-        # correction must use that same voltage factor.
+        # The r2/x2 correction must use the same voltage factor as calc_sc above.
         apply_negative_sequence_ikss(
             net,
             fault=fault_type,
             case=fault_location,
-            lv_tol_percent=10,
+            lv_tol_percent=lv_tol_percent,
             r_fault_ohm=r_fault_ohm,
             x_fault_ohm=x_fault_ohm,
             bus=bus,
@@ -8985,7 +9207,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         try:
             # Run diagnostic again to capture the output
             pp.diagnostic(net)
-        except:
+        except Exception:
             pass
         
         # Restore stdout
@@ -9348,7 +9570,7 @@ def process_short_circuit_diagnostic(diagnostic_output, net):
                         processed["invalid_values"][element_type].append(
                             f"{display_name}: {attr_part} = {value_part}"
                         )
-                except:
+                except Exception:
                     # If parsing fails, add the raw line
                     if "invalid_values" not in processed:
                         processed["invalid_values"] = {}
@@ -9956,11 +10178,13 @@ def optimalPowerFlow(net, opf_params):
                 load_cost_cp1, load_cost_cp2,
                 dcline_cost_cp1, dcline_cost_cp2,
             )
-        # Optionally ensure min_q_mvar/max_q_mvar as well
+        # Generators without dialog Q limits stay effectively unbounded in Q.
         if 'min_q_mvar' not in net.gen.columns:
             net.gen['min_q_mvar'] = -9999.0
         if 'max_q_mvar' not in net.gen.columns:
             net.gen['max_q_mvar'] = 9999.0
+        net.gen['min_q_mvar'] = net.gen['min_q_mvar'].fillna(-9999.0)
+        net.gen['max_q_mvar'] = net.gen['max_q_mvar'].fillna(9999.0)
 
         # AC OPF: pandapower needs finite sn_mva for some paths. Using ~1.05×P made Q limits unrealistically tight
         # vs opf_basic.ipynb (unset sn_mva), shifting voltages (~1.12 pu) while P stayed correct. Use a loose rating

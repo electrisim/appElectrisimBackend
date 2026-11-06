@@ -254,6 +254,7 @@ def solve_if_cached(in_data, params_key):
             return _warm_miss('The saved load-flow model cannot be reused for this study.')
 
         applied = apply_setpoints(net, in_data, params_key, entry['index'])
+        pandapower_electrisim.apply_load_flow_dialog_settings(net, params)
         _log(f"WARM load flow: {applied} setpoint update(s), init=results")
         rc2, rc3, rcs = pandapower_electrisim._resolve_controller_family_flags(params)
         try:

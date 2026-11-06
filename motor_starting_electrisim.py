@@ -619,7 +619,7 @@ def _dynamic_start_rebuild(
         if hasattr(ss, "Bus") and ss.Bus.n > 0:
             vvar = ss.Bus.v
             addrs = list(vvar.a)
-            values = np.asarray(ss.TDS.plt.get_values(addrs), dtype=float)
+            values = andes_electrisim.tds_values(ss, vvar)
             for i, addr in enumerate(addrs):
                 col = values[:, i] if values.ndim == 2 else values
                 bidx = ss.Bus.idx.v[i]
@@ -650,8 +650,7 @@ def _dynamic_start_rebuild(
                 if not hasattr(m, var_name):
                     return None
                 var = getattr(m, var_name)
-                addrs = list(var.a)
-                vals = np.asarray(ss.TDS.plt.get_values(addrs), dtype=float)
+                vals = andes_electrisim.tds_values(ss, var)
                 return vals
 
             id_vals = _series("Id")
@@ -862,6 +861,8 @@ def _build_system_with_motors(
             u=0,
             Sn=mparams["Sn"],
             Vn=mparams["Vn"],
+            # Motor3 defaults to 60 Hz; use the network frequency so 50 Hz systems are right.
+            fn=float(meta.get("frequency") or 50.0),
             rs=mparams["rs"],
             xs=mparams["xs"],
             rr1=mparams["rr1"],
@@ -873,13 +874,13 @@ def _build_system_with_motors(
             c3=mparams["c3"],
         )
         toggle_i += 1
-        ss.add(
-            "Toggle",
-            idx=f"Toggle_Motor_{toggle_i}",
-            model="Motor3",
-            dev=midx,
-            t=t_start,
-        )
+        # "model" is also System.add's first parameter, so Toggle's fields go in param_dict.
+        ss.add("Toggle", {
+            "idx": f"Toggle_Motor_{toggle_i}",
+            "model": "Motor3",
+            "dev": midx,
+            "t": t_start,
+        })
         motor_map[midx] = {
             "id": mid,
             "name": mname,
@@ -889,7 +890,9 @@ def _build_system_with_motors(
             "lrc_pu": lrc,
         }
 
-    ss.setup()
+    # ss is a SystemNoSetup, whose setup() is the no-op used above; run the real one now
+    # that the motors and their start toggles are in.
+    original_system.setup(ss)
     return ss, meta, motor_map
 
 

@@ -54,6 +54,19 @@ sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 _DEV_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'electrisim-dev.log')
 
 
+_DEV_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _rotate_dev_log_if_large():
+    """Keep one previous copy so the dev log cannot grow without bound."""
+    try:
+        if os.path.getsize(_DEV_LOG_PATH) < _DEV_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    os.replace(_DEV_LOG_PATH, _DEV_LOG_PATH + '.1')
+
+
 def _console(msg):
     """Main-thread stderr plus a file. Windows hides prints from Flask worker threads."""
     line = str(msg)
@@ -68,11 +81,30 @@ def _console(msg):
     except Exception:
         pass
     try:
+        _rotate_dev_log_if_large()
         with open(_DEV_LOG_PATH, 'a', encoding='utf-8') as logf:
             logf.write(line + '\n')
             logf.flush()
     except Exception:
         pass
+
+
+def _parse_frequency(value, default=50.0):
+    """Parse a system frequency sent by the frontend (e.g. "50", 60, "60.0").
+
+    The value comes from the request body, so it is parsed as a number and never
+    executed as Python code. Non-numeric input raises ValueError.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return float(default)
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid frequency: {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid frequency: {value!r}")
 
 
 def _coerce_export_flag(value):
@@ -423,7 +455,7 @@ def simulation():
                 # Extract OPF parameters
                 opf_params = {
                     'opf_type': in_data[x]['opf_type'],
-                    'frequency': eval(in_data[x]['frequency']),
+                    'frequency': _parse_frequency(in_data[x]['frequency']),
                     'ac_algorithm': in_data[x]['ac_algorithm'],
                     'dc_algorithm': in_data[x]['dc_algorithm'],
                     'calculate_voltage_angles': in_data[x]['calculate_voltage_angles'],
@@ -467,7 +499,7 @@ def simulation():
                 response_data = warm_loadflow.solve_if_cached(in_data, x)
                 if response_data is None:
                     _console("FULL load flow: building the pandapower model")
-                    frequency=eval(in_data[x]['frequency'])
+                    frequency=_parse_frequency(in_data[x]['frequency'])
                     algorithm=in_data[x]['algorithm']
                     calculate_voltage_angles = in_data[x]['calculate_voltage_angles']
                     init = in_data[x]['initialization']
@@ -482,6 +514,7 @@ def simulation():
 
                     Busbars = pandapower_electrisim.create_busbars(in_data, net)
                     pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                    pandapower_electrisim.apply_load_flow_dialog_settings(net, in_data[x])
 
                     response_data = pandapower_electrisim.powerflow(
                         net, algorithm, calculate_voltage_angles, init, export_python, in_data, Busbars,
@@ -1264,7 +1297,7 @@ def simulation():
                 
                 # Extract economic analysis parameters
                 economic_params = {
-                    'frequency': eval(in_data[x].get('frequency', '50')),
+                    'frequency': _parse_frequency(in_data[x].get('frequency', '50')),
                     'currency': in_data[x].get('currency', 'EUR'),
                     'algorithm': in_data[x].get('algorithm', 'nr'),
                     'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
@@ -1299,7 +1332,7 @@ def simulation():
                     'tap_control': in_data[x].get('tap_control', False),
                     'discrete_tap_control': in_data[x].get('discrete_tap_control', False),
                     'continuous_tap_control': in_data[x].get('continuous_tap_control', False),
-                    'frequency': eval(in_data[x].get('frequency', '50')),
+                    'frequency': _parse_frequency(in_data[x].get('frequency', '50')),
                     'algorithm': in_data[x].get('algorithm', 'nr'),
                     'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
                     'init': in_data[x].get('init', 'dc')
@@ -1325,7 +1358,7 @@ def simulation():
                     'generation_profile': in_data[x].get('generation_profile', 'constant'),
                     'profile_mode': in_data[x].get('profile_mode', 'preset'),
                     'element_profiles': in_data[x].get('element_profiles') or {},
-                    'frequency': eval(in_data[x].get('frequency', '50')),
+                    'frequency': _parse_frequency(in_data[x].get('frequency', '50')),
                     'algorithm': in_data[x].get('algorithm', 'nr'),
                     'calculate_voltage_angles': in_data[x].get('calculate_voltage_angles', 'auto'),
                     'init': in_data[x].get('init') or in_data[x].get('initialization') or 'auto',
@@ -1885,39 +1918,24 @@ def import_pandapower():
     Accepts a Pandapower .py script, executes it to build `net`,
     and returns the network as JSON (the structure expected by insertComponentsForData).
     """
-    payload = request.get_json(force=True)
-    code = payload.get('content', '')
+    payload = request.get_json(force=True, silent=True)
+    code = payload.get('content', '') if isinstance(payload, dict) else ''
 
-    if not code:
+    if not code or not isinstance(code, str):
         return jsonify({'error': 'Empty file content'}), 400
 
-    import pandapower as pp
-    import sys
-    import io
-
-    # Simple execution environment – assumes the script defines a variable `net`
-    global_env = {'pp': pp}
-    local_env = {}
+    import script_guard
 
     try:
-        # Capture stdout to suppress print statements from the uploaded script
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        
         try:
-            exec(code, global_env, local_env)
-        except (UserWarning, Exception) as run_err:
-            # Power flow may fail (no reference bus, zero impedance, etc.) - for import we only need the net structure
-            net = local_env.get('net') or global_env.get('net')
-            if net is not None:
-                # Import does not require power flow results; use net topology anyway
-                pass
-            else:
-                raise run_err
-        finally:
-            sys.stdout = old_stdout
-        
-        net = local_env.get('net') or global_env.get('net')
+            # Checked and run with restricted builtins and imports; see script_guard.py.
+            namespace = script_guard.run_script(code)
+        except script_guard.ScriptRejected as rejected:
+            return jsonify({'error': str(rejected)}), 400
+        except SyntaxError as syntax_err:
+            return jsonify({'error': f'The file is not valid Python: {syntax_err}'}), 400
+
+        net = namespace.get('net')
         if net is None:
             return jsonify({'error': 'No variable named `net` found in Python file'}), 400
 
@@ -2872,7 +2890,7 @@ def import_opendss():
             # Clean up temp file
             try:
                 os.unlink(temp_path)
-            except:
+            except OSError:
                 pass
     except Exception as e:
         import traceback
@@ -2905,4 +2923,8 @@ if __name__ == '__main__':
             )
             raise SystemExit(1)
         _console(f'[Electrisim] logging to this terminal; POST / on port {port}')
-        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False, threaded=True)
+        # The Werkzeug debugger gives code execution to anyone who can reach the port,
+        # so it is opt-in (FLASK_DEBUG=1) rather than always on in development.
+        dev_debug = str(os.getenv('FLASK_DEBUG', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+        dev_host = os.getenv('HOST', '0.0.0.0')
+        app.run(host=dev_host, port=port, debug=dev_debug, use_reloader=False, threaded=True)
