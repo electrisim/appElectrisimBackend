@@ -1695,6 +1695,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             name = row['name'] if 'name' in row else f"Motor_{idx}"
             pn_mech_mw = row.get('pn_mech_mw', 0.0)
             cos_phi = row.get('cos_phi', 0.85)
+            cos_phi_n = row.get('cos_phi_n', cos_phi)
             efficiency_n_percent = row.get('efficiency_n_percent', 90.0)
             lrc_pu = row.get('lrc_pu')
             rx = row.get('rx', 0.0)
@@ -1705,7 +1706,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             in_service = row.get('in_service', True)
             lrc_param = f"lrc_pu={lrc_pu}" if lrc_pu is not None else "lrc_pu=None"
             lines.append(f"pp.create_motor(net, bus=bus_{bus}, name={_py_str(name)}, "
-                        f"pn_mech_mw={pn_mech_mw}, cos_phi={cos_phi}, efficiency_n_percent={efficiency_n_percent}, "
+                        f"pn_mech_mw={pn_mech_mw}, cos_phi={cos_phi}, cos_phi_n={cos_phi_n}, efficiency_n_percent={efficiency_n_percent}, "
                         f"{lrc_param}, rx={rx}, vn_kv={vn_kv}, efficiency_percent={efficiency_percent}, "
                         f"loading_percent={loading_percent}, scaling={scaling}, in_service={in_service})")
         lines.append("")
@@ -4875,9 +4876,13 @@ def create_other_elements(in_data,net,x, Busbars):
                 v = safe_float_local(in_data[x].get(key), default)
                 return v if v and v > 0 else default
             motor_vn_kv = _motor_positive('vn_kv', float(net.bus.at[bus_idx, 'vn_kv']))
+            motor_cos_phi = _motor_positive('cos_phi', 0.85)
             pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
                             pn_mech_mw=safe_float_local(in_data[x].get('pn_mech_mw'), 0.0),
-                            cos_phi=_motor_positive('cos_phi', 0.85),
+                            cos_phi=motor_cos_phi,
+                            # Rated power factor sizes the motor for short circuit; pandapower
+                            # rejects any motor without it.
+                            cos_phi_n=_motor_positive('cos_phi_n', motor_cos_phi),
                             efficiency_n_percent=_motor_positive('efficiency_n_percent', 90.0),
                             lrc_pu=lrc_pu_value,
                             rx=safe_float_local(in_data[x].get('rx'), 0.0),

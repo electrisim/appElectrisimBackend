@@ -329,7 +329,7 @@ def _add_motor_ansi(net, ppci, network: str):
         if lrc <= 0:
             continue
         rx = _f(row.get("rx"), 0.0)
-        cos_phi = _f(row.get("cos_phi"), 0.85) or 0.85
+        cos_phi = _f(row.get("cos_phi_n"), 0.0) or _f(row.get("cos_phi"), 0.85) or 0.85
         eff = _f(row.get("efficiency_n_percent"), 90.0) or 90.0
         sn = pn / (cos_phi * eff / 100.0) if cos_phi > 0 and eff > 0 else pn
         if sn <= 0:
