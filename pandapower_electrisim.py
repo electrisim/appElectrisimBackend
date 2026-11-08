@@ -3979,7 +3979,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 if value is not None and value not in ('None', '', 'null'):
                     try:
                         if param == 'parallel':
-                            line_params[param] = int(value)
+                            line_params[param] = max(1, safe_int(value, 1))
                         else:  # df
                             line_params[param] = float(value)
                     except (ValueError, TypeError):
@@ -4118,10 +4118,10 @@ def create_other_elements(in_data,net,x, Busbars):
             ext_grid_kw = dict(
                 vm_pu=ext_grid_vm_pu,
                 va_degree=safe_float(in_data[x]['va_degree']),
-                s_sc_max_mva=safe_float(in_data[x]['s_sc_max_mva']),
-                s_sc_min_mva=safe_float(in_data[x]['s_sc_min_mva']),
-                rx_max=safe_float(in_data[x]['rx_max']),
-                rx_min=safe_float(in_data[x]['rx_min']),
+                s_sc_max_mva=safe_float(in_data[x].get('s_sc_max_mva')),
+                s_sc_min_mva=safe_float(in_data[x].get('s_sc_min_mva')),
+                rx_max=safe_float(in_data[x].get('rx_max')),
+                rx_min=safe_float(in_data[x].get('rx_min')),
                 r0x0_max=safe_float(in_data[x].get('r0x0_max')),
                 x0x_max=safe_float(in_data[x].get('x0x_max')),
                 r0x0_min=_ext_grid_zero_seq_min(in_data[x], 'r0x0_min', safe_float(in_data[x].get('r0x0_max'))),
@@ -4355,7 +4355,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 bool_keys=('controllable',),
             )
             k_dialog = safe_float(in_data[x].get('k'), 0.0)
-            sgen_idx = pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'],
+            sgen_idx = pp.create_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_mw=safe_float(in_data[x]['p_mw']), q_mvar=safe_float(in_data[x]['q_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x].get('type') or 'wye',
                            k=(k_dialog if k_dialog > 0 else float('nan')), rx=safe_float(in_data[x]['rx']), generator_type=in_data[x]['generator_type'], lrc_pu=safe_float(in_data[x]['lrc_pu']), max_ik_ka=safe_float(in_data[x]['max_ik_ka']), current_source=in_data[x]['current_source'], kappa = 1.5, in_service=in_service,
                            **_sgen_opf)
             attach_converter_sc_inputs(net, sgen_idx, in_data[x])
@@ -4375,7 +4375,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=safe_float(in_data[x]['p_a_mw']), p_b_mw=safe_float(in_data[x]['p_b_mw']), p_c_mw=safe_float(in_data[x]['p_c_mw']), q_a_mvar=safe_float(in_data[x]['q_a_mvar']), q_b_mvar=safe_float(in_data[x]['q_b_mvar']), q_c_mvar=safe_float(in_data[x]['q_c_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x]['type'], in_service=in_service)   
+            pp.create_asymmetric_sgen(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], p_a_mw=safe_float(in_data[x]['p_a_mw']), p_b_mw=safe_float(in_data[x]['p_b_mw']), p_c_mw=safe_float(in_data[x]['p_c_mw']), q_a_mvar=safe_float(in_data[x]['q_a_mvar']), q_b_mvar=safe_float(in_data[x]['q_b_mvar']), q_c_mvar=safe_float(in_data[x]['q_c_mvar']), sn_mva=safe_float(in_data[x]['sn_mva']), scaling=safe_float(in_data[x].get('scaling'), 1.0), type=in_data[x].get('type') or 'wye', in_service=in_service)   
         #Zero sequence parameters** (Added through std_type For Three phase load flow) :
             #vk0_percent** - zero sequence relative short-circuit voltage
             #vkr0_percent** - real part of zero sequence relative short-circuit voltage
@@ -4420,8 +4420,8 @@ def create_other_elements(in_data,net,x, Busbars):
             tap_step_value = safe_float(in_data[x].get('tap_step_percent', None))
             if tap_step_value is None or tap_step_value == 0.0:
                 # Only use default if tap_max != tap_min (indicating tap control is intended)
-                tap_max_val = safe_int(in_data[x].get('tap_max', 0))
-                tap_min_val = safe_int(in_data[x].get('tap_min', 0))
+                tap_max_val = safe_int(in_data[x].get('tap_max'), 0)
+                tap_min_val = safe_int(in_data[x].get('tap_min'), 0)
                 if tap_max_val != tap_min_val and tap_max_val != 0:
                     tap_step_value = 1.5  # Standard default for distribution transformers
                 else:
@@ -4447,10 +4447,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 'parallel': float(parallel_value),
                 'shift_degree': safe_float(in_data[x].get('shift_degree', 0)) + phase_shift_from_group,
                 'tap_side': _normalize_tap_side(in_data[x].get('tap_side', 'hv')),
-                'tap_pos': float(safe_int(in_data[x].get('tap_pos', 0))),
-                'tap_neutral': float(safe_int(in_data[x].get('tap_neutral', 0))),
-                'tap_max': float(safe_int(in_data[x].get('tap_max', 0))),
-                'tap_min': float(safe_int(in_data[x].get('tap_min', 0))),
+                'tap_neutral': float(safe_int(in_data[x].get('tap_neutral'), 0)),
+                'tap_pos': float(safe_int(in_data[x].get('tap_pos'), safe_int(in_data[x].get('tap_neutral'), 0))),
+                'tap_max': float(safe_int(in_data[x].get('tap_max'), 0)),
+                'tap_min': float(safe_int(in_data[x].get('tap_min'), 0)),
                 'tap_step_percent': tap_step_value,
                 'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0)),
                 'tap_changer_type': tap_changer_type  # pandapower 3.0+
@@ -4585,10 +4585,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 'tap_step_percent': safe_float(in_data[x]['tap_step_percent']),
                 'tap_step_degree': safe_float(in_data[x].get('tap_step_degree', 0)),
                 'tap_side': _normalize_tap_side(in_data[x]['tap_side']),
-                'tap_neutral': float(safe_int(in_data[x].get('tap_neutral', 0))),
-                'tap_min': float(safe_int(in_data[x]['tap_min'])),
-                'tap_max': float(safe_int(in_data[x]['tap_max'])),
-                'tap_pos': float(safe_int(in_data[x]['tap_pos'])),
+                'tap_neutral': float(safe_int(in_data[x].get('tap_neutral'), 0)),
+                'tap_min': float(safe_int(in_data[x].get('tap_min'), 0)),
+                'tap_max': float(safe_int(in_data[x].get('tap_max'), 0)),
+                'tap_pos': float(safe_int(in_data[x].get('tap_pos'), safe_int(in_data[x].get('tap_neutral'), 0))),
                 'tap_changer_type': tap_changer_type_3w  # pandapower 3.0+
             }
             
@@ -4841,7 +4841,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_ward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'],qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], in_service=in_service)         
+            pp.create_ward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=safe_float(in_data[x].get('ps_mw'), 0.0),qs_mvar=safe_float(in_data[x].get('qs_mvar'), 0.0), pz_mw=safe_float(in_data[x].get('pz_mw'), 0.0), qz_mvar=safe_float(in_data[x].get('qz_mvar'), 0.0), in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Extended Ward")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -4851,7 +4851,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_xward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=in_data[x]['ps_mw'], qs_mvar=in_data[x]['qs_mvar'], pz_mw=in_data[x]['pz_mw'], qz_mvar=in_data[x]['qz_mvar'], r_ohm =in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'],vm_pu=in_data[x]['vm_pu'], in_service=in_service)         
+            pp.create_xward(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], ps_mw=safe_float(in_data[x].get('ps_mw'), 0.0), qs_mvar=safe_float(in_data[x].get('qs_mvar'), 0.0), pz_mw=safe_float(in_data[x].get('pz_mw'), 0.0), qz_mvar=safe_float(in_data[x].get('qz_mvar'), 0.0), r_ohm =safe_float(in_data[x].get('r_ohm'), 0.0), x_ohm=safe_float(in_data[x].get('x_ohm'), 0.0),vm_pu=safe_float(in_data[x].get('vm_pu'), 1.0), in_service=in_service)         
    
         if (in_data[x]['typ'].startswith("Motor")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -4877,7 +4877,7 @@ def create_other_elements(in_data,net,x, Busbars):
                 return v if v and v > 0 else default
             motor_vn_kv = _motor_positive('vn_kv', float(net.bus.at[bus_idx, 'vn_kv']))
             motor_cos_phi = _motor_positive('cos_phi', 0.85)
-            pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], 
+            pp.create_motor(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'],
                             pn_mech_mw=safe_float_local(in_data[x].get('pn_mech_mw'), 0.0),
                             cos_phi=motor_cos_phi,
                             # Rated power factor sizes the motor for short circuit; pandapower
@@ -4901,7 +4901,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_svc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'], in_service=in_service)
+            pp.create_svc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=safe_float(in_data[x].get('x_l_ohm'), 0.0), x_cvar_ohm=safe_float(in_data[x].get('x_cvar_ohm'), 0.0), set_vm_pu=safe_float(in_data[x].get('set_vm_pu'), 1.0), thyristor_firing_angle_degree=safe_float(in_data[x].get('thyristor_firing_angle_degree'), 0.0), controllable=_electrisim_boolish(in_data[x].get('controllable') if in_data[x].get('controllable') not in ('', None) else True, True), min_angle_degree=safe_float(in_data[x].get('min_angle_degree'), 90.0), max_angle_degree=safe_float(in_data[x].get('max_angle_degree'), 180.0), in_service=in_service)
          
         if (in_data[x]['typ'].startswith("TCSC")):
             from_bus_idx = Busbars.get(in_data[x]['busFrom'])
@@ -4914,7 +4914,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            pp.create_tcsc(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=in_data[x]['x_l_ohm'], x_cvar_ohm=in_data[x]['x_cvar_ohm'], set_p_to_mw=in_data[x]['set_p_to_mw'], thyristor_firing_angle_degree=in_data[x]['thyristor_firing_angle_degree'], controllable=in_data[x]['controllable'], min_angle_degree=in_data[x]['min_angle_degree'], max_angle_degree=in_data[x]['max_angle_degree'], in_service=in_service)
+            pp.create_tcsc(net, from_bus=from_bus_idx, to_bus=to_bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], x_l_ohm=safe_float(in_data[x].get('x_l_ohm'), 0.0), x_cvar_ohm=safe_float(in_data[x].get('x_cvar_ohm'), 0.0), set_p_to_mw=safe_float(in_data[x].get('set_p_to_mw'), 0.0), thyristor_firing_angle_degree=safe_float(in_data[x].get('thyristor_firing_angle_degree'), 0.0), controllable=_electrisim_boolish(in_data[x].get('controllable') if in_data[x].get('controllable') not in ('', None) else True, True), min_angle_degree=safe_float(in_data[x].get('min_angle_degree'), 90.0), max_angle_degree=safe_float(in_data[x].get('max_angle_degree'), 180.0), in_service=in_service)
                    
         if (in_data[x]['typ'].startswith("SSC")):
             bus_idx = Busbars.get(in_data[x]['bus'])
@@ -4924,7 +4924,7 @@ def create_other_elements(in_data,net,x, Busbars):
             in_service = True
             if 'in_service' in in_data[x]:
                 in_service = bool(in_data[x]['in_service']) if isinstance(in_data[x]['in_service'], bool) else (in_data[x]['in_service'] == 'true' or in_data[x]['in_service'] == True)
-            ssc_idx = pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=in_data[x]['r_ohm'], x_ohm=in_data[x]['x_ohm'], set_vm_pu=in_data[x]['set_vm_pu'], vm_internal_pu=in_data[x]['vm_internal_pu'], va_internal_degree=in_data[x]['va_internal_degree'], controllable=_electrisim_boolish(in_data[x].get('controllable') if in_data[x].get('controllable') not in ('', None) else True, True), in_service=in_service)
+            ssc_idx = pp.create_ssc(net, bus=bus_idx, name=in_data[x]['name'], id=in_data[x]['id'], r_ohm=safe_float(in_data[x].get('r_ohm'), 0.0), x_ohm=safe_float(in_data[x].get('x_ohm'), 0.0), set_vm_pu=safe_float(in_data[x].get('set_vm_pu'), 1.0), vm_internal_pu=safe_float(in_data[x].get('vm_internal_pu'), 1.0), va_internal_degree=safe_float(in_data[x].get('va_internal_degree'), 0.0), controllable=_electrisim_boolish(in_data[x].get('controllable') if in_data[x].get('controllable') not in ('', None) else True, True), in_service=in_service)
             # Q rating from the STATCOM dialog (generator convention: max >= 0 capacitive,
             # min <= 0 inductive). Used by Grid Code P-Q to push the STATCOM to its limits.
             for _col in ('q_max_mvar', 'q_min_mvar'):
@@ -10275,6 +10275,134 @@ def _truncate_solver_verbose_log(text: str, max_chars: int = 750_000) -> str:
     return text[:max_chars] + "\n\n… [output truncated — reduce diagram size or keep Suppress warnings enabled]\n"
 
 
+def _opf_phase_shifts_loop_free(net):
+    """True when the network has transformer phase shifts but no loop closes over one.
+
+    Walk the in-service branches carrying the phase shift; a branch that reaches an already
+    visited bus with a different shift means a loop in which the shift drives power.
+    """
+    try:
+        edges = {}
+
+        def add(a, b, shift):
+            edges.setdefault(int(a), []).append((int(b), float(shift)))
+            edges.setdefault(int(b), []).append((int(a), -float(shift)))
+
+        def in_service(row):
+            return _electrisim_boolish(row.get('in_service', True), True)
+
+        has_shift = False
+        for _, row in net.line.iterrows():
+            if in_service(row):
+                add(row['from_bus'], row['to_bus'], 0.0)
+        if 'switch' in net and not net.switch.empty:
+            for _, row in net.switch.iterrows():
+                if row.get('et') == 'b' and _electrisim_boolish(row.get('closed', True), True):
+                    add(row['bus'], row['element'], 0.0)
+        for _, row in net.trafo.iterrows():
+            if not in_service(row):
+                continue
+            sh = float(row.get('shift_degree') or 0.0)
+            has_shift = has_shift or abs(sh % 360.0) > 1e-6
+            add(row['hv_bus'], row['lv_bus'], sh)
+        if 'trafo3w' in net and not net.trafo3w.empty:
+            for _, row in net.trafo3w.iterrows():
+                if not in_service(row):
+                    continue
+                sm = float(row.get('shift_mv_degree') or 0.0)
+                sl = float(row.get('shift_lv_degree') or 0.0)
+                has_shift = has_shift or abs(sm % 360.0) > 1e-6 or abs(sl % 360.0) > 1e-6
+                add(row['hv_bus'], row['mv_bus'], sm)
+                add(row['hv_bus'], row['lv_bus'], sl)
+        for table in ('impedance', 'dcline'):
+            df = getattr(net, table, None)
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    if in_service(row):
+                        add(row['from_bus'], row['to_bus'], 0.0)
+        if not has_shift:
+            return False
+        offset = {}
+        for start in [int(x) for x in net.bus.index]:
+            if start in offset:
+                continue
+            offset[start] = 0.0
+            stack = [start]
+            while stack:
+                u = stack.pop()
+                for v, sh in edges.get(u, []):
+                    want = offset[u] + sh
+                    if v not in offset:
+                        offset[v] = want
+                        stack.append(v)
+                    elif abs(((offset[v] - want) + 180.0) % 360.0 - 180.0) > 1e-6:
+                        return False
+        return True
+    except Exception as exc:
+        print(f"OPF phase-shift loop check failed: {exc}")
+        return False
+
+
+def _opf_infeasibility_hint(net):
+    """Explain a failed OPF in plain words: with nothing controllable OPF can only check the
+    operating point, so run a load flow and list the voltage / loading limits it breaks."""
+    def _controllable(table):
+        df = getattr(net, table, None)
+        if df is None or df.empty or 'controllable' not in df.columns:
+            return 0
+        return int(sum(_electrisim_boolish(v, False) for v in df['controllable'].tolist()))
+
+    try:
+        n_ctrl = sum(_controllable(t) for t in ('gen', 'sgen', 'storage', 'load', 'ext_grid'))
+        if not net.gen.empty and 'controllable' not in net.gen.columns:
+            n_ctrl += len(net.gen)  # pandapower treats generators as controllable by default
+        if hasattr(net, 'dcline') and not net.dcline.empty:
+            n_ctrl += len(net.dcline)
+        probe = deepcopy(net)
+        try:
+            pp.runpp(probe, calculate_voltage_angles='auto')
+        except Exception:
+            return ("No element is controllable and a plain load flow of this network does not converge either."
+                    if n_ctrl == 0 else "")
+        lines = []
+        vm = probe.res_bus['vm_pu']
+        for side, col, cmp in (('above', 'max_vm_pu', vm.gt), ('below', 'min_vm_pu', vm.lt)):
+            if col not in probe.bus.columns:
+                continue
+            lim = pd.to_numeric(probe.bus[col], errors='coerce')
+            bad = cmp(lim + (1e-4 if side == 'above' else -1e-4)) & lim.notna() & probe.bus['in_service']
+            if bad.any():
+                worst = (vm[bad] - lim[bad]).abs().idxmax()
+                lines.append(
+                    f"• {int(bad.sum())} bus(es) {side} their voltage limit; worst {float(vm[worst]):.3f} pu "
+                    f"vs {float(lim[worst]):.2f} pu at a {float(probe.bus.at[worst, 'vn_kv']):g} kV bus.")
+        for table, label in (('line', 'line'), ('trafo', 'transformer'), ('trafo3w', 'three-winding transformer')):
+            df = getattr(probe, table, None)
+            res = getattr(probe, 'res_' + table, None)
+            if df is None or df.empty or res is None or 'max_loading_percent' not in df.columns:
+                continue
+            lim = pd.to_numeric(df['max_loading_percent'], errors='coerce')
+            bad = (lim > 0) & (res['loading_percent'] > lim + 1e-3)
+            if bad.any():
+                lines.append(f"• {int(bad.sum())} {label}(s) above their maximum loading "
+                             f"(worst {float(res.loc[bad, 'loading_percent'].max()):.0f} %).")
+        if n_ctrl == 0:
+            head = ("No generator, static generator, storage, load or external grid is set as controllable, "
+                    "so OPF cannot change the operating point; it can only check it.")
+            if lines:
+                return head + " At that point a load flow breaks these limits:\n" + "\n".join(lines) + \
+                    "\nMake elements controllable (with P/Q limits), or relax the limits / set points."
+            return (head + " A load flow of that point stays within the voltage and loading limits, so "
+                    "run Load Flow for these results, or make the elements you want optimised controllable.")
+        if lines:
+            return ("Without optimisation a load flow breaks these limits, and the controllable elements' "
+                    "P/Q ranges may be too narrow to fix them:\n" + "\n".join(lines))
+        return ""
+    except Exception as hint_exc:  # the hint must never hide the original error
+        print(f"OPF infeasibility hint failed: {hint_exc}")
+        return ""
+
+
 def optimalPowerFlow(net, opf_params):
     """
     Run optimal power flow using pandapower.runopp (AC) or pandapower.rundcopp (DC)
@@ -10361,17 +10489,26 @@ def optimalPowerFlow(net, opf_params):
 
         # OPF limits for external grids / storage (needed for PWL breakpoints)
         if not net.ext_grid.empty:
+            # pandapower applies these P limits to the slack even when it is not controllable. A
+            # missing limit, or the diagram default 0 / 0, means "not set": the grid must be able to
+            # import and export (min_p_mw = 0 made every exporting network, e.g. a wind farm or a
+            # generator larger than the load, infeasible).
+            _EG_P_WIDE = 1e6
             if 'min_p_mw' not in net.ext_grid.columns:
-                net.ext_grid['min_p_mw'] = 0.0
-            else:
-                net.ext_grid['min_p_mw'] = pd.to_numeric(net.ext_grid['min_p_mw'], errors='coerce').fillna(0.0)
+                net.ext_grid['min_p_mw'] = float('nan')
             if 'max_p_mw' not in net.ext_grid.columns:
-                net.ext_grid['max_p_mw'] = 1e6
-            else:
-                net.ext_grid['max_p_mw'] = pd.to_numeric(net.ext_grid['max_p_mw'], errors='coerce')
-                net.ext_grid['max_p_mw'] = net.ext_grid['max_p_mw'].where(net.ext_grid['max_p_mw'].notna(), 1e6)
-            slack_need_wide_cap = net.ext_grid['max_p_mw'] <= net.ext_grid['min_p_mw']
-            net.ext_grid.loc[slack_need_wide_cap, 'max_p_mw'] = net.ext_grid.loc[slack_need_wide_cap, 'min_p_mw'] + 1e6
+                net.ext_grid['max_p_mw'] = float('nan')
+            _mn = pd.to_numeric(net.ext_grid['min_p_mw'], errors='coerce')
+            _mx = pd.to_numeric(net.ext_grid['max_p_mw'], errors='coerce')
+            _unset = (_mn.isna() & _mx.isna()) | ((_mn.fillna(0.0) == 0.0) & (_mx.fillna(0.0) == 0.0))
+            _mn = _mn.where(_mn.notna(), -_EG_P_WIDE)
+            _mx = _mx.where(_mx.notna(), _EG_P_WIDE)
+            _mn[_unset] = -_EG_P_WIDE
+            _mx[_unset] = _EG_P_WIDE
+            slack_need_wide_cap = _mx <= _mn
+            _mx[slack_need_wide_cap] = _mn[slack_need_wide_cap] + _EG_P_WIDE
+            net.ext_grid['min_p_mw'] = _mn.astype(float)
+            net.ext_grid['max_p_mw'] = _mx.astype(float)
 
         if hasattr(net, 'storage') and not net.storage.empty:
             if 'min_p_mw' not in net.storage.columns:
@@ -10681,7 +10818,8 @@ def optimalPowerFlow(net, opf_params):
         # Run optimal power flow based on type
         from pandapower.auxiliary import OPFNotConverged as _OPFNotConverged
 
-        def _run_opf_once(use_init, use_numba, verbose_solver):
+        def _run_opf_once(use_init, use_numba, verbose_solver, use_angles=None):
+            angles = calculate_voltage_angles if use_angles is None else use_angles
             if opf_type == 'ac':
                 pp.runopp(
                     net,
@@ -10691,7 +10829,7 @@ def optimalPowerFlow(net, opf_params):
                     trafo_model=trafo_model,
                     trafo_loading=trafo_loading,
                     ac_line_model=ac_line_model,
-                    calculate_voltage_angles=calculate_voltage_angles,
+                    calculate_voltage_angles=angles,
                     init=use_init,
                     numba=use_numba,
                 )
@@ -10722,6 +10860,17 @@ def optimalPowerFlow(net, opf_params):
             if numba:
                 _push('flat', False)
 
+        # pandapower's AC OPF often fails on networks with Dyn transformers (150/330 degree shifts),
+        # even radial ones. Where no loop closes over a phase shift, leaving the shifts out changes
+        # only the reported angles, so try that last.
+        _angle_free_attempt = None
+        _solver_attempts = [(a[0], a[1], None) for a in _solver_attempts]
+        if (opf_type == 'ac' and str(calculate_voltage_angles).lower() not in ('false', '0', 'no')
+                and _opf_phase_shifts_loop_free(net)):
+            _angle_free_attempt = ('flat', False, False)
+            _solver_attempts.append(_angle_free_attempt)
+        _used_attempt = None
+
         buf = None
         if not suppress_warnings:
             buf = io.StringIO()
@@ -10736,16 +10885,18 @@ def optimalPowerFlow(net, opf_params):
 
                 _saved_printpf_fd = _pp_opf_core.stdout
                 try:
-                    for attempt_idx, (use_init, use_numba) in enumerate(_solver_attempts):
+                    for attempt_idx, (use_init, use_numba, use_angles) in enumerate(_solver_attempts):
                         if attempt_idx > 0:
                             buf.write(
                                 f"\n\n===== OPF retry {attempt_idx + 1}/{len(_solver_attempts)} "
-                                f"(init={use_init!r}, numba={use_numba}) =====\n"
+                                f"(init={use_init!r}, numba={use_numba}"
+                                f"{', without transformer phase shifts' if use_angles is False else ''}) =====\n"
                             )
                         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                             _pp_opf_core.stdout = sys.stdout
                             try:
-                                _run_opf_once(use_init, use_numba, verbose_solver=True)
+                                _run_opf_once(use_init, use_numba, verbose_solver=True, use_angles=use_angles)
+                                _used_attempt = (use_init, use_numba, use_angles)
                                 break
                             except _OPFNotConverged:
                                 if attempt_idx == len(_solver_attempts) - 1:
@@ -10754,9 +10905,10 @@ def optimalPowerFlow(net, opf_params):
                     _pp_opf_core.stdout = _saved_printpf_fd
                 solver_verbose_text = buf.getvalue()
             else:
-                for attempt_idx, (use_init, use_numba) in enumerate(_solver_attempts):
+                for attempt_idx, (use_init, use_numba, use_angles) in enumerate(_solver_attempts):
                     try:
-                        _run_opf_once(use_init, use_numba, verbose_solver=False)
+                        _run_opf_once(use_init, use_numba, verbose_solver=False, use_angles=use_angles)
+                        _used_attempt = (use_init, use_numba, use_angles)
                         break
                     except _OPFNotConverged:
                         if attempt_idx == len(_solver_attempts) - 1:
@@ -10773,6 +10925,9 @@ def optimalPowerFlow(net, opf_params):
         # Initialize diagnostic response
         exc_text = str(e)
         if isinstance(e, OPFNotConverged) or "did not converge" in exc_text.lower():
+            _hint = _opf_infeasibility_hint(net)
+            if _hint:
+                exc_text += "\n\nLikely cause:\n" + _hint
             exc_text += (
                 "\n\nTips:\n"
                 "• The backend already retries AC OPF with **init=flat** (and **numba off** if needed) after a "
@@ -11328,6 +11483,12 @@ def optimalPowerFlow(net, opf_params):
         if solver_verbose_text.strip():
             response_data['solver_verbose_log'] = _truncate_solver_verbose_log(solver_verbose_text)
 
+        if _angle_free_attempt is not None and _used_attempt == _angle_free_attempt:
+            response_data.setdefault('warnings', []).append(
+                "OPF converged only without transformer phase shifts (e.g. Dyn5 = 150\u00b0). No loop in this "
+                "network closes over a phase shift, so powers, currents and voltage magnitudes are unaffected; "
+                "bus voltage angles are shown without the transformer shifts.")
+
         # Label for UI: study currency from OPF payload (coefficient column names stay EUR-style in pandapower).
         response_data['cost_currency'] = str(opf_params.get('cost_currency') or 'EUR')
 
@@ -11751,13 +11912,24 @@ def safe_float(value, default=0.0):
         return default
 
 def safe_int(value, default=1):
-    """Convert value to int with default fallback. Handles 'null', 'None', empty string."""
+    """Convert value to int with default fallback. Handles 'null', 'None', empty string and NaN.
+
+    Whole numbers written as floats ("2.0", -1.0 from imported networks) are accepted; before,
+    they fell back to the default, so a tap position of "-1.0" became +1.
+    """
     if value is None or value == 'null' or value == 'None' or value == '':
         return default
     try:
         return int(value)
     except (ValueError, TypeError):
+        pass
+    try:
+        f = float(value)
+    except (ValueError, TypeError):
         return default
+    if f != f or f in (float('inf'), float('-inf')):
+        return default
+    return int(round(f))
 
 def parse_vector_group(vector_group):
     """Parse vector group to extract base group and phase shift number.

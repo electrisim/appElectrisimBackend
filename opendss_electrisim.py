@@ -256,9 +256,178 @@ def _opendss_float(val, default=0.0):
     try:
         if val is None or val == '':
             return default
-        return float(val)
+        f = float(val)
+        return default if f != f else f
     except (TypeError, ValueError):
         return default
+
+
+def _opendss_tap_ratio_change(element_data):
+    """Per-unit ratio change of an OLTC: (tap_pos - tap_neutral) * tap_step_percent / 100.
+
+    Imported and CIGRE transformers send "null" for unused tap fields; a missing position means
+    the neutral tap (as in pandapower_electrisim), and a missing step means no tap effect.
+    """
+    tap_neutral = _opendss_float(element_data.get('tap_neutral'), 0.0)
+    tap_pos = _opendss_float(element_data.get('tap_pos'), tap_neutral)
+    tap_step_percent = _opendss_float(element_data.get('tap_step_percent'), 0.0)
+    return (tap_pos - tap_neutral) * tap_step_percent / 100.0
+
+
+def _opendss_tap_side(element_data, default='hv'):
+    side = str(element_data.get('tap_side') or '').strip().lower()
+    return side if side in ('hv', 'mv', 'lv') else default
+
+
+# Set while the snapshot load flow builds its circuit (see powerflow()).
+_opendss_lf_shift_conns = False
+
+
+def _vector_group_has_odd_shift(vector_group):
+    """Dy / Yd / Yz style groups (30 degree class); Yy, Dd and Dz are 0 degree class."""
+    vg = str(vector_group or '').upper().replace(' ', '')
+    letters = [c for c in vg if c in 'DYZ']
+    if len(letters) < 2:
+        return False
+    hv, lv = letters[0], letters[1]
+    return hv != lv and {hv, lv} != {'D', 'Z'}
+
+
+def _opendss_in_service(element_data):
+    val = element_data.get('in_service', True)
+    if isinstance(val, str):
+        return val.strip().lower() not in ('false', 'no', '0')
+    return val not in (False, 0, None)
+
+
+def _opendss_vector_groups_break_loops(in_data):
+    """True when the drawn vector groups give some loop another net phase shift than pandapower.
+
+    OpenDSS shifts every mixed delta/wye pair by 30 degrees (ANSI lag) and ignores clock numbers;
+    pandapower uses shift_degree. Only loops matter (a radial transformer just rotates everything
+    behind it): around each loop, and between external grids, the OpenDSS shifts must add up to the
+    same angle as pandapower's, or circulating currents appear (case14: 4-9 versus 4-7-9 with the
+    imported default "Dyn" and shift_degree 0 was 0.04 pu off). When they do add up (CIGRE HV: all
+    Dyn, 0 and 330 degrees) the vector groups are kept: there the 0 degree wye-wye replacement
+    leaves a circuit OpenDSS's iteration does not converge on.
+    """
+    if not isinstance(in_data, dict):
+        return False
+
+    def key(ref):
+        return _sanitize_opendss_name(ref).lower() if ref else None
+
+    vn = {}
+    for elem in in_data.values():
+        if isinstance(elem, dict) and str(elem.get('typ', '')).startswith('Bus') and elem.get('name'):
+            vn[key(elem['name'])] = _opendss_float(elem.get('vn_kv'), 0.0)
+
+    opened = set()
+    for elem in in_data.values():
+        if isinstance(elem, dict) and elem.get('typ') == 'Switch':
+            closed = elem.get('closed', True)
+            if isinstance(closed, str):
+                closed = closed.strip().lower() not in ('false', 'no', '0', 'open')
+            if not closed and str(elem.get('et', 'l')).lower() in ('l', 'line', 't', 'trafo'):
+                opened.add(key(elem.get('element')))
+
+    edges = []   # (bus_a, bus_b, OpenDSS shift minus pandapower shift, degrees, a -> b)
+
+    def mixed(c1, c2):
+        return 30.0 if {c1, c2} == {'wye', 'delta'} else 0.0
+
+    for elem in in_data.values():
+        if not isinstance(elem, dict) or not _opendss_in_service(elem):
+            continue
+        typ = str(elem.get('typ', ''))
+        low = typ.lower()
+        name = key(elem.get('name'))
+        if name in opened:
+            continue
+        if typ.startswith('Three Winding'):
+            hv, mv, lv = key(elem.get('hv_bus')), key(elem.get('mv_bus')), key(elem.get('lv_bus'))
+            if not (hv and mv and lv):
+                continue
+            vg = elem.get('vector_group') or 'YNdd'
+            if str(vg).strip().lower() in ('null', 'none', 'undefined'):
+                vg = 'YNdd'
+            c_hv, c_mv, c_lv = vector_group_to_opendss_conns_3w(vg).split()
+            edges.append((hv, mv, mixed(c_hv, c_mv) - _opendss_float(elem.get('shift_mv_degree'), 0.0)))
+            edges.append((hv, lv, mixed(c_hv, c_lv) - _opendss_float(elem.get('shift_lv_degree'), 0.0)))
+        elif typ.startswith('Transformer') or typ.startswith('Two Winding'):
+            a, c = key(elem.get('busFrom') or elem.get('hv_bus')), key(elem.get('busTo') or elem.get('lv_bus'))
+            if not (a and c):
+                continue
+            if '1ph' in low:
+                edges.append((a, c, 0.0))
+                continue
+            if vn.get(a, 0.0) < vn.get(c, 0.0):
+                a, c = c, a
+            vg = elem.get('vector_group')
+            has_vg = isinstance(vg, str) and vg.strip() and vg.strip().lower() not in ('null', 'none', 'undefined')
+            shift_pp = _opendss_float(elem.get('shift_degree'), 0.0)
+            if has_vg:
+                s_dss = 30.0 if _vector_group_has_odd_shift(vg) else 0.0
+            else:
+                s_dss = 0.0 if abs(shift_pp % 360.0) < 1e-6 else 30.0
+            edges.append((a, c, s_dss - shift_pp))
+        elif typ == 'Switch':
+            if str(elem.get('et', '')).lower() in ('b', 'bus'):
+                closed = elem.get('closed', True)
+                if isinstance(closed, str):
+                    closed = closed.strip().lower() not in ('false', 'no', '0', 'open')
+                if closed and elem.get('bus') and elem.get('element'):
+                    edges.append((key(elem['bus']), key(elem['element']), 0.0))
+        elif typ in ('External Grid', 'Source 1ph') and elem.get('bus'):
+            edges.append(('__ground__', key(elem['bus']), 0.0))
+        elif elem.get('busFrom') and elem.get('busTo') and 'dc' not in low and 'vsc' not in low:
+            edges.append((key(elem['busFrom']), key(elem['busTo']), 0.0))
+
+    adjacency = {}
+    for a, c, d in edges:
+        if a and c and a != c:
+            adjacency.setdefault(a, []).append((c, d))
+            adjacency.setdefault(c, []).append((a, -d))
+    potential = {}
+    for start in adjacency:
+        if start in potential:
+            continue
+        potential[start] = 0.0
+        stack = [start]
+        while stack:
+            u = stack.pop()
+            for v, d in adjacency[u]:
+                expected = potential[u] + d
+                if v not in potential:
+                    potential[v] = expected
+                    stack.append(v)
+                else:
+                    gap = (expected - potential[v]) % 360.0
+                    if min(gap, 360.0 - gap) > 0.5:
+                        return True
+    return False
+
+
+def _opendss_trafo_vector_group(element_data):
+    """Vector group for the OpenDSS winding connections.
+
+    When the diagram gives none, a 0 degree phase shift means wye-wye: every transformer used to be
+    built as Dyn, which adds a 30 degree shift that pandapower (shift_degree 0) does not have.
+    In a load flow whose vector groups break a loop (_opendss_vector_groups_break_loops) the phase
+    shift decides: imported transformers carry the default "Dyn" with shift_degree 0, and in meshed
+    grids (case14: 4-7-9 versus 4-9) the extra 30 degree shifts drove circulating currents
+    (voltages 0.04 pu off). Zero-sequence studies keep the vector group.
+    """
+    vg = element_data.get('vector_group')
+    has_vg = isinstance(vg, str) and vg.strip() and vg.strip().lower() not in ('null', 'none', 'undefined')
+    shift_raw = element_data.get('shift_degree')
+    shift = _opendss_float(shift_raw, None) if shift_raw not in (None, '') else None
+    if has_vg:
+        if (_opendss_lf_shift_conns and shift is not None and abs(shift % 360.0) < 1e-6
+                and _vector_group_has_odd_shift(vg)):
+            return 'YNyn'
+        return vg.strip()
+    return 'YNyn' if abs((shift or 0.0) % 360.0) < 1e-6 else 'Dyn'
 
 
 def _opendss_storage_fixed_pf_suffix(element_data, storage_state):
@@ -402,6 +571,34 @@ def _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name):
     return None
 
 
+def _opendss_pu_base_kv_ll(dss_mod, user_vn_kv):
+    """Line-to-line base kV for per-unit voltages of the active bus.
+
+    pandapower divides by the bus vn_kv, so the diagram value is used. calcv picks each bus's
+    base by rounding a no-load solution to the nearest listed voltage: case14's 12 kV bus 8,
+    next to the 14 kV bus 7, got 14 kV, read 0.93 pu instead of 1.09 and the generator voltage
+    control held the wrong voltage. The calcv base is kept only when the diagram has no value or
+    one far from it (a bus imported at another voltage level).
+    """
+    try:
+        user = float(user_vn_kv)
+    except (TypeError, ValueError):
+        user = 0.0
+    if user != user:
+        user = 0.0
+    try:
+        calc = float(dss_mod.Bus.kVBase()) * math.sqrt(3)
+    except (TypeError, ValueError):
+        calc = 0.0
+    if calc != calc:
+        calc = 0.0
+    if user > 0 and (calc <= 0 or 2.0 / 3.0 <= user / calc <= 1.5):
+        return user
+    if calc > 0:
+        return calc
+    return None
+
+
 def _opendss_single_phase_bus_voltage(dss_mod, user_vn_kv):
     """Solved voltage for a bus that has one node.
 
@@ -467,15 +664,9 @@ def _opendss_read_bus_vm_pu(dss_mod, bus_name, BusbarsDictVoltage):
         a2 = complex(-0.5, -math.sqrt(3) / 2.0)
         v1 = (va + a * vb + a2 * vc) / 3.0
         v1_ll_kv = abs(v1) * math.sqrt(3)
-        try:
-            base_ln = float(dss_mod.Bus.kVBase())
-            if base_ln > 0:
-                return v1_ll_kv / (base_ln * math.sqrt(3))
-        except (TypeError, ValueError):
-            pass
-        base_kv = _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name)
-        if base_kv and float(base_kv) > 0:
-            return v1_ll_kv / float(base_kv)
+        base_kv = _opendss_pu_base_kv_ll(dss_mod, _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name))
+        if base_kv:
+            return v1_ll_kv / base_kv
     except Exception:
         return None
     return None
@@ -625,12 +816,411 @@ def _opendss_snapshot_solve_plans(algorithm, max_iterations):
     return plans
 
 
-def _opendss_solve_snapshot_plan(dss_mod, execute_dss_command, plan, generators_dict=None):
-    """Solve a freshly built circuit for one plan; Vminpu plans relax then restore PQ behaviour."""
+# Synchronous generators (PV buses) of the circuit being built: name -> bus, vset (pu), q0 and qmax (kvar).
+_opendss_pv_generators = {}
+
+
+def _opendss_generator_kvar(dss_mod, generators):
+    """kvar each generator injects in the present solution (generator convention)."""
+    out = {}
+    for name in generators:
+        try:
+            dss_mod.Circuit.SetActiveElement(f'Generator.{name}')
+            powers = dss_mod.CktElement.Powers()
+            phases = int(dss_mod.CktElement.NumPhases() or 3)
+            kvar = -sum(powers[1:2 * phases:2])
+            if math.isfinite(kvar):
+                out[name] = float(kvar)
+        except Exception:
+            pass
+    return out
+
+
+def _opendss_pv_setpoints_missed(dss_mod, BusbarsDictVoltage, source_bus=None, tol_pu=1e-3):
+    """True when the solve did not converge or a generator bus is off its voltage set point."""
+    try:
+        if not dss_mod.Solution.Converged():
+            return True
+    except Exception:
+        return True
+    slack = str(source_bus or '').lower()
+    for g in _opendss_pv_generators.values():
+        bus = str(g['bus'])
+        if bus.lower() == slack:
+            continue
+        v = _opendss_read_bus_vm_pu(dss_mod, bus, BusbarsDictVoltage)
+        if v is None or not math.isfinite(v) or abs(v - float(g['vset'])) > tol_pu:
+            return True
+    return False
+
+
+def _opendss_regulate_pv_generators(dss_mod, BusbarsDictVoltage, source_bus=None, max_iter=40, tol_pu=1e-5,
+                                    start_kvar=None):
+    """Hold every generator bus at its voltage set point, like a pandapower gen (PV bus).
+
+    OpenDSS's Generator Model=3 adjusts kvar with a fixed gain: with a wide Q range it oscillates
+    and never converges (meshed grids, 0 MW condensers in case14), with a narrow one it is just a
+    PQ injection, so transmission cases came out 0.05-0.15 pu low. Here the units run as Model=1
+    and their kvar is corrected together with Newton steps on a measured dV/dQ matrix (one
+    perturbation solve per controlled bus, measured again when progress stalls) and step halving
+    when the error grows. Units on the source bus are not regulated (the source fixes that
+    voltage). Returns (ok, message, kvar per unit); on failure the caller restores Model=3.
+    """
+    import numpy as np
+
+    gens = dict(_opendss_pv_generators)
+    if not gens:
+        return True, None, {}
+    groups = {}
+    for name, g in gens.items():
+        groups.setdefault(str(g['bus']).lower(), []).append(name)
+    slack = str(source_bus or '').lower()
+    controlled = [bus for bus in groups if bus != slack]
+    if len(controlled) > 250:
+        return False, f'{len(controlled)} generator buses is too many for PV control', None
+
+    def run(cmd):
+        dss_mod.Text.Command(cmd)
+
+    start_kvar = start_kvar or {}
+    q = {bus: sum(start_kvar.get(n, gens[n]['q0']) for n in names) for bus, names in groups.items()}
+    qmax = {bus: sum(gens[n]['qmax'] for n in names) for bus, names in groups.items()}
+    vset = {bus: float(gens[names[0]]['vset']) for bus, names in groups.items()}
+
+    def apply(bus):
+        names = groups[bus]
+        for n in names:
+            run(f'Edit Generator.{n} Model=1 kvar={q[bus] / len(names):.6f}')
+
+    def solve():
+        run('solve')
+        return _opendss_circuit_has_usable_solution(dss_mod)
+
+    def final():
+        return {n: q[bus] / len(names) for bus, names in groups.items() for n in names}
+
+    def measure():
+        out = []
+        for bus in controlled:
+            v = _opendss_read_bus_vm_pu(dss_mod, bus, BusbarsDictVoltage)
+            if v is None or not math.isfinite(v):
+                return None
+            out.append(v)
+        return np.array(out)
+
+    def sensitivity(v_base):
+        sens = np.zeros((len(controlled), len(controlled)))
+        for j, bus in enumerate(controlled):
+            dq = max(1000.0, 0.01 * qmax[bus])
+            q[bus] += dq
+            apply(bus)
+            vj = measure() if solve() else None
+            q[bus] -= dq
+            apply(bus)
+            if vj is None:
+                return None
+            sens[:, j] = (vj - v_base) / dq
+        return sens
+
+    for bus in groups:
+        apply(bus)
+    if not solve():
+        return False, 'the load flow with fixed generator Q did not solve', None
+    if not controlled:
+        return True, None, final()
+    v = measure()
+    if v is None:
+        return False, 'generator bus voltages could not be read', None
+    target = np.array([vset[bus] for bus in controlled])
+    sens = sensitivity(v)
+    if sens is None or not solve():
+        return False, 'the voltage sensitivity solve failed', None
+    v = measure()
+    if v is None:
+        return False, 'generator bus voltages could not be read', None
+    active = [i for i in range(len(controlled)) if abs(sens[i, i]) > 1e-12]
+    remeasures = 8
+    prev_norm = None
+    for _ in range(max_iter):
+        err = target - v
+        norm = max((abs(err[i]) for i in active), default=0.0)
+        if norm < tol_pu:
+            return True, None, final()
+        if prev_norm is not None and norm > 0.5 * prev_norm and remeasures > 0:
+            # Slow progress: the operating point moved away from where dV/dQ was measured.
+            remeasures -= 1
+            new_sens = sensitivity(v)
+            if new_sens is None or not solve():
+                return False, 'the voltage sensitivity solve failed', None
+            sens = new_sens
+            v = measure()
+            if v is None:
+                return False, 'generator bus voltages could not be read', None
+            err = target - v
+            norm = max((abs(err[i]) for i in active), default=0.0)
+        step = np.linalg.lstsq(sens[np.ix_(active, active)], err[active], rcond=None)[0]
+        q_start = dict(q)
+        alpha = 1.0
+        v_new = None
+        for _halving in range(6):
+            for k, i in enumerate(active):
+                bus = controlled[i]
+                value = q_start[bus] + alpha * float(step[k])
+                q[bus] = max(-qmax[bus], min(qmax[bus], value))
+                apply(bus)
+            v_new = measure() if solve() else None
+            if v_new is not None and max(abs(target[i] - v_new[i]) for i in active) < norm:
+                break
+            alpha *= 0.5
+        if v_new is None:
+            return False, 'the load flow diverged while regulating generator voltages', None
+        active = [i for i in active if abs(q[controlled[i]]) < qmax[controlled[i]] - 1e-6]
+        prev_norm = norm
+        v = v_new
+    worst = max((abs(target[i] - v[i]) for i in active), default=0.0)
+    if worst < 1e-3:
+        return True, None, final()
+    return False, f'generator voltages did not reach their set points (off by {worst:.4f} pu)', None
+
+
+def _opendss_regulate_pv_with_sources(dss_mod, BusbarsDictVoltage, source_bus=None, max_iter=30):
+    """Hold generator buses at their set points with temporary voltage sources, then hand back.
+
+    OpenDSS injects generator power as a current at every iteration. On meshed transmission grids
+    with large units (case39: 0.25-1 GW at 345 kV) that iteration diverges even when the units are
+    given pandapower's own P and Q, so neither Model=3 nor the kvar loop can work there. A stiff
+    Vsource on each controlled bus makes every solve converge in a few iterations: its angle is
+    corrected with Newton steps on a measured dP/dangle matrix until it delivers the units' kW,
+    and its EMF until the bus sits on the set point. The units then take over with Model=1 and
+    the sources' kvar; from that solved state OpenDSS converges in a couple of iterations.
+    Returns (ok, message, kvar per unit).
+    """
+    import numpy as np
+
+    gens = dict(_opendss_pv_generators)
+    groups = {}
+    for name, g in gens.items():
+        groups.setdefault(str(g['bus']).lower(), []).append(name)
+    slack = str(source_bus or '').lower()
+    controlled = [bus for bus in groups if bus != slack]
+    if not controlled:
+        return True, None, {}
+    if len(controlled) > 250:
+        return False, f'{len(controlled)} generator buses is too many for PV control', None
+
+    def run(cmd):
+        dss_mod.Text.Command(cmd)
+
+    def finite(*vals):
+        return all(v is not None and math.isfinite(v) for v in vals)
+
+    # Starting point: the present (Model=3) solution. Buses it left unsupplied are islands without
+    # a source; a voltage source there would energise them, so the method is not used.
+    angle0, base_kv = [], []
+    for bus in controlled:
+        try:
+            dss_mod.Circuit.SetActiveBus(bus)
+            if int(dss_mod.Bus.NumNodes() or 0) < 3:
+                return False, 'a generator bus is not three-phase', None
+            mag_ang = dss_mod.Bus.VMagAngle()
+            vm = _opendss_read_bus_vm_pu(dss_mod, bus, BusbarsDictVoltage)
+            dss_mod.Circuit.SetActiveBus(bus)
+            kv = _opendss_pu_base_kv_ll(dss_mod, _opendss_busbar_vn_kv(BusbarsDictVoltage, bus))
+        except Exception:
+            return False, 'generator bus voltages could not be read', None
+        if not mag_ang or not finite(vm, float(mag_ang[1])) or vm < 0.3 or not kv:
+            return False, 'a generator bus has no usable starting voltage', None
+        angle0.append(float(mag_ang[1]))
+        base_kv.append(float(kv))
+
+    n = len(controlled)
+    names = [f'pvctl_{k}' for k in range(n)]
+    target = np.array([sum(gens[u].get('p_kw', 0.0) for u in groups[bus]) for bus in controlled])
+    vset = np.array([float(gens[groups[bus][0]]['vset']) for bus in controlled])
+    angle = np.array(angle0)
+    emf = vset.copy()
+    tol_kw = max(0.05, 1e-7 * float(np.sum(np.abs(target))))
+    try:
+        tolerance0 = float(dss_mod.Solution.Tolerance())
+    except Exception:
+        tolerance0 = None
+
+    def apply(k):
+        run(f'Edit Vsource.{names[k]} pu={emf[k]:.10f} angle={angle[k]:.10f}')
+
+    def measure():
+        if not _opendss_circuit_has_usable_solution(dss_mod):
+            return None
+        p, q, v = [], [], []
+        for k, bus in enumerate(controlled):
+            dss_mod.Circuit.SetActiveElement(f'Vsource.{names[k]}')
+            powers = dss_mod.CktElement.Powers()
+            phases = int(dss_mod.CktElement.NumPhases() or 3)
+            pk = -sum(powers[0:2 * phases:2])
+            qk = -sum(powers[1:2 * phases:2])
+            vk = _opendss_read_bus_vm_pu(dss_mod, bus, BusbarsDictVoltage)
+            if not finite(pk, qk, vk):
+                return None
+            p.append(pk)
+            q.append(qk)
+            v.append(vk)
+        return np.array(p), np.array(q), np.array(v)
+
+    def solve_measure():
+        run('solve')
+        return measure()
+
+    def restore(enable_units=True):
+        for k in range(n):
+            try:
+                run(f'Vsource.{names[k]}.enabled=no')
+            except Exception:
+                pass
+        if enable_units:
+            for bus in controlled:
+                for u in groups[bus]:
+                    run(f'Generator.{u}.enabled=yes')
+        if tolerance0 is not None:
+            run(f'set tolerance={tolerance0}')
+
+    def sensitivity(p_base):
+        jac = np.zeros((n, n))
+        step = 0.05
+        for j in range(n):
+            angle[j] += step
+            apply(j)
+            m = solve_measure()
+            angle[j] -= step
+            apply(j)
+            if m is None:
+                return None
+            jac[:, j] = (m[0] - p_base) / step
+        return jac
+
+    try:
+        if tolerance0 is not None:
+            run(f'set tolerance={min(tolerance0, 1e-8)}')
+        for k, bus in enumerate(controlled):
+            for u in groups[bus]:
+                run(f'Generator.{u}.enabled=no')
+            run(f'New Vsource.{names[k]} bus1={bus} basekv={base_kv[k]:.6f} pu={emf[k]:.10f} '
+                f'angle={angle[k]:.10f} MVAsc3=1e7 MVAsc1=1e7')
+        m = solve_measure()
+        if m is None:
+            restore()
+            return False, 'the load flow with voltage sources at the generator buses did not solve', None
+        p, q, v = m
+        jac = sensitivity(p)
+        m = solve_measure() if jac is not None else None
+        if m is None:
+            restore()
+            return False, 'the generator power sensitivity solve failed', None
+        p, q, v = m
+        remeasures = 5
+        prev = None
+        converged = False
+        for _ in range(max_iter):
+            dp = target - p
+            dv = vset - v
+            err = float(np.max(np.abs(dp)))
+            if err < tol_kw and float(np.max(np.abs(dv))) < 1e-7:
+                converged = True
+                break
+            if prev is not None and err > 0.3 * prev and remeasures > 0:
+                remeasures -= 1
+                new_jac = sensitivity(p)
+                m = solve_measure() if new_jac is not None else None
+                if m is None:
+                    restore()
+                    return False, 'the generator power sensitivity solve failed', None
+                jac = new_jac
+                p, q, v = m
+                dp = target - p
+                dv = vset - v
+                err = float(np.max(np.abs(dp)))
+            d_angle = np.linalg.lstsq(jac, dp, rcond=None)[0]
+            angle = angle + np.clip(d_angle, -20.0, 20.0)
+            emf = emf + dv
+            for k in range(n):
+                apply(k)
+            m = solve_measure()
+            if m is None:
+                restore()
+                return False, 'the load flow diverged while matching generator power', None
+            p, q, v = m
+            prev = err
+        if not converged:
+            restore()
+            worst = float(np.max(np.abs(target - p))) / 1000.0
+            return False, f'generator power was not matched (off by {worst:.3f} MW)', None
+
+        # Hand back to the units: Model=1 with the sources' kvar, shared equally on a bus.
+        restore(enable_units=False)
+        kvars = {}
+        for k, bus in enumerate(controlled):
+            share = float(q[k]) / len(groups[bus])
+            for u in groups[bus]:
+                kvars[u] = share
+                run(f'Edit Generator.{u} enabled=yes Model=1 kvar={share:.6f}')
+        run('solve')
+        if not _opendss_circuit_has_usable_solution(dss_mod) or not dss_mod.Solution.Converged():
+            return False, 'the load flow did not settle after the generators took over', None
+        for k, bus in enumerate(controlled):
+            vk = _opendss_read_bus_vm_pu(dss_mod, bus, BusbarsDictVoltage)
+            if not finite(vk) or abs(vk - vset[k]) > 1e-3:
+                return False, 'generator voltages moved after the generators took over', None
+        return True, None, kvars
+    except Exception as exc:
+        try:
+            restore()
+        except Exception:
+            pass
+        return False, f'voltage source control failed: {exc}', None
+
+
+def _opendss_solve_snapshot_plan(dss_mod, execute_dss_command, plan, generators_dict=None, pv_context=None):
+    """Solve a freshly built circuit for one plan; Vminpu plans relax then restore PQ behaviour.
+
+    With pv_context (snapshot load flow) synchronous generators are held at their set points
+    (_opendss_regulate_pv_with_sources, then _opendss_regulate_pv_generators); if both fail,
+    OpenDSS's own Model=3 is used as before and a warning says so.
+    """
     vminpu = plan.get('gen_vminpu')
     if vminpu is not None and generators_dict:
         _opendss_set_all_generator_vminpu(execute_dss_command, generators_dict, vminpu)
     execute_dss_command('solve')
+    if pv_context is not None and _opendss_pv_generators and _opendss_pv_setpoints_missed(
+            dss_mod, pv_context.get('bus_voltages') or {}, pv_context.get('source_bus')):
+        model3_kvar = _opendss_generator_kvar(dss_mod, _opendss_pv_generators)
+        bus_voltages = pv_context.get('bus_voltages') or {}
+        ok, note, kvars = _opendss_regulate_pv_with_sources(dss_mod, bus_voltages, pv_context.get('source_bus'))
+        if not ok:
+            print(f"[OpenDSS] PV control with voltage sources failed ({note}); trying kvar control")
+            for name in _opendss_pv_generators:
+                dss_mod.Text.Command(
+                    f'Edit Generator.{name} enabled=yes Model=3 kvar={model3_kvar.get(name, 0.0):.6f}')
+            dss_mod.Text.Command('solve')
+            if _opendss_circuit_has_usable_solution(dss_mod):
+                ok, note2, kvars = _opendss_regulate_pv_generators(
+                    dss_mod, bus_voltages, pv_context.get('source_bus'), start_kvar=model3_kvar)
+                note = note if ok else (note2 or note)
+        if ok:
+            # Logged (and exported) as plain commands, so the script reproduces the solved state.
+            for name, kvar in kvars.items():
+                execute_dss_command(f'Edit Generator.{name} Model=1 kvar={kvar:.6f}')
+            execute_dss_command('solve')
+        else:
+            print(f"[OpenDSS] PV control failed ({note}); keeping Generator Model=3")
+            pv_context['note'] = note
+            message = (f"Generator voltage set points could not be held ({note}); the generators use "
+                       f"OpenDSS's own voltage control (Model 3), so their bus voltages can differ "
+                       f"from vm_pu.")
+            if message not in _opendss_warnings:
+                _opendss_warn(message)
+            for name, g in _opendss_pv_generators.items():
+                kvar = model3_kvar.get(name, g['q0'])
+                execute_dss_command(f"Edit Generator.{name} Model=3 kvar={kvar:.6f}")
+            execute_dss_command('solve')
     if vminpu is not None and generators_dict and _opendss_circuit_has_usable_solution(dss_mod):
         _opendss_set_all_generator_vminpu(execute_dss_command, generators_dict, 0.50)
         execute_dss_command('solve')
@@ -885,17 +1475,28 @@ def _collect_voltage_bases_from_in_data(in_data, BusbarsDictVoltage):
                 pass
     return sorted(levels, reverse=True)
 
-def _resolve_external_grid_basekv(in_data, bus_basekv):
-    """Use transformer HV rating when slack bus vn_kv was imported at LV level."""
+def _resolve_external_grid_basekv(in_data, bus_basekv, bus_ref=None):
+    """Use transformer HV rating when slack bus vn_kv was imported at LV level.
+
+    Only transformers whose HV side is the slack bus count: a grid on a 22 kV generator bus in a
+    network that also has 380 kV transformers (CIGRE HV) is not mislabelled.
+    """
     try:
         bus_kv = float(bus_basekv)
     except (TypeError, ValueError):
         bus_kv = 110.0
+    slack = _sanitize_opendss_name(bus_ref).lower() if bus_ref else None
     hv_levels = []
     for elem in in_data.values():
+        if not isinstance(elem, dict):
+            continue
         typ = elem.get('typ', '')
         if not (typ.startswith('Transformer') or typ.startswith('Two Winding')):
             continue
+        if slack is not None:
+            hv_ref = elem.get('busFrom') or elem.get('hv_bus')
+            if not hv_ref or _sanitize_opendss_name(hv_ref).lower() != slack:
+                continue
         try:
             hv = float(elem.get('vn_hv_kv') or 0)
             if hv > 0:
@@ -994,7 +1595,7 @@ def _prescan_external_grid(in_data):
         ext_basekv = None
         for _belem in in_data.values():
             if 'Bus' in _belem.get('typ', '') and _sanitize_opendss_name(_belem.get('name', '')) == ext_bus:
-                ext_basekv = _resolve_external_grid_basekv(in_data, _belem.get('vn_kv', 110))
+                ext_basekv = _resolve_external_grid_basekv(in_data, _belem.get('vn_kv', 110), bus_ref)
                 break
         if ext_basekv is None:
             ext_basekv = 110.0
@@ -1032,22 +1633,18 @@ def _new_circuit_command(ext_scan):
         f"angle={ext_scan['angle']}",
     ]
     if ext_scan.get('mvasc3'):
-        parts.append(f"Mvasc3={ext_scan['mvasc3']}")
+        # Mvasc1 too: OpenDSS keeps its 2100 MVA default otherwise, and with a weak grid
+        # (CIGRE LV, 100 MVA) Mvasc1 > 1.5 * Mvasc3 has no real R0 and New Circuit fails (error 303).
+        # The Vsource edit that follows sets the real sequence impedances.
+        parts.append(f"Mvasc3={ext_scan['mvasc3']} Mvasc1={ext_scan['mvasc3']}")
     return ' '.join(parts)
 
 def _bus_vm_pu_from_opendss(V1_mag_ll_kv, BusbarsDictVoltage, matched_bus_id):
-    """Per-unit L-L voltage: prefer OpenDSS calcv base over diagram vn_kv."""
-    try:
-        base_kv_ln = float(dss.Bus.kVBase())
-        base_kv_dss = base_kv_ln * math.sqrt(3)
-        if base_kv_dss > 0 and V1_mag_ll_kv == V1_mag_ll_kv:
-            return V1_mag_ll_kv / base_kv_dss
-    except (TypeError, ValueError):
-        pass
-    base_kv_user = BusbarsDictVoltage.get(matched_bus_id)
-    if base_kv_user is not None and float(base_kv_user) > 0:
-        return V1_mag_ll_kv / float(base_kv_user)
-    return 1.0
+    """Per-unit L-L voltage of the active bus on the diagram vn_kv (see _opendss_pu_base_kv_ll)."""
+    if V1_mag_ll_kv != V1_mag_ll_kv:
+        return 1.0
+    base_kv = _opendss_pu_base_kv_ll(dss, BusbarsDictVoltage.get(matched_bus_id))
+    return V1_mag_ll_kv / base_kv if base_kv else 1.0
 
 
 def _apply_equipment_bus_voltages(in_data, BusbarsDictVoltage, BusbarsDictConnectionToName):
@@ -1081,10 +1678,11 @@ def _apply_equipment_bus_voltages(in_data, BusbarsDictVoltage, BusbarsDictConnec
             b = bus_key(elem.get('bus'))
             if b in BusbarsDictVoltage:
                 BusbarsDictVoltage[b] = _resolve_external_grid_basekv(
-                    in_data, BusbarsDictVoltage[b])
+                    in_data, BusbarsDictVoltage[b], elem.get('bus'))
 
 def create_busbars(in_data, dss, export_commands=False, opendss_commands=None):
     """Create busbars in OpenDSS circuit - Let OpenDSS handle bus creation automatically  when elements are connected"""
+    _opendss_pv_generators.clear()
     BusbarsDictVoltage = {}  
     BusbarsDictConnectionToName = {}
     if opendss_commands is None:
@@ -1422,7 +2020,7 @@ def create_load_1ph_element(dss, element_data, element_name, element_id, Busbars
         q_kvar = float(element_data.get('q_mvar', 0) or 0) * 1000
     load_name = element_name.replace(' ', '_')
     try:
-        load_cmd = f"New Load.{load_name} phases=1 Bus1={bus_terminal} kV={kv} kW={p_kw} kvar={abs(q_kvar)} conn={conn}"
+        load_cmd = f"New Load.{load_name} phases=1 Bus1={bus_terminal} kV={kv} kW={p_kw} kvar={q_kvar} conn={conn}"
         spectrum = element_data.get('spectrum', 'defaultload')
         if spectrum and str(spectrum).lower() != 'none':
             load_cmd += f" spectrum={spectrum}"
@@ -1584,8 +2182,9 @@ def create_transformer_1ph_element(dss, element_data, element_name, element_id, 
         vkr_percent = float(element_data.get('vkr_percent', 0.6) or 0.6)
         kv_hv = float(element_data.get('vn_hv_kv', BusbarsDictVoltage.get(bus_from_name) or 7.2) or 7.2)
         kv_lv = float(element_data.get('vn_lv_kv', BusbarsDictVoltage.get(bus_to_name) or 0.12) or 0.12)
-        tap_pos = float(element_data.get('tap_pos', 0) or 0)
+        tap_pos = _opendss_float(element_data.get('tap_pos'), _opendss_float(element_data.get('tap_neutral'), 0.0))
     except (TypeError, ValueError):
+        _opendss_warn(f"Transformer 1ph '{element_data.get('userFriendlyName') or element_name}' was left out: invalid rating data.")
         return
     if float(BusbarsDictVoltage.get(bus_from_name) or 0) >= float(BusbarsDictVoltage.get(bus_to_name) or 0):
         hv_name, lv_name = bus_from_name, bus_to_name
@@ -1654,7 +2253,39 @@ def create_line_element(dss, element_data, element_name, element_id, BusbarsDict
         r0_ohm_per_km = element_data.get('r0_ohm_per_km')
         x0_ohm_per_km = element_data.get('x0_ohm_per_km')
         c0_nf_per_km = element_data.get('c0_nf_per_km')
-        
+
+        # Zero-sequence data left at 0 / empty / "null" means "not known" (templates and imports
+        # often lack it). Use the positive-sequence value with a warning instead of stopping
+        # the whole study.
+        _zero_seq_defaulted = []
+        for _key, _pos in (('r0_ohm_per_km', r_ohm_per_km), ('x0_ohm_per_km', x_ohm_per_km), ('c0_nf_per_km', c_nf_per_km)):
+            _raw = {'r0_ohm_per_km': r0_ohm_per_km, 'x0_ohm_per_km': x0_ohm_per_km, 'c0_nf_per_km': c0_nf_per_km}[_key]
+            if _raw is None:
+                continue
+            _txt = str(_raw).strip().lower()
+            try:
+                _unset = _txt in ('', 'null', 'none', 'nan') or float(_txt) == 0.0
+            except ValueError:
+                _unset = False
+            if not _unset:
+                continue
+            try:
+                _pos_val = float(_pos)
+            except (TypeError, ValueError):
+                _pos_val = 0.0
+            _new = _pos_val if _pos_val > 0 else None
+            if _key == 'r0_ohm_per_km':
+                r0_ohm_per_km = _new
+            elif _key == 'x0_ohm_per_km':
+                x0_ohm_per_km = _new
+            else:
+                c0_nf_per_km = _new
+            _zero_seq_defaulted.append(_key.split('_')[0].upper())
+        if _zero_seq_defaulted:
+            _opendss_warn(
+                f"Line '{element_data.get('userFriendlyName') or element_name}': zero-sequence "
+                f"{'/'.join(_zero_seq_defaulted)} not set; positive-sequence values used.")
+
         # Validate r0_ohm_per_km, x0_ohm_per_km and c0_nf_per_km for OpenDSS - must be greater than 0
         if r0_ohm_per_km is not None:
             try:
@@ -1820,12 +2451,14 @@ def create_switch_element(dss, element_data, LinesDict, TransformersDict, Busbar
         if line_name is not None:
             try:
                 dss.Circuit.SetActiveElement(f'Line.{line_name}')
-                if dss.ActiveElement.Name() == line_name:
+                # opendssdirect has no dss.ActiveElement (that AttributeError was swallowed, so open line
+                # switches were always ignored); CktElement.Name() is 'Line.<name>' in lower case.
+                if str(dss.CktElement.Name() or '').lower() in (str(line_name).lower(), f'line.{line_name}'.lower()):
                     bus2 = dss.CktElement.BusNames()[1] if len(dss.CktElement.BusNames()) > 1 else ''
-                    if closed:
-                        if bus2.startswith('__opened__'):
-                            run(f'Line.{line_name}.Bus2={bus2.replace("__opened__", "")}')
-                    else:
+                    # Lines are built connected, so a closed switch has nothing to do. It used to re-close
+                    # the line when the open switch at the other end had been handled first (CIGRE MV
+                    # tie lines S1/S3 stayed closed and meshed the feeders).
+                    if not closed:
                         if not bus2.startswith('__opened__'):
                             run(f'Line.{line_name}.Bus2=__opened__{bus2}')
             except Exception:
@@ -1834,7 +2467,9 @@ def create_switch_element(dss, element_data, LinesDict, TransformersDict, Busbar
         trafo_name = _resolve_in_dict(element_data.get('element', ''), TransformersDict)
         if trafo_name is not None:
             try:
-                run(f'Transformer.{trafo_name}.enabled={"yes" if closed else "no"}')
+                # A closed switch must not re-enable a transformer that is out of service.
+                if not closed:
+                    run(f'Transformer.{trafo_name}.enabled=no')
             except Exception:
                 pass
     elif et == 'b':
@@ -2036,7 +2671,8 @@ def create_load_element(dss, element_data, element_name, element_id, BusbarsDict
         
         try:
             # Create load command string
-            load_cmd = f"New Load.{load_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={abs(q_kvar)}"
+            # Signed Q: abs() turned capacitive loads (case39, case300) inductive.
+            load_cmd = f"New Load.{load_name} Bus1={bus_name} kV={bus_voltage} kW={p_kw} kvar={q_kvar}"
             
             # For motors, add model parameter
             if is_motor:
@@ -2343,11 +2979,23 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
 
         try:
             # Model=3 = constant kW / constant kV, matching pandapower gen (a PV bus).
+            # Vpu is the voltage set point; without it every generator held 1.0 pu, whatever the
+            # diagram's vm_pu (case39 generators are set to 0.98-1.06 pu).
+            # Q range: pandapower does not limit gen Q unless asked to, and +/-10 Mvar (the old floor)
+            # turned 200-800 MW units into PQ injections, so meshed grids (case39, CIGRE HV) sagged.
             q_abs_sync = abs(float(q_kvar))
-            maxkvar_sync = max(q_abs_sync * 2.0, 10000.0)
+            sn_kva_sync = _dss_float(element_data.get('sn_mva'), 0.0) * 1000.0
+            # OpenDSS's own Model=3 iteration oscillates with a very wide Q range, so the command keeps a
+            # range scaled to the unit; where that is not enough (0 MW condensers) the snapshot load
+            # flow regulates the unit itself (_opendss_regulate_pv_generators) with pandapower's
+            # unlimited Q.
+            maxkvar_sync = max(q_abs_sync * 2.0, abs(p_kw) * 2.0, sn_kva_sync, 10000.0)
+            pv_qmax_kvar = max(q_abs_sync * 2.0, abs(p_kw) * 2.0, sn_kva_sync, 1.0e6)
+            vpu_sync = vm_pu if 0.5 < vm_pu < 1.5 else 1.0
+            pf_part = f" PF={cos_phi}" if 0.0 < cos_phi <= 1.0 else ""
             gen_cmd = (
                 f"New Generator.{element_name} Bus1={bus_name} kV={bus_voltage} "
-                f"kW={p_kw} kvar={q_kvar} Model=3 PF={cos_phi} "
+                f"kW={p_kw} kvar={q_kvar} Model=3{pf_part} Vpu={vpu_sync} "
                 f"Vminpu=0.5 Vmaxpu=2.0 Maxkvar={maxkvar_sync:.3f} Minkvar={-maxkvar_sync:.3f}"
             )
             
@@ -2418,11 +3066,15 @@ def create_generator_element(dss, element_data, element_name, element_id, Busbar
                 cmd = f'Generator.{element_name}.enabled=no'
                 print(f"[OpenDSS] {cmd}")
                 dss.Text.Command(cmd)
+            else:
+                _opendss_pv_generators[element_name] = {
+                    'bus': bus_name, 'vset': vpu_sync, 'q0': float(q_kvar), 'qmax': pv_qmax_kvar,
+                    'p_kw': float(p_kw)}
 
             GeneratorsDict[element_name] = element_name
             GeneratorsDictId[element_name] = element_id
             created_elements.add(element_name)
-            
+
         except Exception as e:
             print(f"Warning: OpenDSS element '{element_name}' not created: {e}")
     else:
@@ -2573,9 +3225,11 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
         vkr_hv = float(element_data.get('vkr_hv_percent', 1))
         vkr_mv = float(element_data.get('vkr_mv_percent', 1))
         vkr_lv = float(element_data.get('vkr_lv_percent', 1))
-        pfe_kw = float(element_data.get('pfe_kw', 0))
-        i0_percent = float(element_data.get('i0_percent', 0))
-        vector_group = element_data.get('vector_group', 'YNdd')
+        pfe_kw = _opendss_float(element_data.get('pfe_kw'), 0.0)
+        i0_percent = _opendss_float(element_data.get('i0_percent'), 0.0)
+        vector_group = element_data.get('vector_group') or 'YNdd'
+        if str(vector_group).strip().lower() in ('null', 'none', 'undefined'):
+            vector_group = 'YNdd'
 
         # Base conversion - this is the subtle one.
         #
@@ -2631,18 +3285,8 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
 
         # OLTC taps - must match create_transformer_element (2w) and pandapower_electrisim 3w branch.
         # Previously 3w transformers were always exported at Taps=1, which skewed voltages and slack Q.
-        tap_pos_raw = element_data.get('tap_pos', '0')
-        tap_step_percent_raw = element_data.get('tap_step_percent', '1.5')
-        tap_side = str(element_data.get('tap_side', 'hv')).lower()
-        try:
-            tap_pos = float(tap_pos_raw)
-        except (TypeError, ValueError):
-            tap_pos = 0.0
-        try:
-            tap_step_percent = float(tap_step_percent_raw)
-        except (TypeError, ValueError):
-            tap_step_percent = 1.5
-        tap_change = tap_pos * tap_step_percent / 100.0
+        tap_side = _opendss_tap_side(element_data)
+        tap_change = _opendss_tap_ratio_change(element_data)
         tap_hv, tap_mv, tap_lv = 1.0, 1.0, 1.0
         if tap_side == 'hv':
             tap_hv = 1.0 + tap_change
@@ -2685,7 +3329,8 @@ def create_transformer3w_element(dss, element_data, element_name, element_id, Bu
         Transformers3WDictId[element_name] = element_id
         created_elements.add(element_name)
     except Exception as e:
-        pass
+        _opendss_warn(f"Three Winding Transformer '{element_data.get('userFriendlyName') or element_name}' "
+                      f"was left out of the OpenDSS model: {e}")
 
 
 def create_transformer_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, TransformersDict, TransformersDictId, created_elements, execute_dss_command=None):
@@ -2726,8 +3371,8 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             vkr_percent_raw = element_data.get('vkr_percent')
             vn_hv_kv_raw = element_data.get('vn_hv_kv')
             vn_lv_kv_raw = element_data.get('vn_lv_kv')
-            vector_group = element_data.get('vector_group', 'Dyn')  # Default to Dyn if not specified
-            
+            vector_group = _opendss_trafo_vector_group(element_data)
+
             # Validate that both bus voltages are available
             # No defaults or fallbacks - user must provide proper voltage information
             if bus_from_voltage is None:
@@ -2780,28 +3425,15 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             conns = vector_group_to_opendss_conns(vector_group)
             
             # Get loss parameters from frontend
-            pfe_kw_raw = element_data.get('pfe_kw', '0')
-            i0_percent_raw = element_data.get('i0_percent', '0')
-            
-            # Convert loss parameters to float
-            pfe_kw = float(pfe_kw_raw)
-            i0_percent = float(i0_percent_raw)
-            
-            # Get tap parameters from frontend
-            tap_pos_raw = element_data.get('tap_pos', '0')
-            tap_step_percent_raw = element_data.get('tap_step_percent', '1.5')
-            tap_side = element_data.get('tap_side', 'hv')
-            
-            # Convert to numbers
-            tap_pos = float(tap_pos_raw)
-            tap_step_percent = float(tap_step_percent_raw)
-            
-            # Calculate tap values for each winding
+            # "null" losses/taps (CIGRE and imported transformers) raised here and the transformer was
+            # silently left out, so everything behind it had 0 V.
+            pfe_kw = _opendss_float(element_data.get('pfe_kw'), 0.0)
+            i0_percent = _opendss_float(element_data.get('i0_percent'), 0.0)
+            tap_side = _opendss_tap_side(element_data)
             # Tap is a multiplier: 1.0 = neutral position
-            # tap_pos * tap_step_percent gives the percentage change
-            tap_change = tap_pos * tap_step_percent / 100.0
-            
-            if tap_side.lower() == 'hv':
+            tap_change = _opendss_tap_ratio_change(element_data)
+
+            if tap_side == 'hv':
                 # Tap on HV side (winding 1)
                 tap_hv = 1.0 + tap_change
                 tap_lv = 1.0
@@ -2878,12 +3510,11 @@ def create_transformer_element(dss, element_data, element_name, element_id, Busb
             created_elements.add(element_name)
             
         except Exception as e:
-            try:
-                pass
-            except Exception as debug_e:
-                pass
+            _opendss_warn(f"Transformer '{element_data.get('userFriendlyName') or element_name}' "
+                          f"was left out of the OpenDSS model: {e}")
     else:
-        pass
+        _opendss_warn(f"Transformer '{element_data.get('userFriendlyName') or element_name}' "
+                      f"is not connected to two buses and was left out of the OpenDSS model.")
 def create_shunt_reactor_element(dss, element_data, element_name, element_id, BusbarsDictVoltage, BusbarsDictConnectionToName, ShuntsDict, ShuntsDictId, created_elements, execute_dss_command=None):
     """Create a shunt reactor element in OpenDSS"""
     
@@ -4507,7 +5138,29 @@ def _build_monte_carlo_result(mode, number, random_distribution, bus_samples, li
     }
 
 
-def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode,
+def powerflow(*args, **kwargs):
+    """OpenDSS load flow (see _powerflow_impl).
+
+    When the drawn vector groups would give a loop a different net phase shift than pandapower's
+    shift_degree, 0 degree transformers are built wye-wye (_opendss_vector_groups_break_loops).
+    """
+    global _opendss_lf_shift_conns
+    in_data = args[0] if args else kwargs.get('in_data')
+    try:
+        _opendss_lf_shift_conns = _opendss_vector_groups_break_loops(in_data)
+    except Exception as exc:
+        print(f"[OpenDSS] Phase-shift loop check failed: {exc}")
+        _opendss_lf_shift_conns = False
+    if _opendss_lf_shift_conns:
+        print("[OpenDSS] Vector groups disagree with shift_degree around a loop; "
+              "0 degree transformers are built wye-wye")
+    try:
+        return _powerflow_impl(*args, **kwargs)
+    finally:
+        _opendss_lf_shift_conns = False
+
+
+def _powerflow_impl(in_data, frequency, mode, algorithm, loadmodel, max_iterations, tolerance, controlmode,
               export_commands=False, monte_carlo_number=100, monte_carlo_random='Uniform',
               monte_carlo_hour=None):
     """Main powerflow function for OpenDSS
@@ -4654,7 +5307,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                             line_key, {'id': sample['id'], 'name': sample['name'], 'values': []})
                         entry['values'].append(sample['loading_percent'])
             else:
-                _opendss_solve_snapshot_plan(dss, execute_dss_command, plan, gens_for_solve)
+                pv_context = None
+                if str(mode).strip().lower() in ('snapshot', 'snap', ''):
+                    pv_context = {'bus_voltages': BusbarsDictVoltage,
+                                  'source_bus': (ext_scan or {}).get('bus')}
+                _opendss_solve_snapshot_plan(dss, execute_dss_command, plan, gens_for_solve, pv_context)
         except Exception as e:
             print(f"[OpenDSS] Solve EXCEPTION: {e}")
 
@@ -5094,7 +5751,11 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
     
     
     # Process load results - iterate through ALL loads we created
-    
+    # Warnings name loads the way the user labelled them, not by their mxCell id.
+    load_labels = {}
+    for _el in (in_data.values() if isinstance(in_data, dict) else []):
+        if isinstance(_el, dict) and _el.get('name') and _el.get('userFriendlyName'):
+            load_labels[_sanitize_opendss_name(_el['name'])] = str(_el['userFriendlyName'])
     for key, load_name in LoadsDict.items():
         try:
             # Set the active element
@@ -5151,7 +5812,7 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
             ):
                 vm_txt = f'{vm_pu:.3f} pu' if vm_pu is not None else 'low'
                 _opendss_warn(
-                    f"Load '{key}' draws {abs(p_mw) * 1000:.1f} kW vs {abs(p_set_mw) * 1000:.1f} kW set - "
+                    f"Load '{load_labels.get(key, key)}' draws {abs(p_mw) * 1000:.1f} kW vs {abs(p_set_mw) * 1000:.1f} kW set - "
                     f"bus voltage {vm_txt}. Check line length, transformer kVA, or use constant-P load (%SeriesRL=0)."
                 )
 
@@ -5636,16 +6297,10 @@ def powerflow(in_data, frequency, mode, algorithm, loadmodel, max_iterations, to
                                 a2 = complex(-0.5, -math.sqrt(3)/2)
                                 V1 = (Va + a * Vb + a2 * Vc) / 3
                                 V1_ll_kv = abs(V1) * math.sqrt(3)
-                                try:
-                                    base_ln = float(dss.Bus.kVBase())
-                                    if base_ln > 0:
-                                        vm_pu = V1_ll_kv / (base_ln * math.sqrt(3))
-                                except (TypeError, ValueError):
-                                    base_ln = 0
-                                if not base_ln:
-                                    base_kv = _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name)
-                                    if base_kv:
-                                        vm_pu = V1_ll_kv / float(base_kv)
+                                base_kv = _opendss_pu_base_kv_ll(
+                                    dss, _opendss_busbar_vn_kv(BusbarsDictVoltage, bus_name))
+                                if base_kv:
+                                    vm_pu = V1_ll_kv / base_kv
                     except Exception as e:
                         pass
 
@@ -6389,6 +7044,26 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
 
 # --- DG Interconnection Screening (OpenDSS) ---------------------------------
 
+def _dg_label_metrics(in_data, bus_metrics, line_metrics):
+    """Show buses and lines by the names users gave them (OpenDSS reports mxcell_263)."""
+    friendly = {}
+    for el in (in_data or {}).values():
+        if not isinstance(el, dict):
+            continue
+        name, label = el.get('name'), el.get('userFriendlyName')
+        if name and label and str(label).strip() and str(label) != str(name):
+            friendly[_sanitize_opendss_name(str(name)).lower()] = (' '.join(str(label).split()), str(name))
+    counts = {}
+    for label, _name in friendly.values():
+        counts[label] = counts.get(label, 0) + 1
+    # A name shared by several elements ("Bus") gets its id so the location is unambiguous.
+    friendly = {k: (lab if counts[lab] == 1 else f'{lab} ({nm})') for k, (lab, nm) in friendly.items()}
+    for m in list(bus_metrics or []) + list(line_metrics or []):
+        label = friendly.get(str(m.get('name', '')).lower())
+        if label:
+            m['name'] = label
+
+
 def _dg_collect_metrics(dss, BusbarsDictConnectionToName, LinesDict, LinesDictId, ExternalGridsDict):
     """Collect bus voltages (pu), line loadings (%), and source P after a solve."""
     bus_metrics = []
@@ -6536,6 +7211,10 @@ def _dg_evaluate_checks(bus_metrics, line_metrics, source_p_kw, vmin_pu, vmax_pu
     return checks, overall, limiting
 
 
+def _dg_id_key(value):
+    return _sanitize_opendss_name(str(value or '')).replace('#', '_')
+
+
 def _dg_find_der_element(in_data, der_id, der_type):
     """Locate DER element dict by id or name."""
     der_type = str(der_type or '').lower()
@@ -6545,7 +7224,8 @@ def _dg_find_der_element(in_data, der_id, der_type):
         typ = str(el.get('typ', ''))
         eid = str(el.get('id', ''))
         ename = str(el.get('name', ''))
-        if der_id and eid != str(der_id) and ename != str(der_id) and _sanitize_opendss_name(ename) != _sanitize_opendss_name(der_id):
+        # The app's DER picker sends the cell id (mxCell#277); payload names use mxCell_277.
+        if der_id and not ({_dg_id_key(eid), _dg_id_key(ename)} & {_dg_id_key(der_id)}):
             continue
         if der_type in ('pvsystem', 'pv') and typ.startswith('PVSystem'):
             return el
@@ -6622,6 +7302,7 @@ def _dg_build_and_solve(in_data, frequency, controlmode='Time'):
         converged = bool(dss.Solution.Converged())
         bus_metrics, line_metrics, source_p_kw = _dg_collect_metrics(
             dss, BusbarsDictConnectionToName, LinesDict, LinesDictId, ExternalGridsDict)
+        _dg_label_metrics(work, bus_metrics, line_metrics)
         return {
             'ok': True,
             'converged': converged,
@@ -6785,6 +7466,7 @@ def dg_interconnection_screening(in_data, params):
             'proposed_kw': proposed_kw,
             'der_id': der_id,
             'der_type': der_type,
+            'der_name': ' '.join(str(der.get('userFriendlyName') or der.get('name') or der_id).split()),
             'poc_bus_id': poc_bus_id,
             'converged': result_base.get('converged'),
             'limiting_constraint': limiting,

@@ -252,7 +252,6 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
         return {
             "error": True,
             "message": "No motors found in the network. Place Motor elements before running Motor Starting.",
-            "exception": "empty net.motor",
         }
 
     selected = _select_motor_indices(net, motor_ids)
@@ -260,7 +259,6 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
         return {
             "error": True,
             "message": "No motors selected for starting. Select at least one motor.",
-            "exception": "empty selection",
         }
 
     # Remember original motor state
@@ -534,7 +532,6 @@ def _dynamic_start(params: Dict[str, Any], in_data: Dict[str, Any]) -> Dict[str,
         return {
             "error": True,
             "message": "No motors selected for dynamic starting.",
-            "exception": "empty motor list",
         }
 
     return _dynamic_start_rebuild(

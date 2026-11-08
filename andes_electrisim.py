@@ -1305,6 +1305,34 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
         })
 
 
+def _eig_clamped_pitch_state_names(ss, x_names):
+    """Indices of WTPTA1 states whose turbine sits at minimum pitch (pitch loop inactive)."""
+    try:
+        mod = getattr(ss, "WTPTA1", None)
+        if mod is None or not mod.n:
+            return set()
+        theta = np.asarray(mod.theta.v, dtype=float)
+        thmin = np.asarray(mod.thmin.v, dtype=float)
+        if np.nanmax(np.abs(thmin)) > 2 * math.pi:  # stored in degrees
+            thmin = np.radians(thmin)
+        at_min = theta <= thmin + 1e-6
+        if not at_min.any():
+            return set()
+        idx = []
+        for j, name in enumerate(x_names):
+            parts = str(name).split()
+            if len(parts) >= 3 and parts[-2] == "WTPTA1":
+                try:
+                    k = int(parts[-1]) - 1
+                except ValueError:
+                    k = -1
+                if (0 <= k < len(at_min) and at_min[k]) or (k < 0 and at_min.all()):
+                    idx.append(j)
+        return set(idx)
+    except Exception:
+        return set()
+
+
 def run_eig(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
     """Run power flow + eigenvalue analysis; return JSON string."""
     try:
@@ -1366,6 +1394,41 @@ def run_eig(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
         n_zero = int(getattr(ss.EIG, "n_zeros", sum(1 for e in eigenvalues if abs(e["real"] or 0) <= 1e-6 and abs(e["imag"] or 0) <= 1e-6)))
         n_neg = int(getattr(ss.EIG, "n_negative", len(eigenvalues) - n_pos - n_zero))
 
+        x_names = getattr(ss.EIG, "x_name", None)
+        x_names = [str(n) for n in x_names] if x_names is not None else []
+        try:
+            pf_abs = np.abs(np.asarray(ss.EIG.pfactors))
+        except Exception:
+            pf_abs = None
+
+        # Positive modes carried by wind-turbine pitch control that sits at its minimum pitch
+        # (below rated wind): the anti-windup limiter keeps that loop inactive, but the
+        # linearisation ignores limiters, so these modes do not describe the real system.
+        notes = []
+        n_pos_at_limit = 0
+        clamped = _eig_clamped_pitch_state_names(ss, x_names)
+        if n_pos > 0 and clamped and pf_abs is not None and pf_abs.ndim == 2:
+            positive = [i for i, lam in enumerate(mu) if lam.real > 1e-6 and i < pf_abs.shape[1]]
+            pitch_modes = []
+            for i in positive:
+                col = pf_abs[:, i]
+                total = float(col.sum())
+                share = float(sum(col[j] for j in clamped if j < len(col))) / total if total > 0 else 0.0
+                if share >= 0.6:
+                    pitch_modes.append(mu[i])
+            # Identical turbines give repeated eigenvalues whose participation is split arbitrarily
+            # between the copies, so an eigenvalue equal to a pitch mode is that same mode.
+            n_pos_at_limit = sum(
+                1 for i in positive
+                if any(abs(mu[i] - m) <= 1e-3 * max(abs(m), 1e-6) for m in pitch_modes))
+            n_pos_at_limit = min(n_pos_at_limit, n_pos)
+            if n_pos_at_limit:
+                notes.append(
+                    f"{n_pos_at_limit} positive eigenvalue(s) belong to wind-turbine pitch control held at its "
+                    "minimum pitch angle (below rated wind). The pitch limiter keeps that loop inactive, so they "
+                    "are not counted as unstable modes. Confirm with a Transient Stability run if in doubt.")
+                n_pos -= n_pos_at_limit
+
         if n_pos > 0:
             verdict = "unstable"
         elif any((e["damping_ratio"] is not None and e["damping_ratio"] < 0.03 and abs(e["imag"] or 0) > 1e-6) for e in eigenvalues):
@@ -1376,8 +1439,7 @@ def run_eig(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
         # Participation factors for least-damped modes (optional)
         participation = []
         try:
-            pf = np.asarray(ss.EIG.pfactors)
-            x_names = list(getattr(ss.EIG, "x_name", []) or [])
+            pf = pf_abs if pf_abs is not None else np.abs(np.asarray(ss.EIG.pfactors))
             for mode in least_damped[:5]:
                 mi = mode["index"]
                 if pf.ndim == 2 and mi < pf.shape[1]:
@@ -1403,6 +1465,8 @@ def run_eig(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             "power_flow_converged": pf_ok,
             "verdict": verdict,
             "n_positive": n_pos,
+            "n_positive_at_limit": n_pos_at_limit,
+            "notes": notes,
             "n_zeros": n_zero,
             "n_negative": n_neg,
             "eigenvalues": eigenvalues,
