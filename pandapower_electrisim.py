@@ -7054,6 +7054,35 @@ def _electrisim_attach_park_controllers(net, in_data, algorithm='nr', calculate_
 
 
 
+def _electrisim_auto_island_slack(net, in_data=None):
+    """An island (no in-service External Grid) needs one generator as the reference. If no
+    in-service generator is marked slack, mark the largest one and say so in net.warnings."""
+    eg = getattr(net, 'ext_grid', None)
+    if eg is not None and not eg.empty and eg['in_service'].astype(bool).any():
+        return
+    gen = getattr(net, 'gen', None)
+    if gen is None or gen.empty:
+        return
+    live = gen[gen['in_service'].astype(bool)]
+    if live.empty or live['slack'].fillna(False).astype(bool).any():
+        return
+    sn = live['sn_mva'].fillna(0.0) if 'sn_mva' in live.columns else live['p_mw'] * 0.0
+    size = sn.where(sn > 0, (live['p_mw'] * live['scaling']).abs())
+    ref = size.idxmax()
+    net.gen.at[ref, 'slack'] = True
+    name = net.gen.at[ref, 'name']
+    for el in (in_data or {}).values():
+        if isinstance(el, dict) and el.get('name') == name and el.get('userFriendlyName'):
+            name = el['userFriendlyName']
+            break
+    if not hasattr(net, 'warnings') or net.warnings is None:
+        net.warnings = []
+    net.warnings.append(
+        f"No External Grid and no generator marked as slack: Generator '{name}' (largest) is the "
+        "island's reference (slack) machine."
+    )
+
+
 def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=False, in_data=None, Busbars=None,
               run_control_trafo2w=False, run_control_trafo3w=False, run_control_shunt=False, reuse_model=False):
             not_ready = _network_not_ready_error(net, "Power flow")
@@ -7079,6 +7108,7 @@ def powerflow(net, algorithm, calculate_voltage_angles, init, export_python=Fals
             sys.stderr = _safe_buf
             
             try:
+                _electrisim_auto_island_slack(net, in_data)
                 # Check for isolated buses before running power flow
                 isolated_buses = pp.topology.unsupplied_buses(net)
                 if len(isolated_buses) > 0:

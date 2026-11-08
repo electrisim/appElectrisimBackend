@@ -267,9 +267,13 @@ def _iter_elements(in_data: Dict[str, Any]):
 def build_system(
     in_data: Dict[str, Any],
     params: Optional[Dict[str, Any]] = None,
+    grid_behind_impedance: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Build an ANDES System from Electrisim JSON.
+
+    grid_behind_impedance: model each External Grid as a source behind its short-circuit
+    impedance (time-domain studies), not an ideal voltage source.
 
     Returns (ss, meta) where meta includes bus_map, line_map, gen_map, defaults_applied, warnings.
     """
@@ -545,6 +549,29 @@ def build_system(
         ext_grid_slacks.append((idx, bus, bus_vn.get(bus, 110.0), el))
 
     # --- Generators → PV/Slack + SynGen + Exciter + Governor ---
+    def _is_syn_gen(el: Dict[str, Any], typ: str) -> bool:
+        if not typ.startswith("Generator") or typ.startswith("Static Generator") or typ.startswith("Wind Turbine"):
+            return False
+        if "Asymmetric" in typ or "1ph" in typ:
+            return False
+        return bus_map.get(el.get("bus")) is not None and _sb(el.get("in_service"), True)
+
+    # An island (no External Grid) needs one generator as the reference. If none is marked
+    # slack, use the largest one rather than failing with "No slack bus found".
+    auto_slack_name = None
+    if slack_count == 0:
+        syn_gens = [el for _, el, typ in _iter_elements(in_data) if _is_syn_gen(el, typ)]
+        if syn_gens and not any(_sb(el.get("slack"), False) for el in syn_gens):
+            def _size(el: Dict[str, Any]) -> float:
+                sn = _sf(el.get("sn_mva"), 0.0)
+                return sn if sn > 0 else abs(_sf(el.get("p_mw")) * _sf(el.get("scaling"), 1.0))
+            ref = max(syn_gens, key=_size)
+            auto_slack_name = ref.get("name")
+            defaults_applied.append(
+                f"No External Grid and no generator marked as slack: Generator "
+                f"'{ref.get('userFriendlyName') or ref.get('name')}' (largest) is the island's reference machine."
+            )
+
     gen_count = 0
     for _, el, typ in _iter_elements(in_data):
         if not typ.startswith("Generator") or typ.startswith("Static Generator") or typ.startswith("Wind Turbine"):
@@ -586,7 +613,7 @@ def build_system(
             )
             vn = bus_v
 
-        is_slack = _sb(el.get("slack"), False)
+        is_slack = _sb(el.get("slack"), False) or (auto_slack_name is not None and name == auto_slack_name)
         static_idx = f"{'Slack' if is_slack else 'PV'}_G_{gen_count}"
         static_model = "Slack" if is_slack else "PV"
         static_kw = dict(
@@ -670,13 +697,19 @@ def build_system(
                 M=M,
                 D=_dyn("dyn_D", _DEFAULT_GENROU["D"], ("D",)),
                 ra=_dyn("dyn_ra", _DEFAULT_GENROU["ra"], ("ra",)),
-                xl=_dyn("dyn_xl", _DEFAULT_GENROU["xl"], ("xl",)),
                 xd=_dyn("dyn_xd", _DEFAULT_GENROU["xd"], ("xd",)),
                 xq=_dyn("dyn_xq", _DEFAULT_GENROU["xq"], ("xq",)),
                 xd1=_dyn("dyn_xd1", _DEFAULT_GENROU["xd1"], ("xd1",)),
                 xq1=_dyn("dyn_xq1", _DEFAULT_GENROU["xq1"], ("xq1",)),
-                xd2=_dyn("dyn_xd2", _DEFAULT_GENROU["xd2"], ("xd2", "xdss_pu")),
-                xq2=_dyn("dyn_xq2", _DEFAULT_GENROU["xq2"], ("xq2",)),
+            )
+            # GENROU assumes xq'' = xd''; the dialog only offers xd'', and a default xq'' that
+            # differs from it made the machine start off steady state (a drift before any event).
+            # Leakage xl must stay below xd''.
+            xd2 = _dyn("dyn_xd2", _DEFAULT_GENROU["xd2"], ("xd2", "xdss_pu"))
+            kw.update(
+                xd2=xd2,
+                xq2=_dyn("dyn_xq2", xd2, ("xq2",)),
+                xl=_dyn("dyn_xl", min(_DEFAULT_GENROU["xl"], 0.8 * xd2), ("xl",)),
                 Td10=_dyn("dyn_Td10", _DEFAULT_GENROU["Td10"], ("Td10",)),
                 Td20=_dyn("dyn_Td20", _DEFAULT_GENROU["Td20"], ("Td20",)),
                 Tq10=_dyn("dyn_Tq10", _DEFAULT_GENROU["Tq10"], ("Tq10",)),
@@ -900,11 +933,13 @@ def build_system(
             "name": ufname, "bus": bus, **model_ids,
         }
 
-    if renewable_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0:
-        # With no synchronous machine ANDES fails at the first switching event (fault, toggle)
-        # with "list index out of range" in its island bookkeeping. Put a classical source
-        # behind each External Grid: reactance from its short-circuit power, very large
-        # inertia, so it behaves like the stiff grid the Slack represents in power flow.
+    no_syn_machine = renewable_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0
+    if grid_behind_impedance or no_syn_machine:
+        # A bare Slack holds its bus voltage fixed, so a fault on the External Grid bus did
+        # nothing at all. With no synchronous machine ANDES also fails at the first switching
+        # event with "list index out of range". Put a classical source behind each External
+        # Grid: reactance from its short-circuit power, very large inertia, so it is the stiff
+        # grid of the power flow but its bus voltage can collapse during a fault.
         for slack_idx, eg_bus, eg_vn, eg_el in ext_grid_slacks:
             s_sc = _sf(eg_el.get("s_sc_max_mva"), 0.0)
             used_default_ssc = s_sc <= 0
@@ -927,9 +962,8 @@ def build_system(
             )
             ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
             defaults_applied.append(
-                f"External Grid '{ufname}': modelled as a stiff source (H=1000 s, "
-                f"S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}) because the network "
-                "has no synchronous generator."
+                f"External Grid '{ufname}': modelled as a stiff source behind its short-circuit "
+                f"impedance (H=1000 s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''})."
             )
 
     if gen_count + renewable_count == 0:
@@ -1075,7 +1109,7 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             })
 
         andes.config_logger(stream_level=40)
-        ss, meta = build_system(in_data, params)
+        ss, meta = build_system(in_data, params, grid_behind_impedance=True)
 
         # Suppress file outputs
         try:
@@ -1130,6 +1164,19 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 "warnings": meta["warnings"],
             })
         t = np.asarray(ss.dae.ts.t, dtype=float)
+        if not tds_ok and len(t) and t[-1] < tf - 1e-6:
+            fault_note = ""
+            if params.get("fault_bus") and params.get("fault_enabled") not in (False, "false", "False"):
+                fault_note = (
+                    f" With the fault from {_sf(params.get('fault_tf'), 1.0):g} s to "
+                    f"{_sf(params.get('fault_tc'), 1.1):g} s this usually means a generator lost "
+                    "synchronism (the fault lasted longer than its critical clearing time). "
+                    "Try a shorter fault, or check the generator inertia and reactances."
+                )
+            meta["warnings"].append(
+                f"The simulation stopped at {t[-1]:.2f} s of {tf:g} s because the solver could not "
+                f"continue.{fault_note} The curves show the response up to that point."
+            )
         max_pts = int(_sf(params.get("max_points"), 800))
         t_ds = _downsample(t, max_pts)
         # indices for downsample of series
