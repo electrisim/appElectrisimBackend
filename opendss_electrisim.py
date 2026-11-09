@@ -5095,7 +5095,8 @@ def _capture_monte_carlo_sample(BusbarsDictConnectionToName, LinesDict, LinesDic
             currents = dss.CktElement.CurrentsMagAng()
             n_conductors = dss.CktElement.NumConductors()
             n_phases = dss.CktElement.NumPhases()
-            current_ka = _opendss_terminal_i_ka(currents, 0, n_conductors, n_phases, mag_ang=True) if currents else 0.0
+            current_ka = max(_opendss_terminal_i_ka(currents, 0, n_conductors, n_phases, mag_ang=True),
+                             _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases, mag_ang=True)) if currents else 0.0
             rating_ka = float(line_ratings.get(key) or 0)
             lines[key] = {
                 'id': LinesDictId.get(key, key),
@@ -5707,7 +5708,10 @@ def _powerflow_impl(in_data, frequency, mode, algorithm, loadmodel, max_iteratio
                     break
             
             if max_i_ka and max_i_ka > 0 and is_enabled:
-                loading_percent = (i_from_ka / max_i_ka) * 100
+                # The larger end current, as in pandapower: on long or cable lines the charging
+                # current makes the two ends differ (case39 Line_14: 4.6 % from the sending end
+                # against 10.9 % at the receiving end).
+                loading_percent = (max(i_from_ka, i_to_ka) / max_i_ka) * 100
             else:
                 # Fallback if max_i_ka not available or line is disabled
                 loading_percent = 0.0
@@ -6052,29 +6056,22 @@ def _powerflow_impl(in_data, frequency, mode, algorithm, loadmodel, max_iteratio
                         num_phases = 3
                     
                     
-                    # Calculate loading using two methods and use the most reasonable one
-                    
-                    # METHOD 1: Current-based loading
-                    # I_rated = S / (sqrt(3) * V_LL) for 3-phase
-                    # For single-phase: I_rated = S / V
-                    if num_phases == 3:
-                        i_rated_hv_ka = sn_mva / (math.sqrt(3) * vn_hv_kv)
+                    # Loading as pandapower defines it (trafo_loading="current"): the larger winding
+                    # current against that winding's rated current, I * Vn * sqrt(3) / Sn. The HV
+                    # terminal MVA used before scales with the actual voltage, so a transformer at
+                    # 1.05 pu read 5 % more loaded than in pandapower, and LV-side current was ignored.
+                    trafo_data = element_data if in_data else None
+                    if trafo_data:
+                        vn_hv_kv = _opendss_float(trafo_data.get('vn_hv_kv'), 0.0) or vn_hv_kv
+                        vn_lv_kv = _opendss_float(trafo_data.get('vn_lv_kv'), 0.0)
                     else:
-                        i_rated_hv_ka = sn_mva / vn_hv_kv
-                    
-                    loading_by_current = (i_hv_ka / i_rated_hv_ka * 100.0) if i_rated_hv_ka > 0 else 0.0
-                    
-                    # METHOD 2: Power-based loading (MVA method)
-                    # Calculate actual apparent power from HV side (use absolute values for magnitude)
-                    # P and Q can be negative (power flow direction), but for loading we need magnitude
-                    p_hv_abs = abs(p_hv_mw)
-                    q_hv_abs = abs(q_hv_mvar)
-                    s_actual_mva = math.sqrt(p_hv_abs**2 + q_hv_abs**2)
-                    loading_by_power = (s_actual_mva / sn_mva * 100.0) if sn_mva > 0 else 0.0
-                    
-                    
-                    # Use power-based loading (more reliable for transformers)
-                    loading_percent = loading_by_power
+                        vn_lv_kv = 0.0
+                    if not vn_lv_kv:
+                        dss.Transformers.Wdg(2)
+                        vn_lv_kv = dss.Transformers.kV()
+                    k_phase = math.sqrt(3) if num_phases == 3 else 1.0
+                    s_winding_mva = max(i_hv_ka * vn_hv_kv, i_lv_ka * vn_lv_kv) * k_phase
+                    loading_percent = (s_winding_mva / sn_mva * 100.0) if sn_mva > 0 else 0.0
                 except Exception as e:
                     loading_percent = 0.0
             else:
@@ -6153,13 +6150,22 @@ def _powerflow_impl(in_data, frequency, mode, algorithm, loadmodel, max_iteratio
                     i_mv_ka = _opendss_terminal_i_ka(currents, 1, n_conductors, n_phases)
                     i_lv_ka = _opendss_terminal_i_ka(currents, 2, n_conductors, n_phases)
                 sn_hv = 100.0  # default
+                rating = None
                 for elem_key, elem_data in in_data.items():
                     if isinstance(elem_data, dict) and elem_data.get('typ', '').startswith('Three Winding'):
                         if _sanitize_opendss_name(elem_data.get('name', '')) == trafo_name:
                             sn_hv = float(elem_data.get('sn_hv_mva', 100))
+                            rating = [(_opendss_float(elem_data.get(f'vn_{w}_kv'), 0.0),
+                                       _opendss_float(elem_data.get(f'sn_{w}_mva'), 0.0)) for w in ('hv', 'mv', 'lv')]
                             break
-                s_actual = math.sqrt(abs(p_hv_mw)**2 + abs(q_hv_mvar)**2)
-                loading_percent = (s_actual / sn_hv * 100.0) if sn_hv > 0 else 0.0
+                if rating and all(vn > 0 and sn > 0 for vn, sn in rating):
+                    # As pandapower: the largest winding current against that winding's rating.
+                    currents_ka = (i_hv_ka, i_mv_ka, i_lv_ka)
+                    loading_percent = max(i * vn * math.sqrt(3) / sn
+                                          for i, (vn, sn) in zip(currents_ka, rating)) * 100.0
+                else:
+                    s_actual = math.sqrt(abs(p_hv_mw)**2 + abs(q_hv_mvar)**2)
+                    loading_percent = (s_actual / sn_hv * 100.0) if sn_hv > 0 else 0.0
             frontend_id = Transformers3WDictId.get(key, key)
             t3w = Transformer3WOut(name=key, id=frontend_id, i_hv_ka=i_hv_ka, i_mv_ka=i_mv_ka, i_lv_ka=i_lv_ka,
                                    loading_percent=loading_percent, p_hv_mw=p_hv_mw, q_hv_mvar=q_hv_mvar,

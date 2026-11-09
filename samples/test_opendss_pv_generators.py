@@ -10,6 +10,8 @@ Before the fixes the OpenDSS results were 0.04-0.08 pu off:
 3. Per-unit results used OpenDSS's calcv base, which put case14's 12 kV bus 8 on 14 kV.
 4. The imported default "Dyn" on 0 degree transformers broke case14's loops (4-9 versus 4-7-9);
    CIGRE HV, where the default vector groups are consistent, keeps them.
+5. Line loading used only the sending-end current (case39 Line_14: 4.6 % against 10.9 %) and
+   transformer loading the HV terminal MVA; both now follow pandapower's current-based definition.
 
 Run with ``python samples/test_opendss_pv_generators.py``.
 """
@@ -47,6 +49,26 @@ def run(payload):
     return data
 
 
+def loading_gap(data, payload, net):
+    """Largest |loading| difference (percentage points) over lines and transformers, matched by end buses."""
+    elems = {v["name"]: v for v in payload.values() if isinstance(v, dict) and v.get("name")}
+    labels = {v["name"]: str(v.get("userFriendlyName")) for v in payload.values()
+              if isinstance(v, dict) and str(v.get("typ", "")).startswith("Bus")}
+    names = {i: str(n) for i, n in zip(net.bus.index, net.bus.name)}
+    worst = 0.0
+    for kind, table, res, a, c in (("lines", net.line, net.res_line, "from_bus", "to_bus"),
+                                   ("transformers", net.trafo, net.res_trafo, "hv_bus", "lv_bus")):
+        index = {}
+        for i, row in table.iterrows():
+            index.setdefault(frozenset((names[row[a]], names[row[c]])), []).append(i)
+        for r in data.get(kind) or []:
+            src = elems.get(r["name"]) or {}
+            match = index.get(frozenset((labels.get(src.get("busFrom")), labels.get(src.get("busTo"))))) or []
+            if len(match) == 1:
+                worst = max(worst, abs(float(r["loading_percent"]) - float(res.loading_percent[match[0]])))
+    return worst
+
+
 def main() -> None:
     summary = []
     for fixture, factory, tol in CASES:
@@ -66,8 +88,10 @@ def main() -> None:
             diff = float(bus["vm_pu"]) - float(ref[label])
             assert abs(diff) < tol, (fixture, label, bus["vm_pu"], ref[label])
             worst = max(worst, abs(diff))
-        summary.append(f"{fixture.split('_', 2)[2][:-5]} {worst:.4f}")
-    print("OpenDSS PV generators match pandapower (max |dV| pu): " + ", ".join(summary))
+        gap = loading_gap(data, payload, net)
+        assert gap < 1.0, (fixture, "loading", gap)
+        summary.append(f"{fixture.split('_', 2)[2][:-5]} {worst:.4f} pu / {gap:.2f} pp")
+    print("OpenDSS matches pandapower (max |dV|, max loading gap): " + ", ".join(summary))
 
 
 if __name__ == "__main__":
