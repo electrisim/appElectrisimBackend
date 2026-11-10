@@ -15479,7 +15479,8 @@ def _prot_build_oc_relay_time_settings(spec, grading_mode='auto', manual_time_se
 
     IDTOC always uses a 5-element list: pandapower indexes ``time_settings[0:5]``
     and its DataFrame column check for IDTOC is mistyped (``t_gg`` twice).
-    Manual times are applied afterwards via ``_prot_apply_ocrelay_overrides``.
+    With manual grading the list is only reported back; the relay itself is
+    built by ``_prot_build_manual_idtoc_relay`` from the manual time tables.
     """
     subtype = spec.get('oc_relay_type', 'DTOC')
     t_gg = spec.get('t_gg', 0.07)
@@ -15498,13 +15499,18 @@ def _prot_build_oc_relay_time_settings(spec, grading_mode='auto', manual_time_se
     return [t_gg, t_g, t_diff]
 
 
-def _prot_build_manual_time_settings(net, specs, subtype):
+def _prot_build_manual_time_settings(net, specs, subtype, table=None):
     """Return the per-switch DataFrame format expected by pandapower time_grading.
 
     The frame is indexed by switch index because OCRelay reads its times with
     ``time_grading.t_g[switch_index]`` (a label lookup), which would otherwise
     miss whenever switch indices are not a contiguous 0..n-1 range.
+
+    ``table`` picks the column layout: 'IDMT' gives tms / t_grade, anything
+    else gives t_gg / t_g (the DTOC layout). It defaults to the subtype's own
+    layout; IDTOC relays need both, built from the IDTOC switches.
     """
+    table = table or ('IDMT' if subtype == 'IDMT' else 'DTOC')
     rows = []
     for sw_idx in net.switch.index:
         matching = next(
@@ -15515,13 +15521,64 @@ def _prot_build_manual_time_settings(net, specs, subtype):
             None
         )
         matching = matching or {}
-        if subtype == 'IDMT':
+        if table == 'IDMT':
             rows.append({'switch_id': int(sw_idx), 'tms': matching.get('tms', 1.0),
                          't_grade': matching.get('t_grade', 0.5)})
         else:
             rows.append({'switch_id': int(sw_idx), 't_gg': matching.get('t_gg', 0.07),
                          't_g': matching.get('t_g', 0.5)})
     return pd.DataFrame(rows, index=[int(i) for i in net.switch.index])
+
+
+def _prot_build_manual_idtoc_relay(OCRelay, net, kwargs, manual_tables):
+    """Build an IDTOC OCRelay from manual time settings, without automatic grading.
+
+    pandapower's IDTOC set-up always calls ``time_grading`` with a list, which
+    runs the automatic, topology-based grading even when the user graded the
+    relays by hand. That grading only handles networks without transformers
+    and otherwise fails with ``UnboundLocalError: sorted_line_path``.
+
+    IDTOC is a DTOC stage (I>, I>>) plus an IDMT stage (inverse curve). The
+    DTOC and IDMT set-ups do accept a manual time table, so run both on one
+    relay (DTOC fills I_g / I_gg / t_g / t_gg, IDMT fills I_s / k / alpha /
+    tms / t_grade) and then mark it IDTOC. Pickups still come from pandapower
+    (calculated or manual), exactly as its own IDTOC branch does.
+    """
+    device = OCRelay(net, **dict(kwargs, oc_relay_type='DTOC', time_settings=manual_tables['DTOC']))
+    device.oc_relay_type = 'IDMT'
+    device.time_settings = manual_tables['IDMT']
+    device.create_protection_function(net)
+    device.oc_relay_type = 'IDTOC'
+    device.time_settings = kwargs['time_settings']
+    return device
+
+
+def _prot_ocrelay_failure_reason(net, sw_idx, exc, grading_mode):
+    """Plain-language reason a pandapower OCRelay could not be built."""
+    head = f'pandapower OCRelay could not be built ({type(exc).__name__}: {exc}). '
+    tail = ('Trip times and the TCC curve were evaluated by ElectriSim from the Switch '
+            'dialog settings instead.')
+    # pandapower.protection.utility_functions.bus_path_multiple_ext_bus finds no
+    # paths at all when net.trafo is not empty (three-winding ones are not checked).
+    n_trafo = len(getattr(net, 'trafo', ()))
+    try:
+        on_line = (str(net.switch.at[sw_idx, 'et']) == 'l')
+        n_off_line = int(((net.switch['et'] != 'l') & net.switch['closed'].astype(bool)).sum())
+    except Exception:
+        on_line, n_off_line = True, 0
+    if grading_mode == 'auto' and n_trafo:
+        cause = (f"pandapower's automatic time grading only works on networks without "
+                 f"transformers, and this network has {n_trafo}. Choose Manual time grading "
+                 f"to evaluate the relays with pandapower. ")
+    elif not on_line:
+        cause = 'This switch is not on a line, which pandapower OCRelay expects. '
+    elif grading_mode == 'auto' and n_off_line:
+        cause = ("pandapower's automatic time grading needs every closed switch to sit on a "
+                 f"line ({n_off_line} closed switch(es) are on a bus or transformer). "
+                 "Choose Manual time grading to evaluate the relays with pandapower. ")
+    else:
+        cause = ''
+    return head + cause + tail
 
 
 def _prot_ensure_bus_geodata(net):
@@ -15674,10 +15731,17 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
     except ImportError:
         Fuse = None
 
-    manual_times = {
-        subtype: _prot_build_manual_time_settings(net, specs, subtype)
-        for subtype in _OC_SUBTYPE_TO_SWITCH_TYPE
-    } if grading_mode == 'manual' else {}
+    manual_times = {}
+    if grading_mode == 'manual':
+        manual_times = {
+            'DTOC': _prot_build_manual_time_settings(net, specs, 'DTOC'),
+            'IDMT': _prot_build_manual_time_settings(net, specs, 'IDMT'),
+        }
+        # IDTOC needs both tables (see _prot_build_manual_idtoc_relay).
+        idtoc_tables = {
+            table: _prot_build_manual_time_settings(net, specs, 'IDTOC', table)
+            for table in ('DTOC', 'IDMT')
+        }
 
     for sw_id, spec in specs.items():
         sw_idx = _prot_resolve_sw_idx_for_id(net, sw_id)
@@ -15763,7 +15827,10 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     pickup_df = pd.concat([pickup_df] * len(net.switch), ignore_index=True)
                     pickup_df['switch_id'] = list(net.switch.index)
                     kwargs['pickup_current_manual'] = pickup_df
-                device = OCRelay(net, **kwargs)
+                if subtype == 'IDTOC' and grading_mode == 'manual':
+                    device = _prot_build_manual_idtoc_relay(OCRelay, net, kwargs, idtoc_tables)
+                else:
+                    device = OCRelay(net, **kwargs)
                 _prot_apply_ocrelay_overrides(device, spec, grading_mode)
                 summaries.append({
                     'switch_id': sw_id,
@@ -15799,12 +15866,7 @@ def _attach_protection_devices(net, specs, grading_mode='auto'):
                     'custom_evaluator': 'oc_electrisim',
                     'not_computed': False,
                     'settings': dict(spec),
-                    'reason': (
-                        f'pandapower OCRelay could not be built ({type(e).__name__}: {e}); '
-                        'trip times and the TCC curve were evaluated by ElectriSim from the '
-                        'Switch dialog settings. pandapower topological grading requires every '
-                        'closed switch to sit on a line.'
-                    ),
+                    'reason': _prot_ocrelay_failure_reason(net, sw_idx, e, grading_mode),
                     'traceback': tb_text,
                 })
 
