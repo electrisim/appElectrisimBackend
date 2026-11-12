@@ -1214,6 +1214,26 @@ def simulation():
                 else:
                     return response_data
 
+            if "VoltageStabilityPandaPower" in typ:
+                import voltage_stability_electrisim
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== VOLTAGE STABILITY (P-V CURVES) REQUESTED BY USER: {user_email} ===")
+
+                net = pp.create_empty_network(f_hz=_parse_frequency(in_data[x].get('frequency', '50')))
+                Busbars = pandapower_electrisim.create_busbars(in_data, net)
+                pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
+                response_data = voltage_stability_electrisim.voltage_stability_study(net, in_data[x])
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
+
             if "ContingencyAnalysisPandaPower" in typ:
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
