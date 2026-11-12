@@ -186,8 +186,7 @@ def sgen_k_export_lines(net, fault="3ph"):
         fault = "3ph"
     lines = [
         "# Converter k from Ik\" at the reference voltage when that current is set;",
-        "# otherwise the dialog k; otherwise 1.1. r2/x2 are applied inside Electrisim",
-        "# for two-phase and single-phase faults.",
+        "# otherwise the dialog k; otherwise 1.1.",
     ]
     for idx, row in net.sgen.iterrows():
         k_value = resolved_k(net, row, fault)
@@ -462,6 +461,54 @@ _BRANCH_RESULT_COLUMNS = {
         ("ikss_hv_ka", "ikss_mv_ka", "ikss_lv_ka"),
     ),
 }
+
+
+def negative_sequence_export_lines(net, fault, case="max", lv_tol_percent=10, r_fault_ohm=0.0,
+                                   x_fault_ohm=0.0, bus_literal="None"):
+    """Python statements that apply the r2/x2 correction in a standalone script.
+
+    Empty unless the fault is two-phase or single-phase and a converter has X2 set, which is
+    when Electrisim changes pandapower's result. The script then carries this module's
+    functions verbatim, so it reproduces the Electrisim numbers.
+    """
+    if fault not in ("2ph", "1ph") or not _negative_sequence_shunts(net):
+        return []
+    import inspect
+
+    lines = [
+        "# --- Electrisim negative-sequence correction (converters with X2 set) ---",
+        "# pandapower takes Z2 = Z1. Electrisim adds each converter's r2/x2 as a shunt to the",
+        "# negative-sequence network and replaces the voltage-source part of Ik\"; ip, Ith and the",
+        "# branch currents feeding each bus are scaled with that bus's ratio.",
+    ]
+    for idx, row in net.sgen.iterrows():
+        index_literal = str(int(idx)) if isinstance(idx, (int, np.integer)) else repr(idx)
+        for column in ("r2_pu", "x2_pu"):
+            lines.append(f"net.sgen.at[{index_literal}, {column!r}] = {_float(row.get(column))!r}")
+    lines += [
+        "import copy",
+        "import logging",
+        "import math",
+        "import numpy as np",
+        "import pandas as pd",
+        "logger = logging.getLogger('electrisim')",
+        "",
+    ]
+    for func in (_float, _in_service, _is_current_source, _negative_sequence_shunts, _invert_y,
+                 _bus_lookup_ppc, _sequence_z, _fault_impedance_pu, _voltage_source_ikss,
+                 apply_negative_sequence_ikss, _apply_negative_sequence_ikss):
+        lines.extend(inspect.getsource(func).rstrip("\n").split("\n"))
+        lines.append("")
+    lines.append(f"_BRANCH_RESULT_COLUMNS = {_BRANCH_RESULT_COLUMNS!r}")
+    lines.append("")
+    lines.extend(inspect.getsource(_scale_branch_results).rstrip("\n").split("\n"))
+    lines.append("")
+    lines.append(
+        f"apply_negative_sequence_ikss(net, fault={fault!r}, case={case!r}, lv_tol_percent={int(lv_tol_percent)}, "
+        f"r_fault_ohm={float(r_fault_ohm)!r}, x_fault_ohm={float(x_fault_ohm)!r}, bus={bus_literal})"
+    )
+    lines.append("")
+    return lines
 
 
 def _scale_branch_results(net, ratio_by_bus):

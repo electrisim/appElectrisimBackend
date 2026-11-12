@@ -1,6 +1,7 @@
 import sys
 import io
 import contextlib
+import inspect
 import pandapower as pp
 import pandapower.contingency as contingency
 import pandapower.shortcircuit as sc
@@ -29,6 +30,7 @@ from converter_sc_electrisim import (
     apply_converter_short_circuit_k,
     apply_negative_sequence_ikss,
     attach_converter_sc_inputs,
+    negative_sequence_export_lines,
     sgen_k_export_lines,
 )
 import zero_sequence_dialog
@@ -1210,6 +1212,42 @@ def _py_str(value):
     return repr(str(value))
 
 
+# Line columns the IEC short circuit reads besides the positive sequence.
+_LINE_SC_EXPORT_COLS = ('r0_ohm_per_km', 'x0_ohm_per_km', 'c0_nf_per_km', 'endtemp_degree')
+# Synchronous generator short-circuit data (pandapower needs vn_kv, xdss_pu, rdss_ohm, cos_phi).
+_GEN_SC_EXPORT_COLS = ('vn_kv', 'xdss_pu', 'rdss_ohm', 'cos_phi', 'pg_percent')
+# Induction-machine static generators are an impedance in the short circuit, not a current source.
+_SGEN_ASYNC_EXPORT_COLS = ('lrc_pu', 'rx', 'max_ik_ka', 'kappa')
+
+
+def _export_finite_kwargs(row, cols):
+    """``, col=value`` for each column of ``row`` that holds a finite number."""
+    parts = []
+    for col in cols:
+        if col not in row.index:
+            continue
+        try:
+            value = float(row[col])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            parts.append(f", {col}={value!r}")
+    return ''.join(parts)
+
+
+def _export_out_of_service(row):
+    """``, in_service=False`` for an element switched off in the diagram (pandapower's default is True)."""
+    if 'in_service' not in row.index:
+        return ''
+    value = row['in_service']
+    try:
+        if value is None or pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return '' if bool(value) else ', in_service=False'
+
+
 def _dc_elem_id(table, index):
     """Diagram id of a DC element row, or its index when the table has no id column."""
     if 'id' in table.columns:
@@ -1285,7 +1323,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             name = row['name'] if 'name' in row else f"ExtGrid_{idx}"
             ext_id = row.get('id') if hasattr(row, 'get') else (row['id'] if 'id' in row.index else None)
             in_elem = _electrisim_find_in_data_by_ext_grid(in_data, name, ext_id)
-            sc_kwargs = _ext_grid_sc_kwargs_for_export(row, in_elem)
+            sc_kwargs = _ext_grid_sc_kwargs_for_export(row, in_elem) + _export_out_of_service(row)
             lines.append(
                 f"pp.create_ext_grid(net, bus=bus_{bus}, vm_pu={vm_pu}, va_degree={va_degree}, "
                 f"name={_py_str(name)}{sc_kwargs})"
@@ -1313,14 +1351,20 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             # Get optional parameters if they exist
             parallel = row.get('parallel', 1)
             df = row.get('df', 1.0)
-            
+
+            # Zero-sequence data (single-phase faults) and the end temperature (minimum short
+            # circuit, IEC 60909 resistance correction) are on every line Electrisim builds.
+            # Without them the script failed with KeyError 'r0_ohm_per_km' or "Specify end
+            # temperature for lines in net.line.endtemp_degree".
+            extra = _export_finite_kwargs(row, _LINE_SC_EXPORT_COLS) + _export_out_of_service(row)
+
             # Build the create_line_from_parameters call with all parameters
             # Note: 'id' is included as a comment since pandapower doesn't store it natively
             lines.append(f"# Line ID: {line_id}")
             line_code = (f"pp.create_line_from_parameters(net, from_bus=bus_{from_bus}, to_bus=bus_{to_bus}, "
                         f"length_km={length_km}, r_ohm_per_km={r_ohm_per_km}, x_ohm_per_km={x_ohm_per_km}, "
                         f"c_nf_per_km={c_nf_per_km}, g_us_per_km={g_us_per_km}, max_i_ka={max_i_ka}, "
-                        f"type={_py_str(line_type)}, parallel={parallel}, df={df}, name={_py_str(name)})")
+                        f"type={_py_str(line_type)}, parallel={parallel}, df={df}{extra}, name={_py_str(name)})")
             lines.append(line_code)
         lines.append("")
     
@@ -1380,7 +1424,7 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                          f"vector_group={_py_str(vector_group)}, "
                          f"vk0_percent={vk0_percent}, vkr0_percent={vkr0_percent}, "
                          f"mag0_percent={mag0_percent}, mag0_rx={mag0_rx}, "
-                         f"si0_hv_partial={si0_hv_partial}, name={_py_str(name)})")
+                         f"si0_hv_partial={si0_hv_partial}{_export_out_of_service(row)}, name={_py_str(name)})")
             lines.append(trafo_code)
         lines.append("")
     
@@ -1449,8 +1493,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                            f"tap_step_percent={tap_step_percent}, tap_step_degree={tap_step_degree}, tap_changer_type={_py_str(tap_changer_type_3w)}, "
                            f"vector_group={_py_str(vector_group)}, "
                            f"vk0_hv_percent={vk0_hv_percent}, vk0_mv_percent={vk0_mv_percent}, vk0_lv_percent={vk0_lv_percent}, "
-                           f"vkr0_hv_percent={vkr0_hv_percent}, vkr0_mv_percent={vkr0_mv_percent}, vkr0_lv_percent={vkr0_lv_percent}, "
-                           f"name={_py_str(name)})")
+                           f"vkr0_hv_percent={vkr0_hv_percent}, vkr0_mv_percent={vkr0_mv_percent}, vkr0_lv_percent={vkr0_lv_percent}"
+                           f"{_export_out_of_service(row)}, name={_py_str(name)})")
             lines.append(trafo3w_code)
         lines.append("")
     
@@ -1462,7 +1506,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             p_mw = row['p_mw']
             q_mvar = row['q_mvar']
             name = row['name'] if 'name' in row else f"Load_{idx}"
-            lines.append(f"pp.create_load(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name={_py_str(name)})")
+            lines.append(f"pp.create_load(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name={_py_str(name)}"
+                         f"{_export_out_of_service(row)})")
         lines.append("")
     
     # Create static generators
@@ -1496,9 +1541,15 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                 st = row.get('type')
                 if st is not None and str(st).strip():
                     type_part = f", type={str(st)!r}"
+            # An induction-machine generator is an impedance in the IEC short circuit; without
+            # these columns the script would treat it as a converter current source.
+            async_part = ''
+            gtype = str(row.get('generator_type') or '').strip().lower() if 'generator_type' in row.index else ''
+            if gtype in ('async', 'async_doubly_fed'):
+                async_part = f", generator_type={gtype!r}" + _export_finite_kwargs(row, _SGEN_ASYNC_EXPORT_COLS)
             lines.append(
                 f"pp.create_sgen(net, bus=bus_{bus}, p_mw={p_mw}, q_mvar={q_mvar}, name={_py_str(name)}"
-                f"{sn_part}{scale_part}{type_part})"
+                f"{sn_part}{scale_part}{type_part}{async_part}{_export_out_of_service(row)})"
             )
         lines.append("")
     
@@ -1529,6 +1580,15 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                 if not math.isfinite(fval) or (col == 'scaling' and fval == 1.0):
                     continue
                 extra += f", {col}={fval}"
+            # IEC 60909 data (Electrisim fills typical values when the dialog left them at 0).
+            extra += _export_finite_kwargs(row, _GEN_SC_EXPORT_COLS)
+            if 'power_station_trafo' in row.index:
+                pst = row['power_station_trafo']
+                try:
+                    if pst is not None and not pd.isna(pst) and int(pst) in net.trafo.index:
+                        extra += f", power_station_trafo={int(pst)}"
+                except (TypeError, ValueError):
+                    pass
             lines.append(f"pp.create_gen(net, bus=bus_{bus}, p_mw={p_mw}, vm_pu={vm_pu}, name={_py_str(name)}{extra})")
         lines.append("")
     
@@ -1540,7 +1600,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             q_mvar = row['q_mvar']
             p_mw = row['p_mw']
             name = row['name'] if 'name' in row else f"Shunt_{idx}"
-            lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name={_py_str(name)})")
+            lines.append(f"pp.create_shunt(net, bus=bus_{bus}, q_mvar={q_mvar}, p_mw={p_mw}, name={_py_str(name)}"
+                         f"{_export_out_of_service(row)})")
         lines.append("")
     
     # Create storage elements
@@ -1571,7 +1632,6 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
                           f"max_e_mwh={max_e_mwh}, min_e_mwh={min_e_mwh}, "
                           f"soc_percent={soc_percent}, in_service={in_service}, "
                           f"controllable={controllable}")
-            import pandas as pd
             if max_p_mw is not None and not (isinstance(max_p_mw, float) and pd.isna(max_p_mw)):
                 storage_code += f", max_p_mw={max_p_mw}"
             if min_p_mw is not None and not (isinstance(min_p_mw, float) and pd.isna(min_p_mw)):
@@ -1942,6 +2002,22 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         lines.append("    return_all_currents=False,")
         lines.append(")")
         lines.append("")
+        # The same steps Electrisim runs after calc_sc, in the same order.
+        lines.extend(negative_sequence_export_lines(
+            net, fault_type, case=fault_location, lv_tol_percent=sc_lv_tol_percent(sc),
+            r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, bus_literal=_export_py_literal(sc_bus),
+        ))
+        if fault_type == '1ph':
+            lines.append("# --- Electrisim peak and thermal current for the single-phase fault ---")
+            lines.append("# pandapower leaves ip and Ith empty for '1ph'; Electrisim fills them as below.")
+            lines.extend(inspect.getsource(electrisim_1ph_ip_ith).rstrip("\n").split("\n"))
+            lines.append("")
+            lines.append(
+                f"electrisim_1ph_ip_ith(net, case={fault_location!r}, bus={_export_py_literal(sc_bus)}, "
+                f"tk_s={tk_s}, lv_tol_percent={sc_lv_tol_percent(sc)}, "
+                f"r_fault_ohm={r_fault_ohm}, x_fault_ohm={x_fault_ohm})"
+            )
+            lines.append("")
         lines.append("# Print short-circuit results")
         lines.append("print('\\nBus SC Results:')")
         lines.append("print(net.res_bus_sc)")
@@ -9325,6 +9401,66 @@ def _network_not_ready_error(net, study):
     return None
 
 
+def electrisim_1ph_ip_ith(net, case='max', bus=None, tk_s=1.0, lv_tol_percent=10,
+                          r_fault_ohm=0.0, x_fault_ohm=0.0):
+    """Peak (ip) and thermal (Ith) current for a single-phase-to-ground fault, IEC 60909-0.
+
+    pandapower gives Ik1" for a single-phase fault but leaves ip and Ith empty. IEC 60909-0
+    allows the three-phase kappa of the same bus: ip = kappa * sqrt(2) * Ik1" and
+    Ith = Ik1" * sqrt(m + n). kappa and m come from a three-phase run on a copy of the network
+    with the converter current sources switched off, where pandapower's ip / Ik" is exactly
+    kappa * sqrt(2) and Ith / Ik" is sqrt(m + 1). A line's Ith uses the ratio of the fault bus
+    that gives the line's reported current. Returns False when pandapower already filled ip.
+
+    Electrisim runs this after sc.calc_sc(fault='1ph'); the exported Python script carries a
+    copy, so both give the same numbers.
+    """
+    import copy
+
+    import numpy as np
+    import pandas as pd
+    import pandapower.shortcircuit as sc
+
+    res = net.res_bus_sc
+    if res is None or res.empty or not (res['ip_ka'].isna().all() and res['ith_ka'].isna().all()):
+        return False
+    options = dict(case=case, bus=bus, tk_s=tk_s, kappa_method='C', r_fault_ohm=r_fault_ohm,
+                   x_fault_ohm=x_fault_ohm, lv_tol_percent=lv_tol_percent, check_connectivity=True)
+
+    three_phase = copy.deepcopy(net)
+    if len(three_phase.sgen):
+        three_phase.sgen['k'] = 0.0  # converters: no DC component, so only the voltage sources set kappa
+    sc.calc_sc(three_phase, fault='3ph', ip=True, ith=True, branch_results=False, **options)
+    ik3 = three_phase.res_bus_sc['ikss_ka']
+    ik3 = ik3.where(ik3 > 1e-9)
+    ratio_ip = (three_phase.res_bus_sc['ip_ka'] / ik3).reindex(res.index)
+    ratio_ith = (three_phase.res_bus_sc['ith_ka'] / ik3).reindex(res.index)
+    res['ip_ka'] = res['ikss_ka'] * ratio_ip
+    res['ith_ka'] = res['ikss_ka'] * ratio_ith
+
+    # pandapower's line Ith for a single-phase fault is 0 (its m is never computed).
+    lines = getattr(net, 'res_line_sc', None)
+    if lines is not None and not lines.empty and 'ith_ka' in lines.columns \
+            and not isinstance(lines.index, pd.MultiIndex):
+        per_fault = copy.deepcopy(net)
+        sc.calc_sc(per_fault, fault='1ph', ip=False, ith=False, branch_results=True,
+                   return_all_currents=True, **options)
+        currents = per_fault.res_line_sc['ikss_ka']
+        for line in lines.index:
+            try:
+                by_bus = currents.xs(line, level=0)
+            except KeyError:
+                continue
+            by_bus = by_bus[by_bus > 1e-9]
+            if by_bus.empty:
+                lines.at[line, 'ith_ka'] = 0.0
+                continue
+            fault_bus = by_bus.idxmin() if case == 'min' else by_bus.idxmax()
+            ratio = ratio_ith.get(fault_bus, np.nan)
+            lines.at[line, 'ith_ka'] = lines.at[line, 'ikss_ka'] * ratio if np.isfinite(ratio) else np.nan
+    return True
+
+
 def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=None):
     _drop_dc_grid_for_sc(net)
     not_ready = _network_not_ready_error(net, "Short circuit")
@@ -9475,32 +9611,21 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             bus=bus,
         )
         
-        # Check if ip_ka and ith_ka calculations failed (all NaN) for single-phase faults
-        if fault_type == '1ph' and net.res_bus_sc['ip_ka'].isna().all() and net.res_bus_sc['ith_ka'].isna().all():
-            
-            # Calculate ip_ka and ith_ka from ikss_ka using standard electrical engineering formulas
-            # ip_ka = kappa * sqrt(2) * ikss_ka (peak current)
-            # ith_ka = ikss_ka (for short duration faults, thermal current ≈ initial current)
+        # pandapower leaves ip and Ith empty for a single-phase fault. They used to be filled
+        # with a fixed kappa of 1.8 and Ith = Ik1"; IEC 60909-0 uses the bus's own kappa and m.
+        if fault_type == '1ph':
+            try:
+                electrisim_1ph_ip_ith(
+                    net, case=fault_location, bus=bus, tk_s=tk_s, lv_tol_percent=lv_tol_percent,
+                    r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm,
+                )
+            except Exception as ip_err:
+                if not hasattr(net, 'warnings') or net.warnings is None:
+                    net.warnings = []
+                net.warnings.append(
+                    f"Single-phase fault: peak current ip and thermal current Ith could not be "
+                    f"calculated ({ip_err}); Ik1\" is unaffected.")
 
-            # Kappa factor for peak current calculation (typical value for medium voltage networks)
-            # This can vary from 1.0 to 2.0 depending on network characteristics
-            kappa_factor = 1.8  # Conservative estimate for medium voltage networks
-            
-            # Calculate ip_ka (peak short-circuit current)
-            net.res_bus_sc['ip_ka'] = kappa_factor * np.sqrt(2) * net.res_bus_sc['ikss_ka']
-            
-            # Calculate ith_ka (thermal short-circuit current)
-            # For short duration faults (tk_s = 1.0), ith ≈ ikss
-            # For longer durations, ith would be calculated differently
-            if tk_s <= 1.0:
-                net.res_bus_sc['ith_ka'] = net.res_bus_sc['ikss_ka']
-            else:
-                # For longer fault durations, thermal current is typically lower
-                # ith = ikss * sqrt(thermal_factor) where thermal_factor depends on fault duration
-                thermal_factor = 1.0 / tk_s if tk_s > 1.0 else 1.0
-                net.res_bus_sc['ith_ka'] = net.res_bus_sc['ikss_ka'] * np.sqrt(thermal_factor)
-            
-        
     except Exception as e:
         
         # Capture the diagnostic output and process it
