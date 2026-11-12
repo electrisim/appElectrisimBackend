@@ -1228,8 +1228,9 @@ def simulation():
                     'max_loading_percent': in_data[x].get('max_loading_percent', '100'),
                 }
                 
-                # Create network
-                net = pp.create_empty_network()
+                # Create network at the system frequency chosen in the dialog (line charging
+                # scales with it; older clients send none and get 50 Hz as before).
+                net = pp.create_empty_network(f_hz=_parse_frequency(in_data[x].get('frequency', '50')))
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
                 

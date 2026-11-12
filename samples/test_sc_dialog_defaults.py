@@ -105,8 +105,10 @@ def main() -> None:
 
     data = solve("3ph", "min")
     assert data.get("error"), "a zero minimum grid power must not be guessed"
-    params = [p["param"] for p in data["diagnostic"]["invalid_parameters"]]
-    assert params == ["s_sc_min_mva"], params
+    # The missing value is named up front, before pandapower can fail with "nan in Ybus".
+    message = data.get("message") or ""
+    assert "minimum short-circuit power" in message and "'Grid'" in message, message
+    assert "Ybus" not in message, message
     print("3ph min: asks for s_sc_min_mva OK")
     # Studies that run IEC short circuit themselves hit the same generator gap.
     base = payload("3ph", "max")

@@ -6672,6 +6672,14 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     # The powerflow() call above returns base results but leaves the DSS engine
     # in a state that cannot be reliably re-solved.  We rebuild the circuit
     # completely, add monitors, solve once, and proceed to harmonics.
+    #
+    # The rebuild must be the same circuit, solved the same way, as the load flow that just
+    # succeeded: the same source (New Circuit with the External Grid data), the same
+    # transformer connections, the same fallback solve plans and the same generator voltage
+    # control. It used to be a plain "solve" on a differently built circuit, which diverged
+    # on meshed networks with generators (e.g. case39) and ended in OpenDSS error #487.
+    global _opendss_lf_shift_conns
+    in_data = _without_dc_elements(in_data)
     opendss_commands = []
 
     def execute_dss_command(command):
@@ -6681,84 +6689,136 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
             opendss_commands.append(command)
 
     f = frequency
-    execute_dss_command('clear')
-    # Base frequency must be set before New Circuit, or the source is created at 60 Hz.
-    execute_dss_command(f'set DefaultBaseFrequency={f}')
-    execute_dss_command('New Circuit.OpenDSS_Circuit')
-    execute_dss_command(f'set Mode={mode}')
-    execute_dss_command(f'set Algorithm={algorithm}')
-    execute_dss_command(f'set LoadModel={loadmodel}')
-    execute_dss_command(f'set ControlMode={controlmode}')
-    execute_dss_command(f'set MaxIterations={max_iterations}')
-    execute_dss_command(f'set Tolerance={tolerance}')
-
+    effective_controlmode = controlmode
+    if _in_data_needs_time_control(in_data) and str(controlmode).lower() == 'static':
+        effective_controlmode = 'Time'
+    ext_scan = _prescan_external_grid(in_data)
     try:
-        BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
-            in_data, dss, export_commands, opendss_commands)
+        shift_conns = _opendss_vector_groups_break_loops(in_data)
+    except Exception as exc:
+        print(f"[OpenDSS][HARMONICS] Phase-shift loop check failed: {exc}")
+        shift_conns = False
 
-        (LinesDict, LinesDictId, LoadsDict, LoadsDictId,
-         TransformersDict, TransformersDictId,
-         Transformers3WDict, Transformers3WDictId,
-         ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId,
-         GeneratorsDict, GeneratorsDictId,
-         StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId,
-         ExternalGridsDict, ExternalGridsDictId,
-         circuit_source_element_name) = create_other_elements(
-            in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
-            export_commands, opendss_commands, execute_dss_command)
-    except Exception as e:
+    snapshot_mode = str(mode).strip().lower() in ('snapshot', 'snap', '')
+    if snapshot_mode:
+        plans = _opendss_snapshot_solve_plans(algorithm, max_iterations)
+    else:
+        plans = [{'label': str(mode), 'algorithm': algorithm,
+                  'max_iterations': max_iterations, 'gen_vminpu': None}]
+    converged = False
+    fallback_plan = None       # finite voltages, but OpenDSS did not flag convergence
+    plan_index = 0
+    while plan_index < len(plans):
+        plan = plans[plan_index]
+        plan_index += 1
+        del opendss_commands[:]
+        execute_dss_command('clear')
+        # Base frequency must be set before New Circuit, or the source is created at 60 Hz.
+        execute_dss_command(f'set DefaultBaseFrequency={f}')
+        execute_dss_command(_new_circuit_command(ext_scan))
+        execute_dss_command(f'set Mode={mode}')
+        execute_dss_command(f"set Algorithm={plan['algorithm']}")
+        execute_dss_command(f'set LoadModel={loadmodel}')
+        execute_dss_command(f'set ControlMode={effective_controlmode}')
+        execute_dss_command(f"set MaxIterations={plan['max_iterations']}")
+        execute_dss_command(f'set Tolerance={tolerance}')
+
+        _opendss_lf_shift_conns = shift_conns
+        try:
+            BusbarsDictVoltage, BusbarsDictConnectionToName = create_busbars(
+                in_data, dss, export_commands, opendss_commands)
+
+            (LinesDict, LinesDictId, LoadsDict, LoadsDictId,
+             TransformersDict, TransformersDictId,
+             Transformers3WDict, Transformers3WDictId,
+             ShuntsDict, ShuntsDictId, CapacitorsDict, CapacitorsDictId,
+             GeneratorsDict, GeneratorsDictId,
+             StoragesDict, StoragesDictId, PVSystemsDict, PVSystemsDictId,
+             ExternalGridsDict, ExternalGridsDictId,
+             circuit_source_element_name) = create_other_elements(
+                in_data, dss, BusbarsDictVoltage, BusbarsDictConnectionToName,
+                export_commands, opendss_commands, execute_dss_command)
+        except Exception as e:
+            return _opendss_error_response(
+                f"Error creating harmonic circuit: {str(e)}", opendss_commands, export_commands)
+        finally:
+            _opendss_lf_shift_conns = False
+
+        # Add monitors BEFORE solving so they are part of the initial circuit
+        def _find_line_buses(line_key):
+            for x_key in in_data:
+                ed = in_data[x_key]
+                typ = ed.get('typ', '')
+                if (typ == 'Line' or typ.startswith('Impedance')) and (ed.get('name', '') == line_key or ed.get('id', '') == LinesDictId.get(line_key, '')):
+                    return ed.get('busFrom', ''), ed.get('busTo', '')
+            return '', ''
+
+        def _find_trafo_buses(trafo_key):
+            for x_key in in_data:
+                ed = in_data[x_key]
+                _t = ed.get('typ', '')
+                if (_t.startswith("Transformer") or _t.startswith("Two Winding Transformer")) and not _t.startswith("Three Winding Transformer") and (ed.get('name', '') == trafo_key or ed.get('id', '') == TransformersDictId.get(trafo_key, '')):
+                    return ed.get('busFrom', ''), ed.get('busTo', '')
+            return '', ''
+
+        elem_terminal_to_bus = []
+
+        for line_key, dss_line_name in LinesDict.items():
+            execute_dss_command(f'New Monitor.mon_{dss_line_name} element=Line.{dss_line_name} terminal=1 mode=0')
+            execute_dss_command(f'New Monitor.mon_{dss_line_name}_t2 element=Line.{dss_line_name} terminal=2 mode=0')
+            bf, bt = _find_line_buses(line_key)
+            if bf and bf in BusbarsDictConnectionToName:
+                bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
+                elem_terminal_to_bus.append(('Line', dss_line_name, 1, bus_key))
+            if bt and bt in BusbarsDictConnectionToName:
+                bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
+                elem_terminal_to_bus.append(('Line', dss_line_name, 2, bus_key))
+
+        for trafo_key, dss_trafo_name in TransformersDict.items():
+            execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t1 element=Transformer.{dss_trafo_name} terminal=1 mode=0')
+            execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t2 element=Transformer.{dss_trafo_name} terminal=2 mode=0')
+            bf, bt = _find_trafo_buses(trafo_key)
+            if bf and bf in BusbarsDictConnectionToName:
+                bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
+                elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 1, bus_key))
+            if bt and bt in BusbarsDictConnectionToName:
+                bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
+                elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 2, bus_key))
+
+        # ---- Step 3: Solve fundamental power flow on the fresh circuit --------
+        if neglect_load_y:
+            execute_dss_command('set NeglectLoadY=Yes')
+
+        pv_context = None
+        if snapshot_mode:
+            pv_context = {'bus_voltages': BusbarsDictVoltage,
+                          'source_bus': (ext_scan or {}).get('bus')}
+        try:
+            _opendss_solve_snapshot_plan(dss, execute_dss_command, plan, GeneratorsDict, pv_context)
+        except Exception as e:
+            print(f"[OpenDSS][HARMONICS] Fundamental solve failed ({plan['label']}): {e}")
+
+        try:
+            converged = bool(dss.Solution.Converged())
+        except Exception:
+            converged = False
+        usable = _opendss_circuit_has_usable_solution(dss)
+        print(f"[OpenDSS][HARMONICS] Fresh circuit solve ({plan['label']}) converged: {converged}, usable: {usable}")
+        if converged and usable:
+            break
+        converged = False
+        if usable and fallback_plan is None:
+            fallback_plan = plan
+        if plan_index >= len(plans) and fallback_plan is not None and plan is not fallback_plan:
+            # No plan converged cleanly: go back to the first one that gave real voltages.
+            plans.append(fallback_plan)
+
+    if not _opendss_circuit_has_usable_solution(dss):
         return _opendss_error_response(
-            f"Error creating harmonic circuit: {str(e)}", opendss_commands, export_commands)
-
-    # Add monitors BEFORE solving so they are part of the initial circuit
-    def _find_line_buses(line_key):
-        for x_key in in_data:
-            ed = in_data[x_key]
-            typ = ed.get('typ', '')
-            if (typ == 'Line' or typ.startswith('Impedance')) and (ed.get('name', '') == line_key or ed.get('id', '') == LinesDictId.get(line_key, '')):
-                return ed.get('busFrom', ''), ed.get('busTo', '')
-        return '', ''
-
-    def _find_trafo_buses(trafo_key):
-        for x_key in in_data:
-            ed = in_data[x_key]
-            _t = ed.get('typ', '')
-            if (_t.startswith("Transformer") or _t.startswith("Two Winding Transformer")) and not _t.startswith("Three Winding Transformer") and (ed.get('name', '') == trafo_key or ed.get('id', '') == TransformersDictId.get(trafo_key, '')):
-                return ed.get('busFrom', ''), ed.get('busTo', '')
-        return '', ''
-
-    elem_terminal_to_bus = []
-
-    for line_key, dss_line_name in LinesDict.items():
-        execute_dss_command(f'New Monitor.mon_{dss_line_name} element=Line.{dss_line_name} terminal=1 mode=0')
-        execute_dss_command(f'New Monitor.mon_{dss_line_name}_t2 element=Line.{dss_line_name} terminal=2 mode=0')
-        bf, bt = _find_line_buses(line_key)
-        if bf and bf in BusbarsDictConnectionToName:
-            bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
-            elem_terminal_to_bus.append(('Line', dss_line_name, 1, bus_key))
-        if bt and bt in BusbarsDictConnectionToName:
-            bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
-            elem_terminal_to_bus.append(('Line', dss_line_name, 2, bus_key))
-
-    for trafo_key, dss_trafo_name in TransformersDict.items():
-        execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t1 element=Transformer.{dss_trafo_name} terminal=1 mode=0')
-        execute_dss_command(f'New Monitor.mon_{dss_trafo_name}_t2 element=Transformer.{dss_trafo_name} terminal=2 mode=0')
-        bf, bt = _find_trafo_buses(trafo_key)
-        if bf and bf in BusbarsDictConnectionToName:
-            bus_key = BusbarsDictConnectionToName.get(bf, bf).lower()
-            elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 1, bus_key))
-        if bt and bt in BusbarsDictConnectionToName:
-            bus_key = BusbarsDictConnectionToName.get(bt, bt).lower()
-            elem_terminal_to_bus.append(('Transformer', dss_trafo_name, 2, bus_key))
-
-    # ---- Step 3: Solve fundamental power flow on the fresh circuit ------------
-    if neglect_load_y:
-        execute_dss_command('set NeglectLoadY=Yes')
-
-    execute_dss_command('solve')
-
-    converged = dss.Solution.Converged()
-    print(f"[OpenDSS][HARMONICS] Fresh circuit solve converged: {converged}")
+            "Harmonic analysis could not start: the fundamental-frequency load flow of the "
+            "harmonic circuit did not converge. Check generator P/Q, transformer ratings and "
+            "the External Grid short-circuit power, or try Algorithm=Newton.",
+            opendss_commands, export_commands)
 
     # Read fundamental voltages and currents for THD base computation
     user_bus_names = list(set(BusbarsDictConnectionToName.values()))
@@ -6811,8 +6871,14 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
     # ---- Step 4: Enter harmonics mode ----------------------------------------
     all_harmonics = sorted(set([1] + harmonic_orders))
     h_str = '[' + ','.join(str(h) for h in all_harmonics) + ']'
-    execute_dss_command(f'set harmonics={h_str}')
-    execute_dss_command('set mode=harmonics')
+    try:
+        execute_dss_command(f'set harmonics={h_str}')
+        execute_dss_command('set mode=harmonics')
+    except Exception as e:
+        return _opendss_error_response(
+            "Harmonic analysis could not start: OpenDSS did not accept the fundamental-frequency "
+            f"solution ({e}). Try Algorithm=Newton or a higher Max Iterations.",
+            opendss_commands, export_commands)
 
     # ---- Step 5: Apply harmonic-specific modifications and solve harmonics ----
     execute_dss_command('batchedit transformer..* ppm_antifloat=0')
@@ -6843,7 +6909,11 @@ def harmonic_analysis(in_data, frequency, mode, algorithm, loadmodel, max_iterat
         execute_dss_command(f"Edit Transformer.{hvdc_trafos[302]} conns=[wye delta] leadlag=lead")
         print("[OpenDSS][HARMONICS] Applied HVDC harmonics cancelling: 3->301 wye-wye, 3->302 wye-delta leadlag=lead")
 
-    execute_dss_command('solve')
+    try:
+        execute_dss_command('solve')
+    except Exception as e:
+        return _opendss_error_response(
+            f"Harmonic solution failed in OpenDSS: {e}", opendss_commands, export_commands)
 
     # ---- Step 7: Read per-harmonic data from monitors -------------------------
     # After mode=harmonics solve, monitors have one sample per harmonic step.

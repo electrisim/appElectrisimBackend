@@ -365,6 +365,69 @@ def warn_unrealistic_ext_grid_sc_power(net, case='max', in_data_full=None, limit
     return messages
 
 
+def sc_min_case_missing_grid_power(net):
+    """Names of in-service External Grids without a minimum short-circuit power.
+
+    The minimum case reads S"k min; with 0 or nothing entered pandapower stops with
+    "nan value detected in Ybus matrix", which says nothing about the cause.
+    """
+    eg = getattr(net, 'ext_grid', None)
+    if eg is None or eg.empty:
+        return []
+    ufn = getattr(net, 'user_friendly_names', None) or {}
+    missing = []
+    for idx, row in eg.iterrows():
+        if 'in_service' in eg.columns and not bool(row['in_service']):
+            continue
+        value = row.get('s_sc_min_mva') if 's_sc_min_mva' in eg.columns else None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = float('nan')
+        if not (value > 0):
+            name = str(row.get('name'))
+            missing.append(str(ufn.get(name) or name))
+    return missing
+
+
+def ensure_line_endtemp_for_min_case(net):
+    """Fill missing line end temperatures for the minimum short-circuit case, with a warning.
+
+    IEC 60909-0 calculates minimum currents with the conductor resistance at the end
+    temperature of the fault. pandapower refuses to run without it ("Specify end temperature
+    for lines"), and a 0 left in the dialog was taken literally, which lowers the resistance
+    below its 20 degC value and overstates the minimum current. Unset values (blank or 0)
+    get 80 degC for overhead lines and 160 degC for cables.
+    """
+    line = getattr(net, 'line', None)
+    if line is None or line.empty:
+        return
+    if 'endtemp_degree' not in line.columns:
+        net.line['endtemp_degree'] = float('nan')
+    temps = pd.to_numeric(net.line['endtemp_degree'], errors='coerce')
+    unset = temps.isna() | (temps <= 0)
+    if not bool(unset.any()):
+        return
+    types = net.line['type'].astype(str).str.lower() if 'type' in net.line.columns else pd.Series('', index=net.line.index)
+    is_cable = types.isin(['cs', 'cable'])
+    temps = temps.where(~unset, 80.0)
+    temps = temps.where(~(unset & is_cable), 160.0)
+    net.line['endtemp_degree'] = temps.astype(float)
+    n_cable = int((unset & is_cable).sum())
+    n_other = int(unset.sum()) - n_cable
+    parts = []
+    if n_other:
+        parts.append(f"80 degC for {n_other} overhead line(s)")
+    if n_cable:
+        parts.append(f"160 degC for {n_cable} cable(s)")
+    if not hasattr(net, 'warnings') or net.warnings is None:
+        net.warnings = []
+    net.warnings.append(
+        "Minimum short circuit: the conductor end temperature is not set on "
+        f"{int(unset.sum())} line(s); used " + " and ".join(parts) +
+        ". Enter the end temperature in the Line dialog (Short circuit tab) for exact values.")
+
+
 def ensure_ext_grid_zero_sequence_min(net):
     """
     pandapower single-phase min short-circuit reads ext_grid['x0x_min'] and
@@ -3000,6 +3063,44 @@ def electrisim_runpp(net, **kwargs):
         return pp.runpp(net, **merged)
 
 
+def electrisim_runpp_robust(net, algorithm='nr', calculate_voltage_angles=True, init='auto',
+                            max_plans=None, **extra):
+    """Load flow for the studies that solve the network many times (contingency, time series,
+    economic analysis), set up the way the Load Flow study solves it.
+
+    Those studies used a single plain ``runpp``, so they failed on diagrams that Load Flow
+    handles: a STATCOM is solved there as an equivalent voltage-controlled source, and a
+    divergence is retried with more iterations and other start values.
+
+    ``max_plans`` limits the fallback ladder (repeated solves use 2 to stay fast).
+    Returns the keyword arguments of the attempt that converged; raises the last error.
+    """
+    if _electrisim_net_has_facts(net):
+        _electrisim_validate_ssc(net)
+        _electrisim_ssc_to_equivalent_gens(net)
+    facts_present = _electrisim_net_has_facts(net)
+    if facts_present:
+        algorithm = 'nr'   # pandapower implements FACTS for Newton-Raphson only
+    plans = [
+        {'algorithm': algorithm, 'init': init},
+        {'algorithm': algorithm, 'init': init, 'max_iteration': 50},
+        {'algorithm': algorithm, 'init': 'flat', 'max_iteration': 100},
+    ]
+    if not facts_present:
+        plans.append({'algorithm': 'iwamoto_nr', 'init': 'flat', 'max_iteration': 100})
+    if max_plans:
+        plans = plans[:max_plans]
+    last_error = None
+    for plan in plans:
+        kwargs = {'calculate_voltage_angles': calculate_voltage_angles, **extra, **plan}
+        try:
+            electrisim_runpp(net, **kwargs)
+            return kwargs
+        except Exception as plan_err:
+            last_error = plan_err
+    raise last_error
+
+
 def _gen_q_limits_from_dialog(element):
     """(min_q_mvar, max_q_mvar) from a Generator element, or None when not set.
 
@@ -4030,6 +4131,53 @@ def create_other_elements(in_data,net,x, Busbars):
                 )
                 continue
                 
+            line_label = in_data[x].get('userFriendlyName') or in_data[x].get('name') or x
+
+            # A Line drawn between two DC buses. Bus and DC Bus are numbered separately, so it
+            # used to be built as an AC line between two unrelated AC buses (usually with no
+            # impedance, which ended every study in "divide by zero").
+            _dc_names = getattr(net, 'dc_bus_names', None) or set()
+            _from_dc, _to_dc = bus_from in _dc_names, bus_to in _dc_names
+            if _from_dc != _to_dc:
+                raise ValueError(
+                    f"Line '{line_label}' joins an AC bus and a DC bus. The AC and DC sides can only be "
+                    "joined by a converter (VSC). Connect the line to two buses of the same kind.")
+            if _from_dc and _to_dc:
+                _dc_len = safe_float(in_data[x].get('length_km'), 0.0)
+                _dc_r = safe_float(in_data[x].get('r_ohm_per_km'), 0.0)
+                if _dc_len <= 0 or _dc_r <= 0:
+                    raise ValueError(
+                        f"Line '{line_label}' joins two DC buses, so it is calculated as a DC line and "
+                        "needs a length and a resistance R above zero (X and C are not used). "
+                        f"It has length {_dc_len:g} km and R {_dc_r:g} ohm/km.")
+                _dc_imax = safe_float(in_data[x].get('max_i_ka'), 0.0)
+                _dc_in_service = str(in_data[x].get('in_service', True)).strip().lower() not in ('false', '0', 'no')
+                _dc_idx = pp.create_line_dc_from_parameters(
+                    net, from_bus_dc=from_bus_idx, to_bus_dc=to_bus_idx, length_km=_dc_len,
+                    r_ohm_per_km=_dc_r, max_i_ka=_dc_imax if _dc_imax > 0 else 1e3,
+                    name=in_data[x]['name'], in_service=_dc_in_service,
+                    parallel=max(1, safe_int(in_data[x].get('parallel'), 1)))
+                if 'id' not in net.line_dc.columns:
+                    net.line_dc['id'] = ''
+                net.line_dc.at[_dc_idx, 'id'] = in_data[x].get('id', '')
+                if not hasattr(net, 'warnings') or net.warnings is None:
+                    net.warnings = []
+                net.warnings.append(
+                    f"Line '{line_label}' joins two DC buses and was calculated as a DC line "
+                    "(resistance only). Use the DC Line element to make this explicit.")
+                continue
+
+            # A line with no impedance makes the network equations singular; pandapower then
+            # stops with "divide by zero" and no hint at the element.
+            _len = safe_float(in_data[x].get('length_km'), 0.0)
+            _r = safe_float(in_data[x].get('r_ohm_per_km'), 0.0)
+            _xl = safe_float(in_data[x].get('x_ohm_per_km'), 0.0)
+            if _len <= 0 or (_r == 0 and _xl == 0):
+                _why = (f"its length is {_len:g} km" if _len <= 0 else "R and X are both 0")
+                raise ValueError(
+                    f"Line '{line_label}' has no impedance ({_why}). Enter its length and R/X, or, "
+                    "if the two buses are really one node, join them with a closed Switch instead.")
+
             # Create a base parameters dict with required parameters
             line_params = {
                 "from_bus": from_bus_idx,
@@ -9568,6 +9716,22 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         fault_location = 'max'  # Default to max if invalid
  
 
+    if fault_location == 'min':
+        _no_min_power = sc_min_case_missing_grid_power(net)
+        if _no_min_power:
+            _names = ', '.join(f"'{n}'" for n in _no_min_power[:8])
+            if len(_no_min_power) > 8:
+                _names += f" and {len(_no_min_power) - 8} more"
+            return json.dumps({
+                "error": True,
+                "message": (
+                    "Minimum short circuit needs the minimum short-circuit power of every External "
+                    f"Grid, and it is 0 or empty for {_names}. Open the External Grid, go to the "
+                    "short-circuit parameters and enter S\"k min (usually somewhat below S\"k max), "
+                    "or run the Maximum case."),
+            })
+        ensure_line_endtemp_for_min_case(net)
+
     try:
         # Use correct parameter mapping according to Pandapower documentation
         
@@ -10041,121 +10205,234 @@ def _contingency_friendly_name(net, raw_name):
     return name
 
 
+def _contingency_flag(value, default=True):
+    """Dialog flags arrive as "true"/"false" strings, but accept real booleans too."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _contingency_num(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _contingency_limit_violations(net, voltage_limits, thermal_limits, min_vm_pu, max_vm_pu,
+                                  max_loading_percent):
+    """Voltage and loading limit violations in the load-flow results currently held by ``net``."""
+    found = []
+    if voltage_limits and not net.res_bus.empty:
+        vm = net.res_bus.vm_pu
+        for bus_idx in vm.index[(vm < min_vm_pu) | (vm > max_vm_pu)]:
+            value = float(vm.at[bus_idx])
+            bus_name = _contingency_friendly_name(net, net.bus.at[bus_idx, 'name'])
+            found.append({
+                'type': 'voltage',
+                'element': f"Bus_{bus_name}",
+                'description': f"Voltage violation: {value:.3f} p.u.",
+                'severity': 'high' if value < 0.9 or value > 1.1 else 'medium',
+                'value': value,
+            })
+    if thermal_limits:
+        for table_name, res_name, prefix, label in (('line', 'res_line', 'Line', 'Line'),
+                                                    ('trafo', 'res_trafo', 'Trafo', 'Transformer'),
+                                                    ('trafo3w', 'res_trafo3w', 'Trafo', 'Transformer')):
+            res = getattr(net, res_name, None)
+            if res is None or res.empty or 'loading_percent' not in res:
+                continue
+            loading = res.loading_percent
+            table = getattr(net, table_name)
+            for idx in loading.index[loading > max_loading_percent]:
+                value = float(loading.at[idx])
+                name = _contingency_friendly_name(net, table.at[idx, 'name'])
+                found.append({
+                    'type': 'thermal',
+                    'element': f"{prefix}_{name}",
+                    'description': f"{label} overload: {value:.1f}%",
+                    'severity': 'high' if value > 120 else 'medium',
+                    'value': value,
+                })
+    return found
+
+
+def _contingency_mark_pre_existing(case_violations, base_by_key):
+    """Flag violations the network already has with nothing switched out.
+
+    Without this every contingency lists the same base-case violation, and the ones an
+    outage really causes are hard to find.
+    """
+    for violation in case_violations:
+        base = base_by_key.get((violation['type'], violation['element']))
+        if base is None:
+            continue
+        violation['pre_existing'] = True
+        violation['base_value'] = base['value']
+        if violation['type'] == 'voltage':
+            violation['description'] += f" (base case: {base['value']:.3f} p.u.)"
+        else:
+            violation['description'] += f" (base case: {base['value']:.1f}%)"
+
+
+def _contingency_result_rows(net):
+    """Bus / line / transformer result rows for the results currently held by ``net``."""
+    def _col(table, column, idx):
+        return table.at[idx, column] if column in table.columns else None
+
+    buses = [{
+        'bus_id': _col(net.bus, 'id', idx),
+        'name': _contingency_friendly_name(net, net.bus.at[idx, 'name']),
+        'vm_pu': row.vm_pu, 'va_degree': row.va_degree, 'p_mw': row.p_mw, 'q_mvar': row.q_mvar,
+    } for idx, row in net.res_bus.iterrows()]
+    lines = [{
+        'line_id': _col(net.line, 'id', idx),
+        'name': _contingency_friendly_name(net, net.line.at[idx, 'name']),
+        'loading_percent': row.loading_percent,
+        'p_from_mw': row.p_from_mw, 'q_from_mvar': row.q_from_mvar,
+        'p_to_mw': row.p_to_mw, 'q_to_mvar': row.q_to_mvar,
+    } for idx, row in net.res_line.iterrows()]
+    trafos = [{
+        'trafo_id': _col(net.trafo, 'id', idx),
+        'name': _contingency_friendly_name(net, net.trafo.at[idx, 'name']),
+        'loading_percent': row.loading_percent,
+        'p_hv_mw': row.p_hv_mw, 'q_hv_mvar': row.q_hv_mvar,
+        'p_lv_mw': row.p_lv_mw, 'q_lv_mvar': row.q_lv_mvar,
+    } for idx, row in net.res_trafo.iterrows()]
+    res_t3 = getattr(net, 'res_trafo3w', None)
+    if res_t3 is not None and not res_t3.empty:
+        trafos.extend({
+            'trafo_id': _col(net.trafo3w, 'id', idx),
+            'name': _contingency_friendly_name(net, net.trafo3w.at[idx, 'name']),
+            'loading_percent': row.loading_percent,
+            'p_hv_mw': row.p_hv_mw, 'q_hv_mvar': row.q_hv_mvar,
+            'p_mv_mw': row.p_mv_mw, 'q_mv_mvar': row.q_mv_mvar,
+            'p_lv_mw': row.p_lv_mw, 'q_lv_mvar': row.q_lv_mvar,
+        } for idx, row in res_t3.iterrows())
+    return buses, lines, trafos
+
+
 def contingency_analysis(net, contingency_params):
     """
-    Perform contingency analysis on the network.
-    
+    N-1 screening: switch out each in-service element of the selected type in turn, run an
+    AC load flow and check voltage and loading limits.
+
     Parameters:
     net: pandapower network
     contingency_params: dictionary containing contingency analysis parameters
     """
     try:
-        # Extract parameters
-        contingency_type = contingency_params.get('contingency_type', 'N-1')
         element_type = contingency_params.get('element_type', 'line')
-        elements_to_analyze = contingency_params.get('elements_to_analyze', 'all')
-        voltage_limits = contingency_params.get('voltage_limits', 'true') == 'true'
-        thermal_limits = contingency_params.get('thermal_limits', 'true') == 'true'
-        min_vm_pu = float(contingency_params.get('min_vm_pu', 0.95))
-        max_vm_pu = float(contingency_params.get('max_vm_pu', 1.05))
-        max_loading_percent = float(contingency_params.get('max_loading_percent', 100))
-        
-        # Validate network connectivity
-        isolated_buses = top.unsupplied_buses(net)
-        if len(isolated_buses) > 0:
-            raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
-        
-        # Check if network has elements
-        
-        # Run base case power flow
-        electrisim_runpp(net, algorithm='nr', calculate_voltage_angles=True)
-        
-        # Define contingency cases based on element type
+        voltage_limits = _contingency_flag(contingency_params.get('voltage_limits', 'true'))
+        thermal_limits = _contingency_flag(contingency_params.get('thermal_limits', 'true'))
+        min_vm_pu = _contingency_num(contingency_params.get('min_vm_pu'))
+        max_vm_pu = _contingency_num(contingency_params.get('max_vm_pu'))
+        max_loading_percent = _contingency_num(contingency_params.get('max_loading_percent'))
+        min_vm_pu = 0.95 if min_vm_pu is None else min_vm_pu
+        max_vm_pu = 1.05 if max_vm_pu is None else max_vm_pu
+        max_loading_percent = 100.0 if max_loading_percent is None else max_loading_percent
+        if min_vm_pu >= max_vm_pu:
+            return json.dumps({'error': (
+                f"Minimum voltage ({min_vm_pu:g} p.u.) must be below maximum voltage "
+                f"({max_vm_pu:g} p.u.).")})
+
+        not_ready = _network_not_ready_error(net, 'Contingency analysis')
+        if not_ready:
+            return not_ready
+
+        warnings_out = []
+
+        # Base case (nothing switched out). Its violations are reported once and flagged in
+        # every contingency, so the ones an outage causes stand out.
+        try:
+            electrisim_runpp_robust(net, algorithm='nr', calculate_voltage_angles=True,
+                                    **_electrisim_enforce_q_lims_kw(net))
+        except Exception as base_exc:
+            return json.dumps({'error': (
+                "The load flow of the intact network did not converge, so no outage can be "
+                "screened. Run Load Flow first and resolve the problems it reports. "
+                f"({base_exc})")})
+
+        # Buses that are dead before any outage (open switch, spare section) are not an
+        # effect of a contingency: name them once and leave them out of every case.
+        base_dead = {b for b in net.res_bus.index[net.res_bus.vm_pu.isna()]
+                     if bool(net.bus.at[b, 'in_service'])}
+        if base_dead:
+            dead_names = [_contingency_friendly_name(net, net.bus.at[b, 'name']) for b in sorted(base_dead)]
+            shown = ', '.join(dead_names[:10]) + (f" (+{len(dead_names) - 10} more)" if len(dead_names) > 10 else '')
+            warnings_out.append(
+                f"{len(base_dead)} bus(es) are not supplied in the intact network and are left out "
+                f"of the screening: {shown}.")
+
+        base_violations = _contingency_limit_violations(
+            net, voltage_limits, thermal_limits, min_vm_pu, max_vm_pu, max_loading_percent)
+        base_by_key = {(v['type'], v['element']): v for v in base_violations}
+
         contingency_cases = []
-        
-        if element_type == 'line' or element_type == 'all':
-            # Add line contingencies
-            for line_idx in net.line.index:
-                if net.line.loc[line_idx, 'in_service']:
-                    line_name = _contingency_friendly_name(net, net.line.loc[line_idx, 'name'])
-                    contingency_cases.append({
-                        'name': f"Line_{line_name}",
-                        'type': 'line',
-                        'element_idx': line_idx,
-                        'description': f"Outage of line {line_name}"
-                    })
-        
-        if element_type == 'transformer' or element_type == 'all':
-            # Add transformer contingencies
-            for trafo_idx in net.trafo.index:
-                if net.trafo.loc[trafo_idx, 'in_service']:
-                    trafo_name = _contingency_friendly_name(net, net.trafo.loc[trafo_idx, 'name'])
-                    contingency_cases.append({
-                        'name': f"Trafo_{trafo_name}",
-                        'type': 'trafo',
-                        'element_idx': trafo_idx,
-                        'description': f"Outage of transformer {trafo_name}"
-                    })
-        
-        if element_type == 'generator' or element_type == 'all':
-            # Add generator contingencies
-            for gen_idx in net.gen.index:
-                if net.gen.loc[gen_idx, 'in_service']:
-                    gen_name = _contingency_friendly_name(net, net.gen.loc[gen_idx, 'name'])
-                    contingency_cases.append({
-                        'name': f"Gen_{gen_name}",
-                        'type': 'gen',
-                        'element_idx': gen_idx,
-                        'description': f"Outage of generator {gen_name}"
-                    })
-        
-        # Results storage
+
+        def _add_cases(table, case_type, prefix, label):
+            for idx in table.index:
+                if not bool(table.at[idx, 'in_service']):
+                    continue
+                name = _contingency_friendly_name(net, table.at[idx, 'name'])
+                contingency_cases.append({
+                    'name': f"{prefix}_{name}",
+                    'type': case_type,
+                    'element_idx': idx,
+                    'description': f"Outage of {label} {name}",
+                })
+
+        if element_type in ('line', 'all'):
+            _add_cases(net.line, 'line', 'Line', 'line')
+        if element_type in ('transformer', 'all'):
+            _add_cases(net.trafo, 'trafo', 'Trafo', 'transformer')
+            _add_cases(net.trafo3w, 'trafo3w', 'Trafo', 'three-winding transformer')
+        if element_type in ('generator', 'all'):
+            _add_cases(net.gen, 'gen', 'Gen', 'generator')
+
+        if not contingency_cases:
+            what = {'line': 'lines', 'transformer': 'transformers', 'generator': 'generators'}.get(
+                element_type, 'lines, transformers or generators')
+            return json.dumps({'error': (
+                f"There are no in-service {what} to switch out. The network has {len(net.line)} lines, "
+                f"{len(net.trafo) + len(net.trafo3w)} transformers and {len(net.gen)} generators.")},
+                separators=(',', ':'))
+
         contingency_results = []
         violations = []
         critical_contingencies = []
-        
-        # Store base case results
-        base_case_results = {
-            'bus_vm_pu': net.res_bus.vm_pu.copy(),
-            'bus_va_degree': net.res_bus.va_degree.copy(),
-            'line_loading_percent': net.res_line.loading_percent.copy() if not net.res_line.empty else pd.Series(),
-            'trafo_loading_percent': net.res_trafo.loading_percent.copy() if not net.res_trafo.empty else pd.Series()
-        }
-        
-        # Run contingency analysis
-        for i, contingency_case in enumerate(contingency_cases):
+        worst = None   # (violation count, name, rows) of the converged case shown in the tables
+
+        for contingency_case in contingency_cases:
+            # The element is switched out on the network itself and switched back in afterwards:
+            # copying the whole network for every case dominated the run time on large diagrams.
+            table = getattr(net, contingency_case['type'])
+            element_idx = contingency_case['element_idx']
+            table.at[element_idx, 'in_service'] = False
             try:
-                # Deep copy required — net.copy() returns a plain dict without .line / .bus accessors
-                net_cont = deepcopy(net)
-                
-                # Apply contingency
-                if contingency_case['type'] == 'line':
-                    net_cont.line.loc[contingency_case['element_idx'], 'in_service'] = False
-                elif contingency_case['type'] == 'trafo':
-                    net_cont.trafo.loc[contingency_case['element_idx'], 'in_service'] = False
-                elif contingency_case['type'] == 'gen':
-                    net_cont.gen.loc[contingency_case['element_idx'], 'in_service'] = False
-                
-                # Run power flow for contingency case
-                electrisim_runpp(net_cont, algorithm='nr', calculate_voltage_angles=True)
-                
-                # Check for violations
+                electrisim_runpp_robust(net, algorithm='nr', calculate_voltage_angles=True, max_plans=2,
+                                        **_electrisim_enforce_q_lims_kw(net))
+
                 case_violations = []
 
                 # Buses cut off by the outage get no voltage (NaN), so the limit checks below
                 # never see them. Report them, with the load and generation they take with them.
-                islanded = [b for b in net_cont.res_bus.index[net_cont.res_bus.vm_pu.isna()]
-                            if bool(net_cont.bus.at[b, 'in_service'])]
+                islanded = [b for b in net.res_bus.index[net.res_bus.vm_pu.isna()]
+                            if bool(net.bus.at[b, 'in_service']) and b not in base_dead]
                 if islanded:
                     isl = set(islanded)
-                    def _lost(table):
-                        if table.empty:
+
+                    def _lost(tbl):
+                        if tbl.empty:
                             return 0.0
-                        rows = table[table.bus.isin(isl) & table.in_service.astype(bool)]
+                        rows = tbl[tbl.bus.isin(isl) & tbl.in_service.astype(bool)]
                         return float((rows.p_mw * rows.scaling).sum()) if 'scaling' in rows else float(rows.p_mw.sum())
-                    lost_load = _lost(net_cont.load)
-                    lost_gen = _lost(net_cont.gen) + _lost(net_cont.sgen)
-                    names = [_contingency_friendly_name(net, net_cont.bus.at[b, 'name']) for b in islanded]
+                    lost_load = _lost(net.load)
+                    lost_gen = _lost(net.gen) + _lost(net.sgen)
+                    names = [_contingency_friendly_name(net, net.bus.at[b, 'name']) for b in islanded]
                     shown = ', '.join(names[:10]) + (f" (+{len(names) - 10} more)" if len(names) > 10 else '')
                     case_violations.append({
                         'type': 'islanding',
@@ -10165,98 +10442,19 @@ def contingency_analysis(net, contingency_params):
                         'severity': 'high',
                     })
 
-                # Check voltage violations
-                if voltage_limits:
-                    voltage_violations = net_cont.res_bus[
-                        (net_cont.res_bus.vm_pu < min_vm_pu) | 
-                        (net_cont.res_bus.vm_pu > max_vm_pu)
-                    ]
-                    for bus_idx, bus_data in voltage_violations.iterrows():
-                        bus_name = _contingency_friendly_name(net, net_cont.bus.loc[bus_idx, 'name'])
-                        case_violations.append({
-                            'type': 'voltage',
-                            'element': f"Bus_{bus_name}",
-                            'description': f"Voltage violation: {bus_data.vm_pu:.3f} p.u.",
-                            'severity': 'high' if bus_data.vm_pu < 0.9 or bus_data.vm_pu > 1.1 else 'medium'
-                        })
-                
-                # Check thermal violations
-                if thermal_limits:
-                    # Check line loading
-                    if not net_cont.res_line.empty:
-                        line_overloads = net_cont.res_line[
-                            net_cont.res_line.loading_percent > max_loading_percent
-                        ]
-                        for line_idx, line_data in line_overloads.iterrows():
-                            line_name = _contingency_friendly_name(net, net_cont.line.loc[line_idx, 'name'])
-                            case_violations.append({
-                                'type': 'thermal',
-                                'element': f"Line_{line_name}",
-                                'description': f"Line overload: {line_data.loading_percent:.1f}%",
-                                'severity': 'high' if line_data.loading_percent > 120 else 'medium'
-                            })
-                    
-                    # Check transformer loading
-                    if not net_cont.res_trafo.empty:
-                        trafo_overloads = net_cont.res_trafo[
-                            net_cont.res_trafo.loading_percent > max_loading_percent
-                        ]
-                        for trafo_idx, trafo_data in trafo_overloads.iterrows():
-                            trafo_name = _contingency_friendly_name(net, net_cont.trafo.loc[trafo_idx, 'name'])
-                            case_violations.append({
-                                'type': 'thermal',
-                                'element': f"Trafo_{trafo_name}",
-                                'description': f"Transformer overload: {trafo_data.loading_percent:.1f}%",
-                                'severity': 'high' if trafo_data.loading_percent > 120 else 'medium'
-                            })
-                
-                # Store results for this contingency
-                contingency_result = {
+                limit_violations = _contingency_limit_violations(
+                    net, voltage_limits, thermal_limits, min_vm_pu, max_vm_pu, max_loading_percent)
+                _contingency_mark_pre_existing(limit_violations, base_by_key)
+                case_violations.extend(limit_violations)
+
+                contingency_results.append({
                     'name': contingency_case['name'],
                     'description': contingency_case['description'],
                     'converged': True,
                     'violations': case_violations,
-                    'bus_results': [],
-                    'line_results': [],
-                    'trafo_results': []
-                }
-                
-                # Store bus results
-                for bus_idx, bus_data in net_cont.res_bus.iterrows():
-                    contingency_result['bus_results'].append({
-                        'bus_id': net_cont.bus.loc[bus_idx, 'id'],
-                        'name': _contingency_friendly_name(net, net_cont.bus.loc[bus_idx, 'name']),
-                        'vm_pu': bus_data.vm_pu,
-                        'va_degree': bus_data.va_degree,
-                        'p_mw': bus_data.p_mw,
-                        'q_mvar': bus_data.q_mvar
-                    })
-                
-                # Store line results
-                for line_idx, line_data in net_cont.res_line.iterrows():
-                    contingency_result['line_results'].append({
-                        'line_id': net_cont.line.loc[line_idx, 'id'],
-                        'name': _contingency_friendly_name(net, net_cont.line.loc[line_idx, 'name']),
-                        'loading_percent': line_data.loading_percent,
-                        'p_from_mw': line_data.p_from_mw,
-                        'q_from_mvar': line_data.q_from_mvar,
-                        'p_to_mw': line_data.p_to_mw,
-                        'q_to_mvar': line_data.q_to_mvar
-                    })
-                
-                # Store transformer results
-                for trafo_idx, trafo_data in net_cont.res_trafo.iterrows():
-                    contingency_result['trafo_results'].append({
-                        'trafo_id': net_cont.trafo.loc[trafo_idx, 'id'],
-                        'name': _contingency_friendly_name(net, net_cont.trafo.loc[trafo_idx, 'name']),
-                        'loading_percent': trafo_data.loading_percent,
-                        'p_hv_mw': trafo_data.p_hv_mw,
-                        'q_hv_mvar': trafo_data.q_hv_mvar,
-                        'p_lv_mw': trafo_data.p_lv_mw,
-                        'q_lv_mvar': trafo_data.q_lv_mvar
-                    })
-                
-                # Add to violations list if any violations found
+                    'new_violations': sum(1 for v in case_violations if not v.get('pre_existing')),
+                })
+
                 if case_violations:
                     violations.extend(case_violations)
                     if any(v['severity'] == 'high' for v in case_violations):
@@ -10265,13 +10463,16 @@ def contingency_analysis(net, contingency_params):
                             'description': contingency_case['description'],
                             'violations': len(case_violations)
                         })
-                
-                contingency_results.append(contingency_result)
-                
+
+                # Keep full result rows only for the case shown in the result tables.
+                count, case_name = len(case_violations), contingency_case['name']
+                if (worst is None or count > worst[0]
+                        or (count == worst[0] and count > 0 and case_name.casefold() < worst[1].casefold())):
+                    worst = (count, case_name, _contingency_result_rows(net))
+
             except Exception as e:
                 err_text = str(e)
-                err_lower = err_text.lower()
-                is_convergence = 'did not converge' in err_lower
+                is_convergence = 'did not converge' in err_text.lower()
                 try:
                     from pandapower.auxiliary import LoadFlowNotConverged
                     is_convergence = is_convergence or isinstance(e, LoadFlowNotConverged)
@@ -10287,7 +10488,7 @@ def contingency_analysis(net, contingency_params):
                     violation_desc = err_text
                     violation_type = 'error'
 
-                contingency_result = {
+                contingency_results.append({
                     'name': contingency_case['name'],
                     'description': contingency_case['description'],
                     'converged': False,
@@ -10297,128 +10498,50 @@ def contingency_analysis(net, contingency_params):
                         'element': 'System',
                         'description': violation_desc,
                         'severity': 'high'
-                    }]
-                }
-                contingency_results.append(contingency_result)
+                    }],
+                    'new_violations': 1,
+                })
                 critical_contingencies.append({
                     'name': contingency_case['name'],
                     'description': failure_desc,
                     'violations': 1
                 })
-        
-        # Prepare summary
+            finally:
+                table.at[element_idx, 'in_service'] = True
+
         summary = {
             'contingencies_analyzed': len(contingency_cases),
             'violations': violations,
             'critical_contingencies': critical_contingencies,
             'total_violations': len(violations),
-            'total_critical': len(critical_contingencies)
+            'total_critical': len(critical_contingencies),
+            'base_case_violations': base_violations,
+            'cases_with_new_violations': sum(1 for c in contingency_results if c.get('new_violations')),
         }
-        
-        # Prepare output classes for consistent formatting
-        class ContingencyBusOut(object):
-            def __init__(self, bus_id: str, name: str, vm_pu: float, va_degree: float, p_mw: float, q_mvar: float):
-                self.bus_id = bus_id
-                self.name = name
-                self.vm_pu = vm_pu
-                self.va_degree = va_degree
-                self.p_mw = p_mw
-                self.q_mvar = q_mvar
-        
-        class ContingencyLineOut(object):
-            def __init__(self, line_id: str, name: str, loading_percent: float, p_from_mw: float, q_from_mvar: float, p_to_mw: float, q_to_mvar: float):
-                self.line_id = line_id
-                self.name = name
-                self.loading_percent = loading_percent
-                self.p_from_mw = p_from_mw
-                self.q_from_mvar = q_from_mvar
-                self.p_to_mw = p_to_mw
-                self.q_to_mvar = q_to_mvar
-        
-        class ContingencyTransformerOut(object):
-            def __init__(self, trafo_id: str, name: str, loading_percent: float, p_hv_mw: float, q_hv_mvar: float, p_lv_mw: float, q_lv_mvar: float):
-                self.trafo_id = trafo_id
-                self.name = name
-                self.loading_percent = loading_percent
-                self.p_hv_mw = p_hv_mw
-                self.q_hv_mvar = q_hv_mvar
-                self.p_lv_mw = p_lv_mw
-                self.q_lv_mvar = q_lv_mvar
-        
-        # Convert results to output format
-        bus_out_list = []
-        line_out_list = []
-        trafo_out_list = []
-        
-        # Check if we have contingency results
-        if not contingency_cases:
-            error_message = f"No contingency cases found. Network has {len(net.line)} lines, {len(net.trafo)} transformers, {len(net.gen)} generators."
-            return json.dumps({'error': error_message}, separators=(',', ':'))
-        
-        if not contingency_results:
-            error_message = f"No contingency results generated. All {len(contingency_cases)} cases failed to converge."
-            return json.dumps({'error': error_message}, separators=(',', ':'))
-        
-        # Use the worst-case scenario results for display
-        worst_case = max(contingency_results, key=lambda x: len(x.get('violations', [])))
-        
-        for bus_result in worst_case.get('bus_results', []):
-            bus_out = ContingencyBusOut(
-                bus_id=bus_result['bus_id'],
-                name=bus_result['name'],
-                vm_pu=bus_result['vm_pu'],
-                va_degree=bus_result['va_degree'],
-                p_mw=bus_result['p_mw'],
-                q_mvar=bus_result['q_mvar']
-            )
-            bus_out_list.append(bus_out)
-        
-        for line_result in worst_case.get('line_results', []):
-            line_out = ContingencyLineOut(
-                line_id=line_result['line_id'],
-                name=line_result['name'],
-                loading_percent=line_result['loading_percent'],
-                p_from_mw=line_result['p_from_mw'],
-                q_from_mvar=line_result['q_from_mvar'],
-                p_to_mw=line_result['p_to_mw'],
-                q_to_mvar=line_result['q_to_mvar']
-            )
-            line_out_list.append(line_out)
-        
-        for trafo_result in worst_case.get('trafo_results', []):
-            trafo_out = ContingencyTransformerOut(
-                trafo_id=trafo_result['trafo_id'],
-                name=trafo_result['name'],
-                loading_percent=trafo_result['loading_percent'],
-                p_hv_mw=trafo_result['p_hv_mw'],
-                q_hv_mvar=trafo_result['q_hv_mvar'],
-                p_lv_mw=trafo_result['p_lv_mw'],
-                q_lv_mvar=trafo_result['q_lv_mvar']
-            )
-            trafo_out_list.append(trafo_out)
-        
-        # Prepare result dictionary
+
+        bus_rows, line_rows, trafo_rows = worst[2] if worst else ([], [], [])
         result = {
-            'bus': [bus.__dict__ for bus in bus_out_list],
-            'line': [line.__dict__ for line in line_out_list],
-            'transformer': [trafo.__dict__ for trafo in trafo_out_list],
+            'bus': bus_rows,
+            'line': line_rows,
+            'transformer': trafo_rows,
             'summary': summary,
-            'contingency_results': contingency_results
+            'contingency_results': contingency_results,
+            'worst_case': worst[1] if worst else None,
         }
-        
+        if warnings_out:
+            result['warnings'] = warnings_out
+
         # Sanitize NaN/Inf so the body is strict JSON (browser JSON.parse rejects NaN tokens).
-        response = json.dumps(
+        return json.dumps(
             _sanitize_for_strict_json(result),
             default=_json_serialize_default,
             allow_nan=False,
             separators=(',', ':'),
         )
-        
-        return response
-        
+
     except Exception as e:
         error_message = f"Contingency analysis failed: {str(e)}"
-        return json.dumps({'error': error_message}) 
+        return json.dumps({'error': error_message})
 
 
 def _truncate_solver_verbose_log(text: str, max_chars: int = 750_000) -> str:
@@ -12721,6 +12844,10 @@ def _ts_orig_p_for_element(net, elem_name, element_type):
         for idx in net.gen.index:
             if str(net.gen.loc[idx, 'name']) == elem_name:
                 return float(net.gen.loc[idx, 'p_mw'])
+    if element_type == 'storage' and len(net.storage) > 0:
+        for idx in net.storage.index:
+            if str(net.storage.loc[idx, 'name']) == elem_name:
+                return float(net.storage.loc[idx, 'p_mw'])
     return None
 
 
@@ -12775,10 +12902,11 @@ def _ts_run_powerflow(net, timeseries_params, time_index, prev_converged):
     try:
         electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init=pf_init, **pf_kwargs)
     except Exception:
-        if pf_init == 'results':
-            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=cva, init='auto', **pf_kwargs)
-        else:
-            raise
+        # A step that does not solve from the previous step's voltages (or in the default
+        # number of iterations) is retried from scratch before it is given up.
+        retry_init = init_param if init_param != 'results' else 'auto'
+        electrisim_runpp_robust(net, algorithm=algorithm, calculate_voltage_angles=cva, init=retry_init,
+                                max_plans=2, **pf_kwargs)
     return bool(net.converged)
 
 
@@ -12799,7 +12927,9 @@ def time_series_simulation(net, timeseries_params):
         element_profiles = timeseries_params.get('element_profiles') or {}
 
         import datetime
-        time_stamps = [datetime.datetime(2024, 1, 1, hour=h) for h in range(time_steps)]
+        # One hour per step; timedelta keeps runs longer than 24 steps valid (hour=24 raised ValueError).
+        _ts_start = datetime.datetime(2024, 1, 1)
+        time_stamps = [_ts_start + datetime.timedelta(hours=h) for h in range(time_steps)]
 
         orig_load_p = net.load['p_mw'].copy() if len(net.load) > 0 else None
         orig_load_q = net.load['q_mvar'].copy() if len(net.load) > 0 else None
@@ -12807,6 +12937,7 @@ def time_series_simulation(net, timeseries_params):
         orig_gen_q = net.gen['q_mvar'].copy() if len(net.gen) > 0 and 'q_mvar' in net.gen.columns else None
         orig_sgen_p = net.sgen['p_mw'].copy() if len(net.sgen) > 0 else None
         orig_sgen_q = net.sgen['q_mvar'].copy() if len(net.sgen) > 0 else None
+        orig_storage_p = net.storage['p_mw'].copy() if len(net.storage) > 0 else None
 
         load_profile_values = _ts_build_load_preset(load_profile, time_steps)
         gen_profile_values = _ts_build_gen_preset(generation_profile, time_steps)
@@ -12819,10 +12950,13 @@ def time_series_simulation(net, timeseries_params):
                 if not isinstance(spec, dict):
                     continue
                 values = _ts_normalize_profile(spec.get('values', []), time_steps)
-                declared_mode = spec.get('mode', 'scale')
+                declared_mode = spec.get('mode') or 'scale'
                 element_type = spec.get('element_type')
                 orig_p = _ts_orig_p_for_element(net, elem_name, element_type)
-                mode = _ts_resolve_profile_mode(declared_mode, values, orig_p)
+                # Trust an explicit mode (the Electrisim dialog always sends one). Guessing only for
+                # API calls without a mode: the guess read wind/solar scale factors (max ~1.1-1.4) as MW
+                # for every unit between about 1 and 6.5 MW.
+                mode = declared_mode if spec.get('mode') else _ts_resolve_profile_mode(declared_mode, values, orig_p)
                 ufn = getattr(net, 'user_friendly_names', {}) or {}
                 display_name = (
                     spec.get('display_name')
@@ -12847,6 +12981,13 @@ def time_series_simulation(net, timeseries_params):
 
         all_results = []
         prev_converged = False
+        failed_time_steps = []
+        first_failure = None
+
+        # STATCOMs are solved as equivalent voltage sources, as in the Load Flow study.
+        if _electrisim_net_has_facts(net):
+            _electrisim_validate_ssc(net)
+            _electrisim_ssc_to_equivalent_gens(net)
 
         for t in range(time_steps):
             if orig_load_p is not None:
@@ -12867,7 +13008,30 @@ def time_series_simulation(net, timeseries_params):
                     val, mode = _element_profile(elem_name, 'gen', t, gen_profile_values)
                     _ts_set_pq(net.gen, idx, orig_gen_p, orig_gen_q, val, mode)
 
-            prev_converged = _ts_run_powerflow(net, timeseries_params, t, prev_converged)
+            if orig_storage_p is not None:
+                for idx in net.storage.index:
+                    spec = resolved_profiles.get(str(net.storage.loc[idx, 'name']))
+                    if not spec or spec.get('element_type') != 'storage':
+                        continue
+                    # Positive = charging, negative = discharging (pandapower convention).
+                    val = float(spec['values'][t])
+                    if spec.get('mode') == 'absolute':
+                        net.storage.loc[idx, 'p_mw'] = val
+                    else:
+                        net.storage.loc[idx, 'p_mw'] = float(orig_storage_p.loc[idx]) * val
+
+            # One hour that cannot be solved (voltage collapse at peak load, for example) used to
+            # abort the whole study. It is now reported as a failed step and the run goes on.
+            try:
+                prev_converged = _ts_run_powerflow(net, timeseries_params, t, prev_converged)
+            except Exception as step_err:
+                prev_converged = False
+                failed_time_steps.append(t)
+                if first_failure is None:
+                    first_failure = step_err
+                all_results.append({'time_step': t, 'converged': False, 'bus_results': None,
+                                    'line_results': None})
+                continue
 
             all_results.append({
                 'time_step': t,
@@ -12877,7 +13041,16 @@ def time_series_simulation(net, timeseries_params):
                 'gen_results': net.res_gen.copy() if len(net.gen) > 0 else None,
                 'sgen_results': net.res_sgen.copy() if len(net.sgen) > 0 else None,
                 'load_results': net.res_load.copy() if len(net.load) > 0 else None,
+                'trafo_results': net.res_trafo.copy() if len(net.trafo) > 0 else None,
+                'trafo3w_results': net.res_trafo3w.copy() if len(net.trafo3w) > 0 else None,
+                'ext_grid_results': net.res_ext_grid.copy() if len(net.ext_grid) > 0 else None,
+                'storage_results': net.res_storage.copy() if len(net.storage) > 0 else None,
             })
+
+        if failed_time_steps and len(failed_time_steps) == len(all_results):
+            raise RuntimeError(
+                f"no time step could be solved (step 0: {first_failure}). Run Load Flow on the "
+                "diagram first; if it converges, check the profiles for unrealistic values.")
 
         # Prepare results
         class TimeSeriesBusOut(object):
@@ -12891,13 +13064,16 @@ def time_series_simulation(net, timeseries_params):
                 self.q_mvar = q_mvar
         
         class TimeSeriesLineOut(object):
-            def __init__(self, name: str, id: str, time_step: int, loading_percent: float, p_from_mw: float, p_to_mw: float):
+            def __init__(self, name: str, id: str, time_step: int, loading_percent: float, p_from_mw: float, p_to_mw: float,
+                         from_bus: str = None, to_bus: str = None):
                 self.name = name
                 self.id = id
                 self.time_step = time_step
                 self.loading_percent = loading_percent
                 self.p_from_mw = p_from_mw
                 self.p_to_mw = p_to_mw
+                self.from_bus = from_bus
+                self.to_bus = to_bus
 
         class TimeSeriesLoadOut(object):
             def __init__(self, name: str, id: str, time_step: int, p_mw: float, q_mvar: float):
@@ -12922,6 +13098,8 @@ def time_series_simulation(net, timeseries_params):
         all_sgens = []
 
         for result in all_results:
+            if not result['converged']:
+                continue   # failed step: no rows, listed in failed_time_steps
             t = result['time_step']
             bus_results = result['bus_results']
             line_results = result['line_results']
@@ -12950,7 +13128,9 @@ def time_series_simulation(net, timeseries_params):
                     time_step=t,
                     loading_percent=safe_float(line['loading_percent']),
                     p_from_mw=safe_float(line['p_from_mw']),
-                    p_to_mw=safe_float(line['p_to_mw'])
+                    p_to_mw=safe_float(line['p_to_mw']),
+                    from_bus=str(net.bus.loc[net.line.loc[idx, 'from_bus'], 'name']),
+                    to_bus=str(net.bus.loc[net.line.loc[idx, 'to_bus'], 'name'])
                 ))
 
             if load_results is not None:
@@ -12976,6 +13156,32 @@ def time_series_simulation(net, timeseries_params):
                         p_mw=safe_float(sgen['p_mw']),
                         q_mvar=safe_float(sgen['q_mvar'])
                     ))
+
+        ufn_map = getattr(net, 'user_friendly_names', {}) or {}
+
+        def _ts_rows(table, res_key, kind, fields):
+            rows = []
+            for result in all_results:
+                res = result.get(res_key)
+                if res is None:
+                    continue
+                for idx, r in res.iterrows():
+                    tech = net[table].loc[idx, 'name']
+                    row = {
+                        'name': get_display_name(ufn_map.get(tech, tech), tech, kind, idx, 'timeseries'),
+                        'id': str(tech),
+                        'time_step': result['time_step'],
+                    }
+                    for f in fields:
+                        row[f] = safe_float(r[f]) if f in r.index else 0.0
+                    rows.append(row)
+            return rows
+
+        all_trafos = _ts_rows('trafo', 'trafo_results', 'Transformer', ('loading_percent', 'p_hv_mw', 'q_hv_mvar'))
+        all_trafos3w = _ts_rows('trafo3w', 'trafo3w_results', 'Three Winding Transformer', ('loading_percent', 'p_hv_mw'))
+        all_ext_grids = _ts_rows('ext_grid', 'ext_grid_results', 'External Grid', ('p_mw', 'q_mvar'))
+        all_gens = _ts_rows('gen', 'gen_results', 'Generator', ('p_mw', 'q_mvar', 'vm_pu'))
+        all_storages = _ts_rows('storage', 'storage_results', 'Storage', ('p_mw', 'q_mvar'))
 
         # Summary statistics with display names (user-friendly + technical ID)
         vm_stats = {}
@@ -13033,6 +13239,13 @@ def time_series_simulation(net, timeseries_params):
             'lines': [vars(line) for line in all_lines],
             'loads': [vars(ld) for ld in all_loads],
             'sgens': [vars(sg) for sg in all_sgens],
+            'gens': all_gens,
+            'transformers': all_trafos,
+            'transformers3w': all_trafos3w,
+            'externalgrids': all_ext_grids,
+            'storages': all_storages,
+            'time_step_converged': [bool(r['converged']) for r in all_results],
+            'failed_time_steps': failed_time_steps,
             'voltage_statistics': vm_stats,
             'loading_statistics': loading_stats,
             'time_stamps': [str(ts) for ts in time_stamps]
@@ -13043,7 +13256,7 @@ def time_series_simulation(net, timeseries_params):
         # Initialize diagnostic response
         diagnostic_response = {
             "error": True,
-            "message": "Time series simulation failed",
+            "message": f"Time series simulation failed: {e}",
             "exception": str(e),
             "diagnostic": {}
         }
@@ -13575,8 +13788,8 @@ def economic_analysis(net, in_data, params):
                 energy_price = None
         
         try:
-            electrisim_runpp(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles, init=init,
-                     **_electrisim_enforce_q_lims_kw(net))
+            electrisim_runpp_robust(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles,
+                                    init=init, **_electrisim_enforce_q_lims_kw(net))
         except Exception as pf_err:
             return {
                 'error': f'Power flow failed: {str(pf_err)}',
