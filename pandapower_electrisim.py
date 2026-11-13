@@ -2066,21 +2066,26 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         lines.append(")")
         lines.append("")
         # The same steps Electrisim runs after calc_sc, in the same order.
-        lines.extend(negative_sequence_export_lines(
-            net, fault_type, case=fault_location, lv_tol_percent=sc_lv_tol_percent(sc),
-            r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, bus_literal=_export_py_literal(sc_bus),
-        ))
+        call_args = (f"case={fault_location!r}, bus={_export_py_literal(sc_bus)}, tk_s={tk_s}, "
+                     f"lv_tol_percent={sc_lv_tol_percent(sc)}, r_fault_ohm={r_fault_ohm}, "
+                     f"x_fault_ohm={x_fault_ohm}")
         if fault_type == '1ph':
             lines.append("# --- Electrisim peak and thermal current for the single-phase fault ---")
             lines.append("# pandapower leaves ip and Ith empty for '1ph'; Electrisim fills them as below.")
             lines.extend(inspect.getsource(electrisim_1ph_ip_ith).rstrip("\n").split("\n"))
             lines.append("")
-            lines.append(
-                f"electrisim_1ph_ip_ith(net, case={fault_location!r}, bus={_export_py_literal(sc_bus)}, "
-                f"tk_s={tk_s}, lv_tol_percent={sc_lv_tol_percent(sc)}, "
-                f"r_fault_ohm={r_fault_ohm}, x_fault_ohm={x_fault_ohm})"
-            )
+            lines.append(f"electrisim_1ph_ip_ith(net, {call_args})")
             lines.append("")
+        lines.append("# --- Electrisim line and transformer currents ---")
+        lines.append("# Phase currents for unbalanced faults; for the minimum case, the fault at the branch's own end.")
+        lines.extend(inspect.getsource(electrisim_branch_sc_results).rstrip("\n").split("\n"))
+        lines.append("")
+        lines.append(f"electrisim_branch_sc_results(net, fault={fault_type!r}, {call_args})")
+        lines.append("")
+        lines.extend(negative_sequence_export_lines(
+            net, fault_type, case=fault_location, lv_tol_percent=sc_lv_tol_percent(sc),
+            r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, bus_literal=_export_py_literal(sc_bus),
+        ))
         lines.append("# Print short-circuit results")
         lines.append("print('\\nBus SC Results:')")
         lines.append("print(net.res_bus_sc)")
@@ -9590,16 +9595,14 @@ def electrisim_1ph_ip_ith(net, case='max', bus=None, tk_s=1.0, lv_tol_percent=10
     allows the three-phase kappa of the same bus: ip = kappa * sqrt(2) * Ik1" and
     Ith = Ik1" * sqrt(m + n). kappa and m come from a three-phase run on a copy of the network
     with the converter current sources switched off, where pandapower's ip / Ik" is exactly
-    kappa * sqrt(2) and Ith / Ik" is sqrt(m + 1). A line's Ith uses the ratio of the fault bus
-    that gives the line's reported current. Returns False when pandapower already filled ip.
+    kappa * sqrt(2) and Ith / Ik" is sqrt(m + 1). Line and transformer currents come from
+    electrisim_branch_sc_results. Returns False when pandapower already filled ip.
 
     Electrisim runs this after sc.calc_sc(fault='1ph'); the exported Python script carries a
     copy, so both give the same numbers.
     """
     import copy
 
-    import numpy as np
-    import pandas as pd
     import pandapower.shortcircuit as sc
 
     res = net.res_bus_sc
@@ -9618,27 +9621,344 @@ def electrisim_1ph_ip_ith(net, case='max', bus=None, tk_s=1.0, lv_tol_percent=10
     ratio_ith = (three_phase.res_bus_sc['ith_ka'] / ik3).reindex(res.index)
     res['ip_ka'] = res['ikss_ka'] * ratio_ip
     res['ith_ka'] = res['ikss_ka'] * ratio_ith
+    return True
 
-    # pandapower's line Ith for a single-phase fault is 0 (its m is never computed).
-    lines = getattr(net, 'res_line_sc', None)
-    if lines is not None and not lines.empty and 'ith_ka' in lines.columns \
-            and not isinstance(lines.index, pd.MultiIndex):
-        per_fault = copy.deepcopy(net)
-        sc.calc_sc(per_fault, fault='1ph', ip=False, ith=False, branch_results=True,
-                   return_all_currents=True, **options)
-        currents = per_fault.res_line_sc['ikss_ka']
-        for line in lines.index:
+
+def electrisim_branch_sc_results(net, fault='3ph', case='max', bus=None, tk_s=1.0, lv_tol_percent=10,
+                                 r_fault_ohm=0.0, x_fault_ohm=0.0):
+    """Line and transformer short-circuit currents as Electrisim reports them (IEC 60909-0).
+
+    pandapower gives one current per branch over all the studied fault locations. Electrisim
+    changes three things:
+
+    * Single-phase and two-phase faults: a branch's current is its largest phase current, built
+      from the sequence currents and the phase shift of the transformers between the branch and
+      the fault. pandapower spread the whole fault current over the positive-sequence network, so
+      on the far side of a Dyn transformer a single-phase fault came out sqrt(3) too high and a
+      two-phase fault 2/sqrt(3) too low, and the zero-sequence path (cable capacitance, earthing)
+      was ignored.
+    * Minimum case: the current for a fault at one of the branch's own terminals, the one where
+      the branch carries more current (the far end of a radial feeder), with ip and Ith of that
+      same fault. pandapower took the smallest current over every fault in the network, usually a
+      fault behind other transformers, together with ip and Ith of a different fault. A
+      three-winding transformer shows, per winding, the largest current for a fault at one of its
+      own terminals (no single fault loads all three windings), with fault_bus None.
+    * Column fault_bus: the bus whose fault gives the reported value.
+
+    The maximum case keeps the largest value over all studied faults. Electrisim runs this after
+    sc.calc_sc (and, for a single-phase fault, after electrisim_1ph_ip_ith); the exported Python
+    script carries a copy, so both give the same numbers. Returns False when there is nothing to do.
+    """
+    import copy
+    import math
+
+    import numpy as np
+    import pandas as pd
+    import pandapower.shortcircuit as sc
+
+    elements = {
+        'line': ('res_line_sc', ('from_bus', 'to_bus'), ('ikss_from_ka', 'ikss_to_ka')),
+        'trafo': ('res_trafo_sc', ('hv_bus', 'lv_bus'), ('ikss_hv_ka', 'ikss_lv_ka')),
+        'trafo3w': ('res_trafo3w_sc', ('hv_bus', 'mv_bus', 'lv_bus'),
+                    ('ikss_hv_ka', 'ikss_mv_ka', 'ikss_lv_ka')),
+    }
+    present = []
+    for element, (table, _terminals, _sides) in elements.items():
+        frame = getattr(net, table, None)
+        if frame is not None and not frame.empty and not isinstance(frame.index, pd.MultiIndex):
+            present.append(element)
+    res_bus = getattr(net, 'res_bus_sc', None)
+    if not present or res_bus is None or res_bus.empty:
+        return False
+    studied = [int(b) for b in res_bus.index[res_bus['ikss_ka'].notna()]]
+    if bus is not None:
+        chosen = {int(b) for b in np.atleast_1d(bus)}
+        studied = [b for b in studied if b in chosen]
+    if not studied:
+        return False
+    options = dict(case=case, bus=bus, tk_s=tk_s, kappa_method='C', r_fault_ohm=r_fault_ohm,
+                   x_fault_ohm=x_fault_ohm, lv_tol_percent=lv_tol_percent, check_connectivity=True)
+
+    def bus_angles():
+        """Positive-sequence angle of every bus from the transformer phase shifts (degrees)."""
+        links = {}
+
+        def link(a, b, shift):
+            links.setdefault(int(a), []).append((int(b), shift))
+            links.setdefault(int(b), []).append((int(a), -shift))
+
+        def degrees(value):
+            return float(value) if pd.notna(value) else 0.0
+
+        for _, row in net.line[net.line.in_service.astype(bool)].iterrows():
+            link(row.from_bus, row.to_bus, 0.0)
+        for _, row in net.trafo[net.trafo.in_service.astype(bool)].iterrows():
+            link(row.hv_bus, row.lv_bus, -degrees(row.get('shift_degree', 0.0)))
+        for _, row in net.trafo3w[net.trafo3w.in_service.astype(bool)].iterrows():
+            link(row.hv_bus, row.mv_bus, -degrees(row.get('shift_mv_degree', 0.0)))
+            link(row.hv_bus, row.lv_bus, -degrees(row.get('shift_lv_degree', 0.0)))
+        for _, row in net.impedance[net.impedance.in_service.astype(bool)].iterrows():
+            link(row.from_bus, row.to_bus, 0.0)
+        for _, row in net.switch[(net.switch.et == 'b') & net.switch.closed.astype(bool)].iterrows():
+            link(row.bus, row.element, 0.0)
+        angles = {}
+        for start in net.bus.index:
+            if int(start) in angles:
+                continue
+            angles[int(start)] = 0.0
+            stack = [int(start)]
+            while stack:
+                here = stack.pop()
+                for there, shift in links.get(here, []):
+                    if there not in angles:
+                        angles[there] = angles[here] + shift
+                        stack.append(there)
+        return angles
+
+    def angles_of(buses):
+        return np.array([angles.get(int(b), 0.0) for b in buses], dtype=float)
+
+    def zero_sequence_columns(ybus, columns):
+        """Zero-sequence Zbus columns, with every part of the network that has no earth held at zero.
+
+        pandapower models an open zero-sequence path (a delta winding) as a 1e20 pu branch and
+        inverts the whole Ybus. A part with no zero-sequence earth at all (a delta winding feeding
+        cables without capacitance) is then singular and spoils the voltages elsewhere, so the
+        open paths are cut, each remaining part is checked, and only the earthed parts are solved.
+        """
+        from scipy.sparse import coo_matrix, csgraph, diags
+        from scipy.sparse.linalg import splu
+
+        y = ybus.tocoo()
+        keep = (y.row == y.col) | (np.abs(y.data) > 1e-10)
+        rows, cols, data = y.row[keep], y.col[keep], y.data[keep]
+        y = coo_matrix((data, (rows, cols)), shape=ybus.shape).tocsr()
+        pattern = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=ybus.shape)
+        n_parts, part = csgraph.connected_components(pattern, directed=False)
+        floating = np.zeros(y.shape[0], dtype=bool)
+        for p in range(n_parts):
+            members = np.flatnonzero(part == p)
             try:
-                by_bus = currents.xs(line, level=0)
-            except KeyError:
+                probe = splu(y[members][:, members].tocsc()).solve(np.ones(len(members), dtype=complex))
+                floating[members] = not np.all(np.isfinite(probe)) or np.abs(probe).max() > 1e12
+            except RuntimeError:  # exactly singular
+                floating[members] = True
+        earthed = diags((~floating).astype(float))
+        y = (earthed @ y @ earthed + diags(floating.astype(float))).tocsc()
+        rhs = np.zeros((y.shape[0], len(columns)), dtype=complex)
+        rhs[columns, np.arange(len(columns))] = 1.0
+        z = splu(y).solve(rhs)
+        z[floating, :] = 0.0
+        z[:, floating[columns]] = 0.0
+        return z
+
+    def single_phase_per_fault():
+        """Per (branch, fault bus) largest phase current of a single-phase-to-earth fault, in kA."""
+        from pandapower.auxiliary import _add_auxiliary_elements
+        from pandapower.pd2ppc_zero import _pd2ppc_zero
+        from pandapower.pypower.idx_brch_sc import K_ST
+        from pandapower.pypower.idx_bus import BASE_KV
+        from pandapower.pypower.idx_bus_sc import C_MAX, C_MIN, IKCV, IKSS1, IKSS2, R_EQUIV, X_EQUIV
+        from pandapower.shortcircuit.currents import _calc_ikss_1ph
+        from pandapower.shortcircuit.impedance import _calc_rx, _calc_ybus, _calc_zbus
+        from pandapower.shortcircuit.ppc_conversion import (_create_k_updated_ppci, _get_is_ppci_bus,
+                                                            _init_ppc)
+
+        # The same steps as pandapower's single-phase calculation, keeping the zero-sequence network.
+        work = copy.deepcopy(net)
+        sc.calc_sc(work, fault='1ph', ip=False, ith=False, branch_results=False, **options)
+        _add_auxiliary_elements(work)
+        ppc, ppci = _init_ppc(work)
+        faults = np.array(studied, dtype=np.int64)
+        ppci_bus = _get_is_ppci_bus(work, faults)
+        _, ppci, _ = _create_k_updated_ppci(work, ppci, ppci_bus=ppci_bus)
+        _calc_ybus(ppci)
+        _ppc_0, ppci_0 = _pd2ppc_zero(work, ppc['branch'][:, K_ST])
+        _calc_ybus(ppci_0)
+        _calc_zbus(work, ppci)
+        _calc_zbus(work, ppci_0)
+        _calc_rx(work, ppci, ppci_bus)
+        _calc_rx(work, ppci_0, ppci_bus)
+        _calc_ikss_1ph(work, ppci, ppci_0, ppci_bus)
+        if ppci_0['bus'].shape[0] != ppci['bus'].shape[0]:
+            raise RuntimeError('positive- and zero-sequence networks have different buses')
+
+        bus_lookup = work._pd2ppc_lookups['bus']
+        fi = bus_lookup[faults].astype(np.int64)
+        base_ka = ppci['baseMVA'] / (math.sqrt(3.0) * ppci['bus'][:, BASE_KV].real)
+        c_factor = ppci['bus'][:, C_MIN if case == 'min' else C_MAX].real
+        z1 = ppci['bus'][:, R_EQUIV].real + 1j * ppci['bus'][:, X_EQUIV].real
+        z0 = ppci_0['bus'][:, R_EQUIV].real + 1j * ppci_0['bus'][:, X_EQUIV].real
+        i_seq = c_factor[fi] / (2.0 * z1[fi] + z0[fi])  # I1 = I2 = I0 per fault, per unit
+        expected = ppci_0['bus'][fi, IKSS1].real
+        got = 3.0 * np.abs(i_seq) * base_ka[fi]
+        if np.any(np.isfinite(expected) & (np.abs(got - expected) > 1e-6 * np.maximum(1.0, expected))):
+            raise RuntimeError('sequence currents do not reproduce pandapower Ik1"')
+
+        z1_bus = ppci['internal']['Zbus']
+        v1 = -z1_bus[:, fi] * i_seq  # bus voltages, one column per fault
+        v0 = -zero_sequence_columns(ppci_0['internal']['Ybus'], fi) * i_seq
+        flows = {
+            ('f', 1): ppci['internal']['Yf'].tocsr() @ v1, ('t', 1): ppci['internal']['Yt'].tocsr() @ v1,
+            ('f', 0): ppci_0['internal']['Yf'].tocsr() @ v0, ('t', 0): ppci_0['internal']['Yt'].tocsr() @ v0,
+        }
+        ikcv = np.nan_to_num(ppci['bus'][:, IKCV].real)  # converter current sources, kA
+        sources = bool(np.any(ikcv != 0))
+        if sources:  # the same superposition as pandapower's current-source branch currents
+            ikss2 = np.nan_to_num(ppci['bus'][:, IKSS2].real)
+            v_cs = z1_bus.dot(-ikcv / base_ka)[:, None] + z1_bus[:, fi] * (ikss2[fi] / base_ka[fi])
+            flows[('f', 'cs')] = ppci['internal']['Yf'].tocsr() @ v_cs
+            flows[('t', 'cs')] = ppci['internal']['Yt'].tocsr() @ v_cs
+
+        def ppci_rows(internal):
+            in_service = internal['internal']['branch_is']
+            rows = np.full(in_service.shape[0], -1, dtype=np.int64)
+            rows[in_service] = np.arange(int(in_service.sum()))
+            return rows
+
+        rows1, rows0 = ppci_rows(ppci), ppci_rows(ppci_0)
+        branch_lookup = work._pd2ppc_lookups['branch']
+        fault_angle = angles_of(faults)
+        turns = 2.0 * np.pi * np.arange(3) / 3.0
+        frames = {}
+        for element in present:
+            if element not in branch_lookup:
                 continue
-            by_bus = by_bus[by_bus > 1e-9]
-            if by_bus.empty:
-                lines.at[line, 'ith_ka'] = 0.0
-                continue
-            fault_bus = by_bus.idxmin() if case == 'min' else by_bus.idxmax()
-            ratio = ratio_ith.get(fault_bus, np.nan)
-            lines.at[line, 'ith_ka'] = lines.at[line, 'ikss_ka'] * ratio if np.isfinite(ratio) else np.nan
+            start = branch_lookup[element][0]
+            table = net[element]
+            _table, terminals, sides = elements[element]
+            positions = np.arange(len(table))
+            columns = {}
+            for winding, (terminal, side) in enumerate(zip(terminals, sides)):
+                end = 'f' if winding == 0 else 't'
+                if element == 'trafo3w':  # hv, mv and lv windings are three branches from the star point
+                    ppc_rows = start + winding * len(table) + positions
+                else:
+                    ppc_rows = start + positions
+                r1, r0 = rows1[ppc_rows], rows0[ppc_rows]
+                i1 = np.where((r1 >= 0)[:, None], flows[(end, 1)][np.maximum(r1, 0)], 0j)
+                i0 = np.where((r0 >= 0)[:, None], flows[(end, 0)][np.maximum(r0, 0)], 0j)
+                terminal_buses = table[terminal].values.astype(np.int64)
+                shift = np.radians(angles_of(terminal_buses)[:, None] - fault_angle[None, :])
+                # phase k: I0 + I1 e^{j(shift + k 120)} + I2 e^{-j(shift + k 120)}, with I2 = I1
+                phase = np.max([np.abs(i0 + 2.0 * i1 * np.cos(shift + t)) for t in turns], axis=0)
+                if sources:
+                    phase = phase + np.abs(np.where((r1 >= 0)[:, None], flows[(end, 'cs')][np.maximum(r1, 0)], 0j))
+                phase = phase * base_ka[bus_lookup[terminal_buses]][:, None]
+                phase[r1 < 0, :] = 0.0
+                columns[side] = phase.ravel()
+            frame = pd.DataFrame(columns, index=pd.MultiIndex.from_product([table.index, faults],
+                                                                            names=[element, 'bus']))
+            if element == 'line':
+                frame['ikss_ka'] = frame[list(sides)].max(axis=1)
+                fault_level = frame.index.get_level_values(1)
+                frame['ip_ka'] = frame['ikss_ka'].values * ratio_ip.reindex(fault_level).values
+                frame['ith_ka'] = frame['ikss_ka'].values * ratio_ith.reindex(fault_level).values
+            frames[element] = frame
+        return frames
+
+    ikss_bus = res_bus['ikss_ka'].where(res_bus['ikss_ka'] > 1e-9)
+    ratio_ip = res_bus['ip_ka'] / ikss_bus if 'ip_ka' in res_bus.columns else ikss_bus * np.nan
+    ratio_ith = res_bus['ith_ka'] / ikss_bus if 'ith_ka' in res_bus.columns else ikss_bus * np.nan
+    angles = bus_angles() if fault in ('1ph', '2ph') else {}
+    if fault == '1ph':
+        per_fault = single_phase_per_fault()
+    else:
+        work = copy.deepcopy(net)
+        sc.calc_sc(work, fault=fault, ip=True, ith=True, branch_results=True, return_all_currents=True,
+                   **options)
+        per_fault = {}
+        for element in present:
+            frame = getattr(work, elements[element][0], None)
+            if frame is not None and not frame.empty and isinstance(frame.index, pd.MultiIndex):
+                per_fault[element] = frame.copy()
+        if fault == '2ph':
+            # I2 = -I1, so phase k carries 2 |I1| |sin(shift + k 120)|: pandapower's value
+            # (sqrt(3) |I1|) on the fault's side, 2/sqrt(3) times it across a 30-degree shift.
+            turns = 2.0 * np.pi * np.arange(3) / 3.0
+            for element, frame in per_fault.items():
+                table = net[element]
+                _table, terminals, sides = elements[element]
+                branches = frame.index.get_level_values(0)
+                fault_angle = angles_of(frame.index.get_level_values(1))
+                for terminal, side in zip(terminals, sides):
+                    if side not in frame.columns:
+                        continue
+                    shift = np.radians(angles_of(table[terminal].reindex(branches).values) - fault_angle)
+                    factor = 2.0 * np.abs(np.sin(shift[:, None] + turns[None, :])).max(axis=1) / math.sqrt(3.0)
+                    frame[side] = frame[side].values * factor
+                    if element == 'line' and terminal == 'from_bus':
+                        for column in ('ikss_ka', 'ip_ka', 'ith_ka'):
+                            if column in frame.columns:
+                                frame[column] = frame[column].values * factor
+
+    floor = 1e-6  # kA; pandapower leaves numerical noise of about 1e-11 in branches the fault does not reach
+    for element in present:
+        frame = getattr(net, elements[element][0])
+        rows = per_fault.get(element)
+        if rows is None or rows.empty:
+            continue
+        rows = rows[rows.index.get_level_values(1).isin(studied)]
+        table = net[element]
+        _table, terminals, sides = elements[element]
+        side_columns = [s for s in sides if s in rows.columns]
+        copy_columns = [c for c in rows.columns if c in frame.columns]
+        current_columns = [c for c in copy_columns if c.endswith('_ka')]
+        rows = rows.copy()
+        for column in current_columns:
+            rows[column] = rows[column].where(~(rows[column].abs() < floor), 0.0)
+        current =(rows[side_columns].max(axis=1) if side_columns else rows['ikss_ka']).fillna(0.0)
+        branches = rows.index.get_level_values(0)
+        fault_buses = rows.index.get_level_values(1).astype(np.int64)
+        carrying = current.values > floor
+        pick = pd.DataFrame({'branch': branches, 'fault': fault_buses, 'current': current.values,
+                             'position': np.arange(len(rows))})
+        if case == 'min':
+            # A fault at the branch's own terminals, the one with the larger current; if no terminal
+            # was studied, the smallest current over the studied faults.
+            own = np.zeros(len(rows), dtype=bool)
+            for terminal in terminals:
+                if terminal in table.columns:
+                    own |= table[terminal].reindex(branches).values.astype(np.int64) == fault_buses
+            pick['group'] = np.where(carrying & own, 0, np.where(carrying, 1, 2))
+            pick['key'] = np.where(pick['group'] == 0, -pick['current'], pick['current'])
+        else:
+            pick['group'] = np.where(carrying, 0, 2)
+            pick['key'] = -pick['current']
+        first = pick.sort_values(['branch', 'group', 'key'], kind='mergesort') \
+                    .drop_duplicates('branch', keep='first').set_index('branch')
+        first = first[first.index.isin(frame.index)]
+        live = first[first['group'] < 2]
+        dead = first.index[first['group'] == 2]
+
+        frame['fault_bus'] = pd.Series([None] * len(frame), index=frame.index, dtype=object)
+        if len(dead):
+            frame.loc[dead, current_columns] = 0.0
+        if live.empty:
+            continue
+        if case == 'min':  # every value from that one fault
+            chosen = rows.iloc[live['position'].values]
+            for column in copy_columns:
+                frame.loc[live.index, column] = chosen[column].values
+        else:  # each current at its own largest over the studied faults
+            largest = rows[current_columns].groupby(level=0).max()
+            for column in current_columns:
+                frame.loc[live.index, column] = largest[column].reindex(live.index).values
+        if element == 'line':
+            frame.loc[live.index, 'ikss_ka'] = live['current'].values
+        frame.loc[live.index, 'fault_bus'] = pd.Series([int(b) for b in live['fault'].values],
+                                                       index=live.index, dtype=object)
+        if case == 'min' and len(terminals) == 3 and side_columns:
+            # One fault cannot load all three windings (a fault at the MV bus leaves the LV winding
+            # without current), so each winding shows its largest current for a fault at one of
+            # the transformer's own terminals, and no single fault bus is named.
+            own_rows = rows[own & carrying]
+            if not own_rows.empty:
+                per_winding = own_rows[side_columns].groupby(level=0).max()
+                per_winding = per_winding[per_winding.index.isin(frame.index)]
+                for column in side_columns:
+                    frame.loc[per_winding.index, column] = per_winding[column].values
+                frame.loc[per_winding.index, 'fault_bus'] = None
     return True
 
 
@@ -9797,17 +10117,6 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             return_all_currents=False,  # Changed: False gives max/min per branch with simple index
             lv_tol_percent=lv_tol_percent,
         )
-        # The r2/x2 correction must use the same voltage factor as calc_sc above.
-        apply_negative_sequence_ikss(
-            net,
-            fault=fault_type,
-            case=fault_location,
-            lv_tol_percent=lv_tol_percent,
-            r_fault_ohm=r_fault_ohm,
-            x_fault_ohm=x_fault_ohm,
-            bus=bus,
-        )
-        
         # pandapower leaves ip and Ith empty for a single-phase fault. They used to be filled
         # with a fixed kappa of 1.8 and Ith = Ik1"; IEC 60909-0 uses the bus's own kappa and m.
         if fault_type == '1ph':
@@ -9822,6 +10131,32 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 net.warnings.append(
                     f"Single-phase fault: peak current ip and thermal current Ith could not be "
                     f"calculated ({ip_err}); Ik1\" is unaffected.")
+
+        # Line and transformer currents: phase currents for unbalanced faults, and the fault at the
+        # branch's own end for the minimum case (pandapower's minimum came from any fault anywhere).
+        try:
+            electrisim_branch_sc_results(
+                net, fault=fault_type, case=fault_location, bus=bus, tk_s=tk_s,
+                lv_tol_percent=lv_tol_percent, r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm,
+            )
+        except Exception as branch_err:
+            if not hasattr(net, 'warnings') or net.warnings is None:
+                net.warnings = []
+            net.warnings.append(
+                f"Line and transformer short-circuit currents are pandapower's own aggregate over all "
+                f"fault locations ({branch_err}); bus results are unaffected.")
+
+        # The r2/x2 correction must use the same voltage factor as calc_sc above. It scales the
+        # bus ip / Ith and the branch currents together with the bus Ik".
+        apply_negative_sequence_ikss(
+            net,
+            fault=fault_type,
+            case=fault_location,
+            lv_tol_percent=lv_tol_percent,
+            r_fault_ohm=r_fault_ohm,
+            x_fault_ohm=x_fault_ohm,
+            bus=bus,
+        )
 
     except Exception as e:
         
@@ -9940,6 +10275,22 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             return float(v)
         return v
 
+    def _branch_entry_value(entry, col, val):
+        """Copy one branch result column; fault_bus becomes the bus name and id the frontend knows."""
+        if col != 'fault_bus':
+            entry[col] = _clean_value(val)
+            return
+        entry['fault_bus'] = None
+        entry['fault_bus_id'] = None
+        try:
+            fault_idx = int(val)
+        except (TypeError, ValueError):
+            return
+        if fault_idx in net.bus.index:
+            entry['fault_bus'] = _clean_value(net.bus.at[fault_idx, 'name']) if 'name' in net.bus.columns else str(fault_idx)
+            if 'id' in net.bus.columns:
+                entry['fault_bus_id'] = _clean_value(net.bus.at[fault_idx, 'id'])
+
     # Start result payload with busbar data (existing behaviour)
     result = {**busbars.__dict__}
 
@@ -10016,7 +10367,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
 
             # Copy all numeric result columns
             for col, val in row.items():
-                line_entry[col] = _clean_value(val)
+                _branch_entry_value(line_entry, col, val)
 
             lines_sc_list.append(line_entry)
             
@@ -10056,7 +10407,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 continue
 
             for col, val in row.items():
-                trafo_entry[col] = _clean_value(val)
+                _branch_entry_value(trafo_entry, col, val)
 
             trafos_sc_list.append(trafo_entry)
             
@@ -10093,7 +10444,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 continue
 
             for col, val in row.items():
-                trafo_entry[col] = _clean_value(val)
+                _branch_entry_value(trafo_entry, col, val)
 
             trafos3w_sc_list.append(trafo_entry)
 
