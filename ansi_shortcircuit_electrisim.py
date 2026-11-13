@@ -815,6 +815,10 @@ def _branch_result_rows(
 
 def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
     """Run ANSI/IEEE C37 short-circuit study; returns compact JSON string."""
+    from pandapower_electrisim import network_not_ready_message
+    not_ready = network_not_ready_message(net, "ANSI short circuit", needs='source')
+    if not_ready:
+        return json.dumps({"error": True, "message": not_ready})
     fault = str(in_data.get("fault_type", in_data.get("fault", "3ph")) or "3ph").lower()
     if fault not in ("3ph", "2ph", "1ph"):
         fault = "3ph"

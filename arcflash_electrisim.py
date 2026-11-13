@@ -201,6 +201,11 @@ def arcflash(net, in_data, in_data_full=None):
     if clearing_time_min_s <= 0:
         clearing_time_min_s = clearing_time_s
 
+    from pandapower_electrisim import network_not_ready_message
+    not_ready = network_not_ready_message(net, "Arc flash", needs='source')
+    if not_ready:
+        return json.dumps({"error": True, "message": not_ready})
+
     # Generators left without short-circuit data would make calc_sc fail (before k: k needs Sn).
     from pandapower_electrisim import ensure_gen_short_circuit_data
     sc_data_notes = ensure_gen_short_circuit_data(net, in_data_full)
@@ -221,7 +226,7 @@ def arcflash(net, in_data, in_data_full=None):
     except Exception as e:
         return json.dumps({
             "error": True,
-            "message": "Short-circuit calculation failed (required for arc flash).",
+            "message": f"Arc flash needs the short-circuit currents, and their calculation failed: {e}",
             "exception": str(e),
         })
 

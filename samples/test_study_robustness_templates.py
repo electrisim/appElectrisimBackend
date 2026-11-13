@@ -219,6 +219,41 @@ def test_minimum_short_circuit_inputs():
     print("minimum short circuit OK: missing S\"k min named, end temperature defaulted with a warning")
 
 
+def test_empty_and_unsupplied_diagrams():
+    """Every study answers in plain words when there is nothing to calculate.
+
+    A diagram without buses, or without any source, used to end in "division by zero" (ANSI),
+    "max() arg is an empty sequence" (economic analysis, time series) or pandapower's
+    "No reference bus is available".
+    """
+    studies = {
+        "contingency": CONTINGENCY, "time series": TIME_SERIES, "economic": ECONOMIC,
+        "ANSI": {"typ": "ShortCircuitAnsi Parameters", "fault_type": "3ph"},
+        "arc flash": {"typ": "ArcFlashPandaPower Parameters", "electrode_config": "VCB",
+                      "working_distance_mm": "455", "conductor_gap_mm": "25", "clearing_time_s": "0.2"},
+        "OPF": {"typ": "OptimalPowerFlowPandaPower Parameters", "opf_type": "ac", "frequency": "50",
+                "ac_algorithm": "pypower", "dc_algorithm": "pypower", "calculate_voltage_angles": "auto",
+                "init": "pf", "delta": "1e-10", "trafo_model": "t", "trafo_loading": "current",
+                "ac_line_model": "pi", "numba": True, "suppress_warnings": True, "cost_function": "none"},
+        "voltage stability": {"typ": "VoltageStabilityPandaPower Parameters", "mode": "all_loads"},
+    }
+    no_source = {k: v for k, v in network("study_time_series_basic.json").items()
+                 if not str(v.get("typ", "")).startswith("External Grid")}
+    # Short-circuit studies accept any source, so for them the PV unit has to go as well.
+    no_sc_source = {k: v for k, v in no_source.items() if not str(v.get("typ", "")).startswith("Static Generator")}
+    raw_texts = ("division by zero", "empty sequence", "No reference bus", "Server error")
+    for label, params in studies.items():
+        unsupplied = no_sc_source if label in ("ANSI", "arc flash") else no_source
+        for case, net, expect in (("no buses", {}, "no buses"), ("no source", unsupplied, "no in-service")):
+            status, data = run(net, params)
+            text = str(data.get("message") or data.get("error") or "")
+            assert status == 200, (label, case, status, text)
+            assert data.get("error"), (label, case)
+            assert expect in text, (label, case, text)
+            assert not any(raw in text for raw in raw_texts), (label, case, text)
+    print("empty / unsupplied diagrams OK: plain message from", ", ".join(studies))
+
+
 def main() -> None:
     test_contingency_base_case_and_trafo3w()
     test_contingency_leaves_network_unchanged()
@@ -227,6 +262,7 @@ def main() -> None:
     test_line_between_dc_buses()
     test_zero_impedance_line_is_named()
     test_minimum_short_circuit_inputs()
+    test_empty_and_unsupplied_diagrams()
     print("All template robustness checks passed.")
 
 

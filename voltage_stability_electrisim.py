@@ -33,6 +33,7 @@ import pandapower_electrisim as pe
 MAX_SOLVES = 400
 CURVE_POINTS = 45
 SHOWN_CURVES = 8
+RANK_MAX_BUSES = 60
 
 
 class _Grower:
@@ -198,46 +199,12 @@ class _StudyError(Exception):
     pass
 
 
-def _study(net, params):
-    mode = 'bus' if str(params.get('mode', 'all_loads')).strip().lower() in ('bus', 'new_load', 'site') else 'all_loads'
-    min_vm = _num(params.get('min_vm_pu'), 0.95)
-    max_loading = _num(params.get('max_loading_percent'), 100.0)
-    power_factor = _num(params.get('power_factor'), 0.95)
-    if not 0 < power_factor <= 1:
-        raise _StudyError("Power factor must be above 0 and at most 1.")
+class _NoTip(Exception):
+    """The load kept solving over the whole search range."""
 
-    if net.bus.empty:
-        raise _StudyError("The diagram has no buses.")
-    try:
-        pe.electrisim_runpp_robust(net, algorithm='nr', calculate_voltage_angles=True,
-                                   **pe._electrisim_enforce_q_lims_kw(net))
-    except Exception as exc:
-        raise _StudyError(
-            "The load flow of the network as drawn did not converge, so there is no starting point "
-            f"for the study. Run Load Flow first and resolve what it reports. ({exc})")
 
-    bus_idx = None
-    if mode == 'bus':
-        bus_idx = _resolve_bus(net, params.get('bus_id') or params.get('bus_name'))
-        if bus_idx is None:
-            raise _StudyError("Choose the bus where the new load connects.")
-        if not bool(net.bus.at[bus_idx, 'in_service']) or math.isnan(float(net.res_bus.vm_pu.at[bus_idx])):
-            raise _StudyError(f"Bus '{_friendly(net, 'bus', bus_idx)}' is not supplied, so no load can be added there.")
-    else:
-        if net.load.empty or not bool(net.load.in_service.astype(bool).any()):
-            raise _StudyError("There are no in-service loads to grow. Add a Load, or use \"Add a new load at one bus\".")
-
-    grower = _Grower(net, mode, bus_idx, power_factor)
-    base_x = grower.base_mw
-    if mode == 'all_loads' and base_x <= 0:
-        raise _StudyError("The loads add up to 0 MW or less, so they cannot be scaled up. Use \"Add a new load at one bus\".")
-
-    system_load = float(net.res_load.p_mw.sum()) if len(net.load) else 0.0
-    if mode == 'bus':
-        first_step = max(0.02 * abs(system_load), 0.001 * float(net.bus.at[bus_idx, 'vn_kv']) ** 2 / 10.0, 0.01)
-    else:
-        first_step = 0.05 * base_x
-
+def _trace(net, grower, base_x, first_step, tolerance, n_points):
+    """Find the tip and sample the curve. Returns (tip_x, points)."""
     if not grower.solve(base_x):
         raise _StudyError("The starting point could not be solved again; the network is at its limit as drawn.")
 
@@ -246,7 +213,8 @@ def _study(net, params):
     step = first_step
     bad = None
     doublings = 0
-    while grower.solves < MAX_SOLVES and doublings < 40:
+    budget = grower.solves + MAX_SOLVES
+    while grower.solves < budget and doublings < 40:
         doublings += 1
         trial = good + step
         if grower.solve(trial):
@@ -256,16 +224,11 @@ def _study(net, params):
             bad = trial
             break
     if bad is None:
-        if bus_idx is not None and _is_slack_bus(net, bus_idx):
-            raise _StudyError(
-                f"Bus '{_friendly(net, 'bus', bus_idx)}' is the slack bus (External Grid or slack generator). It holds "
-                "its voltage and supplies whatever is asked, so it has no collapse point. Choose another bus.")
-        raise _StudyError("No voltage limit was found within the search range; check the External Grid and generator data.")
+        raise _NoTip()
 
     # --- bisection between the last solved and the first failed value
-    tolerance = max(_num(params.get('tip_tolerance_percent'), 0.2), 0.01) / 100.0
     grower.solve(good)
-    while (bad - good) > tolerance * max(good, first_step) and grower.solves < MAX_SOLVES:
+    while (bad - good) > tolerance * max(good, first_step) and grower.solves < budget:
         middle = 0.5 * (good + bad)
         if grower.solve(middle):
             good = middle
@@ -276,7 +239,7 @@ def _study(net, params):
 
     # --- sample the curve, denser towards the tip
     span = tip_x - base_x
-    xs = [base_x + span * (1.0 - (1.0 - i / (CURVE_POINTS - 1)) ** 2) for i in range(CURVE_POINTS)]
+    xs = [base_x + span * (1.0 - (1.0 - i / (n_points - 1)) ** 2) for i in range(n_points)]
     xs[-1] = tip_x
     points = []
     grower.has_solution = False
@@ -285,10 +248,12 @@ def _study(net, params):
             points.append(_snapshot(net, x))
     if len(points) < 3:
         raise _StudyError("Too few points of the curve could be solved to draw it.")
-    tip = points[-1]
-    xs = [p['x_mw'] for p in points]
+    return tip_x, points
 
-    # --- limits met on the way
+
+def _find_limits(net, points, base_x, tip_x, min_vm, max_loading):
+    """Limits met between the starting point and the tip, in the order they are met."""
+    xs = [p['x_mw'] for p in points]
     buses = [b for b in net.bus.index if not math.isnan(float(points[0]['vm'].at[b]))]
     min_vm_series = [float(min(p['vm'].at[b] for b in buses)) for p in points]
     x_voltage = _first_crossing(xs, min_vm_series, min_vm, below=True)
@@ -332,6 +297,159 @@ def _study(net, params):
         item['margin_mw'] = item['x_mw'] - base_x
         item['margin_percent'] = (100.0 * (item['x_mw'] - base_x) / base_x) if base_x > 0 else None
         item['already_violated'] = item['x_mw'] <= base_x + 1e-9
+    return limits, buses, min_vm_series
+
+
+def _bus_first_step(net, bus_idx, system_load):
+    return max(0.02 * abs(system_load), 0.001 * float(net.bus.at[bus_idx, 'vn_kv']) ** 2 / 10.0, 0.01)
+
+
+def _rank_buses(net, params, min_vm, max_loading, power_factor):
+    """The one-bus study repeated for many buses: how much new load each can take.
+
+    Coarser than the single study (tip within 1 %, 16 curve points) to keep it quick.
+    """
+    wanted = params.get('bus_ids') or []
+    if isinstance(wanted, str):
+        wanted = [w for w in wanted.replace(';', ',').split(',') if w.strip()]
+    if wanted:
+        candidates = []
+        for ref in wanted:
+            idx = _resolve_bus(net, ref)
+            if idx is not None and idx not in candidates:
+                candidates.append(idx)
+    else:
+        candidates = list(net.bus.index)
+    candidates = [b for b in candidates
+                  if bool(net.bus.at[b, 'in_service']) and not math.isnan(float(net.res_bus.vm_pu.at[b]))
+                  and not _is_slack_bus(net, b)]
+    if not candidates:
+        raise _StudyError("There is no supplied bus to study apart from the slack bus.")
+    max_buses = int(_num(params.get('max_buses'), RANK_MAX_BUSES))
+    if len(candidates) > max_buses:
+        raise _StudyError(
+            f"Comparing buses runs the study once per bus, and this would be {len(candidates)} buses. "
+            f"Select up to {max_buses} buses on the diagram before opening the dialog.")
+
+    system_load = float(net.res_load.p_mw.sum()) if len(net.load) else 0.0
+    grower = _Grower(net, 'bus', candidates[0], power_factor)
+    rows, skipped = [], []
+    for bus_idx in candidates:
+        grower.apply(0.0)
+        net.load.at[grower.load_idx, 'bus'] = bus_idx
+        grower.has_solution = False
+        try:
+            tip_x, points = _trace(net, grower, 0.0, _bus_first_step(net, bus_idx, system_load), 0.01, 16)
+        except (_NoTip, _StudyError):
+            skipped.append(_friendly(net, 'bus', bus_idx))
+            continue
+        limits, _buses, min_vm_series = _find_limits(net, points, 0.0, tip_x, min_vm, max_loading)
+        by_kind = {item['kind']: item for item in limits}
+        first = limits[0]
+        rows.append({
+            'bus': _friendly(net, 'bus', bus_idx),
+            'bus_id': _element_id(net, 'bus', bus_idx),
+            'vn_kv': float(net.bus.at[bus_idx, 'vn_kv']),
+            'collapse_mw': tip_x,
+            'voltage_limit_mw': by_kind['voltage']['x_mw'] if 'voltage' in by_kind else None,
+            'voltage_limit_element': by_kind['voltage'].get('element') if 'voltage' in by_kind else None,
+            'thermal_limit_mw': by_kind['thermal']['x_mw'] if 'thermal' in by_kind else None,
+            'thermal_limit_element': by_kind['thermal'].get('element') if 'thermal' in by_kind else None,
+            'first_limit_kind': first['kind'],
+            'first_limit_mw': first['x_mw'],
+            'first_limit_element': first.get('element'),
+            'already_violated': bool(first['already_violated']),
+            'tip_min_vm_pu': float(min_vm_series[-1]),
+        })
+    grower.apply(0.0)
+    net.load.at[grower.load_idx, 'in_service'] = False
+    if not rows:
+        raise _StudyError("None of the buses could be studied; run Load Flow and check the network first.")
+    rows.sort(key=lambda r: (-r['first_limit_mw'], -r['collapse_mw']))
+    result = {
+        'study': 'voltage_stability_ranking',
+        'mode': 'rank',
+        'power_factor': power_factor,
+        'min_vm_pu': min_vm,
+        'max_loading_percent': max_loading,
+        'buses': rows,
+        'skipped_buses': skipped,
+        'load_flows_run': grower.solves,
+        'notes': [
+            "Each bus is studied on its own: a new load is added at that bus only, and the existing loads stay as they are.",
+            "The extra power comes from the slack (External Grid or slack generator); other generators keep their set points.",
+            "The collapse value is the last point that solved, within 1 % of the true tip and slightly below it.",
+        ],
+    }
+    warnings_out = [str(w) for w in (getattr(net, 'warnings', None) or [])]
+    if warnings_out:
+        result['warnings'] = warnings_out
+    return pe._sanitize_for_strict_json(result)
+
+
+def _study(net, params):
+    raw_mode = str(params.get('mode', 'all_loads')).strip().lower()
+    mode = 'rank' if raw_mode in ('rank', 'rank_buses', 'compare') else (
+        'bus' if raw_mode in ('bus', 'new_load', 'site') else 'all_loads')
+    min_vm = _num(params.get('min_vm_pu'), 0.95)
+    max_loading = _num(params.get('max_loading_percent'), 100.0)
+    power_factor = _num(params.get('power_factor'), 0.95)
+    if not 0 < power_factor <= 1:
+        raise _StudyError("Power factor must be above 0 and at most 1.")
+
+    not_ready = pe.network_not_ready_message(net, 'Voltage stability study')
+    if not_ready:
+        raise _StudyError(not_ready)
+    try:
+        pe.electrisim_runpp_robust(net, algorithm='nr', calculate_voltage_angles=True,
+                                   **pe._electrisim_enforce_q_lims_kw(net))
+    except Exception as exc:
+        raise _StudyError(
+            "The load flow of the network as drawn did not converge, so there is no starting point "
+            f"for the study. Run Load Flow first and resolve what it reports. ({exc})")
+
+    if mode == 'rank':
+        return _rank_buses(net, params, min_vm, max_loading, power_factor)
+
+    bus_idx = None
+    if mode == 'bus':
+        bus_idx = _resolve_bus(net, params.get('bus_id') or params.get('bus_name'))
+        if bus_idx is None:
+            raise _StudyError("Choose the bus where the new load connects.")
+        if not bool(net.bus.at[bus_idx, 'in_service']) or math.isnan(float(net.res_bus.vm_pu.at[bus_idx])):
+            raise _StudyError(f"Bus '{_friendly(net, 'bus', bus_idx)}' is not supplied, so no load can be added there.")
+    else:
+        if net.load.empty or not bool(net.load.in_service.astype(bool).any()):
+            asym = getattr(net, 'asymmetric_load', None)
+            if asym is not None and not asym.empty:
+                raise _StudyError(
+                    "This study grows three-phase Loads, and the diagram has only asymmetric (per-phase) "
+                    "loads. Use \"A new load is added at one bus\" or \"Compare buses\" instead.")
+            raise _StudyError("There are no in-service loads to grow. Add a Load, or use \"Add a new load at one bus\".")
+
+    grower = _Grower(net, mode, bus_idx, power_factor)
+    base_x = grower.base_mw
+    if mode == 'all_loads' and base_x <= 0:
+        raise _StudyError("The loads add up to 0 MW or less, so they cannot be scaled up. Use \"Add a new load at one bus\".")
+
+    system_load = float(net.res_load.p_mw.sum()) if len(net.load) else 0.0
+    if mode == 'bus':
+        first_step = _bus_first_step(net, bus_idx, system_load)
+    else:
+        first_step = 0.05 * base_x
+
+    tolerance = max(_num(params.get('tip_tolerance_percent'), 0.2), 0.01) / 100.0
+    try:
+        tip_x, points = _trace(net, grower, base_x, first_step, tolerance, CURVE_POINTS)
+    except _NoTip:
+        if bus_idx is not None and _is_slack_bus(net, bus_idx):
+            raise _StudyError(
+                f"Bus '{_friendly(net, 'bus', bus_idx)}' is the slack bus (External Grid or slack generator). It holds "
+                "its voltage and supplies whatever is asked, so it has no collapse point. Choose another bus.")
+        raise _StudyError("No voltage limit was found within the search range; check the External Grid and generator data.")
+    tip = points[-1]
+    xs = [p['x_mw'] for p in points]
+    limits, buses, min_vm_series = _find_limits(net, points, base_x, tip_x, min_vm, max_loading)
     binding = limits[0]
 
     # --- buses ranked by how far the voltage falls

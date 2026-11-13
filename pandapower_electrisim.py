@@ -9529,6 +9529,39 @@ def _drop_dc_grid_for_sc(net):
             net[table].drop(net[table].index, inplace=True)
 
 
+def network_not_ready_message(net, study, needs='slack'):
+    """Plain text when the diagram cannot be calculated at all, or None.
+
+    ``needs='slack'`` (load-flow based studies): a reference is required, an External Grid or a
+    Generator ticked as slack. ``needs='source'`` (short-circuit based studies): any in-service
+    source will do. Without these checks the studies stop inside pandapower with texts such as
+    "No reference bus is available", "max() arg is an empty sequence" or "division by zero".
+    """
+    if net.bus.empty:
+        return (f"{study} cannot run: the diagram has no buses. Add at least one Bus, connect the "
+                "elements to it and try again.")
+
+    def _in_service(table):
+        df = net[table] if table in net else None
+        if df is None or df.empty:
+            return 0
+        return int(df.in_service.astype(bool).sum()) if 'in_service' in df.columns else len(df)
+
+    if needs == 'source':
+        if sum(_in_service(t) for t in ('ext_grid', 'gen', 'sgen', 'ward', 'xward')) == 0:
+            return (f"{study} cannot run: the diagram has no in-service source. Add an External Grid, "
+                    "a Generator or a Static Generator connected to a bus.")
+    elif needs == 'slack':
+        slack_gens = 0
+        if 'gen' in net and not net.gen.empty and 'slack' in net.gen.columns:
+            slack_gens = int((net.gen.slack.astype(bool) & net.gen.in_service.astype(bool)).sum())
+        if _in_service('ext_grid') == 0 and slack_gens == 0:
+            return (f"{study} cannot run: the diagram has no in-service External Grid (and no Generator "
+                    "set as slack), so nothing fixes the voltage and balances the power. Add an "
+                    "External Grid and connect it to a bus.")
+    return None
+
+
 def _network_not_ready_error(net, study):
     """Plain-language error when the diagram has nothing to calculate, or None.
 
@@ -10339,9 +10372,9 @@ def contingency_analysis(net, contingency_params):
                 f"Minimum voltage ({min_vm_pu:g} p.u.) must be below maximum voltage "
                 f"({max_vm_pu:g} p.u.).")})
 
-        not_ready = _network_not_ready_error(net, 'Contingency analysis')
+        not_ready = network_not_ready_message(net, 'Contingency analysis')
         if not_ready:
-            return not_ready
+            return json.dumps({'error': not_ready})
 
         warnings_out = []
 
@@ -10746,9 +10779,16 @@ def optimalPowerFlow(net, opf_params):
             dcline_cost_cp2 = {}
         
         # Check for isolated buses
+        not_ready = network_not_ready_message(net, 'Optimal power flow')
+        if not_ready:
+            return {"error": True, "message": not_ready, "exception": not_ready, "diagnostic": {}}
         isolated_buses = top.unsupplied_buses(net)
         if len(isolated_buses) > 0:
-            raise ValueError(f"Isolated buses found: {isolated_buses}. Check your network connectivity.")
+            _iso_names = [str((getattr(net, 'user_friendly_names', None) or {}).get(
+                str(net.bus.at[b, 'name']), net.bus.at[b, 'name'])) for b in sorted(isolated_buses)]
+            _iso_shown = ', '.join(_iso_names[:10]) + (f" (+{len(_iso_names) - 10} more)" if len(_iso_names) > 10 else '')
+            raise ValueError(f"These buses are not supplied: {_iso_shown}. Connect them to the rest of the "
+                             "network or take them out of service.")
         
         # Ensure min/max p_mw columns exist before default cost setup (PWL uses these breakpoints)
         if 'min_p_mw' not in net.gen.columns:
@@ -12920,6 +12960,9 @@ def time_series_simulation(net, timeseries_params):
     and do not change this execution path.
     """
     try:
+        not_ready = network_not_ready_message(net, 'Time series simulation')
+        if not_ready:
+            return {"error": True, "message": not_ready, "exception": not_ready, "diagnostic": {}}
         time_steps = int(timeseries_params.get('time_steps', 24))
         load_profile = timeseries_params.get('load_profile', 'constant')
         generation_profile = timeseries_params.get('generation_profile', 'constant')
@@ -13787,12 +13830,15 @@ def economic_analysis(net, in_data, params):
             except (TypeError, ValueError):
                 energy_price = None
         
+        not_ready = network_not_ready_message(net, 'Economic analysis')
         try:
+            if not_ready:
+                raise RuntimeError(not_ready)
             electrisim_runpp_robust(net, algorithm=algorithm, calculate_voltage_angles=calculate_voltage_angles,
                                     init=init, **_electrisim_enforce_q_lims_kw(net))
         except Exception as pf_err:
             return {
-                'error': f'Power flow failed: {str(pf_err)}',
+                'error': not_ready or f'Power flow failed: {str(pf_err)}',
                 'total_capex': 0,
                 'total_power_losses_mw': 0,
                 'total_energy_losses_mwh': None,
@@ -17141,11 +17187,17 @@ def protection_coordination(net, prot_params, in_data):
             grading_mode = 'auto'
 
         # Validate connectivity early so we surface a clear message before sc.calc_sc.
+        not_ready = network_not_ready_message(net, 'Protection coordination', needs='source')
+        if not_ready:
+            return json.dumps({'error': True, 'message': not_ready, 'scenarios': [], 'devices': []})
         isolated_buses = top.unsupplied_buses(net)
         if len(isolated_buses) > 0:
+            _iso_names = [str((getattr(net, 'user_friendly_names', None) or {}).get(
+                str(net.bus.at[b, 'name']), net.bus.at[b, 'name'])) for b in sorted(isolated_buses)]
+            _iso_shown = ', '.join(_iso_names[:10]) + (f" (+{len(_iso_names) - 10} more)" if len(_iso_names) > 10 else '')
             return json.dumps({
                 'error': True,
-                'message': f'Isolated buses found: {sorted(isolated_buses)}. Connect every component to a supplied bus before running protection coordination.',
+                'message': f'These buses are not supplied: {_iso_shown}. Connect every component to a supplied bus before running protection coordination.',
                 'scenarios': [],
                 'devices': [],
                 'summary': {'converged': False},

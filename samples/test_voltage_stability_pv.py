@@ -101,6 +101,28 @@ def test_messages():
     print("messages OK: slack bus, no loads, unknown bus")
 
 
+def test_compare_buses():
+    phi = math.acos(0.95)
+    p_max = V_KV ** 2 * math.cos(phi) / (2 * X_OHM * (1 + math.sin(phi)))
+    data = post(two_bus(0.95, mode="rank"))
+    assert not data.get("error"), data.get("error")
+    assert data["study"] == "voltage_stability_ranking"
+    # the slack bus is left out, so only the load bus is ranked
+    assert [row["bus"] for row in data["buses"]] == ["Site"], data["buses"]
+    row = data["buses"][0]
+    assert p_max * 0.985 <= row["collapse_mw"] <= p_max * 1.0005, (row["collapse_mw"], p_max)
+    assert row["first_limit_kind"] == "voltage" and 0 < row["first_limit_mw"] < row["collapse_mw"]
+    assert row["voltage_limit_mw"] == row["first_limit_mw"]
+
+    # the single-bus study gives the same limits (finer steps), so the two views agree
+    single = post(two_bus(0.95))
+    assert abs(single["limits"][0]["x_mw"] - row["first_limit_mw"]) <= 0.03 * single["limits"][0]["x_mw"]
+
+    data = post(two_bus(0.95, mode="rank", bus_ids=["b"], max_buses="0"))
+    assert "Select up to 0 buses" in (data.get("error") or ""), data
+    print(f"compare buses OK: Site collapses at {row['collapse_mw']:.1f} MW, first limit at {row['first_limit_mw']:.1f} MW")
+
+
 def test_case39_template():
     with open(os.path.join(FIXTURES, "opendss_lf_case39.json"), encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -133,6 +155,7 @@ def test_case39_template():
 def main() -> None:
     test_two_bus_matches_theory()
     test_messages()
+    test_compare_buses()
     test_case39_template()
     print("All voltage stability checks passed.")
 
