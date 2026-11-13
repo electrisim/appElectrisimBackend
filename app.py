@@ -1076,7 +1076,13 @@ def simulation():
                         controlmode,
                         harmonics,
                         neglect_load_y,
-                        export_commands
+                        export_commands,
+                        operating_point_network=in_data[x].pop('operatingPointNetwork', None),
+                        scan={
+                            'bus_ids': in_data[x].get('scanBusIds') or [],
+                            'max_order': in_data[x].get('scanMaxOrder'),
+                            'step': in_data[x].get('scanStep'),
+                        },
                     )
                 else:
                     response_data = opendss_electrisim.powerflow(
@@ -1223,6 +1229,22 @@ def simulation():
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
                 response_data = voltage_stability_electrisim.voltage_stability_study(net, in_data[x])
+
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                if 'gzip' in accept_encoding and len(response_data) > 1024:
+                    compressed = gzip.compress(response_data.encode('utf-8'))
+                    response = make_response(compressed)
+                    response.headers['Content-Encoding'] = 'gzip'
+                    response.headers['Content-Type'] = 'application/json'
+                    response.headers['Content-Length'] = len(compressed)
+                    return response
+                return response_data
+
+            if "GridFormingStatcomSizing" in typ:
+                import grid_forming_statcom_electrisim
+                user_email = in_data[x].get('user_email', 'unknown@user.com')
+                print(f"=== GRID-FORMING STATCOM SIZING REQUESTED BY USER: {user_email} ===")
+                response_data = grid_forming_statcom_electrisim.grid_forming_statcom_study(in_data, x)
 
                 accept_encoding = request.headers.get('Accept-Encoding', '')
                 if 'gzip' in accept_encoding and len(response_data) > 1024:
