@@ -6092,13 +6092,14 @@ def _powerflow_impl(in_data, frequency, mode, algorithm, loadmodel, max_iteratio
                     vn_hv_kv = dss.Transformers.kV()
                     
                     
-                    # Get number of phases from transformer properties
+                    # Number of phases of the active transformer. opendssdirect has no
+                    # Transformers.Phases(); calling it raised, the fallback of 3 applied sqrt(3)
+                    # to single-phase units and showed them 73 % more loaded than they are.
                     try:
-                        num_phases = dss.Transformers.Phases()
+                        num_phases = int(dss.CktElement.NumPhases())
                     except Exception:
-                        # Fallback: assume 3-phase if not available
                         num_phases = 3
-                    
+
                     
                     # Loading as pandapower defines it (trafo_loading="current"): the larger winding
                     # current against that winding's rated current, I * Vn * sqrt(3) / Sn. The HV
