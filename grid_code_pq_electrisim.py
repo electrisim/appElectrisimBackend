@@ -2786,12 +2786,23 @@ def _pq_sweep_voltage(net, ctx, v_pu, u_scale, p_points, i_park, tap_bounds, sig
                     f"({', '.join(sorted(set(uniq)))})"
                 )
             elif uniq:
-                words = {
-                    'divergence': 'no load-flow solution beyond this Q: plant voltages collapse '
-                                  '(full unit and STATCOM Q is not reachable at this grid voltage)',
-                }
+                # No Q at all on this side is a missing point (it fails the compliance check),
+                # not a limited one.
+                q_side = q_max_pcc if side == 'max' else q_min_pcc
+                if q_side is None:
+                    words = {
+                        'divergence': 'no load-flow solution on this edge at this grid voltage: '
+                                      'plant voltages collapse, so the point is missing and fails the check',
+                    }
+                    head = f"Q_{side} not found"
+                else:
+                    words = {
+                        'divergence': 'no load-flow solution beyond this Q: plant voltages collapse '
+                                      '(full unit and STATCOM Q is not reachable at this grid voltage)',
+                    }
+                    head = f"Q_{side} limited"
                 warnings.append(
-                    f"V={v_pu}pu, P={p_val:.1f}MW: Q_{side} limited "
+                    f"V={v_pu}pu, P={p_val:.1f}MW: {head} "
                     f"({', '.join(words.get(x, x) for x in sorted(set(uniq)))})"
                 )
 

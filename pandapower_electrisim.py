@@ -14492,6 +14492,41 @@ def _rpc_masked_q_interp_clip(p_target, p_list, q_list):
     return float(np.interp(pt, px, qy, left=float(qy[0]), right=float(qy[-1])))
 
 
+def _rpc_q_for_compliance(x_target, x_list, q_list, tol=1e-6):
+    """
+    Q at x_target for a compliance check: interpolate between solved points only.
+    None when x_target is a swept point whose Q has no load-flow solution, or lies
+    outside the solved span. A missing point must fail the check, never borrow a
+    neighbour's Q (that is only acceptable for drawing the chart).
+    """
+    pairs = []
+    unsolved = []
+    for x, q in zip(x_list, q_list):
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            continue
+        if q is None:
+            unsolved.append(xf)
+            continue
+        try:
+            pairs.append((xf, float(q)))
+        except (TypeError, ValueError):
+            unsolved.append(xf)
+    xt = float(x_target)
+    solved_here = [q for x, q in pairs if abs(x - xt) <= tol]
+    if solved_here:
+        return solved_here[0]
+    if not pairs or any(abs(x - xt) <= tol for x in unsolved):
+        return None
+    pairs.sort(key=lambda t: t[0])
+    if xt < pairs[0][0] - tol or xt > pairs[-1][0] + tol:
+        return None
+    px = np.array([t[0] for t in pairs], dtype=float)
+    qy = np.array([t[1] for t in pairs], dtype=float)
+    return float(np.interp(xt, px, qy))
+
+
 def _rpc_merge_uq_voltages(voltage_levels, uq_requirements, requirements=None):
     """
     U-Q/Pmax needs a voltage sweep. If the client sent U-Q requirement voltages
@@ -14602,8 +14637,9 @@ def _rpc_check_uq_compliance(uq_curve, uq_requirements, tol_mvar=1e-4):
     for u_s in sorted(u_check):
         req_max_v = float(np.interp(u_s, ru, rmax, left=float(rmax[0]), right=float(rmax[-1])))
         req_min_v = float(np.interp(u_s, ru, rmin, left=float(rmin[0]), right=float(rmin[-1])))
-        cap_max_v = _rpc_masked_q_interp_clip(u_s, cap_u, cap_q_max)
-        cap_min_v = _rpc_masked_q_interp_clip(u_s, cap_u, cap_q_min)
+        # A voltage with no load-flow solution (or outside the solved span) is not compliant.
+        cap_max_v = _rpc_q_for_compliance(u_s, cap_u, cap_q_max)
+        cap_min_v = _rpc_q_for_compliance(u_s, cap_u, cap_q_min)
         if cap_max_v is None or cap_min_v is None:
             return False
         if cap_max_v < req_max_v - tol_mvar or cap_min_v > req_min_v + tol_mvar:
