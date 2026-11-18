@@ -189,10 +189,11 @@ def three_winding() -> None:
     regular = three_winding_solve("1ph", "max", c0_nf_per_km=10.0)
     t3, reference = floating.res_trafo3w_sc.iloc[0], regular.res_trafo3w_sc.iloc[0]
     assert floating.res_line_sc.at[0, "ikss_ka"] == 0.0 and t3["ikss_mv_ka"] == 0.0, (floating.res_line_sc, t3)
-    # pandapower's own bus Ik1 differs between the two (its inversion of the singular network), so
-    # compare the 110 kV current per kA of 10 kV fault current.
+    # The bus Ik1 uses the same zero-sequence network (samples/test_sc_unearthed_zero_sequence.py).
     ik_floating, ik_regular = floating.res_bus_sc["ikss_ka"].at[2], regular.res_bus_sc["ikss_ka"].at[2]
-    assert close(t3["ikss_hv_ka"] / ik_floating, reference["ikss_hv_ka"] / ik_regular, 1e-3), (t3, reference)
+    assert close(ik_floating, ik_regular, 1e-3), (floating.res_bus_sc, regular.res_bus_sc)
+    for side in ("ikss_hv_ka", "ikss_lv_ka"):
+        assert close(t3[side], reference[side], 1e-3), (side, t3, reference)
     # Phase currents on the 110 kV side: 2 I1 cos 30 from the positive and negative sequence, plus
     # part of the zero sequence that the YN winding carries.
     transferred = ik_floating / 3.0 * 10.0 / 110.0

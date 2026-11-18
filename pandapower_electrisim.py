@@ -33,6 +33,7 @@ from converter_sc_electrisim import (
     negative_sequence_export_lines,
     sgen_k_export_lines,
 )
+import sc_zero_sequence_zbus
 import zero_sequence_dialog
 try:
     from pandapower.control.controller.station_control import BinarySearchControl
@@ -40,6 +41,8 @@ except ImportError:  # older pandapower: no park controller support
     BinarySearchControl = ()
 
 zero_sequence_dialog.install()
+# Single-phase faults: Z0 stays right when part of the network has no zero-sequence earth.
+sc_zero_sequence_zbus.install()
 
 
 def _install_switch_sc_results_fix():
@@ -2048,6 +2051,8 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
         if not net.sgen.empty:
             lines.extend(sgen_k_export_lines(net, fault_type))
         lines.append("")
+        if fault_type == '1ph':
+            lines.extend(sc_zero_sequence_zbus.export_lines())
         lines.append("sc.calc_sc(")
         lines.append("    net,")
         lines.append(f"    fault={fault_type!r},")
@@ -9718,40 +9723,6 @@ def electrisim_branch_sc_results(net, fault='3ph', case='max', bus=None, tk_s=1.
     def angles_of(buses):
         return np.array([angles.get(int(b), 0.0) for b in buses], dtype=float)
 
-    def zero_sequence_columns(ybus, columns):
-        """Zero-sequence Zbus columns, with every part of the network that has no earth held at zero.
-
-        pandapower models an open zero-sequence path (a delta winding) as a 1e20 pu branch and
-        inverts the whole Ybus. A part with no zero-sequence earth at all (a delta winding feeding
-        cables without capacitance) is then singular and spoils the voltages elsewhere, so the
-        open paths are cut, each remaining part is checked, and only the earthed parts are solved.
-        """
-        from scipy.sparse import coo_matrix, csgraph, diags
-        from scipy.sparse.linalg import splu
-
-        y = ybus.tocoo()
-        keep = (y.row == y.col) | (np.abs(y.data) > 1e-10)
-        rows, cols, data = y.row[keep], y.col[keep], y.data[keep]
-        y = coo_matrix((data, (rows, cols)), shape=ybus.shape).tocsr()
-        pattern = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=ybus.shape)
-        n_parts, part = csgraph.connected_components(pattern, directed=False)
-        floating = np.zeros(y.shape[0], dtype=bool)
-        for p in range(n_parts):
-            members = np.flatnonzero(part == p)
-            try:
-                probe = splu(y[members][:, members].tocsc()).solve(np.ones(len(members), dtype=complex))
-                floating[members] = not np.all(np.isfinite(probe)) or np.abs(probe).max() > 1e12
-            except RuntimeError:  # exactly singular
-                floating[members] = True
-        earthed = diags((~floating).astype(float))
-        y = (earthed @ y @ earthed + diags(floating.astype(float))).tocsc()
-        rhs = np.zeros((y.shape[0], len(columns)), dtype=complex)
-        rhs[columns, np.arange(len(columns))] = 1.0
-        z = splu(y).solve(rhs)
-        z[floating, :] = 0.0
-        z[:, floating[columns]] = 0.0
-        return z
-
     def single_phase_per_fault():
         """Per (branch, fault bus) largest phase current of a single-phase-to-earth fault, in kA."""
         from pandapower.auxiliary import _add_auxiliary_elements
@@ -9760,7 +9731,10 @@ def electrisim_branch_sc_results(net, fault='3ph', case='max', bus=None, tk_s=1.
         from pandapower.pypower.idx_bus import BASE_KV
         from pandapower.pypower.idx_bus_sc import C_MAX, C_MIN, IKCV, IKSS1, IKSS2, R_EQUIV, X_EQUIV
         from pandapower.shortcircuit.currents import _calc_ikss_1ph
-        from pandapower.shortcircuit.impedance import _calc_rx, _calc_ybus, _calc_zbus
+        # calc_sc's own Zbus step. Electrisim and the exported script replace it so that a part of
+        # the zero-sequence network without an earth is held open, the same Z0 as the bus results.
+        from pandapower.shortcircuit.calc_sc import _calc_zbus
+        from pandapower.shortcircuit.impedance import _calc_rx, _calc_ybus
         from pandapower.shortcircuit.ppc_conversion import (_create_k_updated_ppci, _get_is_ppci_bus,
                                                             _init_ppc)
 
@@ -9797,7 +9771,8 @@ def electrisim_branch_sc_results(net, fault='3ph', case='max', bus=None, tk_s=1.
 
         z1_bus = ppci['internal']['Zbus']
         v1 = -z1_bus[:, fi] * i_seq  # bus voltages, one column per fault
-        v0 = -zero_sequence_columns(ppci_0['internal']['Ybus'], fi) * i_seq
+        # An unearthed part moves as one (all its Z0 entries are equal), so its branches carry no I0.
+        v0 = -ppci_0['internal']['Zbus'][:, fi] * i_seq
         flows = {
             ('f', 1): ppci['internal']['Yf'].tocsr() @ v1, ('t', 1): ppci['internal']['Yt'].tocsr() @ v1,
             ('f', 0): ppci_0['internal']['Yf'].tocsr() @ v0, ('t', 0): ppci_0['internal']['Yt'].tocsr() @ v0,

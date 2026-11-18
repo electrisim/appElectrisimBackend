@@ -23,6 +23,8 @@ import math
 import numpy as np
 import pandas as pd
 
+from sc_zero_sequence_zbus import electrisim_zbus
+
 logger = logging.getLogger(__name__)
 
 _IK_COLUMN = {
@@ -387,7 +389,10 @@ def _apply_negative_sequence_ikss(net, fault, case, lv_tol_percent, r_fault_ohm,
     if fault == "1ph":
         _ppc0, ppci0 = _pd2ppc_zero(work, ppc["branch"][:, K_ST])
         _calc_ybus(ppci0)
-        z0 = _invert_y(ppci0["internal"]["Ybus"].toarray())
+        # The same Z0 as calc_sc: parts without a zero-sequence earth are held open.
+        z0 = electrisim_zbus(ppci0["internal"]["Ybus"])
+        if z0 is None:
+            z0 = _invert_y(ppci0["internal"]["Ybus"].toarray())
         z0_diag = np.diag(z0)
 
     sbase = _float(getattr(work, "sn_mva", 1.0), 1.0) or 1.0
@@ -469,7 +474,8 @@ def negative_sequence_export_lines(net, fault, case="max", lv_tol_percent=10, r_
 
     Empty unless the fault is two-phase or single-phase and a converter has X2 set, which is
     when Electrisim changes pandapower's result. The script then carries this module's
-    functions verbatim, so it reproduces the Electrisim numbers.
+    functions verbatim, so it reproduces the Electrisim numbers. A single-phase script must
+    also define electrisim_zbus (sc_zero_sequence_zbus.export_lines, emitted before calc_sc).
     """
     if fault not in ("2ph", "1ph") or not _negative_sequence_shunts(net):
         return []
