@@ -35,6 +35,8 @@ from converter_sc_electrisim import (
 )
 import sc_zero_sequence_zbus
 import zero_sequence_dialog
+import iec_breaking_electrisim
+from iec_breaking_electrisim import electrisim_iec_breaking
 try:
     from pandapower.control.controller.station_control import BinarySearchControl
 except ImportError:  # older pandapower: no park controller support
@@ -1339,6 +1341,21 @@ def sc_lv_tol_percent(in_data):
     return value if value in (6, 10) else 10
 
 
+def sc_contact_parting_ms(in_data, default=50.0):
+    """Contact parting time t_min of the IEC 60909 study in ms, from the Short Circuit dialog.
+
+    t_min is the relay time plus the breaker's minimum opening time. The DC component, the
+    breaking current Ib and the breaker check are taken at this instant, unless a breaker has
+    its own contact parting time. Missing, zero or unreadable values give 50 ms.
+    """
+    raw = (in_data or {}).get('t_min_ms')
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) and value > 0 else float(default)
+
+
 def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_voltage_angles, init,
                                     study='powerflow', sc_in_data=None):
     """Generate Python code to recreate the pandapower network (load flow or short circuit)."""
@@ -2091,6 +2108,10 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
             net, fault_type, case=fault_location, lv_tol_percent=sc_lv_tol_percent(sc),
             r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, bus_literal=_export_py_literal(sc_bus),
         ))
+        lines.extend(_iec_breaking_export_lines(
+            net, fault_type, fault_location, _export_py_literal(sc_bus), sc_lv_tol_percent(sc),
+            r_fault_ohm, x_fault_ohm, sc_contact_parting_ms(sc),
+        ))
         lines.append("# Print short-circuit results")
         lines.append("print('\\nBus SC Results:')")
         lines.append("print(net.res_bus_sc)")
@@ -2160,6 +2181,49 @@ def generate_pandapower_python_code(net, in_data, Busbars, algorithm, calculate_
     lines.append("    print(net.controller)")
     
     return '\n'.join(lines)
+
+
+IEC_BREAKER_RATING_COLUMNS = ('interrupting_rating_ka', 'momentary_rating_ka', 'contact_parting_ms',
+                              'dc_time_constant_ms', 'rated_dc_percent')
+
+
+def _iec_breaking_export_lines(net, fault_type, fault_location, bus_literal, lv_tol_percent,
+                               r_fault_ohm, x_fault_ohm, t_min_ms):
+    """Python statements that add Ib, i_DC and Ib,asym and check the breakers, as Electrisim does.
+
+    The script carries iec_breaking_electrisim verbatim, so it prints the same numbers.
+    Switches are created in order, so the n-th switch of the script is the n-th switch here.
+    """
+    lines = [
+        "# --- Electrisim breaking duty at contact parting (IEC 60909-0 4.4 and 4.5, IEC 62271-100) ---",
+        f"# Ib, the DC component i_DC and Ib,asym at t_min = {float(t_min_ms):g} ms go into net.res_bus_sc;",
+        "# each circuit breaker is checked against its rated making current, Isc and DC component.",
+    ]
+    sw = getattr(net, 'switch', None)
+    if sw is not None and not sw.empty:
+        for col in IEC_BREAKER_RATING_COLUMNS:
+            lines.append(f"net.switch[{col!r}] = float('nan')")
+        for pos, (_, row) in enumerate(sw.iterrows()):
+            for col in IEC_BREAKER_RATING_COLUMNS:
+                value = safe_float(row.get(col), float('nan')) if col in sw.columns else float('nan')
+                if math.isfinite(value) and value > 0:
+                    lines.append(f"net.switch.at[{pos}, {col!r}] = {float(value)!r}")
+        lines.append("")
+    source = inspect.getsource(iec_breaking_electrisim).rstrip("\n").split("\n")
+    lines.extend(source)
+    lines.append("")
+    lines.append(
+        f"breaker_duties = electrisim_iec_breaking(net, fault={fault_type!r}, case={fault_location!r}, "
+        f"bus={bus_literal}, lv_tol_percent={int(lv_tol_percent)}, r_fault_ohm={float(r_fault_ohm)!r}, "
+        f"x_fault_ohm={float(x_fault_ohm)!r}, t_min_s={float(t_min_ms) / 1000.0!r})"
+    )
+    lines.append("if breaker_duties:")
+    lines.append("    import pandas as pd")
+    lines.append("    print('\\nCircuit breakers (IEC 62271-100):')")
+    lines.append("    print(pd.DataFrame(breaker_duties)[['name', 't_cp_ms', 'ip_ka', 'making_rating_ka', 'ib_ka', "
+                 "'breaking_rating_ka', 'dc_percent', 'rated_dc_percent', 'ib_asym_ka', 'status']].to_string())")
+    lines.append("")
+    return lines
 
 
 def _export_python_requested(flag):
@@ -5395,6 +5459,10 @@ def create_other_elements(in_data,net,x, Busbars):
                 ('rated_voltage_kv', 'rated_voltage_kv', float('nan')),
                 ('contact_parting_cycles', 'contact_parting_cycles', float('nan')),
                 ('generator_cb', 'generator_cb', False),
+                # IEC 62271-100 breaker check of the IEC 60909 study
+                ('contact_parting_ms', 'contact_parting_ms', float('nan')),
+                ('dc_time_constant_ms', 'dc_time_constant_ms', float('nan')),
+                ('rated_dc_percent', 'rated_dc_percent', float('nan')),
             ):
                 if col not in net.switch.columns:
                     net.switch[col] = default
@@ -9937,6 +10005,25 @@ def electrisim_branch_sc_results(net, fault='3ph', case='max', bus=None, tk_s=1.
     return True
 
 
+IEC_BREAKING_COLUMNS = ('ib_ka', 'idc_ka', 'ib_asym_ka', 'dc_percent', 'xr_dc', 'tau_dc_ms')
+
+
+def _iec_json_value(value):
+    """NaN and inf become None, numpy scalars plain Python, for the result JSON."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value) if math.isfinite(float(value)) else None
+    return value
+
+
+def _iec_breaking_fields(row):
+    """The breaking-duty columns of one res_bus_sc row (None where not calculated)."""
+    return {col: _iec_json_value(row[col]) if col in row.index else None for col in IEC_BREAKING_COLUMNS}
+
+
 def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=None):
     _drop_dc_grid_for_sc(net)
     not_ready = _network_not_ready_error(net, "Short circuit")
@@ -10025,6 +10112,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
     ith = True
     topology = in_data.get('topology', 'radial')
     tk_s = float(in_data.get('tk_s', 1.0))
+    t_min_ms = sc_contact_parting_ms(in_data)
     r_fault_ohm = float(in_data.get('r_fault_ohm', 0.0))
     x_fault_ohm = float(in_data.get('x_fault_ohm', 0.0))
     inverse_y = in_data.get('inverse_y', False)
@@ -10133,6 +10221,21 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             bus=bus,
         )
 
+        # Breaking duty at contact parting (t_min): Ib, the DC component, Ib,asym, and the
+        # IEC 62271-100 making / breaking check of each circuit breaker. Uses the final Ik" and ip.
+        try:
+            breaker_duties = electrisim_iec_breaking(
+                net, fault=fault_type, case=fault_location, bus=bus, lv_tol_percent=lv_tol_percent,
+                r_fault_ohm=r_fault_ohm, x_fault_ohm=x_fault_ohm, t_min_s=t_min_ms / 1000.0,
+            )
+        except Exception as breaking_err:
+            breaker_duties = []
+            if not hasattr(net, 'warnings') or net.warnings is None:
+                net.warnings = []
+            net.warnings.append(
+                f"Breaking current Ib and the DC component could not be calculated ({breaking_err}); "
+                f"Ik\", ip and Ith are unaffected.")
+
     except Exception as e:
         
         # Capture the diagnostic output and process it
@@ -10199,7 +10302,8 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 
     #wyrzuciłem skss_mw bo wyskakiwał błąd przy zwarciu jednofazowym
     class BusbarOut(object):
-        def __init__(self, name: str, id: str, ikss_ka: float, ip_ka: float, ith_ka: float, rk_ohm: float, xk_ohm: float):
+        def __init__(self, name: str, id: str, ikss_ka: float, ip_ka: float, ith_ka: float, rk_ohm: float, xk_ohm: float,
+                     **breaking):
             self.name = name
             self.id = id
             self.ikss_ka = ikss_ka
@@ -10207,6 +10311,9 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             self.ith_ka = ith_ka
             self.rk_ohm = rk_ohm
             self.xk_ohm = xk_ohm
+            # At contact parting t_min: ib_ka, idc_ka, ib_asym_ka, dc_percent, xr_dc, tau_dc_ms
+            for key, value in breaking.items():
+                setattr(self, key, value)
 
     class BusbarsOut(object):
         def __init__(self, busbars: List[BusbarOut]):
@@ -10236,6 +10343,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             ith_ka=ith_ka,
             rk_ohm=row['rk_ohm'],
             xk_ohm=row['xk_ohm'],
+            **_iec_breaking_fields(row),
         )
 
         busbarList.append(busbar)
@@ -10289,6 +10397,7 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
                 "ith_ka": ith_ka,
                 "rk_ohm": _clean_value(row['rk_ohm']),
                 "xk_ohm": _clean_value(row['xk_ohm']),
+                **_iec_breaking_fields(row),
             }
             ext_grid_sc_list.append(ext_entry)
         if ext_grid_sc_list:
@@ -10448,10 +10557,15 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         'fault_bus_ids': collect_fault_bus_refs(in_data) if fault_bus_mode == 'selection' else [],
         'fault_bus_names': list(in_data.get('fault_bus_names') or []) if fault_bus_mode == 'selection' else [],
         'tk_s': tk_s,
+        't_min_ms': t_min_ms,
+        'frequency_hz': float(getattr(net, 'f_hz', 50.0) or 50.0),
         'r_fault_ohm': r_fault_ohm,
         'x_fault_ohm': x_fault_ohm,
         'standard': 'iec60909',
     }
+    result['breaker_duties'] = [
+        {key: _iec_json_value(value) for key, value in duty.items()} for duty in breaker_duties
+    ]
 
     if export_python and in_data_full is not None and Busbars is not None:
         try:
