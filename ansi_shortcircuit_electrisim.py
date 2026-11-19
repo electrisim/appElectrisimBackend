@@ -151,6 +151,21 @@ def _lv_extra_multiplier(xr: float, device_class: str, freq_hz: float = 60.0) ->
     return _peak_multiplier_remote(xr, freq_hz) / _peak_multiplier_remote(test_xr, freq_hz)
 
 
+def close_latch_factor(device_class: str, freq_hz: float = 60.0) -> float:
+    """Close-and-latch (momentary) peak as a multiple of the symmetrical interrupting rating.
+
+    IEEE C37.04 rates an HV breaker's closing and latching current at 2.6 x its rated
+    short-circuit current at 60 Hz (2.5 x at 50 Hz, as IEC 62271-100); IEEE C37.013 rates a
+    generator breaker at 2.74 x. Low-voltage breakers (C37.13, UL 489) have no separate rating:
+    their peak capability is the first-cycle peak of the test circuit, at the test X/R.
+    """
+    if device_class == "generator_c37_013":
+        return 2.74
+    if device_class in ("lv_c37_013", "mccb_ul_489"):
+        return _peak_multiplier_remote(_lv_test_xr(device_class), freq_hz)
+    return 2.5 if float(freq_hz) < 55.0 else 2.6
+
+
 def _machine_x_multiplier(network: str, machine_kind: str, hp: float = 0.0) -> float:
     """ANSI reactance multiplier on subtransient base."""
     if network == NETWORK_FIRST:
@@ -621,12 +636,17 @@ def _compute_device_duties(
             continue
         vn = float(net.bus.at[bus, "vn_kv"])
         dc = _resolve_device_class(vn, sw)
+        # in_ka is the switch's rated (continuous) current, not a short-circuit rating, so it is
+        # never used for the interrupting check.
         int_rating = _f(sw.get("interrupting_rating_ka"), 0.0)
         mom_rating = _f(sw.get("momentary_rating_ka"), 0.0)
-        if int_rating <= 0:
-            int_rating = _f(sw.get("in_ka"), 0.0)
-        if mom_rating <= 0:
-            mom_rating = int_rating
+        mom_source = "entered" if mom_rating > 0 else None
+        if mom_rating <= 0 and int_rating > 0:
+            # The momentary duty is a peak current and the interrupting rating a symmetrical
+            # r.m.s. value: without an entered close-and-latch rating, use the peak the device
+            # standard ties to the interrupting rating.
+            mom_rating = int_rating * close_latch_factor(dc, freq_hz)
+            mom_source = "derived"
 
         xr_fc = br.get("xr_first", 15.0) or 15.0
         xr_int = br.get("xr_interrupting", xr_fc) or xr_fc
@@ -679,6 +699,7 @@ def _compute_device_duties(
             "duty_steady_ka": _clean(i_30),
             "interrupting_rating_ka": _clean(int_rating) if int_rating > 0 else None,
             "momentary_rating_ka": _clean(mom_rating) if mom_rating > 0 else None,
+            "momentary_rating_source": mom_source,
             "interrupting_pass": int_pass if int_rating > 0 else None,
             "momentary_pass": mom_pass if mom_rating > 0 else None,
             "margin_interrupting_ka": _clean(margin_int),

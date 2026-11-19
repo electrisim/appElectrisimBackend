@@ -6,7 +6,8 @@ end temperature for lines in net.line.endtemp_degree", because the export left o
 zero-sequence data and end temperature, which Electrisim itself uses. The export also dropped
 out-of-service flags, the generator short-circuit data and induction-machine static generators,
 and did not repeat the steps Electrisim runs after calc_sc (the converter r2/x2 correction and
-the single-phase ip / Ith).
+the single-phase ip / Ith). The breaking current Ib, the DC component and Ib,asym at contact
+parting must come out of the script the same way.
 
 Single-phase ip and Ith used a fixed kappa of 1.8 with Ith = Ik1" (line Ith showed 0). They now
 use each bus's own IEC 60909 kappa and m, the same values as the three-phase fault.
@@ -121,13 +122,14 @@ def main() -> None:
             assert "xdss_pu=" in code and "generator_type='async'" in code
             assert ("apply_negative_sequence_ikss(net" in code) == (fault != "3ph")
             assert ("electrisim_1ph_ip_ith(net" in code) == (fault == "1ph")
+            assert "breaker_duties = electrisim_iec_breaking(net" in code, "breaking duty missing from the script"
             net = run_script(code)
 
             checked = 0
             for b in data["busbars"]:
                 idx = net.bus.index[net.bus.name == b["name"]][0]
                 row = net.res_bus_sc.loc[idx]
-                for col in ("ikss_ka", "ip_ka", "ith_ka"):
+                for col in ("ikss_ka", "ip_ka", "ith_ka", "ib_ka", "idc_ka", "ib_asym_ka", "dc_percent"):
                     got = None if math.isnan(row[col]) else float(row[col])
                     assert close(b[col], got), f"{fault} {case} bus {b['name']} {col}: study {b[col]} script {got}"
                     checked += 1
