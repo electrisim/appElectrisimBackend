@@ -15,6 +15,12 @@ Duties (each can be switched off):
 - oscillation damping P = A sin(2 pi f_osc t)
 - frequency support   droop with deadband, limited to a share of the plant power, for a
                       bridging time (FSM / LFSM while the turbines take over)
+- fault ride-through  reactive current through a voltage dip, dIq = k dU (k-factor) on the
+                      rated current of the facility or of the STATCOM; checked against the
+                      short-time current of the converter (no stored energy needed)
+
+The facility is the generating plant (Static Generators) or a load, such as a data centre (a
+Load with the computational load model switched on).
 
 What comes from the diagram: the STATCOM rating and coupling reactance, the plant rated power,
 the reactive power the STATCOM carries in the solved load flow (with the park controller, plant
@@ -200,6 +206,69 @@ def duty_table(d, phase_jump_mw):
             'basis': (f"droop {d['droop'] * 100:g} %, deadband {d['deadband_hz'] * 1000:g} mHz, limited to "
                       f"{d['support_cap_mw']:.1f} MW for {d['support_time']:g} s")})
     return rows
+
+
+# --------------------------------------------------------------------------- fault ride-through
+
+def read_frt(params):
+    """Settings of the fault ride-through duty (reactive current during a voltage dip)."""
+    p = params or {}
+    characteristic = str(p.get('frt_characteristic', 'step')).strip().lower()
+    return {
+        'enabled': _flag(p.get('duty_frt'), False),
+        'k': max(_num(p.get('frt_k_factor'), 2.0), 0.0),
+        'deadband': min(max(_num(p.get('frt_deadband_percent'), 10.0), 0.0), 50.0) / 100.0,
+        'characteristic': 'continuous' if characteristic.startswith('cont') else 'step',
+        'retained': min(max(_num(p.get('frt_retained_pu'), 0.0), 0.0), 1.0),
+        'iq_max': max(_num(p.get('frt_iq_max_pu'), 1.0), 0.0),
+        'base_kind': 'statcom' if str(p.get('frt_base', 'facility')).strip().lower().startswith('statcom') else 'facility',
+        'share': min(max(_num(p.get('frt_statcom_share_percent'), 100.0), 0.0), 100.0) / 100.0,
+    }
+
+
+def frt_requirement(frt, facility_mva, statcom_mva, q_pre_mvar, overload, vn_kv):
+    """Reactive current the STATCOM must carry through the deepest dip, and the rating it needs.
+
+    The additional reactive current is ``k * dU`` (step characteristic: the whole dip once it leaves
+    the deadband) or ``k * (dU - deadband)`` (continuous), in p.u. of the rated current of the base,
+    limited to ``iq_max``. It comes on top of the reactive current before the dip. Currents are given
+    as MVA at rated voltage (sqrt(3) * Un * I), the unit of the converter rating.
+    """
+    base_mva = statcom_mva if frt['base_kind'] == 'statcom' else facility_mva
+    du = max(1.0 - frt['retained'], 0.0)
+    if du <= frt['deadband'] + 1e-12:
+        d_iq = 0.0
+    elif frt['characteristic'] == 'continuous':
+        d_iq = frt['k'] * (du - frt['deadband'])
+    else:
+        d_iq = frt['k'] * du
+    limited = d_iq > frt['iq_max'] + 1e-12
+    d_iq = min(d_iq, frt['iq_max'])
+    share_mva = base_mva * frt['share']
+    d_iq_mva = d_iq * share_mva
+    iq_pre = float(q_pre_mvar or 0.0)
+    capped = False
+    if d_iq > 0:
+        iq_total = iq_pre + d_iq_mva
+        if iq_total > frt['iq_max'] * share_mva:
+            iq_total, capped = frt['iq_max'] * share_mva, True
+    else:
+        iq_total = abs(iq_pre)
+    iq_total = max(iq_total, 0.0)
+    required = iq_total / overload
+    available = statcom_mva * overload
+    return {
+        'enabled': True,
+        'k_factor': frt['k'], 'deadband_percent': frt['deadband'] * 100, 'characteristic': frt['characteristic'],
+        'retained_pu': frt['retained'], 'delta_u_pu': _r(du, 4), 'iq_max_pu': frt['iq_max'],
+        'base_kind': frt['base_kind'], 'base_mva': _r(base_mva, 2), 'statcom_share_percent': frt['share'] * 100,
+        'delta_iq_pu': _r(d_iq, 4), 'delta_iq_limited': limited, 'delta_iq_mva': _r(d_iq_mva, 2),
+        'iq_pre_mva': _r(iq_pre, 2), 'iq_total_mva': _r(iq_total, 2), 'iq_total_capped': capped,
+        'iq_total_ka': _r(iq_total / (math.sqrt(3) * vn_kv), 3) if vn_kv > 0 else None,
+        'q_in_dip_mvar': _r(iq_total * frt['retained'], 2),
+        'available_mva': _r(available, 2), 'required_rating_mva': _r(required, 2),
+        'rating_ok': required <= statcom_mva * 1.0005,
+    }
 
 
 # --------------------------------------------------------------------------- supercapacitor bank
@@ -430,6 +499,58 @@ def _find_statcom(net, ref):
     return int(active[0] if len(active) else net.ssc.index[0])
 
 
+def _diagram_loads(in_data):
+    """Balanced loads of the diagram as dicts (the computational-load flag is not in pandapower)."""
+    out = []
+    for key, el in (in_data or {}).items():
+        if not isinstance(el, dict):
+            continue
+        typ = str(el.get('typ') or '')
+        if not typ.startswith('Load') or typ.startswith('Load DC') or 'Asymmetric' in typ or 'Parameters' in typ:
+            continue
+        scaling = _num(el.get('scaling'), 1.0)
+        p = _num(el.get('p_mw'), 0.0) * scaling
+        q = _num(el.get('q_mvar'), 0.0) * scaling
+        sn = _num(el.get('sn_mva'), 0.0)
+        out.append({
+            'refs': {str(el.get(k)) for k in ('id', 'name', 'userFriendlyName') if el.get(k) not in (None, '')},
+            'name': str(el.get('userFriendlyName') or el.get('name') or key),
+            'p_mw': p, 's_mva': sn if sn > 0 else math.hypot(p, q),
+            'in_service': _flag(el.get('in_service'), True),
+            'computational': _flag(el.get('dc_computational_enabled'), False),
+        })
+    return out
+
+
+def _facility(in_data, net, ref):
+    """The facility the STATCOM serves: the generating plant, or a load such as a data centre.
+
+    ``ref`` empty / ``generation``: the Static Generators in service; if there are none, the loads
+    with the computational (data-centre) load model. Anything else names one load (id or name).
+    """
+    ref = str(ref or '').strip()
+    loads = _diagram_loads(in_data)
+    if ref and ref.lower() not in ('generation', 'auto'):
+        hit = next((ld for ld in loads if ref in ld['refs']), None)
+        if hit is None:
+            raise _StudyError(f"The load '{ref}' chosen as the facility is not on the diagram any more. "
+                              'Choose the facility again in this dialog.')
+        return {'kind': 'load', 'name': hit['name'], 'p_mw': hit['p_mw'], 's_mva': hit['s_mva'], 'units': 1}
+    if len(net.sgen):
+        active = net.sgen[net.sgen.in_service.astype(bool)]
+        if len(active):
+            scaling = active['scaling'] if 'scaling' in active.columns else 1.0
+            s_mva = float(active['sn_mva'].fillna(0).sum()) if 'sn_mva' in active.columns else 0.0
+            return {'kind': 'generation', 'name': 'Static Generators in service',
+                    'p_mw': float((active['p_mw'] * scaling).sum()), 's_mva': s_mva, 'units': int(len(active))}
+    centres = [ld for ld in loads if ld['computational'] and ld['in_service']]
+    if centres:
+        return {'kind': 'load', 'name': ', '.join(ld['name'] for ld in centres),
+                'p_mw': sum(ld['p_mw'] for ld in centres), 's_mva': sum(ld['s_mva'] for ld in centres),
+                'units': len(centres)}
+    return {'kind': 'generation', 'name': 'Static Generators in service', 'p_mw': 0.0, 's_mva': 0.0, 'units': 0}
+
+
 def _grid_strength(net, buses):
     """Short-circuit power of the grid at ``buses`` (max and min case), converters excluded."""
     import pandapower.shortcircuit as sc
@@ -549,6 +670,45 @@ def _checklist(kind, ctx):
                      'result': ('Not asked for by these conditions.' if not ctx['storage'] else
                                 'Not asked for by these conditions; the bank below covers only the duties you switched on.'),
                      'status': 'info'})
+
+    frt = ctx.get('frt') or {}
+    if frt.get('enabled'):
+        base = 'the STATCOM rating' if frt['base_kind'] == 'statcom' else 'the facility rated power'
+        formula = 'k·ΔU' if frt['characteristic'] == 'step' else 'k·(ΔU − deadband)'
+        share = '' if frt['statcom_share_percent'] >= 99.95 else f", {frt['statcom_share_percent']:g} % of it from the STATCOM"
+        rows.append({'item': 'FRT 1',
+                     'requirement': (f"Additional reactive current in a voltage dip, ΔIq = {formula} outside a "
+                                     f"±{frt['deadband_percent']:g} % deadband, up to {frt['iq_max_pu']:g} p.u."),
+                     'result': (f"Dip to {frt['retained_pu']:g} p.u. (ΔU = {frt['delta_u_pu']:g} p.u.), k = {frt['k_factor']:g}: "
+                                f"ΔIq = {frt['delta_iq_pu']:g} p.u. of {base} ({frt['base_mva']:,.0f} MVA) = "
+                                f"{frt['delta_iq_mva']:,.0f} MVA at rated voltage{share}"
+                                + (' (limited)' if frt['delta_iq_limited'] else '') + '.'),
+                     'status': 'ok' if frt['rating_ok'] else 'check'})
+        rows.append({'item': 'FRT 2',
+                     'requirement': 'Converter current through the dip within its short-time current capability',
+                     'result': (f"{frt['iq_pre_mva']:,.0f} MVA before the dip + ΔIq"
+                                + (f", limited to {frt['iq_max_pu']:g} p.u.," if frt['iq_total_capped'] else '')
+                                + f" = {frt['iq_total_mva']:,.0f} MVA"
+                                + (f" ({frt['iq_total_ka']:g} kA)" if frt.get('iq_total_ka') is not None else '')
+                                + f"; the converter gives {frt['available_mva']:,.0f} MVA ({ctx['overload']:g} p.u. of "
+                                f"{ctx['rating']:,.0f} MVA)."),
+                     'status': 'ok' if frt['rating_ok'] else 'check'})
+    elif kind == 'data_centre_frt':
+        rows.append({'item': 'FRT 1', 'requirement': 'Additional reactive current in a voltage dip (k-factor)',
+                     'result': 'Duty switched off in this study', 'status': 'check'})
+    if kind == 'data_centre_frt':
+        fac = ctx.get('facility') or {}
+        rows.append({'item': 'FRT 3',
+                     'requirement': 'The facility stays connected and keeps drawing its power through the dip (load ride-through)',
+                     'result': ((f"Facility: {fac.get('name')}. " if fac.get('kind') == 'load' else '') +
+                                'Not decided by this sizing. Run Transient Stability (ANDES) with a fault at the connection '
+                                'point: it simulates this STATCOM, the UPS transfer and walk-in of the computational loads '
+                                'and the ride-through curve.'),
+                     'status': 'info'})
+        rows.append({'item': 'Energy storage', 'requirement': 'Supercapacitors on the STATCOM',
+                     'result': ('Not needed for reactive current.' if not ctx['storage'] else
+                                'The bank below covers the grid-forming duties you switched on.'),
+                     'status': 'info'})
     return rows
 
 
@@ -585,22 +745,20 @@ def _study(in_data, x):
                           'the STATCOM rating in this dialog.')
 
     plant_mw = _num(params.get('plant_mw'), 0.0)
-    plant_units = 0
-    plant_mva = 0.0
-    if len(net.sgen):
-        active = net.sgen[net.sgen.in_service.astype(bool)]
-        scaling = active['scaling'] if 'scaling' in active.columns else 1.0
-        plant_units = int(len(active))
-        model_mw = float((active['p_mw'] * scaling).sum())
-        if 'sn_mva' in active.columns:
-            plant_mva = float(active['sn_mva'].fillna(0).sum())
-    else:
-        model_mw = 0.0
+    facility = _facility(in_data, net, params.get('facility_id'))
+    plant_units = facility['units']
+    plant_mva = facility['s_mva']
+    model_mw = facility['p_mw']
     if plant_mw <= 0:
         plant_mw = model_mw
     if plant_mw <= 0:
-        raise _StudyError('The diagram has no Static Generators in service, so the plant rated power is unknown. '
-                          'Type the plant rated power in this dialog.')
+        if facility['kind'] == 'load':
+            raise _StudyError(f"The load '{facility['name']}' chosen as the facility has no active power. "
+                              'Enter its power in the Load, or type the facility rated power in this dialog.')
+        raise _StudyError('The diagram has no Static Generators in service and no data-centre load (a Load with '
+                          'the computational load model switched on), so the facility rated power is unknown. '
+                          'Choose the facility in this dialog or type its rated power.')
+    facility_mva = max(plant_mva, plant_mw)
 
     # reactive power the STATCOM carries in the solved model
     q_operating = None
@@ -652,10 +810,22 @@ def _study(in_data, x):
     core = sizing_core(params, plant_mw, rating, phase_mw, f0)
     d = core.pop('duties_settings')
     peak = core['requirement']['peak_mw']
-    required_rating = math.hypot(peak, q_reserved) / overload
+    required_events = math.hypot(peak, q_reserved) / overload
     limit = rating * overload
     headroom = math.sqrt(max(limit * limit - q_reserved * q_reserved, 0.0))
-    rating_ok = required_rating <= rating * 1.0005
+    events_ok = required_events <= rating * 1.0005
+
+    # fault ride-through: reactive current through the deepest dip, on top of the current before it
+    frt_settings = read_frt(params)
+    frt = {'enabled': False}
+    if frt_settings['enabled']:
+        frt = frt_requirement(frt_settings, facility_mva, rating, q_operating if q_operating is not None else 0.0,
+                              overload, vn)
+        if q_operating is None:
+            warnings.append('The reactive current before the dip is unknown (no load flow), so the fault ride-through '
+                            'check starts from zero.')
+    required_rating = max(required_events, frt.get('required_rating_mva') or 0.0)
+    rating_ok = events_ok and frt.get('rating_ok', True)
     if core['storage_needed'] and q_mode not in ('full', 'percent') and q_operating is not None and abs(q_operating) >= 0.98 * rating:
         warnings.append(f'In the load flow of this model the STATCOM is at its reactive limit ({abs(q_operating):.0f} Mvar), '
                         'so nothing is left for active power. Check the voltage set point and the plant controller, '
@@ -690,11 +860,12 @@ def _study(in_data, x):
     inertia_row = next((r for r in core['duties'] if r['key'] == 'inertia'), None)
     kind = str(params.get('requirement_set', 'custom')).strip().lower()
     checklist = _checklist(kind, {
-        'd': d, 'rating_ok': rating_ok, 'rating': rating, 'q_reserved': q_reserved, 'x_pu': x_c / z_base,
+        'd': d, 'rating_ok': events_ok, 'rating': rating, 'q_reserved': q_reserved, 'x_pu': x_c / z_base,
         'phase_mw': phase_mw, 'kinetic': kinetic,
         'inertia_peak': inertia_row['peak_mw'] if inertia_row else 0.0,
         'inertia_e': inertia_row['energy_discharge_mj'] if inertia_row else 0.0,
         'pcc_sk_min': (grid_pcc or {}).get('sk_min_mva'), 'storage': core['storage_needed'],
+        'frt': frt, 'overload': overload, 'facility': facility,
     })
 
     notes = [
@@ -712,6 +883,14 @@ def _study(in_data, x):
             'The converter is checked for reactive power only.',
             'Switch on a duty in the dialog to see what a supercapacitor bank for it would look like.',
         ]
+    if frt['enabled']:
+        notes.append(
+            'Fault ride-through: reactive current needs no stored energy. The converter must carry the reactive current '
+            'before the dip plus k·ΔU through the dip, within its short-time current capability. The dip is the retained '
+            'voltage you entered; the reactive power in the dip is that current times the retained voltage.')
+        notes.append(
+            'Whether the facility itself rides through (UPS transfer, IT load lost) is simulated by Transient Stability '
+            '(ANDES), which includes this STATCOM and the computational loads.')
     return {
         'study': 'grid_forming_statcom_sizing',
         'requirement_set': kind,
@@ -723,10 +902,13 @@ def _study(in_data, x):
             'q_operating_mvar': _r(q_operating, 2), 'q_reserved_mvar': _r(q_reserved, 2),
             'overload_pu': overload, 'p_headroom_mw': _r(headroom, 2),
             'required_rating_mva': _r(required_rating, 1), 'rating_ok': rating_ok,
+            'required_rating_events_mva': _r(required_events, 1), 'rating_ok_events': events_ok,
             'x_coupling_ohm': _r(x_c, 3), 'x_coupling_pu': _r(x_c / z_base, 3),
             'phase_jump_mw': _r(phase_mw, 2) if d['phase_jump'] else None,
         },
-        'plant': {'p_mw': _r(plant_mw, 2), 'p_model_mw': _r(model_mw, 2), 's_mva': _r(plant_mva, 2), 'units': plant_units},
+        'plant': {'p_mw': _r(plant_mw, 2), 'p_model_mw': _r(model_mw, 2), 's_mva': _r(plant_mva, 2), 'units': plant_units,
+                  'kind': facility['kind'], 'name': facility['name'], 'base_mva': _r(facility_mva, 2)},
+        'frt': frt,
         'inertia': {
             'enabled': d['inertia'], 'h_s': d['h_s'], 'base_mva': _r(d['inertia_base_mva'], 2),
             'kinetic_energy_mws': _r(kinetic, 1),
