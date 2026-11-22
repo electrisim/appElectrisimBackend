@@ -91,9 +91,12 @@ def test_frt_formula():
     small = gfm.frt_requirement(gfm.read_frt(dict(FRT_ONLY, frt_retained_pu="0.95")), 300.0, 150.0, -30.0, 1.0, 34.5)
     assert small["delta_iq_pu"] == 0.0 and abs(small["iq_total_mva"] - 30.0) < 1e-9
     # deepest dip: k * dU = 2 is limited to 1 p.u.; a higher short-time current makes the converter enough
+    # 150 MVA with 20 Mvar before the dip covers dips down to 1 - (150 - 20) / (2 * 300) = 0.783 p.u.
+    assert abs(out["covers_down_to_pu"] - (1 - 130 / 600)) < 1e-3, out["covers_down_to_pu"]
     deep = gfm.frt_requirement(gfm.read_frt(dict(FRT_ONLY, frt_retained_pu="0")), 300.0, 150.0, 0.0, 2.0, 34.5)
     assert deep["delta_iq_limited"] and abs(deep["iq_total_mva"] - 300.0) < 1e-6
     assert deep["rating_ok"] is True and abs(deep["required_rating_mva"] - 150.0) < 1e-6
+    assert deep["covers_down_to_pu"] == 0.0
     # half of it from the STATCOM (the rest from other units)
     half = gfm.frt_requirement(gfm.read_frt(dict(FRT_ONLY, frt_retained_pu="0", frt_statcom_share_percent="50")),
                                300.0, 150.0, 0.0, 1.0, 34.5)
@@ -252,12 +255,27 @@ def test_data_centre_ups_in_transient_stability():
     assert 1.0 < dc["recovery_s"] < 5.0, dc["recovery_s"]
     assert [e["event"] for e in dc["events"]] == [
         "UPS on battery", "UPS back on the grid, walk-in starts", "IT load fully back on the grid"]
-    # 0 V for 0.15 s is inside the envelope: the facility had to ride through and dropped its load
-    assert out["ride_through"]["pass"] is True and out["ride_through"]["verdict"] == "load_dropped"
+    # 0 V for 0.15 s is inside the envelope, so the facility must ride through. The UPS waits 1 s and
+    # walks in over 2 s: the power is back about 2.8 s after the voltage, later than the 1 s allowed.
+    assert out["ride_through"]["pass"] is True and out["ride_through"]["verdict"] == "slow_recovery"
     assert out["ride_through"]["t_event_s"] == 1.0
+    assert 2.0 < dc["recovery_after_voltage_s"] < 3.5 and dc["recovered_in_time"] is False, dc
+    assert 1.1 < dc["voltage_back_t_s"] < 1.3, dc["voltage_back_t_s"]
+    # a UPS that returns after 0.1 s and walks in over 0.5 s brings the power back in time
+    fast_net = data_centre_network(hold_s="10", walk_in_s="0.5")
+    fast_net["8"]["dc_ups_return_delay_s"] = "0.1"
+    fast = _tds(fast_net, **BOLTED_POI)
+    fdc = fast["data_centres"][0]
+    assert fdc["verdict"] == "ups_transfer" and fdc["recovered_in_time"] is True, fdc
+    assert fdc["recovery_after_voltage_s"] < 1.0 and fast["ride_through"]["verdict"] == "pass"
+    # the frequency of the external grid settles back once the load has returned
+    f = fast["frequency_hz"]
+    assert max(f) > 60.005 and abs(f[-1] - 60.0) < 0.005, (max(f), f[-1])
     # without a UPS the IT load is lost; only the cooling stays
-    lost = _tds(data_centre_network(hold_s="0"), **BOLTED_POI)["data_centres"][0]
+    lost_out = _tds(data_centre_network(hold_s="0"), **BOLTED_POI)
+    lost = lost_out["data_centres"][0]
     assert lost["verdict"] == "it_lost" and lost["p_mw"][-1] < 0.2 * 300, lost["p_mw"][-1]
+    assert lost["recovered_in_time"] is None and lost_out["ride_through"]["verdict"] == "load_lost"
     # a line trip leaves the voltage above the transfer voltage: the data centre rides through
     trip = _tds(data_centre_network(), toggle_line="line_a", toggle_t="1.0")
     assert trip["data_centres"][0]["verdict"] == "rides_through" and trip["ride_through"]["verdict"] == "pass"

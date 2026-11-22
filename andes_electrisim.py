@@ -113,6 +113,11 @@ _RENEWABLE_DEFAULTS: Dict[str, Dict[str, float]] = {
 }
 
 
+# External Grid in time domain: a classical source behind its short-circuit impedance, with large
+# inertia, and damping that brings its frequency back within about 0.5 s (2H/D) after a power change.
+_GRID_SOURCE_H_S = 1000.0
+_GRID_SOURCE_TAU_S = 0.5
+
 # STATCOM (SSC) in time domain: a converter with no active power, REGCA1 + REECA1 (PQFLAG 0:
 # reactive-current priority). With voltage control (QFLAG 1, VFLAG 0) a PI controller (Kvp, Kvi)
 # holds the load-flow voltage; without it (QFLAG 0) the STATCOM holds its load-flow reactive
@@ -126,7 +131,9 @@ _DC_PQ_BREAK_PU = 0.7
 # Without a UPS the IT power supplies ride through one cycle; then the servers restart.
 _DC_NO_UPS_HOLD_S = 0.02
 _DC_DEFAULTS = {"it_share_percent": 85.0, "hold_s": 300.0, "transfer_pu": 0.85, "return_pu": 0.9,
-                "return_delay_s": 1.0, "walk_in_s": 5.0}
+                "return_delay_s": 1.0, "walk_in_s": 5.0, "recovery_s": 1.0}
+# Power counts as back at 90 % of its value before the disturbance.
+_DC_RECOVERED_SHARE = 0.9
 
 
 class _UpsState:
@@ -419,6 +426,7 @@ def _add_data_centre_load(ss: Any, el: Dict[str, Any], n: int, bus: Any, vn: flo
     ret = _dyn_value(el, "dc_ups_return_pu", _DC_DEFAULTS["return_pu"])
     delay = _dyn_value(el, "dc_ups_return_delay_s", _DC_DEFAULTS["return_delay_s"])
     walk = _dyn_value(el, "dc_ups_walk_in_s", _DC_DEFAULTS["walk_in_s"])
+    recovery_limit = max(_dyn_value(el, "dc_recovery_s", _DC_DEFAULTS["recovery_s"]), 0.0)
     ups = _UpsState(hold, transfer, ret, delay, walk)
     notes.append(
         f"Load '{name}': computational load, {it * 100:g} % IT behind "
@@ -429,6 +437,7 @@ def _add_data_centre_load(ss: Any, el: Dict[str, Any], n: int, bus: Any, vn: flo
     return {
         "name": name, "bus": bus, "p_mw": p_mw, "q_mvar": q_mvar, "it_share": it, "parts": parts, "ups": ups,
         "hold_s": hold, "transfer_pu": transfer, "return_pu": ret, "return_delay_s": delay, "walk_in_s": walk,
+        "recovery_limit_s": recovery_limit,
         "curve": _ride_curve(el.get("dc_ride_through_csv")), "history": [],
     }
 
@@ -1228,15 +1237,18 @@ def build_system(
                 Sn=sn_base,
                 Vn=eg_vn,
                 fn=freq,
-                M=2.0 * 1000.0,
-                D=0.0,
+                M=2.0 * _GRID_SOURCE_H_S,
+                # Damping stands for the primary frequency response of the external system: after
+                # a power change its frequency settles back (time constant 2H/D) instead of drifting.
+                D=2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S,
                 ra=0.0,
                 xd1=xd1,
             )
             ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
             defaults_applied.append(
                 f"External Grid '{ufname}': modelled as a stiff source behind its short-circuit "
-                f"impedance (H=1000 s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''})."
+                f"impedance (H={_GRID_SOURCE_H_S:g} s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}, "
+                f"frequency damping {2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S * sn_base / freq:,.0f} MW/Hz)."
             )
 
     # A grid with only data-centre loads is still a valid time-domain study: the External Grid
@@ -1464,14 +1476,33 @@ def _data_centre_results(dc: Dict[str, Any], t: np.ndarray, v: np.ndarray, idx: 
     p_min = float(np.min(p[after])) if np.any(after) else p_pre
     it_off = frac < 0.999
     recovery = None
+    p_back_t = None          # when the power is back to 90 % for good
     if p_pre > 0 and np.any(after):
-        low = np.where(after & (p < 0.9 * p_pre))[0]
+        low = np.where(after & (p < _DC_RECOVERED_SHARE * p_pre))[0]
         if len(low):
-            later = np.where((np.arange(len(t)) > low[-1]) & (p >= 0.9 * p_pre))[0]
-            if len(later) and t_event is not None:
-                recovery = float(t[later[0]] - t_event)
+            later = np.where((np.arange(len(t)) > low[-1]) & (p >= _DC_RECOVERED_SHARE * p_pre))[0]
+            if len(later):
+                p_back_t = float(t[later[0]])
+                if t_event is not None:
+                    recovery = p_back_t - t_event
         else:
             recovery = 0.0
+            p_back_t = float(t_event) if t_event is not None else 0.0
+    # When the voltage is back for good: at or above the continuous limit of the ride-through
+    # curve (its last value), or 0.9 p.u. without a curve.
+    v_ok = dc["curve"][-1][1] if dc["curve"] else 0.9
+    v_back_t = None
+    if np.any(after):
+        dips = np.where(after & (v < v_ok - 1e-6))[0]
+        if len(dips):
+            back = np.where((np.arange(len(t)) > dips[-1]) & (v >= v_ok - 1e-6))[0]
+            if len(back):
+                v_back_t = float(t[back[0]])
+        else:
+            v_back_t = float(t_event) if t_event is not None else 0.0
+    after_voltage = None
+    if p_back_t is not None and v_back_t is not None:
+        after_voltage = max(p_back_t - v_back_t, 0.0)
     ups = dc["ups"]
     lost = ups.state == "lost"
     transferred = any("battery" in e["event"] or "below the transfer" in e["event"] for e in ups.events)
@@ -1492,6 +1523,12 @@ def _data_centre_results(dc: Dict[str, Any], t: np.ndarray, v: np.ndarray, idx: 
                 "battery_s": _clean_num(round(ups.battery_s, 4)), "final_state": ups.state},
         "it_off_s": _clean_num(float(np.sum(np.diff(t)[it_off[1:]])) if len(t) > 1 else 0.0),
         "recovery_s": _clean_num(recovery),
+        "voltage_back_pu": _clean_num(v_ok),
+        "voltage_back_t_s": _clean_num(v_back_t),
+        "recovery_after_voltage_s": _clean_num(after_voltage),
+        "recovery_limit_s": _clean_num(dc["recovery_limit_s"]),
+        "recovered_in_time": (None if lost else
+                              bool(after_voltage is not None and after_voltage <= dc["recovery_limit_s"] + 1e-9)),
         "events": ups.events[:20],
         "within_envelope": None,
         "verdict": verdict,
@@ -1727,15 +1764,19 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 res["within_envelope"] = bool(np.all(env_v >= _envelope(curve) - 1e-5))
             data_centre_out.append(res)
 
-        # Ride-through verdict: inside the envelope the facility must keep drawing its power.
+        # Ride-through verdict. Inside the envelope the facility must stay connected and be back at
+        # its power within the allowed time after the voltage has recovered; outside it, it may trip.
         verdict = None
         if data_centre_out:
-            dropped = [d for d in data_centre_out if d["verdict"] != "rides_through"]
             inside = all(d["within_envelope"] is not False for d in data_centre_out)
             if not inside:
-                verdict = "outside_envelope" if not dropped else "outside_envelope_load_dropped"
+                verdict = "outside_envelope"
+            elif any(d["verdict"] == "it_lost" for d in data_centre_out):
+                verdict = "load_lost"
+            elif any(d["recovered_in_time"] is False for d in data_centre_out):
+                verdict = "slow_recovery"
             else:
-                verdict = "load_dropped" if dropped else "pass"
+                verdict = "pass"
 
         statcom_out = []
         smap = meta.get("statcom_map") or {}
@@ -1788,8 +1829,8 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 "toggle_gen_t": params.get("toggle_gen_t"),
             },
             "poi_metrics": {
-                "poi_bus": (poi_bus_key or None) if not poi_from_load else
-                           meta["bus_name_by_idx"].get(str(data_centres[0]["bus"])),
+                "poi_bus": (meta["bus_name_by_idx"].get(str(ss.Bus.idx.v[poi_col]), poi_bus_key)
+                            if poi_col is not None else (poi_bus_key or None)),
                 "poi_from_load": poi_from_load,
                 "v_min_pu": _clean_num(poi_v_min) if poi_v_min is not None else None,
                 "frequency_nadir_hz": _clean_num(freq_nadir) if freq_nadir is not None else None,

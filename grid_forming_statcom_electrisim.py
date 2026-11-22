@@ -257,6 +257,21 @@ def frt_requirement(frt, facility_mva, statcom_mva, q_pre_mvar, overload, vn_kv)
     iq_total = max(iq_total, 0.0)
     required = iq_total / overload
     available = statcom_mva * overload
+    # The deepest dip the installed converter covers: where the current it needs reaches what it gives.
+    deepest = min(frt['k'] * (1.0 - frt['deadband'] if frt['characteristic'] == 'continuous' else 1.0), frt['iq_max'])
+    total_deepest = min(iq_pre + deepest * share_mva, frt['iq_max'] * share_mva) if deepest > 0 else abs(iq_pre)
+    if abs(iq_pre) > available:
+        covers = None                          # not even the current before the dip fits
+    elif share_mva <= 0 or frt['k'] <= 0 or total_deepest <= available:
+        covers = 0.0
+    else:
+        du_max = (available - iq_pre) / (frt['k'] * share_mva)
+        if frt['characteristic'] == 'continuous':
+            du_max += frt['deadband']
+        if du_max <= frt['deadband'] + 1e-12:
+            covers = 1.0 - frt['deadband']     # only dips inside the deadband
+        else:
+            covers = max(1.0 - du_max, 0.0)
     return {
         'enabled': True,
         'k_factor': frt['k'], 'deadband_percent': frt['deadband'] * 100, 'characteristic': frt['characteristic'],
@@ -267,6 +282,7 @@ def frt_requirement(frt, facility_mva, statcom_mva, q_pre_mvar, overload, vn_kv)
         'iq_total_ka': _r(iq_total / (math.sqrt(3) * vn_kv), 3) if vn_kv > 0 else None,
         'q_in_dip_mvar': _r(iq_total * frt['retained'], 2),
         'available_mva': _r(available, 2), 'required_rating_mva': _r(required, 2),
+        'covers_down_to_pu': _r(covers, 3),
         'rating_ok': required <= statcom_mva * 1.0005,
     }
 
