@@ -1612,6 +1612,11 @@ def pandapower_net_to_json(net):
                 _scalar(r['va_degree']),
                 _scalar(r['slack_weight']),
                 bool(_scalar(r['in_service'])) if r.get('in_service') is not None else True,
+                # short-circuit data, in the column order the OpenDSS import already sends; without it
+                # the diagram fell back to a 1,000,000 MVA grid
+                *[_scalar(r[c]) if c in df.columns else None
+                  for c in ('s_sc_max_mva', 's_sc_min_mva', 'rx_max', 'rx_min',
+                            'r0x0_max', 'x0x_max', 'r0x0_min', 'x0x_min')],
             ])
         return rows
 

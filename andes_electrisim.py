@@ -113,6 +113,95 @@ _RENEWABLE_DEFAULTS: Dict[str, Dict[str, float]] = {
 }
 
 
+# External Grid in time domain: a classical source behind its short-circuit impedance, with large
+# inertia, and damping that brings its frequency back within about 0.5 s (2H/D) after a power change.
+_GRID_SOURCE_H_S = 1000.0
+_GRID_SOURCE_TAU_S = 0.5
+
+# STATCOM (SSC) in time domain: a converter with no active power, REGCA1 + REECA1 (PQFLAG 0:
+# reactive-current priority). With voltage control (QFLAG 1, VFLAG 0) a PI controller (Kvp, Kvi)
+# holds the load-flow voltage; without it (QFLAG 0) the STATCOM holds its load-flow reactive
+# power. In a dip REECA1 adds Kqv * (dU - deadband) of reactive current, limited to Imax. The
+# gains, Kqv and Imax are given on the STATCOM rating.
+_STATCOM_DEFAULTS = {"kqv": 2.0, "deadband_percent": 10.0, "imax_pu": 1.0, "kvp": 20.0, "kvi": 100.0}
+
+# Constant power below this voltage would ask for unlimited current; like PSS/E PQBRAK the
+# constant-power parts of a computational load become constant current under it.
+_DC_PQ_BREAK_PU = 0.7
+# Without a UPS the IT power supplies ride through one cycle; then the servers restart.
+_DC_NO_UPS_HOLD_S = 0.02
+_DC_DEFAULTS = {"it_share_percent": 85.0, "hold_s": 300.0, "transfer_pu": 0.85, "return_pu": 0.9,
+                "return_delay_s": 1.0, "walk_in_s": 5.0, "recovery_s": 1.0}
+# Power counts as back at 90 % of its value before the disturbance.
+_DC_RECOVERED_SHARE = 0.9
+
+
+class _UpsState:
+    """IT share of a data-centre load behind a UPS, switched step by step during the simulation.
+
+    ``grid``: the IT load draws its power from the grid. ``battery``: the bus voltage fell below the
+    transfer voltage, the UPS carries the IT load and draws nothing from the grid. ``walk_in``: the
+    voltage has been back above the return voltage for the return delay; the rectifier ramps the IT
+    load back over the walk-in time. ``lost``: the UPS ran longer than its hold-up time (or there is
+    no UPS), the IT load has dropped and stays off for the rest of the run.
+    """
+
+    def __init__(self, hold_s: float, transfer_pu: float, return_pu: float, return_delay_s: float, walk_in_s: float):
+        self.has_ups = hold_s > 0
+        self.hold_s = hold_s if hold_s > 0 else _DC_NO_UPS_HOLD_S
+        self.transfer_pu = transfer_pu
+        self.return_pu = max(return_pu, transfer_pu)
+        self.return_delay_s = max(return_delay_s, 0.0)
+        self.walk_in_s = max(walk_in_s, 0.0)
+        self.state = "grid"
+        self.battery_s = 0.0          # time on the UPS energy store so far
+        self._t_last: Optional[float] = None
+        self._t_above: Optional[float] = None
+        self._t_walk: Optional[float] = None
+        self.events: List[Dict[str, Any]] = []
+
+    def _log(self, t: float, what: str, v: float) -> None:
+        self.events.append({"t_s": round(float(t), 4), "event": what, "v_pu": round(float(v), 4)})
+
+    def update(self, t: float, v: float) -> float:
+        """Advance to time ``t`` with bus voltage ``v``; return the IT share on the grid (0 to 1)."""
+        dt = 0.0 if self._t_last is None else max(t - self._t_last, 0.0)
+        self._t_last = t
+        if self.state == "battery":
+            self.battery_s += dt
+        if self.state in ("grid", "walk_in") and v < self.transfer_pu:
+            self.state = "battery"
+            self._t_above = None
+            self._log(t, "UPS on battery" if self.has_ups else "IT supplies below the transfer voltage", v)
+        elif self.state == "battery":
+            if self.battery_s > self.hold_s + 1e-9:
+                self.state = "lost"
+                self._log(t, "IT load lost (UPS hold-up time used up)" if self.has_ups
+                          else "IT load lost (no UPS)", v)
+            elif not self.has_ups and v >= self.transfer_pu:
+                # the power supplies bridged the dip on their own capacitors: no walk-in
+                self.state = "grid"
+                self._log(t, "IT supplies back on the grid", v)
+            elif v >= self.return_pu:
+                if self._t_above is None:
+                    self._t_above = t
+                if t - self._t_above >= self.return_delay_s - 1e-9:
+                    self.state = "walk_in"
+                    self._t_walk = t
+                    self._log(t, "UPS back on the grid, walk-in starts", v)
+            else:
+                self._t_above = None
+        if self.state == "walk_in" and self._t_walk is not None:
+            if self.walk_in_s <= 0 or t - self._t_walk >= self.walk_in_s:
+                self.state = "grid"
+                self._log(t, "IT load fully back on the grid", v)
+        if self.state == "grid":
+            return 1.0
+        if self.state == "walk_in":
+            return min(max((t - self._t_walk) / self.walk_in_s, 0.0), 1.0)
+        return 0.0
+
+
 def _sf(value: Any, default: float = 0.0) -> float:
     if value is None or value == "" or str(value).lower() in ("none", "null", "nan"):
         return default
@@ -262,6 +351,95 @@ def _iter_elements(in_data: Dict[str, Any]):
         if "Parameters" in typ:
             continue
         yield key, el, typ
+
+
+def _ride_curve(text: Any) -> List[Tuple[float, float]]:
+    """Ride-through envelope from CSV lines ``time_s, v_min_pu`` (time from the start of the disturbance)."""
+    pts: List[Tuple[float, float]] = []
+    for line in str(text or "").strip().splitlines():
+        parts = line.strip().replace(";", ",").split(",")
+        if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
+            pts.append((_sf(parts[0]), _sf(parts[1])))
+    # stable sort keeps a vertical step (two points at the same time) in the order it was typed
+    pts.sort(key=lambda p: p[0])
+    return pts
+
+
+def _curve_vmin(pts: List[Tuple[float, float]], t_rel: float) -> float:
+    """Lowest allowed voltage ``t_rel`` seconds after the disturbance starts.
+
+    Before the disturbance and after the last point the last value applies (the continuous limit).
+    A vertical step (two points at the same time) takes the lower value at that instant.
+    """
+    if not pts:
+        return 0.0
+    if t_rel < 0 or t_rel >= pts[-1][0]:
+        return pts[-1][1]
+    if t_rel <= pts[0][0]:
+        return pts[0][1]
+    at = [v for tp, v in pts if abs(tp - t_rel) <= 1e-9]
+    if at:
+        # "0 p.u. for 150 ms" includes the instant 150 ms, where the solver also stores the
+        # state just before the fault clears
+        return min(at)
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+        if t0 < t_rel < t1:
+            return v0 + (v1 - v0) * (t_rel - t0) / (t1 - t0)
+    return pts[-1][1]
+
+
+def _add_data_centre_load(ss: Any, el: Dict[str, Any], n: int, bus: Any, vn: float, p_mw: float,
+                          q_mvar: float, sn_base: float, notes: List[str]) -> Dict[str, Any]:
+    """Data-centre (computational) load: an IT part behind a UPS and a cooling part.
+
+    Each part is a PQ (for the power flow) replaced in time domain by a ZIP. The IT part is
+    constant power; the cooling part uses the Constant Impedance / Constant Current percentages of
+    the Load and is constant power for the rest. Constant power is applied step by step as a
+    constant current refreshed from the last voltage (constant current below 0.7 p.u.), which keeps
+    the solver stable at zero voltage. The UPS switches the IT part off and back on.
+    """
+    name = str(el.get("userFriendlyName") or el.get("name") or f"Load_{n}")
+    it = min(max(_dyn_value(el, "dc_it_share_percent", _DC_DEFAULTS["it_share_percent"]), 0.0), 100.0) / 100.0
+    z = min(max(_sf(el.get("const_z_percent")), 0.0), 100.0)
+    i = min(max(_sf(el.get("const_i_percent")), 0.0), 100.0 - z)
+    parts: Dict[str, Dict[str, Any]] = {}
+    for part, share in (("it", it), ("cooling", 1.0 - it)):
+        if share <= 1e-9 or (abs(p_mw) < 1e-9 and abs(q_mvar) < 1e-9):
+            continue
+        tag = "IT" if part == "it" else "COOL"
+        pq_idx = f"PQ_DC_{tag}_{n}"
+        ss.add("PQ", idx=pq_idx, name=f"{name} ({'IT' if part == 'it' else 'cooling'})", bus=bus,
+               p0=p_mw * share / sn_base, q0=q_mvar * share / sn_base, Vn=vn, u=1)
+        kz = 0.0 if part == "it" else z
+        zip_idx = f"ZIP_DC_{tag}_{n}"
+        ss.add("ZIP", idx=zip_idx, name=f"{name} ({part})", pq=pq_idx,
+               kpp=0.0, kpi=100.0 - kz, kpz=kz, kqp=0.0, kqi=100.0 - kz, kqz=kz)
+        parts[part] = {
+            "zip": zip_idx, "p_pu": p_mw * share / sn_base, "q_pu": q_mvar * share / sn_base,
+            "p_mw": p_mw * share,
+            "const_p": 1.0 if part == "it" else (100.0 - z - i) / 100.0,
+            "const_i": 0.0 if part == "it" else i / 100.0,
+            "const_z": kz / 100.0,
+        }
+    hold = max(_dyn_value(el, "dc_ups_hold_s", _DC_DEFAULTS["hold_s"]), 0.0)
+    transfer = _dyn_value(el, "dc_ups_transfer_pu", _DC_DEFAULTS["transfer_pu"])
+    ret = _dyn_value(el, "dc_ups_return_pu", _DC_DEFAULTS["return_pu"])
+    delay = _dyn_value(el, "dc_ups_return_delay_s", _DC_DEFAULTS["return_delay_s"])
+    walk = _dyn_value(el, "dc_ups_walk_in_s", _DC_DEFAULTS["walk_in_s"])
+    recovery_limit = max(_dyn_value(el, "dc_recovery_s", _DC_DEFAULTS["recovery_s"]), 0.0)
+    ups = _UpsState(hold, transfer, ret, delay, walk)
+    notes.append(
+        f"Load '{name}': computational load, {it * 100:g} % IT behind "
+        + (f"a UPS (transfer below {transfer:g} p.u., hold-up {hold:g} s, walk-in {walk:g} s)" if hold > 0 else
+           "no UPS (IT lost after one cycle below the transfer voltage)")
+        + f", {100 - it * 100:g} % cooling ({z:g} % Z, {i:g} % I, rest constant power)."
+    )
+    return {
+        "name": name, "bus": bus, "p_mw": p_mw, "q_mvar": q_mvar, "it_share": it, "parts": parts, "ups": ups,
+        "hold_s": hold, "transfer_pu": transfer, "return_pu": ret, "return_delay_s": delay, "walk_in_s": walk,
+        "recovery_limit_s": recovery_limit,
+        "curve": _ride_curve(el.get("dc_ride_through_csv")), "history": [],
+    }
 
 
 def build_system(
@@ -460,8 +638,9 @@ def build_system(
                 "(simplified mapping not included in MVP)."
             )
 
-    # --- Loads (PQ) ---
+    # --- Loads (PQ); data-centre (computational) loads get an IT part behind a UPS ---
     pq_i = 0
+    data_centres: List[Dict[str, Any]] = []
     for _, el, typ in _iter_elements(in_data):
         if not typ.startswith("Load") or typ.startswith("Load DC"):
             continue
@@ -476,6 +655,10 @@ def build_system(
         p_mw = _sf(el.get("p_mw")) * scaling
         q_mvar = _sf(el.get("q_mvar")) * scaling
         u = 1 if _sb(el.get("in_service"), True) else 0
+        if u and _sb(el.get("dc_computational_enabled"), False):
+            data_centres.append(_add_data_centre_load(ss, el, pq_i, bus, bus_vn.get(bus, 110.0), p_mw, q_mvar,
+                                                      sn_base, defaults_applied))
+            continue
         ss.add(
             "PQ",
             idx=f"PQ_{pq_i}",
@@ -933,7 +1116,106 @@ def build_system(
             "name": ufname, "bus": bus, **model_ids,
         }
 
-    no_syn_machine = renewable_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0
+    # --- STATCOMs (SSC) → PV with P = 0 + REGCA1 + REECA1 (reactive current only) ---
+    statcom_map: Dict[str, Dict[str, Any]] = {}
+    statcom_count = 0
+    held_buses = {b for b in list(ss.PV.bus.v) + list(ss.Slack.bus.v)}
+    # Buses that reach a Slack through the branches ANDES has (three-winding transformers and DC
+    # lines are skipped, so part of a diagram can end up as an island without a reference).
+    adjacency: Dict[Any, set] = {}
+    for b1, b2, ub in zip(ss.Line.bus1.v, ss.Line.bus2.v, ss.Line.u.v):
+        if ub:
+            adjacency.setdefault(b1, set()).add(b2)
+            adjacency.setdefault(b2, set()).add(b1)
+    reach = set(ss.Slack.bus.v)
+    frontier = list(reach)
+    while frontier:
+        b = frontier.pop()
+        for nb in adjacency.get(b, ()):
+            if nb not in reach:
+                reach.add(nb)
+                frontier.append(nb)
+    for _, el, typ in _iter_elements(in_data):
+        if not typ.startswith("SSC"):
+            continue
+        bus = bus_map.get(el.get("bus"))
+        if bus is None or not _sb(el.get("in_service"), True):
+            continue
+        ufname = str(el.get("userFriendlyName") or el.get("name") or "STATCOM")
+        if not _sb(el.get("dyn_statcom_enabled"), True):
+            warnings.append(f"STATCOM '{ufname}': left out of the dynamic model (switched off in its Dynamics tab).")
+            continue
+        if not _sb(el.get("controllable"), True):
+            warnings.append(f"STATCOM '{ufname}': Controllable is unticked, so it exchanges no reactive power "
+                            "and is left out of the dynamic model.")
+            continue
+        q_max = abs(_sf(el.get("q_max_mvar")))
+        q_min = abs(_sf(el.get("q_min_mvar")))
+        sn_ssc = _dyn_value(el, "dyn_statcom_sn_mva", 0.0)
+        if sn_ssc <= 0:
+            sn_ssc = max(q_max, q_min)
+        if sn_ssc <= 0:
+            warnings.append(f"STATCOM '{ufname}': no Q rating, so it is left out of the dynamic model. "
+                            "Enter Q max / Q min in the STATCOM.")
+            continue
+        if bus in held_buses:
+            warnings.append(f"STATCOM '{ufname}': its bus voltage is already held by a generator or the grid, "
+                            "so the STATCOM is left out of the dynamic model.")
+            continue
+        if bus not in reach:
+            warnings.append(f"STATCOM '{ufname}': its bus is not connected to the External Grid in the dynamic model "
+                            "(three-winding transformers and DC lines are not modelled in ANDES), so the STATCOM "
+                            "is left out.")
+            continue
+        n_ssc = len(statcom_map) + 1
+        kqv = max(_dyn_value(el, "dyn_statcom_kqv", _STATCOM_DEFAULTS["kqv"]), 0.0)
+        db = min(max(_dyn_value(el, "dyn_statcom_deadband_percent", _STATCOM_DEFAULTS["deadband_percent"]), 0.0), 50.0) / 100.0
+        imax = max(_dyn_value(el, "dyn_statcom_imax_pu", _STATCOM_DEFAULTS["imax_pu"]), 0.1)
+        v_control = _sb(el.get("dyn_statcom_voltage_control"), True)
+        kvp = max(_dyn_value(el, "dyn_statcom_kvp", _STATCOM_DEFAULTS["kvp"]), 0.0)
+        kvi = max(_dyn_value(el, "dyn_statcom_kvi", _STATCOM_DEFAULTS["kvi"]), 0.0)
+        v_set = _sf(el.get("set_vm_pu"), 1.0)
+        if not (0.5 <= v_set <= 1.5):
+            v_set = 1.0
+        pv_idx = f"PV_SSC_{n_ssc}"
+        ss.add(
+            "PV", idx=pv_idx, name=f"{ufname} (STATCOM)", bus=bus, Vn=bus_vn.get(bus, 110.0), Sn=sn_ssc,
+            p0=0.0, q0=0.0, v0=v_set,
+            qmax=(q_max if q_max > 0 else sn_ssc) / sn_base, qmin=-(q_min if q_min > 0 else sn_ssc) / sn_base,
+        )
+        held_buses.add(bus)
+        reg_idx = _add_model_safe(
+            ss, "REGCA1", defaults_applied, f"STATCOM '{ufname}'",
+            idx=f"REGCA1_SSC_{n_ssc}", name=f"REGCA1_{ufname}", bus=bus, gen=pv_idx, Sn=sn_ssc,
+            Tg=0.02, Lvplsw=0.0, Volim=1.2, Lvpnt0=0.4, Iolim=-imax,
+        )
+        ree_idx = None
+        if reg_idx:
+            ree_idx = _add_model_safe(
+                ss, "REECA1", defaults_applied, f"STATCOM '{ufname}'",
+                idx=f"REECA1_SSC_{n_ssc}", name=f"REECA1_{ufname}", reg=reg_idx,
+                PFFLAG=0.0, VFLAG=0.0, QFLAG=1.0 if v_control else 0.0, PFLAG=0.0, PQFLAG=0.0,
+                # the gains are entered on the STATCOM rating; REECA1 works on the system base
+                Vref1=v_set, Kvp=kvp * sn_ssc / sn_base, Kvi=kvi * sn_ssc / sn_base,
+                Vref0=0.0, dbd1=-db, dbd2=db, Vdip=v_set - db, Vup=v_set + max(db, 0.2), Kqv=kqv,
+                # Iqh1 / Iql1 are on the system base; the V-Iq table and Imax on the STATCOM rating.
+                # The current limit goes into the flat V-Iq table: with Imax below the table, ANDES
+                # initialises Iqmax from the table and then reports a mismatch.
+                Iqh1=imax * sn_ssc / sn_base, Iql1=-imax * sn_ssc / sn_base, Imax=999.0,
+                Iq1=imax, Iq2=imax, Iq3=imax, Iq4=imax,
+            )
+        statcom_map[str(el.get("name") or ufname)] = {
+            "name": ufname, "bus": bus, "sn_mva": sn_ssc, "pv_idx": pv_idx, "reg_idx": reg_idx, "ree_idx": ree_idx,
+            "kqv": kqv, "deadband_percent": db * 100, "imax_pu": imax,
+        }
+        if ree_idx:
+            statcom_count += 1
+            defaults_applied.append(
+                f"STATCOM '{ufname}': converter model REGCA1 + REECA1, {sn_ssc:g} MVA, no active power, holds its "
+                f"load-flow reactive power; in a dip it adds Kqv = {kqv:g} times the voltage drop beyond ±{db * 100:g} % "
+                f"as reactive current, up to {imax:g} p.u.")
+
+    no_syn_machine = renewable_count + statcom_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0
     if grid_behind_impedance or no_syn_machine:
         # A bare Slack holds its bus voltage fixed, so a fault on the External Grid bus did
         # nothing at all. With no synchronous machine ANDES also fails at the first switching
@@ -955,21 +1237,26 @@ def build_system(
                 Sn=sn_base,
                 Vn=eg_vn,
                 fn=freq,
-                M=2.0 * 1000.0,
-                D=0.0,
+                M=2.0 * _GRID_SOURCE_H_S,
+                # Damping stands for the primary frequency response of the external system: after
+                # a power change its frequency settles back (time constant 2H/D) instead of drifting.
+                D=2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S,
                 ra=0.0,
                 xd1=xd1,
             )
             ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
             defaults_applied.append(
                 f"External Grid '{ufname}': modelled as a stiff source behind its short-circuit "
-                f"impedance (H=1000 s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''})."
+                f"impedance (H={_GRID_SOURCE_H_S:g} s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}, "
+                f"frequency damping {2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S * sn_base / freq:,.0f} MW/Hz)."
             )
 
-    if gen_count + renewable_count == 0:
+    # A grid with only data-centre loads is still a valid time-domain study: the External Grid
+    # becomes a source behind its impedance and the UPS logic is the dynamics of interest.
+    if gen_count + renewable_count + statcom_count == 0 and not (grid_behind_impedance and data_centres):
         raise ValueError(
-            "Transient / eigenvalue analysis requires at least one synchronous Generator "
-            "or renewable dynamic plant. External Grid alone is not sufficient."
+            "Transient / eigenvalue analysis requires at least one synchronous Generator, "
+            "renewable dynamic plant or STATCOM. External Grid alone is not sufficient."
         )
 
     if slack_count == 0:
@@ -1051,6 +1338,9 @@ def build_system(
         "sn_mva": sn_base,
         "n_generators": gen_count,
         "n_renewable_plants": renewable_count,
+        "n_statcoms": statcom_count,
+        "statcom_map": statcom_map,
+        "data_centres": data_centres,
         "n_buses": len(bus_name_by_idx),
     }
     return ss, meta
@@ -1098,6 +1388,155 @@ def _syn_names(ss) -> Tuple[List[str], List[str]]:
     return names, models
 
 
+def _restore_angles_after_fault(ss: Any) -> None:
+    """Also put the bus angles back to their pre-fault values when a fault clears.
+
+    ANDES restores the pre-fault voltages but keeps the angles of the faulted state. A bus that
+    sat at zero voltage (downstream of a bolted fault) then starts Newton from a meaningless
+    angle and settles on the trivial V = 0 solution, so the network never recovered.
+    """
+    fault = getattr(ss, "Fault", None)
+    if fault is None or not fault.n:
+        return
+    stored: Dict[str, np.ndarray] = {}
+    apply_fault, clear_fault = fault.tf.callback, fault.tc.callback
+
+    def _apply(is_time):
+        if np.any(is_time):
+            stored["a"] = np.array(ss.dae.y[:ss.Bus.n])
+        return apply_fault(is_time)
+
+    def _clear(is_time):
+        done = clear_fault(is_time)
+        if done and "a" in stored and getattr(fault.config, "restore", 1):
+            ss.dae.y[:ss.Bus.n] = stored["a"]
+        return done
+
+    fault.tf.callback = _apply
+    fault.tc.callback = _clear
+
+
+def _data_centre_stepper(ss: Any, data_centres: List[Dict[str, Any]]):
+    """Callback ANDES runs before every step: UPS logic and constant power of the computational loads."""
+    zip_model = ss.ZIP
+    for dc in data_centres:
+        dc["v_addr"] = int(ss.Bus.v.a[ss.Bus.idx2uid(dc["bus"])])
+        for part in dc["parts"].values():
+            part["uid"] = int(zip_model.idx2uid(part["zip"]))
+
+    def _pert(t, system):
+        t = float(t)
+        y = system.dae.y
+        for dc in data_centres:
+            v = float(y[dc["v_addr"]])
+            if dc.get("v0") is None:
+                dc["v0"] = v if v > 0.05 else 1.0
+            frac = dc["ups"].update(t, v)
+            veff = max(v, _DC_PQ_BREAK_PU)
+            it = dc["parts"].get("it")
+            if it:
+                zip_model.pi0.v[it["uid"]] = frac * it["p_pu"] / veff
+                zip_model.qi0.v[it["uid"]] = frac * it["q_pu"] / veff
+            cool = dc["parts"].get("cooling")
+            if cool:
+                scale = cool["const_i"] / dc["v0"] + cool["const_p"] / veff
+                zip_model.pi0.v[cool["uid"]] = cool["p_pu"] * scale
+                zip_model.qi0.v[cool["uid"]] = cool["q_pu"] * scale
+            dc["history"].append((t, frac, veff))
+
+    return _pert
+
+
+def _data_centre_results(dc: Dict[str, Any], t: np.ndarray, v: np.ndarray, idx: np.ndarray,
+                         t_event: Optional[float]) -> Dict[str, Any]:
+    """Power drawn from the grid by a computational load over the run, and what its UPS did."""
+    hist = dc["history"]
+    v0 = dc.get("v0") or 1.0
+    if hist:
+        h_t = np.array([h[0] for h in hist])
+        h_frac = np.array([h[1] for h in hist])
+        h_veff = np.array([h[2] for h in hist])
+        # the values set at the callback before a step are those used to reach the next stored time
+        pos = np.clip(np.searchsorted(h_t, t, side="left") - 1, 0, len(h_t) - 1)
+        frac, veff = h_frac[pos], h_veff[pos]
+        frac[t <= h_t[0]] = 1.0
+        veff[t <= h_t[0]] = max(v0, _DC_PQ_BREAK_PU)
+    else:
+        frac = np.ones_like(t)
+        veff = np.full_like(t, max(v0, _DC_PQ_BREAK_PU))
+    p = np.zeros_like(t)
+    it = dc["parts"].get("it")
+    if it:
+        p += frac * it["p_mw"] * v / veff
+    cool = dc["parts"].get("cooling")
+    if cool:
+        p += cool["p_mw"] * (cool["const_i"] * v / v0 + cool["const_p"] * v / veff + cool["const_z"] * (v / v0) ** 2)
+    p_pre = float(p[0]) if len(p) else 0.0
+    after = t >= (t_event if t_event is not None else 0.0)
+    p_min = float(np.min(p[after])) if np.any(after) else p_pre
+    it_off = frac < 0.999
+    recovery = None
+    p_back_t = None          # when the power is back to 90 % for good
+    if p_pre > 0 and np.any(after):
+        low = np.where(after & (p < _DC_RECOVERED_SHARE * p_pre))[0]
+        if len(low):
+            later = np.where((np.arange(len(t)) > low[-1]) & (p >= _DC_RECOVERED_SHARE * p_pre))[0]
+            if len(later):
+                p_back_t = float(t[later[0]])
+                if t_event is not None:
+                    recovery = p_back_t - t_event
+        else:
+            recovery = 0.0
+            p_back_t = float(t_event) if t_event is not None else 0.0
+    # When the voltage is back for good: at or above the continuous limit of the ride-through
+    # curve (its last value), or 0.9 p.u. without a curve.
+    v_ok = dc["curve"][-1][1] if dc["curve"] else 0.9
+    v_back_t = None
+    if np.any(after):
+        dips = np.where(after & (v < v_ok - 1e-6))[0]
+        if len(dips):
+            back = np.where((np.arange(len(t)) > dips[-1]) & (v >= v_ok - 1e-6))[0]
+            if len(back):
+                v_back_t = float(t[back[0]])
+        else:
+            v_back_t = float(t_event) if t_event is not None else 0.0
+    after_voltage = None
+    if p_back_t is not None and v_back_t is not None:
+        after_voltage = max(p_back_t - v_back_t, 0.0)
+    ups = dc["ups"]
+    lost = ups.state == "lost"
+    transferred = any("battery" in e["event"] or "below the transfer" in e["event"] for e in ups.events)
+    if lost:
+        verdict = "it_lost"
+    elif transferred:
+        verdict = "ups_transfer"
+    else:
+        verdict = "rides_through"
+    return {
+        "name": dc["name"],
+        "p_mw_pre": _clean_num(p_pre),
+        "p_mw_min": _clean_num(p_min),
+        "load_drop_mw": _clean_num(max(p_pre - p_min, 0.0)),
+        "it_share_percent": _clean_num(dc["it_share"] * 100),
+        "ups": {"present": ups.has_ups, "hold_s": dc["hold_s"], "transfer_pu": dc["transfer_pu"],
+                "return_pu": dc["return_pu"], "return_delay_s": dc["return_delay_s"], "walk_in_s": dc["walk_in_s"],
+                "battery_s": _clean_num(round(ups.battery_s, 4)), "final_state": ups.state},
+        "it_off_s": _clean_num(float(np.sum(np.diff(t)[it_off[1:]])) if len(t) > 1 else 0.0),
+        "recovery_s": _clean_num(recovery),
+        "voltage_back_pu": _clean_num(v_ok),
+        "voltage_back_t_s": _clean_num(v_back_t),
+        "recovery_after_voltage_s": _clean_num(after_voltage),
+        "recovery_limit_s": _clean_num(dc["recovery_limit_s"]),
+        "recovered_in_time": (None if lost else
+                              bool(after_voltage is not None and after_voltage <= dc["recovery_limit_s"] + 1e-9)),
+        "events": ups.events[:20],
+        "within_envelope": None,
+        "verdict": verdict,
+        "p_mw": [_clean_num(float(x)) for x in p[idx].tolist()],
+        "v_pu": [_clean_num(float(x)) for x in v[idx].tolist()],
+    }
+
+
 def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
     """Run power flow + time-domain simulation; return JSON string."""
     try:
@@ -1134,6 +1573,11 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 ss.TDS.config.tstep = tstep
             except Exception:
                 pass
+
+        _restore_angles_after_fault(ss)
+        data_centres = meta.get("data_centres") or []
+        if data_centres:
+            ss.TDS.callpert = _data_centre_stepper(ss, data_centres)
 
         try:
             tds_ok = bool(ss.TDS.run())
@@ -1238,16 +1682,41 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
             mean_w = np.mean([np.asarray(s["values"], dtype=float) for s in omega], axis=0)
             freq_hz = (mean_w * meta["frequency"]).tolist()
 
+        # Full-resolution bus voltages for the ride-through checks (the series above are thinned)
+        v_full = tds_values(ss, ss.Bus.v) if ss.Bus.n > 0 else np.zeros((len(t), 0))
+        bus_col = {str(b): i for i, b in enumerate(ss.Bus.idx.v)}
+
+        def _bus_column(key: Any) -> Optional[int]:
+            key = str(key or "")
+            if not key:
+                return None
+            if key in bus_col:
+                return bus_col[key]
+            for i, b in enumerate(ss.Bus.idx.v):
+                if meta["bus_name_by_idx"].get(str(b)) == key or str(ss.Bus.name.v[i]) == key:
+                    return i
+            mapped = meta["bus_map"].get(key)
+            return bus_col.get(str(mapped)) if mapped is not None else None
+
+        # The disturbance starts at the first fault or switching event; ride-through curves are
+        # given in seconds from that moment.
+        event_times = []
+        if getattr(ss, "Fault", None) is not None and ss.Fault.n:
+            event_times += [float(x) for x, u in zip(ss.Fault.tf.v, ss.Fault.u.v) if u]
+        if getattr(ss, "Toggle", None) is not None and ss.Toggle.n:
+            event_times += [float(x) for x in ss.Toggle.t.v]
+        t_event = min(event_times) if event_times else None
+
         poi_bus_key = params.get("poi_bus") or params.get("poi_bus_name") or ""
+        poi_col = _bus_column(poi_bus_key)
+        poi_from_load = False
+        if poi_col is None and data_centres:
+            # no POI chosen: check the voltage where the (first) data centre is connected
+            poi_col = bus_col.get(str(data_centres[0]["bus"]))
+            poi_from_load = poi_col is not None
         poi_v_min = None
-        poi_v_series = None
-        if poi_bus_key and bus_v:
-            for s in bus_v:
-                if s.get("id") == poi_bus_key or s.get("name") == poi_bus_key:
-                    poi_v_series = s.get("values") or []
-                    if poi_v_series:
-                        poi_v_min = min(poi_v_series)
-                    break
+        if poi_col is not None and len(t):
+            poi_v_min = float(np.min(v_full[:, poi_col]))
 
         freq_nadir = None
         freq_settling = None
@@ -1265,42 +1734,74 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 if str(el.get("dc_computational_enabled", "")).lower() in ("true", "1", "yes"):
                     ride_csv = el.get("dc_ride_through_csv") or "0,0.9\n10,0.9"
                     break
-        ride_pts = []
-        for line in str(ride_csv).strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.replace(";", ",").split(",")
-            if len(parts) >= 2:
-                ride_pts.append((_sf(parts[0]), _sf(parts[1])))
-        ride_pts.sort(key=lambda p: p[0])
+        ride_pts = _ride_curve(ride_csv)
+        t_rel = t - (t_event if t_event is not None else 0.0)
 
-        def _vmin_curve(t_val: float) -> float:
-            if not ride_pts:
-                return 0.0
-            if t_val <= ride_pts[0][0]:
-                return ride_pts[0][1]
-            for i in range(len(ride_pts) - 1):
-                t0, v0 = ride_pts[i]
-                t1, v1 = ride_pts[i + 1]
-                if t0 <= t_val <= t1:
-                    if t1 <= t0:
-                        return v0
-                    return v0 + (v1 - v0) * (t_val - t0) / (t1 - t0)
-            return ride_pts[-1][1]
+        def _envelope(pts):
+            return np.array([_curve_vmin(pts, float(x)) for x in t_rel])
 
         ride_pass = None
         ride_fail_t = None
         ride_fail_v = None
-        if poi_v_series and ride_pts and t_ds is not None:
-            ride_pass = True
-            for ti, vi in zip(t_ds.tolist(), poi_v_series):
-                vmin = _vmin_curve(float(ti))
-                if float(vi) < vmin - 1e-5:
-                    ride_pass = False
-                    ride_fail_t = float(ti)
-                    ride_fail_v = float(vi)
-                    break
+        if poi_col is not None and ride_pts and len(t):
+            env = _envelope(ride_pts)
+            below = np.where(v_full[:, poi_col] < env - 1e-5)[0]
+            ride_pass = not len(below)
+            if len(below):
+                ride_fail_t = float(t[below[0]])
+                ride_fail_v = float(v_full[below[0], poi_col])
+
+        data_centre_out = []
+        for dc in data_centres:
+            col = bus_col.get(str(dc["bus"]))
+            if col is None:
+                continue
+            curve = dc["curve"] or ride_pts
+            env_col = poi_col if poi_col is not None else col
+            env_v = v_full[:, env_col] if curve else None
+            res = _data_centre_results(dc, t, v_full[:, col], idx, t_event)
+            if curve:
+                res["within_envelope"] = bool(np.all(env_v >= _envelope(curve) - 1e-5))
+            data_centre_out.append(res)
+
+        # Ride-through verdict. Inside the envelope the facility must stay connected and be back at
+        # its power within the allowed time after the voltage has recovered; outside it, it may trip.
+        verdict = None
+        if data_centre_out:
+            inside = all(d["within_envelope"] is not False for d in data_centre_out)
+            if not inside:
+                verdict = "outside_envelope"
+            elif any(d["verdict"] == "it_lost" for d in data_centre_out):
+                verdict = "load_lost"
+            elif any(d["recovered_in_time"] is False for d in data_centre_out):
+                verdict = "slow_recovery"
+            else:
+                verdict = "pass"
+
+        statcom_out = []
+        smap = meta.get("statcom_map") or {}
+        if smap and getattr(ss, "REGCA1", None) is not None and ss.REGCA1.n:
+            reg_ids = [str(x) for x in ss.REGCA1.idx.v]
+            qe = tds_values(ss, ss.REGCA1.Qe)
+            # S1_y is the reactive current the converter delivers (Iqcmd after its lag); the command
+            # itself jumps for one step at every event
+            iq = tds_values(ss, ss.REGCA1.S1_y)
+            for info in smap.values():
+                if not info.get("ree_idx") or str(info.get("reg_idx")) not in reg_ids:
+                    continue
+                j = reg_ids.index(str(info["reg_idx"]))
+                q_mvar = qe[:, j] * meta["sn_mva"]
+                iq_pu = np.abs(iq[:, j]) * meta["sn_mva"] / info["sn_mva"]  # on the STATCOM rating
+                after = t >= (t_event if t_event is not None else 0.0)
+                statcom_out.append({
+                    "name": info["name"], "sn_mva": info["sn_mva"], "kqv": info["kqv"],
+                    "deadband_percent": info["deadband_percent"], "imax_pu": info["imax_pu"],
+                    "q_mvar_pre": _clean_num(float(q_mvar[0])) if len(q_mvar) else None,
+                    "iq_pu_peak": _clean_num(float(np.max(iq_pu[after]))) if np.any(after) else None,
+                    "q_mvar_peak": _clean_num(float(np.max(q_mvar[after]))) if np.any(after) else None,
+                    "q_mvar": [_clean_num(float(x)) for x in q_mvar[idx].tolist()],
+                    "iq_pu": [_clean_num(float(x)) for x in iq_pu[idx].tolist()],
+                })
 
         result = {
             "error": False,
@@ -1330,7 +1831,9 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 "toggle_gen_t": params.get("toggle_gen_t"),
             },
             "poi_metrics": {
-                "poi_bus": poi_bus_key or None,
+                "poi_bus": (meta["bus_name_by_idx"].get(str(ss.Bus.idx.v[poi_col]), poi_bus_key)
+                            if poi_col is not None else (poi_bus_key or None)),
+                "poi_from_load": poi_from_load,
                 "v_min_pu": _clean_num(poi_v_min) if poi_v_min is not None else None,
                 "frequency_nadir_hz": _clean_num(freq_nadir) if freq_nadir is not None else None,
                 "frequency_final_hz": _clean_num(freq_settling) if freq_settling is not None else None,
@@ -1341,7 +1844,11 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
                 "fail_time_s": _clean_num(ride_fail_t) if ride_fail_t is not None else None,
                 "fail_voltage_pu": _clean_num(ride_fail_v) if ride_fail_v is not None else None,
                 "curve_points": [{"t_s": a, "v_min_pu": b} for a, b in ride_pts],
+                "t_event_s": _clean_num(t_event) if t_event is not None else None,
+                "verdict": verdict,
             },
+            "data_centres": data_centre_out,
+            "statcoms": statcom_out,
         }
         return json.dumps(result)
     except Exception as e:
