@@ -1783,7 +1783,9 @@ def run_tds(in_data: Dict[str, Any], params: Dict[str, Any]) -> str:
         if smap and getattr(ss, "REGCA1", None) is not None and ss.REGCA1.n:
             reg_ids = [str(x) for x in ss.REGCA1.idx.v]
             qe = tds_values(ss, ss.REGCA1.Qe)
-            iq = tds_values(ss, ss.REGCA1.Iqcmd)
+            # S1_y is the reactive current the converter delivers (Iqcmd after its lag); the command
+            # itself jumps for one step at every event
+            iq = tds_values(ss, ss.REGCA1.S1_y)
             for info in smap.values():
                 if not info.get("ree_idx") or str(info.get("reg_idx")) not in reg_ids:
                     continue
