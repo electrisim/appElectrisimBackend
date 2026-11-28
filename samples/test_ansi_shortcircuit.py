@@ -370,6 +370,141 @@ def test_two_phase_fault_ratio():
     print(f"PASS 2ph/3ph ratio = {ratio:.4f} (sqrt(3)/2 = {math.sqrt(3)/2:.4f})")
 
 
+def _grid_z(vn_kv, s_sc_mva, rx):
+    x = (vn_kv * vn_kv / s_sc_mva) / math.sqrt(1.0 + rx * rx)
+    return complex(rx * x, x)
+
+
+def _trafo_z(vk_percent, vkr_percent, vn_kv, sn_mva):
+    zb = vn_kv * vn_kv / sn_mva
+    r = vkr_percent / 100.0 * zb
+    return complex(r, math.sqrt((vk_percent / 100.0 * zb) ** 2 - r * r))
+
+
+def _dyn_test_net(vk, vkr):
+    net = pp.create_empty_network(sn_mva=100, f_hz=60)
+    hv = pp.create_bus(net, vn_kv=13.8, name="HV")
+    lv = pp.create_bus(net, vn_kv=0.48, name="LV")
+    pp.create_ext_grid(net, bus=hv, vm_pu=1.0, s_sc_max_mva=500.0, rx_max=0.1, rx_min=0.1,
+                       x0x_max=2.0, r0x0_max=0.2, x0x_min=2.0, r0x0_min=0.2)
+    pp.create_transformer_from_parameters(
+        net, hv_bus=hv, lv_bus=lv, sn_mva=2.5, vn_hv_kv=13.8, vn_lv_kv=0.48,
+        vk_percent=vk, vkr_percent=vkr, pfe_kw=0.0, i0_percent=0.0,
+        vk0_percent=vk, vkr0_percent=vkr, mag0_percent=100.0, mag0_rx=0.0,
+        si0_hv_partial=0.9, vector_group="Dyn", name="T1")
+    return net
+
+
+def test_transformer_nameplate_impedance():
+    """IEEE C37.010 uses the nameplate transformer impedance, not IEC 60909's K_T.
+
+    pandapower multiplies transformer impedances by K_T = 0.95 c / (1 + 0.6 x_T) as it builds
+    them, so the study used to read 7 % high behind a 20 % transformer and 1 % low behind a
+    5.75 % one (the earlier 5 % tolerance hid it).
+    """
+    for vk, vkr in ((5.75, 1.0), (12.0, 0.5), (20.0, 0.4)):
+        net = _dyn_test_net(vk, vkr)
+        z = _grid_z(0.48, 500.0, 0.1) + _trafo_z(vk, vkr, 0.48, 2.5)
+        i_hand = 0.48 / (math.sqrt(3) * abs(z))
+        got = _by_name(_run(net)["busbars"])["LV"]["i_first_sym_ka"]
+        assert abs(got / i_hand - 1) < 1e-3, f"vk={vk} %: LV I={got} expected {i_hand}"
+
+    net = pp.create_empty_network(sn_mva=100, f_hz=60)
+    hv = pp.create_bus(net, vn_kv=110.0, name="HV")
+    mv = pp.create_bus(net, vn_kv=20.0, name="MV")
+    lv = pp.create_bus(net, vn_kv=10.0, name="LV")
+    pp.create_ext_grid(net, bus=hv, vm_pu=1.0, s_sc_max_mva=5000.0, rx_max=0.1, rx_min=0.1)
+    pp.create_transformer3w_from_parameters(
+        net, hv_bus=hv, mv_bus=mv, lv_bus=lv, vn_hv_kv=110.0, vn_mv_kv=20.0, vn_lv_kv=10.0,
+        sn_hv_mva=40.0, sn_mv_mva=40.0, sn_lv_mva=40.0, vk_hv_percent=12.0, vk_mv_percent=8.0,
+        vk_lv_percent=18.0, vkr_hv_percent=0.4, vkr_mv_percent=0.4, vkr_lv_percent=0.4,
+        pfe_kw=0.0, i0_percent=0.0, name="T3")
+    # vk_lv_percent is the HV-LV pair, so the LV fault sees the grid plus that impedance.
+    z = _grid_z(10.0, 5000.0, 0.1) + _trafo_z(18.0, 0.4, 10.0, 40.0)
+    i_hand = 10.0 / (math.sqrt(3) * abs(z))
+    got = _by_name(_run(net)["busbars"])["LV"]["i_first_sym_ka"]
+    assert abs(got / i_hand - 1) < 1e-3, f"three-winding LV I={got} expected {i_hand}"
+    print(f"PASS nameplate transformer impedance (no K_T): three-winding LV I={got:.4f} kA "
+          f"(hand {i_hand:.4f})")
+
+
+def test_single_line_to_ground_sequence_networks():
+    """Line to ground: I = 3E / |2 Z1 + Z0| with pandapower's zero-sequence network.
+
+    The Dyn transformer's delta winding cuts the zero-sequence path, so the HV bus only sees
+    the grid's Z0 and the LV bus only the transformer's.
+    """
+    vk, vkr = 5.75, 1.0
+    net = _dyn_test_net(vk, vkr)
+    zs1 = _grid_z(13.8, 500.0, 0.1)
+    zs0 = complex(0.2 * 2.0 * zs1.imag, 2.0 * zs1.imag)  # x0x = 2, r0x0 = 0.2
+    zt = _trafo_z(vk, vkr, 0.48, 2.5)
+    zs1_lv = zs1 * (0.48 / 13.8) ** 2
+    cases = {
+        "HV": (13.8, 2 * zs1 + zs0),
+        "LV": (0.48, 2 * (zs1_lv + zt) + zt),
+    }
+    rows = _by_name(_run(net, fault_type="1ph")["busbars"])
+    for name, (vn, z_loop) in cases.items():
+        i_hand = 3 * vn / math.sqrt(3) / abs(z_loop)
+        xr_hand = z_loop.imag / z_loop.real
+        got = rows[name]
+        assert abs(got["i_first_sym_ka"] / i_hand - 1) < 1e-3, \
+            f"{name}: I_SLG={got['i_first_sym_ka']} expected {i_hand}"
+        assert abs(got["xr_first"] / xr_hand - 1) < 5e-3, \
+            f"{name}: X/R={got['xr_first']} expected {xr_hand}"
+    print(f"PASS line-to-ground: HV {rows['HV']['i_first_sym_ka']:.4f} kA, "
+          f"LV {rows['LV']['i_first_sym_ka']:.4f} kA, LV X/R {rows['LV']['xr_first']:.3f}")
+
+
+def test_line_to_ground_on_unearthed_network_is_capacitive():
+    """Behind a YNd transformer the 20 kV system has no earth, so a line-to-ground fault only
+    drives the cable's charging current, I = 3E / |2 Z1 + Z0| with Z0 the zero-sequence
+    capacitance (about sqrt(3) w C0 U). The earlier model put every line's zero-sequence
+    impedance to earth and reported kiloamperes here."""
+    def build(c0_nf_per_km, f_hz=60):
+        net = pp.create_empty_network(sn_mva=100, f_hz=f_hz)
+        hv = pp.create_bus(net, vn_kv=110.0, name="HV")
+        mv = pp.create_bus(net, vn_kv=20.0, name="MV")
+        far = pp.create_bus(net, vn_kv=20.0, name="FAR")
+        pp.create_ext_grid(net, bus=hv, vm_pu=1.0, s_sc_max_mva=5000.0, rx_max=0.1, rx_min=0.1,
+                           x0x_max=1.0, r0x0_max=0.1)
+        pp.create_transformer_from_parameters(
+            net, hv_bus=hv, lv_bus=mv, sn_mva=40.0, vn_hv_kv=110.0, vn_lv_kv=20.0,
+            vk_percent=12.0, vkr_percent=0.4, pfe_kw=0.0, i0_percent=0.0,
+            vk0_percent=12.0, vkr0_percent=0.4, mag0_percent=100.0, mag0_rx=0.0,
+            si0_hv_partial=0.9, vector_group="YNd", name="T1")
+        pp.create_line_from_parameters(
+            net, from_bus=mv, to_bus=far, length_km=10.0, r_ohm_per_km=0.1, x_ohm_per_km=0.12,
+            c_nf_per_km=0.0, max_i_ka=0.5, r0_ohm_per_km=0.4, x0_ohm_per_km=1.0,
+            c0_nf_per_km=c0_nf_per_km, name="CABLE")
+        return net
+
+    net = build(250.0)
+    rows = _by_name(_run(net, fault_type="1ph")["busbars"])
+    i3 = _by_name(_run(net)["busbars"])["MV"]["i_first_sym_ka"]
+    z1 = _grid_z(20.0, 5000.0, 0.1) + _trafo_z(12.0, 0.4, 20.0, 40.0)
+    y_half = 1j * 2 * math.pi * 60 * 250e-9 * 10.0 / 2
+    z_line0 = complex(0.4 * 10.0, 1.0 * 10.0)
+    z0 = 1 / (y_half + 1 / (z_line0 + 1 / y_half))
+    i_hand = 3 * 20.0 / math.sqrt(3) / abs(2 * z1 + z0)
+    got = rows["MV"]["i_first_sym_ka"]
+    assert abs(got / i_hand - 1) < 5e-3, f"MV I_SLG={got} expected {i_hand} (charging current)"
+    assert got < 0.01 * i3, f"MV I_SLG={got} kA should be far below I_3ph={i3} kA"
+
+    # app.py builds every network at pandapower's default 50 Hz: the study frequency from the
+    # dialog has to reach the line charging, or a 60 Hz study reports 50/60 of the current.
+    as_app = _by_name(_run(build(250.0, f_hz=50), fault_type="1ph")["busbars"])["MV"]["i_first_sym_ka"]
+    assert abs(as_app / got - 1) < 1e-9, f"50 Hz network, 60 Hz study: I_SLG={as_app} kA, expected {got} kA"
+
+    open_rows = _by_name(_run(build(0.0), fault_type="1ph")["busbars"])
+    for name in ("MV", "FAR"):
+        assert open_rows[name]["i_first_sym_ka"] < 1e-4, \
+            f"{name}: no zero-sequence path, got I_SLG={open_rows[name]['i_first_sym_ka']} kA"
+    print(f"PASS unearthed line-to-ground: MV {got * 1000:.2f} A (hand {i_hand * 1000:.2f} A), "
+          f"I_3ph {i3:.3f} kA")
+
+
 if __name__ == "__main__":
     test_peak_multiplier_formula()
     test_interrupting_multiplier_bounds()
@@ -387,4 +522,7 @@ if __name__ == "__main__":
     test_line_mapping_with_out_of_service_branch()
     test_pre_post_ansi_delta()
     test_two_phase_fault_ratio()
+    test_transformer_nameplate_impedance()
+    test_single_line_to_ground_sequence_networks()
+    test_line_to_ground_on_unearthed_network_is_capacitive()
     print("\nAll ANSI short-circuit tests passed.")

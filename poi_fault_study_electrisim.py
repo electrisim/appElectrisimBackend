@@ -229,12 +229,16 @@ def _iec_bus_sc(
         ensure_ext_grid_zero_sequence_min,
         ensure_ext_grid_zero_sequence_ratios,
         ensure_gen_short_circuit_data,
+        ensure_line_zero_sequence_data,
+        ensure_trafo3w_zero_sequence_data,
     )
 
     ensure_gen_short_circuit_data(work)  # before k: k from Ik" needs the rating
     apply_converter_short_circuit_k(work, fault)
     ensure_ext_grid_zero_sequence_min(work)
     ensure_ext_grid_zero_sequence_ratios(work, fault)
+    ensure_trafo3w_zero_sequence_data(work, fault)
+    ensure_line_zero_sequence_data(work, fault)
     try:
         sc.calc_sc(
             work,
@@ -334,6 +338,10 @@ def run_poi_fault_study(net, in_data: dict, in_data_full=None) -> str:
     freq_hz = _f(in_data.get("frequency_hz", net.f_hz if hasattr(net, "f_hz") else 50), 50.0)
     if freq_hz <= 0:
         freq_hz = 50.0
+    # app.py builds the network at pandapower's default 50 Hz; the IEC single-phase rows take
+    # the line charging (C0) from net.f_hz. IEC 60909 (kappa method C) knows 50 and 60 Hz only.
+    net = copy.deepcopy(net)
+    net.f_hz = 60.0 if freq_hz >= 55.0 else 50.0
     cp_cycles = _f(in_data.get("contact_parting_cycles", 3), 3.0)
     slg_target_a = _f(in_data.get("slg_target_ground_i_a", 0), 0.0)
 

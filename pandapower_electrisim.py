@@ -315,7 +315,7 @@ def ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data_full=None):
                     fixed.append(f"R0/X0 {suffix}=0.1")
         if fixed:
             raw = net.ext_grid.at[idx, 'name'] if 'name' in net.ext_grid.columns else idx
-            label = friendly.get(raw) or raw
+            label = friendly.get(raw) or (getattr(net, 'user_friendly_names', None) or {}).get(raw) or raw
             messages.append(f"External Grid '{label}': zero-sequence ratios not set, used "
                             + ", ".join(fixed) + " for the single-phase fault.")
     if messages:
@@ -323,6 +323,147 @@ def ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data_full=None):
             net.warnings = []
         net.warnings.extend(messages)
     return messages
+
+
+def ensure_trafo3w_zero_sequence_data(net, fault_type, in_data_full=None):
+    """
+    A single-phase fault needs the zero-sequence short-circuit voltages of every three-winding
+    transformer. The dialog starts them at 0 and pandapower has no fallback for three-winding
+    transformers, so every single-phase fault stopped with "Equivalent transformer with zero
+    impedance!". Use the positive-sequence values of a winding whose vk0 is not set (vkr0 too,
+    when it is not set or larger) and say so in net.warnings.
+    """
+    if fault_type != '1ph':
+        return []
+    t3 = getattr(net, 'trafo3w', None)
+    if t3 is None or getattr(t3, 'empty', True):
+        return []
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and str(row.get('typ', '')).startswith('Three Winding Transformer')}
+    for side in ('hv', 'mv', 'lv'):
+        for col in (f'vk0_{side}_percent', f'vkr0_{side}_percent'):
+            if col not in net.trafo3w.columns:
+                net.trafo3w[col] = np.nan
+    messages = []
+    for idx in net.trafo3w.index:
+        used = []
+        for side in ('hv', 'mv', 'lv'):
+            vk0_col, vkr0_col = f'vk0_{side}_percent', f'vkr0_{side}_percent'
+            if safe_float(net.trafo3w.at[idx, vk0_col], 0.0) > 0:
+                continue
+            vk = safe_float(net.trafo3w.at[idx, f'vk_{side}_percent'], 0.0)
+            vkr = safe_float(net.trafo3w.at[idx, f'vkr_{side}_percent'], 0.0)
+            net.trafo3w.at[idx, vk0_col] = vk
+            vkr0 = safe_float(net.trafo3w.at[idx, vkr0_col], 0.0)
+            if not (0 < vkr0 <= vk):
+                net.trafo3w.at[idx, vkr0_col] = vkr
+            used.append(side.upper())
+        if used:
+            raw = net.trafo3w.at[idx, 'name'] if 'name' in net.trafo3w.columns else idx
+            label = friendly.get(raw) or (getattr(net, 'user_friendly_names', None) or {}).get(raw) or raw
+            messages.append(
+                f"Three-winding transformer '{label}': zero-sequence short-circuit voltage vk0 not set for "
+                f"{'/'.join(used)}, used the positive-sequence vk and vkr for the single-phase fault. "
+                "Enter vk0 from the test report for exact results.")
+    if messages:
+        if not hasattr(net, 'warnings') or net.warnings is None:
+            net.warnings = []
+        net.warnings.extend(messages)
+    return messages
+
+
+def _listed_names(labels, limit=5):
+    shown = ", ".join(f"'{label}'" for label in labels[:limit])
+    if len(labels) > limit:
+        shown += f" and {len(labels) - limit} more"
+    return shown
+
+
+def ensure_line_zero_sequence_data(net, fault_type, in_data_full=None):
+    """
+    A single-phase fault needs each line's zero-sequence impedance. A line drawn without it
+    carries R0 = X0 = 0, a zero-impedance branch in the zero sequence, and every single-phase
+    fault stopped with "divide by zero encountered in divide". Use the positive-sequence R and X
+    for a line whose R0 and X0 are both 0 or not set, and say so in net.warnings. C0 is kept
+    (not set counts as 0, no capacitance).
+    """
+    if fault_type != '1ph':
+        return []
+    line = getattr(net, 'line', None)
+    if line is None or getattr(line, 'empty', True):
+        return []
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and str(row.get('typ', '')).startswith('Line')}
+    for col in ('r0_ohm_per_km', 'x0_ohm_per_km'):
+        if col not in net.line.columns:
+            net.line[col] = 0.0
+    if 'c0_nf_per_km' not in net.line.columns:
+        net.line['c0_nf_per_km'] = 0.0
+    net.line['c0_nf_per_km'] = pd.to_numeric(net.line['c0_nf_per_km'], errors='coerce').fillna(0.0)
+    labels = []
+    for idx in net.line.index:
+        r0 = safe_float(net.line.at[idx, 'r0_ohm_per_km'], 0.0)
+        x0 = safe_float(net.line.at[idx, 'x0_ohm_per_km'], 0.0)
+        if r0 != 0 or x0 != 0:
+            net.line.at[idx, 'r0_ohm_per_km'] = r0
+            net.line.at[idx, 'x0_ohm_per_km'] = x0
+            continue
+        net.line.at[idx, 'r0_ohm_per_km'] = safe_float(net.line.at[idx, 'r_ohm_per_km'], 0.0)
+        net.line.at[idx, 'x0_ohm_per_km'] = safe_float(net.line.at[idx, 'x_ohm_per_km'], 0.0)
+        if 'in_service' in net.line.columns and not bool(net.line.at[idx, 'in_service']):
+            continue
+        raw = net.line.at[idx, 'name'] if 'name' in net.line.columns else idx
+        labels.append(str(friendly.get(raw) or (getattr(net, 'user_friendly_names', None) or {}).get(raw) or raw))
+    if not labels:
+        return []
+    noun = "Line" if len(labels) == 1 else "Lines"
+    messages = [
+        f"{noun} {_listed_names(labels)}: zero-sequence impedance not set (R0 = X0 = 0), used the "
+        "positive-sequence R and X for the single-phase fault. Enter R0 and X0 from the line data "
+        "for exact results (X0 is often about 3 X on overhead lines)."]
+    if not hasattr(net, 'warnings') or net.warnings is None:
+        net.warnings = []
+    net.warnings.extend(messages)
+    return messages
+
+
+# Three-winding vector groups that pandapower 3.3 can build in the zero sequence
+# (pd2ppc_zero._add_trafo3w_sc_impedance_zero); any other group stops a single-phase fault.
+TRAFO3W_ZERO_SEQUENCE_GROUPS = frozenset(
+    {a + b + c for a in "dy" for b in "dy" for c in "dy"}
+    | {"ynyd", "yndy", "yynd", "ydyn", "ynynd", "yndyn", "yndd", "ynyy", "dynyn"})
+
+
+def trafo3w_vector_group_problem(net, fault_type, in_data_full=None):
+    """Message naming three-winding transformers a single-phase fault cannot model, or None.
+
+    pandapower checks every three-winding transformer, in service or not, and stopped with
+    "<group> not supported yet for trafo3w!" without naming it.
+    """
+    if fault_type != '1ph':
+        return None
+    t3 = getattr(net, 'trafo3w', None)
+    if t3 is None or getattr(t3, 'empty', True) or 'vector_group' not in t3.columns:
+        return None
+    friendly = {row.get('name'): row.get('userFriendlyName') for row in (in_data_full or {}).values()
+                if isinstance(row, dict) and str(row.get('typ', '')).startswith('Three Winding Transformer')}
+    bad = []
+    for idx in t3.index:
+        group = str(t3.at[idx, 'vector_group'] or '')
+        if group.lower() in TRAFO3W_ZERO_SEQUENCE_GROUPS:
+            continue
+        raw = t3.at[idx, 'name'] if 'name' in t3.columns else idx
+        label = friendly.get(raw) or (getattr(net, 'user_friendly_names', None) or {}).get(raw) or raw
+        bad.append(f"'{label}' ({group or 'no vector group'})")
+    if not bad:
+        return None
+    shown = ", ".join(bad[:5]) + (f" and {len(bad) - 5} more" if len(bad) > 5 else "")
+    subject = (f"three-winding transformer {shown} has" if len(bad) == 1
+               else f"three-winding transformers {shown} have")
+    return (f"Single-phase fault cannot run: {subject} a vector group the zero-sequence model does "
+            "not support. Use one of YNynd, YNdyn, YNyd, YNdy, YNdd, YNyy, Dynyn, Ydyn, Yynd or a "
+            "group without an earthed neutral (for example Yyd, Ddy); the clock number goes into "
+            "the phase shift fields.")
 
 
 def warn_unrealistic_ext_grid_sc_power(net, case='max', in_data_full=None, limit_ka=150.0):
@@ -10148,9 +10289,13 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
             })
         ensure_line_endtemp_for_min_case(net)
 
+    _trafo3w_group_problem = trafo3w_vector_group_problem(net, fault_type, in_data_full)
+    if _trafo3w_group_problem:
+        return json.dumps({"error": True, "message": _trafo3w_group_problem})
+
     try:
         # Use correct parameter mapping according to Pandapower documentation
-        
+
         # Call short circuit calculation with correct parameters including ip and ith.
         # IMPORTANT: branch_results=True is required to populate res_line_sc / res_trafo_sc / res_trafo3w_sc.
         # NOTE: return_all_currents=False (default) gives max/min per branch (simple index).
@@ -10158,6 +10303,8 @@ def shortcircuit(net, in_data, in_data_full=None, export_python=False, Busbars=N
         #       For UI display, we want max/min per branch, so keep return_all_currents=False.
         ensure_ext_grid_zero_sequence_min(net)
         ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data_full)
+        ensure_trafo3w_zero_sequence_data(net, fault_type, in_data_full)
+        ensure_line_zero_sequence_data(net, fault_type, in_data_full)
         ensure_gen_short_circuit_data(net, in_data_full)
         warn_unrealistic_ext_grid_sc_power(net, fault_location, in_data_full)
         apply_converter_short_circuit_k(net, fault_type)
@@ -17707,6 +17854,17 @@ def protection_coordination(net, prot_params, in_data):
         # Dialog-default zeros (generator short-circuit data, grid X0/X) would make calc_sc fail.
         sc_data_notes = ensure_gen_short_circuit_data(net, in_data)
         sc_data_notes += ensure_ext_grid_zero_sequence_ratios(net, fault_type, in_data)
+        sc_data_notes += ensure_trafo3w_zero_sequence_data(net, fault_type, in_data)
+        sc_data_notes += ensure_line_zero_sequence_data(net, fault_type, in_data)
+        trafo3w_group_problem = trafo3w_vector_group_problem(net, fault_type, in_data)
+        if trafo3w_group_problem:
+            return json.dumps({
+                'error': True,
+                'message': trafo3w_group_problem,
+                'scenarios': [],
+                'devices': [],
+                'summary': {'converged': False},
+            }, separators=(',', ':'))
 
         attach_summaries = _attach_protection_devices(net, specs, grading_mode)
         attached_count = sum(1 for s in attach_summaries if s.get('attached'))

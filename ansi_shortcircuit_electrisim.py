@@ -193,6 +193,63 @@ def _motor_hp(pn_mech_mw: float) -> float:
 # PPC / Ybus for ANSI (no IEC c-factor, no K_G, no K_T)
 # ---------------------------------------------------------------------------
 
+# The voltage factor c_max that _init_ansi_ppc leaves on every bus while pandapower builds the
+# branches (case "max", 10 % LV tolerance), and that pandapower puts into K_T.
+_IEC_C_MAX_BUILD = 1.1
+
+
+def _kt_cancel_scale(vk_percent, vkr_percent, psu=None) -> np.ndarray:
+    """Scale for vk and vkr that makes pandapower's K_T product come out at the nameplate value.
+
+    pandapower multiplies the transformer impedance by K_T = 0.95 c / (1 + 0.6 x_T), with x_T
+    taken from the same vk and vkr. With both scaled by s = 1 / (0.95 c - 0.6 x_T), K_T from the
+    scaled data is exactly 1 / s. Power station unit transformers have K_T = 1 and keep s = 1.
+    """
+    vk = pd.to_numeric(pd.Series(vk_percent), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    vkr = pd.to_numeric(pd.Series(vkr_percent), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    xt = np.sqrt(np.clip((vk / 100.0) ** 2 - (vkr / 100.0) ** 2, 0.0, None))
+    den = 0.95 * _IEC_C_MAX_BUILD - 0.6 * xt
+    scale = np.where(den > 0.05, 1.0 / np.where(den > 0.05, den, 1.0), 1.0)
+    if psu is not None:
+        is_psu = pd.Series(psu).fillna(False).astype(bool).to_numpy()
+        scale = np.where(is_psu, 1.0, scale)
+    return scale
+
+
+def _cancel_transformer_correction_factor(net) -> None:
+    """Take the IEC 60909 factor K_T back out of the transformer impedances.
+
+    In short-circuit mode pandapower multiplies each transformer's positive- and
+    zero-sequence impedance by K_T while it builds the branches, before _init_ansi_ppc can
+    reset the K_T column, so the ANSI study ran 7 % high behind a 20 % transformer and 1 % low
+    behind a 5.75 % one. IEEE C37.010 uses the nameplate impedance. ``net`` is the study's
+    working copy; its vk, vkr, vk0 and vkr0 are scaled so that pandapower's product gives the
+    nameplate values (and mag0_percent the other way, as pandapower takes the zero-sequence
+    magnetising impedance from the scaled vk0 before K_T).
+    """
+    trafo = net.get("trafo")
+    if trafo is not None and not trafo.empty and "vk_percent" in trafo.columns:
+        psu = trafo["power_station_unit"] if "power_station_unit" in trafo.columns else None
+        s = _kt_cancel_scale(trafo["vk_percent"].values, trafo.get("vkr_percent", 0.0), psu)
+        for col in ("vk_percent", "vkr_percent", "vk0_percent", "vkr0_percent"):
+            if col in trafo.columns:
+                trafo[col] = pd.to_numeric(trafo[col], errors="coerce").astype(float) * s
+        if "mag0_percent" in trafo.columns:
+            trafo["mag0_percent"] = pd.to_numeric(trafo["mag0_percent"], errors="coerce").astype(float) / s
+
+    t3 = net.get("trafo3w")
+    if t3 is not None and not t3.empty:
+        psu = t3["power_station_unit"] if "power_station_unit" in t3.columns else None
+        for side in ("hv", "mv", "lv"):
+            vk_col, vkr_col = f"vk_{side}_percent", f"vkr_{side}_percent"
+            if vk_col not in t3.columns:
+                continue
+            s = _kt_cancel_scale(t3[vk_col].values, t3.get(vkr_col, 0.0), psu)
+            for col in (vk_col, vkr_col, f"vk0_{side}_percent", f"vkr0_{side}_percent"):
+                if col in t3.columns:
+                    t3[col] = pd.to_numeric(t3[col], errors="coerce").astype(float) * s
+
+
 def _init_ansi_ppc(net, prefault_v: float = 1.0):
     """Build ppc/ppci for ANSI study without IEC 60909 corrections."""
     from pandapower.auxiliary import _add_ppc_options, _add_sc_options
@@ -418,41 +475,128 @@ def _add_storage_ansi(net, ppci, network: str):
         _y_add_shunt(ppci, bus_ppc, _z_to_y_pu(r_ohm, x_ohm, base_z))
 
 
-def _build_zero_sequence_y(net, prefault_v: float):
-    """Approximate zero-sequence Y for LG faults."""
-    _, ppci0 = _init_ansi_ppc(net, prefault_v)
-    if not net.line.empty:
-        for _, row in net.line[net.line.in_service].iterrows():
-            f_ppc = _ppc_bus(net, int(row["from_bus"]))
-            t_ppc = _ppc_bus(net, int(row["to_bus"]))
-            if f_ppc is None or t_ppc is None:
-                continue
-            from_bus = int(row["from_bus"])
-            vn = float(net.bus.at[from_bus, "vn_kv"])
-            length = _f(row.get("length_km"), 1.0) or 1.0
-            r0 = _f(row.get("r0_ohm_per_km"), _f(row.get("r_ohm_per_km"), 0.0)) * length
-            x0 = _f(row.get("x0_ohm_per_km"), _f(row.get("x_ohm_per_km"), 0.0)) * length
-            if r0 == 0 and x0 == 0:
-                x0 = _f(row.get("x_ohm_per_km"), 0.0) * length
-            base_z = vn * vn / ppci0["baseMVA"]
-            y0 = _z_to_y_pu(r0, x0, base_z)
-            for bp in (f_ppc, t_ppc):
-                _y_add_shunt(ppci0, int(bp), y0)
-    _add_ext_grid_ansi(net, ppci0, prefault_v)
+# Zero-sequence impedance of a bus with no path to earth (pandapower's open-path value).
+_Z0_OPEN = 1e20 * (1.0 + 1.0j)
+
+_IMPEDANCE_Z0_FROM_Z1 = (("rft0_pu", "rft_pu"), ("xft0_pu", "xft_pu"), ("rtf0_pu", "rtf_pu"),
+                         ("xtf0_pu", "xtf_pu"), ("gf0_pu", "gf_pu"), ("bf0_pu", "bf_pu"),
+                         ("gt0_pu", "gt_pu"), ("bt0_pu", "bt_pu"))
+
+
+def _impedance_zero_sequence_from_positive(net0) -> List[str]:
+    """Give each Impedance without zero-sequence data Z0 = Z1, on the zero-sequence copy.
+
+    pandapower reads rft0_pu ... bt0_pu, which Electrisim did not write, and stopped with
+    KeyError 'rft0_pu'. Z0 = Z1 is the IEC 60909-0 value for a current-limiting reactor and keeps
+    the earthing paths of the positive sequence. Values that are set are kept.
+    """
+    imp = net0.get("impedance")
+    if imp is None or imp.empty:
+        return []
+    filled = pd.Series(False, index=imp.index)
+    for zero_col, pos_col in _IMPEDANCE_Z0_FROM_Z1:
+        pos = pd.to_numeric(imp[pos_col], errors="coerce") if pos_col in imp.columns else 0.0
+        if zero_col in imp.columns:
+            current = pd.to_numeric(imp[zero_col], errors="coerce")
+        else:
+            current = pd.Series(np.nan, index=imp.index)
+        missing = current.isna()
+        if zero_col.startswith(("rft0", "xft0", "rtf0", "xtf0")):
+            filled |= missing
+        imp[zero_col] = current.where(~missing, pos).fillna(0.0).astype(float)
+    labels = [_display_name(net0, str(imp.at[i, "name"]) if "name" in imp.columns else str(i), i)
+              for i in imp.index[filled.to_numpy()]]
+    if not labels:
+        return []
+    shown = ", ".join(f"'{label}'" for label in labels[:5])
+    if len(labels) > 5:
+        shown += f" and {len(labels) - 5} more"
+    noun = "Impedance" if len(labels) == 1 else "Impedances"
+    return [f"{noun} {shown}: no zero-sequence data, used Z0 = Z1 (R0 = R1, X0 = X1) "
+            f"for the line-to-ground fault."]
+
+
+def _drop_extended_wards_from_zero_sequence(net0) -> None:
+    """Leave Extended Wards out of the zero-sequence copy, as pandapower does for a plain Ward.
+
+    An Extended Ward is a positive-sequence equivalent without zero-sequence data. pandapower
+    3.3 reserves a zero-sequence branch for it but never fills it (R = X = 0), so the build
+    divided by zero. Its internal bus is a dead end in every sequence, so dropping it from the
+    zero-sequence network changes no other bus.
+    """
+    xward = net0.get("xward")
+    if xward is not None and not xward.empty:
+        net0["xward"] = xward.iloc[0:0].copy()
+
+
+def _zero_sequence_z_diag(net, n_bus: int, n_branch: int) -> Tuple[np.ndarray, List[str]]:
+    """Zero-sequence driving-point impedance (per unit) of every bus, for line-to-ground faults.
+
+    Uses pandapower's zero-sequence model: transformer vector groups and earthed neutrals
+    (YN / D windings, vk0), line R0 / X0 / C0 and the External Grid X0/X and R0/X0. A part of
+    the network that has no earth of its own (behind a delta winding) stays open, so a fault
+    there carries only its capacitive current. The IEC 60909 correction factors are left out
+    (K_ST = 1) and the grid impedance is |Z| = Un^2 / S"k as in the positive sequence.
+
+    The earlier model ignored every transformer and put each line's zero-sequence impedance
+    from both ends to earth, so an unearthed 6 kV switchboard showed a larger line-to-ground
+    current than its three-phase current.
+
+    ``net`` is the network prepared by ``_init_ansi_ppc``; it is not changed. Returns the
+    impedances indexed like the positive-sequence ppci buses, and notes on the data used.
+    """
+    from pandapower.pd2ppc_zero import _pd2ppc_zero
+    from pandapower_electrisim import (
+        ensure_ext_grid_zero_sequence_ratios,
+        ensure_line_zero_sequence_data,
+        ensure_trafo3w_zero_sequence_data,
+    )
+    from sc_zero_sequence_zbus import electrisim_calc_zbus
+
+    work0 = copy.deepcopy(net)
+    work0.warnings = []
+    notes = list(ensure_ext_grid_zero_sequence_ratios(work0, "1ph"))
+    notes += ensure_trafo3w_zero_sequence_data(work0, "1ph")
+    notes += ensure_line_zero_sequence_data(work0, "1ph")
+    notes += _impedance_zero_sequence_from_positive(work0)
+    _drop_extended_wards_from_zero_sequence(work0)
+    if not work0.ext_grid.empty:
+        s_sc = pd.to_numeric(work0.ext_grid["s_sc_max_mva"], errors="coerce")
+        s_sc = s_sc.where(s_sc > 0, 10000.0)  # the default of _add_ext_grid_ansi
+        rx = pd.to_numeric(work0.ext_grid.get("rx_max", 0.1), errors="coerce")
+        work0.ext_grid["rx_max"] = rx.where(rx >= 0, 0.1).fillna(0.1)
+        # pandapower multiplies the grid impedance by the voltage factor c of the bus, which
+        # _init_ansi_ppc sets to 1.1 (case max, 10 % LV tolerance); this cancels it.
+        work0.ext_grid["s_sc_max_mva"] = s_sc * 1.1
+    _, ppci0 = _pd2ppc_zero(work0, np.ones(n_branch))
     _calc_ybus(ppci0)
-    _calc_zbus(net, ppci0)
-    return ppci0
+    electrisim_calc_zbus(work0, ppci0)
+    zbus0 = ppci0["internal"]["Zbus"]
+
+    z0 = np.full(n_bus, _Z0_OPEN, dtype=np.complex128)
+    for pp_bus in net.bus.index:
+        b1 = _ppc_bus(net, int(pp_bus))
+        b0 = _ppc_bus(work0, int(pp_bus))
+        if b1 is None or b0 is None or b1 >= n_bus or b0 >= zbus0.shape[0]:
+            continue
+        z0[b1] = zbus0[b0, b0]
+    return z0, notes
 
 
 def _fault_currents_ka(
     ppci,
-    ppci0,
+    z0_diag,
     fault: str,
     prefault_v: float,
     r_fault_ohm: float,
     x_fault_ohm: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (i_sym_ka, r_ohm, x_ohm) per ppci bus index."""
+    """Return (i_sym_ka, r_ohm, x_ohm) per ppci bus index.
+
+    r_ohm / x_ohm describe the fault loop that sets the X/R ratio: Z1 + Zf for a three-phase
+    fault, (Z1 + Z2 + Zf) / 2 line to line and (Z1 + Z2 + Z0 + 3 Zf) / 3 line to ground
+    (IEEE C37.010: X/R of a line-to-ground fault from 2 X1 + X0 and 2 R1 + R0).
+    """
     n = ppci["bus"].shape[0]
     z_diag = np.diag(ppci["internal"]["Zbus"]).astype(np.complex128)
     base_kv = ppci["bus"][:, BASE_KV]
@@ -467,34 +611,26 @@ def _fault_currents_ka(
     x_eq = np.zeros(n, dtype=float)
 
     for b in range(n):
-        z_th = z_diag[b]
-        if r_fault_ohm > 0 or x_fault_ohm > 0:
-            z_th = z_th + complex(r_fault_ohm, x_fault_ohm) / base_z[b]
-        r_eq[b] = z_th.real * base_z[b]
-        x_eq[b] = z_th.imag * base_z[b]
-        z_abs = abs(z_th)
-        if z_abs < 1e-12:
-            z_abs = 1e-12
+        z1 = z_diag[b]
+        z_f = complex(r_fault_ohm, x_fault_ohm) / base_z[b] if (r_fault_ohm > 0 or x_fault_ohm > 0) else 0j
         v = prefault_v
-        if fault == "3ph":
-            i_pu = v / z_abs
-        elif fault == "2ph":
-            # Line-to-line fault: I2 = sqrt(3)/2 * I3ph in this per-unit system,
-            # since I2 = Un/|Z1+Z2| on the line-to-line voltage.
-            i_pu = math.sqrt(3.0) * v / (2.0 * z_abs)
+        if fault == "2ph":
+            # Line-to-line fault: I = sqrt(3) E / |Z1 + Z2 + Zf| in this per-unit system,
+            # with Z2 = Z1.
+            z_loop = 2.0 * z1 + z_f
+            i_pu = math.sqrt(3.0) * v / max(abs(z_loop), 1e-12)
+            z_eq = z_loop / 2.0
         elif fault == "1ph":
-            z0 = complex(1e-6, 1e-6)
-            if ppci0 is not None:
-                try:
-                    z0 = np.diag(ppci0["internal"]["Zbus"])[b]
-                except Exception:
-                    pass
-            z_seq = z_th + z_th + z0
-            if abs(z_seq) < 1e-12:
-                z_seq = 1e-12 + 0j
-            i_pu = 3.0 * v / abs(z_seq)
+            # Line-to-ground fault: I = 3 E / |Z1 + Z2 + Z0 + 3 Zf|.
+            z0 = z0_diag[b] if z0_diag is not None and b < len(z0_diag) else _Z0_OPEN
+            z_loop = 2.0 * z1 + z0 + 3.0 * z_f
+            i_pu = 3.0 * v / max(abs(z_loop), 1e-12)
+            z_eq = z_loop / 3.0
         else:
-            i_pu = v / z_abs
+            z_eq = z1 + z_f
+            i_pu = v / max(abs(z_eq), 1e-12)
+        r_eq[b] = z_eq.real * base_z[b]
+        x_eq[b] = z_eq.imag * base_z[b]
         i_sym[b] = abs(i_pu) * base_i[b]
     return i_sym, r_eq, x_eq
 
@@ -719,16 +855,28 @@ def _solve_network(
     x_fault_ohm: float,
     gen_meta: Dict[int, dict],
     fault_pp_buses: Optional[List[int]] = None,
+    zero_sequence: Optional[dict] = None,
+    f_hz: Optional[float] = None,
 ) -> Dict[str, dict]:
     """Solve one ANSI network.
+
+    ``zero_sequence`` (a dict) keeps the zero-sequence bus impedances between the three
+    networks of one study: machines are not earthed, so they are the same in all three. The
+    notes on the zero-sequence data used are left in it under "notes".
+
+    ``f_hz`` is the study frequency. app.py builds the network at pandapower's default 50 Hz,
+    and the line charging (C0) of the zero-sequence network follows the network frequency.
 
     Returns {"bus": {pp_bus: (i_sym_ka, r_ohm, x_ohm)},
              "line": {pp_line: (i_from_ka, i_to_ka)},
              "trafo": {pp_trafo: (i_hv_ka, i_lv_ka)}}.
     """
     work = copy.deepcopy(net)
+    if f_hz:
+        work.f_hz = float(f_hz)
     if hasattr(work, "gen") and not work.gen.empty and "ansi_machine_type" not in work.gen.columns:
         work.gen["ansi_machine_type"] = "turbo"
+    _cancel_transformer_correction_factor(work)
     ppc, ppci = _init_ansi_ppc(work, prefault_v)
     _add_ext_grid_ansi(work, ppci, prefault_v)
     _add_gen_ansi(work, ppci, network, gen_meta)
@@ -737,8 +885,14 @@ def _solve_network(
     _add_storage_ansi(work, ppci, network)
     _calc_ybus(ppci)
     _calc_zbus(work, ppci)
-    ppci0 = _build_zero_sequence_y(work, prefault_v) if fault == "1ph" else None
-    i_sym, r_eq, x_eq = _fault_currents_ka(ppci, ppci0, fault, prefault_v, r_fault_ohm, x_fault_ohm)
+    z0_diag = None
+    if fault == "1ph":
+        cache = zero_sequence if zero_sequence is not None else {}
+        if cache.get("z0") is None or len(cache["z0"]) != ppci["bus"].shape[0]:
+            cache["z0"], cache["notes"] = _zero_sequence_z_diag(
+                work, ppci["bus"].shape[0], ppc["branch"].shape[0])
+        z0_diag = cache["z0"]
+    i_sym, r_eq, x_eq = _fault_currents_ka(ppci, z0_diag, fault, prefault_v, r_fault_ohm, x_fault_ohm)
 
     buses: Dict[int, Tuple[float, float, float]] = {}
     for pp_bus in work.bus.index:
@@ -843,6 +997,10 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
     fault = str(in_data.get("fault_type", in_data.get("fault", "3ph")) or "3ph").lower()
     if fault not in ("3ph", "2ph", "1ph"):
         fault = "3ph"
+    from pandapower_electrisim import trafo3w_vector_group_problem
+    trafo3w_group_problem = trafo3w_vector_group_problem(net, fault, in_data_full)
+    if trafo3w_group_problem:
+        return json.dumps({"error": True, "message": trafo3w_group_problem})
     freq_hz = _f(in_data.get("frequency_hz", in_data.get("frequency", 60)), 60.0)
     if freq_hz <= 0:
         freq_hz = 60.0
@@ -856,9 +1014,13 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
     fault_pp_buses = resolve_pp_fault_bus_indices(net, in_data)
 
     gen_meta: Dict[int, dict] = {}
-    sol_first = _solve_network(net, NETWORK_FIRST, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
-    sol_int = _solve_network(net, NETWORK_INT, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
-    sol_30 = _solve_network(net, NETWORK_30, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses)
+    zero_sequence: dict = {}
+    sol_first = _solve_network(net, NETWORK_FIRST, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses,
+                               zero_sequence, f_hz=freq_hz)
+    sol_int = _solve_network(net, NETWORK_INT, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses,
+                             zero_sequence, f_hz=freq_hz)
+    sol_30 = _solve_network(net, NETWORK_30, fault, prefault_v, r_fault, x_fault, gen_meta, fault_pp_buses,
+                            zero_sequence, f_hz=freq_hz)
     rx_first, rx_int, rx_30 = sol_first["bus"], sol_int["bus"], sol_30["bus"]
 
     busbar_list = []
@@ -911,8 +1073,9 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
             "i_steady_ka": _clean(i_steady),
             "xr_first": _clean(xr_fc),
             "xr_interrupting": _clean(xr_int),
-            "rk_ohm": _clean(r_ohm),
-            "xk_ohm": _clean(x_ohm),
+            # a line-to-ground fault in a part with no earth has an open loop (no current)
+            "rk_ohm": _clean(r_ohm) if abs(r_ohm) < 1e12 else None,
+            "xk_ohm": _clean(x_ohm) if abs(x_ohm) < 1e12 else None,
             "mf_peak": _clean(mf_peak),
             "mf_interrupting": _clean(mf_int_symm),
         })
@@ -942,6 +1105,7 @@ def shortcircuit_ansi(net, in_data, in_data_full=None) -> str:
         "device_duties": device_duties,
         "lines_sc": lines_sc,
         "trafos_sc": trafos_sc,
+        "warnings": list(zero_sequence.get("notes") or []),
         "study": "shortcircuit",
         "engine": "ansi",
         "study_params": {
