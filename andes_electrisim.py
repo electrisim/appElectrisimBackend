@@ -447,6 +447,7 @@ def build_system(
     params: Optional[Dict[str, Any]] = None,
     grid_behind_impedance: bool = False,
     dynamic_loads: bool = False,
+    grid_sc_case: str = "max",
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Build an ANDES System from Electrisim JSON.
@@ -457,6 +458,9 @@ def build_system(
     dynamic_loads: the caller adds dynamic loads of its own before setup (the induction motors
     of Motor Starting). A network fed only by External Grids is then valid: with no synchronous
     machine in it, each External Grid becomes a source behind its short-circuit impedance.
+
+    grid_sc_case: "max" (S"k max, R/X max) or "min" (S"k min, R/X min) for that impedance. A
+    grid whose S"k min is not set uses its maximum values.
 
     Returns (ss, meta) where meta includes bus_map, line_map, gen_map, defaults_applied, warnings.
     """
@@ -1221,18 +1225,24 @@ def build_system(
                 f"as reactive current, up to {imax:g} p.u.")
 
     no_syn_machine = (renewable_count + statcom_count > 0 or dynamic_loads) and ss.GENROU.n + ss.GENCLS.n == 0
+    grid_sources: List[Dict[str, Any]] = []
     if grid_behind_impedance or no_syn_machine:
         # A bare Slack holds its bus voltage fixed, so a fault on the External Grid bus did
         # nothing at all. With no synchronous machine ANDES also fails at the first switching
         # event with "list index out of range". Put a classical source behind each External
-        # Grid: its short-circuit impedance (S_sc max and R/X max), very large inertia, so it is
-        # the stiff grid of the power flow but its bus voltage drops with the current it supplies.
+        # Grid: its short-circuit impedance (S_sc and R/X of grid_sc_case), very large inertia, so
+        # it is the stiff grid of the power flow but its bus voltage drops with the current it supplies.
+        sc_case = "min" if str(grid_sc_case or "max").strip().lower() == "min" else "max"
         for slack_idx, eg_bus, eg_vn, eg_el in ext_grid_slacks:
-            s_sc = _sf(eg_el.get("s_sc_max_mva"), 0.0)
+            case_used = sc_case
+            s_sc = _sf(eg_el.get(f"s_sc_{case_used}_mva"), 0.0)
+            if s_sc <= 0 and case_used == "min":
+                case_used = "max"  # S"k min not set: the grid's maximum values
+                s_sc = _sf(eg_el.get("s_sc_max_mva"), 0.0)
             used_default_ssc = s_sc <= 0
             if used_default_ssc:
                 s_sc = 10000.0
-            rx = max(_sf(eg_el.get("rx_max"), 0.0), 0.0)
+            rx = max(_sf(eg_el.get(f"rx_{case_used}"), 0.0), 0.0)
             # |Z| = Sn / S_sc on the source's own base Sn = sn_base, split by R/X. (|Z| used to be
             # capped at 1 pu, which made any grid weaker than Sn as strong as Sn.)
             z_sc = max(sn_base / s_sc, 1e-4)
@@ -1255,9 +1265,12 @@ def build_system(
                 xd1=xd1,
             )
             ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
+            grid_sources.append({"name": str(ufname), "case_requested": sc_case, "case_used": case_used,
+                                 "s_sc_mva": s_sc, "rx": rx, "default_s_sc": used_default_ssc})
             defaults_applied.append(
                 f"External Grid '{ufname}': modelled as a stiff source behind its short-circuit "
-                f"impedance (H={_GRID_SOURCE_H_S:g} s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}, "
+                f"impedance (H={_GRID_SOURCE_H_S:g} s, S_sc {case_used}={s_sc:.0f} MVA"
+                f"{' default' if used_default_ssc else ''}{' (S_sc min not set)' if case_used != sc_case else ''}, "
                 f"R/X={rx:g}, frequency damping {2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S * sn_base / freq:,.0f} MW/Hz)."
             )
 
@@ -1354,6 +1367,7 @@ def build_system(
         "statcom_map": statcom_map,
         "data_centres": data_centres,
         "n_buses": len(bus_name_by_idx),
+        "grid_sources": grid_sources,
     }
     return ss, meta
 

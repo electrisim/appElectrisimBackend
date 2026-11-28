@@ -5,18 +5,19 @@ eigenvalue analysis requires at least one synchronous Generator, renewable dynam
 STATCOM. External Grid alone is not sufficient." A network fed only by an External Grid, such
 as the "Industrial plant 6 kV with motors" template, could only be studied in steady state.
 
-Now, with no generator or converter plant in the network, each External Grid is a source behind
-its short-circuit impedance, as in Transient Stability: |Z| = S_base / S"k max, split by
-R/X max. (Transient Stability used the reactance alone, capped at 1 pu: a grid weaker than the
-100 MVA system base came out as strong as 100 MVA, and R/X was ignored.)
+Now each External Grid is a source behind its short-circuit impedance, as in Transient
+Stability: |Z| = S_base / S"k, split by R/X (S"k min and R/X min by default, the study's
+grid_sc_case). (Transient Stability used the reactance alone, capped at 1 pu: a grid weaker than
+the 100 MVA system base came out as strong as 100 MVA, and R/X was ignored.) Steady-state mode
+puts the grid behind the same impedance from the start on.
 
 1. A 3000 MVA, 110 kV grid feeds a 2.5 MW motor through a 6.3 MVA transformer. The motor runs
-   up and passes. The dip right after the start is within a few percent of steady-state mode on
-   the same diagram, and the 110 kV bus dips by the grid's share of the source impedance
-   (steady-state mode keeps the External Grid an ideal source, so its bus does not move there).
+   up and passes. Right after the start the dips at the 6 kV and the 110 kV bus are within a few
+   percent of steady-state mode on the same diagram, and the 110 kV bus dips by the grid's share
+   of the source impedance.
 2. A weak 60 MVA, 20 kV grid at R/X 0 and 1: the grid source in ANDES is exactly that
-   impedance, and the dips at the grid bus and at the motor bus match steady-state mode with the
-   grid drawn as a line of that impedance from an ideal source.
+   impedance, and the dips at the grid bus and at the motor bus match steady-state mode, which
+   gives the same dips as the grid drawn as a line of that impedance from an ideal source.
 3. The template itself, as the frontend sends it, with all in-service motors started DOL: all
    six motors run up.
 
@@ -130,10 +131,10 @@ def test_grid_only_network():
           f"(grid share {share * dyn['mv']:.3f} %, steady state {steady['hv']:.3f} %)")
     assert m["pass"] is True and m["stalled"] is False, m
     assert 0.0 < m["start_time_s"] < T_END - T_START, m
-    # The same locked rotor on the same network as steady-state mode.
-    assert abs(dyn["mv"] / steady["mv"] - 1.0) < 0.05, (dyn["mv"], steady["mv"])
+    # The same locked rotor on the same network and the same grid source as steady-state mode.
+    for key in ("mv", "hv"):
+        assert abs(dyn[key] / steady[key] - 1.0) < 0.03, (key, dyn[key], steady[key])
     # Not an ideal source: the grid bus drops with the current through the grid's own impedance.
-    assert abs(steady["hv"]) < 1e-6, steady
     assert abs(dyn["hv"] / (share * dyn["mv"]) - 1.0) < 0.1, (dyn["hv"], share * dyn["mv"])
 
 
@@ -146,18 +147,22 @@ def test_weak_grid_source_impedance():
         assert abs(x - z / math.sqrt(1.0 + rx * rx)) < 1e-9 and abs(r - rx * x) < 1e-9, (rx, r, x)
 
         dyn = first_dips(solve(diagram(elements, "dynamic")))
-        # The same grid in steady-state mode: an ideal source behind a line of that impedance.
+        steady = steady_dips(solve(diagram(elements, "steady")))
+        # The same grid drawn as an ideal source behind a line of that impedance.
         x_ohm = 20.0 ** 2 / s_sc / math.sqrt(1.0 + rx * rx)
         line = {"typ": "Line0", "name": "mxCell_zg", "id": "zg", "userFriendlyName": "Grid impedance",
                 "busFrom": "mxCell_src", "busTo": "mxCell_pcc", "r_ohm_per_km": str(rx * x_ohm),
                 "x_ohm_per_km": str(x_ohm), "c_nf_per_km": "0", "g_us_per_km": "0", "length_km": "1",
                 "max_i_ka": "10", "type": "cs", "parallel": "1", "df": "1", "in_service": "true"}
-        steady = steady_dips(solve(diagram([grid("src", 1e6, 0.0), bus("src", 20)] + elements[1:] + [line],
-                                           "steady")))
+        drawn = steady_dips(solve(diagram([grid("src", 1e6, 0.0), bus("src", 20)] + elements[1:] + [line],
+                                          "steady")))
         print(f"60 MVA grid, R/X {rx:g}: source {r:.4f} + j{x:.4f} pu; dip at 20 kV {dyn['pcc']:.2f} % "
-              f"(steady state behind a line {steady['pcc']:.2f} %), at 6 kV {dyn['mv']:.2f} % ({steady['mv']:.2f} %)")
+              f"(steady state {steady['pcc']:.2f} %, behind a line {drawn['pcc']:.2f} %), at 6 kV {dyn['mv']:.2f} % "
+              f"({steady['mv']:.2f} %, {drawn['mv']:.2f} %)")
         for key in ("pcc", "mv"):
-            assert abs(dyn[key] / steady[key] - 1.0) < 0.05, (rx, key, dyn[key], steady[key])
+            # Steady state puts the grid behind exactly that impedance (to the 1e6 MVA source's 1e-4 pu).
+            assert abs(steady[key] / drawn[key] - 1.0) < 2e-3, (rx, key, steady[key], drawn[key])
+            assert abs(dyn[key] / steady[key] - 1.0) < 0.03, (rx, key, dyn[key], steady[key])
 
 
 def test_template():
