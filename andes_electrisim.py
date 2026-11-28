@@ -446,12 +446,17 @@ def build_system(
     in_data: Dict[str, Any],
     params: Optional[Dict[str, Any]] = None,
     grid_behind_impedance: bool = False,
+    dynamic_loads: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Build an ANDES System from Electrisim JSON.
 
     grid_behind_impedance: model each External Grid as a source behind its short-circuit
     impedance (time-domain studies), not an ideal voltage source.
+
+    dynamic_loads: the caller adds dynamic loads of its own before setup (the induction motors
+    of Motor Starting). A network fed only by External Grids is then valid: with no synchronous
+    machine in it, each External Grid becomes a source behind its short-circuit impedance.
 
     Returns (ss, meta) where meta includes bus_map, line_map, gen_map, defaults_applied, warnings.
     """
@@ -1215,19 +1220,24 @@ def build_system(
                 f"load-flow reactive power; in a dip it adds Kqv = {kqv:g} times the voltage drop beyond ±{db * 100:g} % "
                 f"as reactive current, up to {imax:g} p.u.")
 
-    no_syn_machine = renewable_count + statcom_count > 0 and ss.GENROU.n + ss.GENCLS.n == 0
+    no_syn_machine = (renewable_count + statcom_count > 0 or dynamic_loads) and ss.GENROU.n + ss.GENCLS.n == 0
     if grid_behind_impedance or no_syn_machine:
         # A bare Slack holds its bus voltage fixed, so a fault on the External Grid bus did
         # nothing at all. With no synchronous machine ANDES also fails at the first switching
         # event with "list index out of range". Put a classical source behind each External
-        # Grid: reactance from its short-circuit power, very large inertia, so it is the stiff
-        # grid of the power flow but its bus voltage can collapse during a fault.
+        # Grid: its short-circuit impedance (S_sc max and R/X max), very large inertia, so it is
+        # the stiff grid of the power flow but its bus voltage drops with the current it supplies.
         for slack_idx, eg_bus, eg_vn, eg_el in ext_grid_slacks:
             s_sc = _sf(eg_el.get("s_sc_max_mva"), 0.0)
             used_default_ssc = s_sc <= 0
             if used_default_ssc:
                 s_sc = 10000.0
-            xd1 = min(max(sn_base / s_sc, 1e-4), 1.0)  # on the source's own base Sn = sn_base
+            rx = max(_sf(eg_el.get("rx_max"), 0.0), 0.0)
+            # |Z| = Sn / S_sc on the source's own base Sn = sn_base, split by R/X. (|Z| used to be
+            # capped at 1 pu, which made any grid weaker than Sn as strong as Sn.)
+            z_sc = max(sn_base / s_sc, 1e-4)
+            xd1 = z_sc / math.sqrt(1.0 + rx * rx)
+            ra = rx * xd1
             ss.add(
                 "GENCLS",
                 idx=f"GENCLS_EG_{slack_idx}",
@@ -1241,19 +1251,21 @@ def build_system(
                 # Damping stands for the primary frequency response of the external system: after
                 # a power change its frequency settles back (time constant 2H/D) instead of drifting.
                 D=2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S,
-                ra=0.0,
+                ra=ra,
                 xd1=xd1,
             )
             ufname = eg_el.get("userFriendlyName") or eg_el.get("name") or slack_idx
             defaults_applied.append(
                 f"External Grid '{ufname}': modelled as a stiff source behind its short-circuit "
                 f"impedance (H={_GRID_SOURCE_H_S:g} s, S_sc={s_sc:.0f} MVA{' default' if used_default_ssc else ''}, "
-                f"frequency damping {2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S * sn_base / freq:,.0f} MW/Hz)."
+                f"R/X={rx:g}, frequency damping {2.0 * _GRID_SOURCE_H_S / _GRID_SOURCE_TAU_S * sn_base / freq:,.0f} MW/Hz)."
             )
 
     # A grid with only data-centre loads is still a valid time-domain study: the External Grid
-    # becomes a source behind its impedance and the UPS logic is the dynamics of interest.
-    if gen_count + renewable_count + statcom_count == 0 and not (grid_behind_impedance and data_centres):
+    # becomes a source behind its impedance and the UPS logic is the dynamics of interest. So is
+    # one with only the caller's dynamic loads (Motor Starting's motors).
+    if gen_count + renewable_count + statcom_count == 0 and not (
+            (grid_behind_impedance and data_centres) or dynamic_loads):
         raise ValueError(
             "Transient / eigenvalue analysis requires at least one synchronous Generator, "
             "renewable dynamic plant or STATCOM. External Grid alone is not sufficient."
