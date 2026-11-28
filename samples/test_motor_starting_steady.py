@@ -71,7 +71,8 @@ def main() -> None:
                            efficiency_n_percent="95", loading_percent="100", lrc_pu="7", vn_kv="0.4"))
     motor = result["motors"][0]
     assert abs(motor["lrc_pu"] - 7.0) < 1e-9, motor
-    assert abs(motor["i_start_ka"] / motor["i_rated_ka"] - 7.0) < 1e-6, motor
+    # 7 x In at rated voltage; I start is the current at the voltage the motor sees.
+    assert abs(motor["i_start_ka"] / (motor["i_rated_ka"] * motor["v_start_pu"]) - 7.0) < 1e-6, motor
     print("motor starting (steady) OK")
 
 
