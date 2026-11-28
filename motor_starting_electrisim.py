@@ -7,9 +7,18 @@ with locked-rotor current scaled by starting method (DOL, soft-start, star-delta
 autotransformer, reactor).
 
 Dynamic: ANDES Motor3 + Toggle startup (DOL native; soft-start approximated).
+
+Both modes model the sources alike. Before the start every source holds the voltage of the
+load flow. From the start on, each External Grid is a fixed voltage behind its short-circuit
+impedance (S"k min or max, the study's ``grid_sc_case``), so its bus dips with the current it
+supplies. Synchronous generators are their own dynamic model in ANDES; in the steady-state
+locked-rotor snapshot each is a fixed voltage behind its transient reactance xd' (its voltage
+regulator has not acted yet), and it controls its voltage again after the start.
 """
 from __future__ import annotations
 
+import cmath
+import contextlib
 import json
 import math
 import re
@@ -34,6 +43,15 @@ VALID_METHODS = ("dol", "soft_start", "star_delta", "autotransformer", "reactor"
 
 # Time step of the dynamic (ANDES) motor start: dips and run-up times change by under 1 % below it.
 _TDS_STEP_S = 0.005
+
+# A synchronous generator's transient reactance xd' when none is entered: the GENROU default of
+# the dynamic model (andes_electrisim._DEFAULT_GENROU["xd1"]), on the generator's rating.
+_GEN_XD1_DEFAULT = 0.3
+# Smallest grid source impedance, in pu on the study's system base (sn_mva, 100 MVA by default),
+# as the ANDES grid source: S"k is capped at sn_mva / 1e-4 (1e6 MVA on 100 MVA).
+_Z_SOURCE_MIN_PU = 1e-4
+# Short-circuit power assumed for an External Grid with none set, as the ANDES grid source.
+_S_SC_DEFAULT_MVA = 10000.0
 
 
 def _sf(value: Any, default: float = 0.0) -> float:
@@ -245,6 +263,169 @@ def _run_pp(net) -> Optional[str]:
         return str(e)
 
 
+def _grid_sc_case(params: Dict[str, Any]) -> str:
+    """The External Grid impedance comes from S"k min ("min", the deeper dip, default) or S"k max."""
+    return "max" if str(params.get("grid_sc_case") or "min").strip().lower() == "max" else "min"
+
+
+def _grid_source_notes(grid_sources: List[Dict[str, Any]]) -> List[str]:
+    """Warnings for External Grids whose impedance did not come from the requested S"k
+    (worded as the External Grid dialog names the fields)."""
+    notes = []
+    for g in grid_sources:
+        if g.get("default_s_sc"):
+            notes.append(f"External Grid '{g['name']}': no Short Circuit Power is set; its impedance uses "
+                         f"{g['s_sc_mva']:.0f} MVA.")
+        elif g.get("case_used") != g.get("case_requested"):
+            notes.append(f"External Grid '{g['name']}': Min Short Circuit Power is not set; its impedance uses "
+                         f"the Max Short Circuit Power, {g['s_sc_mva']:.0f} MVA.")
+    return notes
+
+
+def _generator_transient_impedance(el: Dict[str, Any], bus_vn_kv: float, sn_base: float) -> Tuple[complex, float, float]:
+    """(ra + j xd' on the system base at the bus voltage, xd' pu, rating MVA) of a synchronous generator.
+
+    The same machine data, defaults and bases as the generator of the dynamic (ANDES) model.
+    """
+    def _value(keys: Tuple[str, ...], default: float, positive: bool) -> float:
+        for key in keys:
+            raw = el.get(key)
+            if raw is None or str(raw).strip().lower() in ("", "none", "null"):
+                continue
+            v = _sf(raw, default)
+            if positive and not v > 0:
+                continue
+            return v
+        return default
+
+    machine = str(el.get("dyn_machine_model") or el.get("machine_model") or "GENROU").strip().upper()
+    xd1_keys = ("dyn_xd1", "xd1", "xdss_pu") if machine == "GENCLS" else ("dyn_xd1", "xd1")
+    xd1 = _value(xd1_keys, _GEN_XD1_DEFAULT, True)
+    ra = max(_value(("dyn_ra", "ra"), 0.0, False), 0.0)
+    sn = _sf(el.get("sn_mva"), 0.0)
+    if sn <= 0:
+        sn = max(abs(_sf(el.get("p_mw")) * _sf(el.get("scaling"), 1.0)) * 1.25, 100.0)
+    vn = _sf(el.get("vn_kv"), 0.0)
+    if vn <= 0 or (bus_vn_kv > 0 and abs(vn - bus_vn_kv) / bus_vn_kv > 0.5):
+        vn = bus_vn_kv
+    scale = sn_base / sn * ((vn / bus_vn_kv) ** 2 if bus_vn_kv > 0 else 1.0)
+    return complex(ra, xd1) * scale, xd1, sn
+
+
+def _source_emfs(net, in_data: Dict[str, Any], case: str, warnings: List[str],
+                 sn_study_mva: float = 100.0) -> Dict[str, List[Dict[str, Any]]]:
+    """The voltage behind each source's impedance, from the pre-start load flow in ``net.res_*``.
+
+    External Grid: its short-circuit impedance |Z| = U^2 / S"k (``case``), split by R/X, the
+    source of the dynamic mode (whose system base is ``sn_study_mva``). Synchronous generator:
+    ra + j xd'. E = V + Z I with V and I of the load flow, so the network is unchanged until the
+    start draws more current.
+    """
+    sb = float(net.sn_mva)  # pandapower's own base (1 MVA by default), not the study's
+    out: Dict[str, List[Dict[str, Any]]] = {"grids": [], "generators": []}
+
+    def _v(bus: int) -> complex:
+        return float(net.res_bus.at[bus, "vm_pu"]) * cmath.exp(1j * math.radians(float(net.res_bus.at[bus, "va_degree"])))
+
+    def _emf(bus: int, p_mw: Any, q_mvar: Any, z: complex) -> Optional[complex]:
+        p, q = _sf(p_mw, float("nan")), _sf(q_mvar, float("nan"))
+        if math.isnan(p) or math.isnan(q) or bus not in net.res_bus.index:
+            return None
+        v = _v(bus)
+        return v + z * (complex(p, q) / sb / v).conjugate() if abs(v) > 0 else None
+
+    names = getattr(net, "user_friendly_names", None) or {}
+    for idx, row in net.ext_grid.iterrows():
+        if not _sb(row.get("in_service"), True) or idx not in net.res_ext_grid.index:
+            continue
+        name = str(names.get(row.get("name"), row.get("name")))
+        case_used = case
+        s_sc = _sf(row.get(f"s_sc_{case}_mva"), 0.0)
+        if s_sc <= 0 and case == "min":
+            case_used = "max"
+            s_sc = _sf(row.get("s_sc_max_mva"), 0.0)
+        default_s_sc = s_sc <= 0
+        if default_s_sc:
+            s_sc = _S_SC_DEFAULT_MVA
+        rx = max(_sf(row.get(f"rx_{case_used}"), 0.0), 0.0)
+        z_abs = sb / min(s_sc, sn_study_mva / _Z_SOURCE_MIN_PU)
+        x = z_abs / math.sqrt(1.0 + rx * rx)
+        bus = int(row["bus"])
+        z = complex(rx * x, x)
+        e = _emf(bus, net.res_ext_grid.at[idx, "p_mw"], net.res_ext_grid.at[idx, "q_mvar"], z)
+        if e is None:
+            warnings.append(f"External Grid '{name}': no load-flow result; it stays an ideal source.")
+            continue
+        out["grids"].append({"index": idx, "bus": bus, "z": z, "e": e, "name": name, "case_requested": case,
+                             "case_used": case_used, "s_sc_mva": s_sc, "rx": rx, "default_s_sc": default_s_sc})
+
+    if hasattr(net, "gen") and net.gen is not None and not net.gen.empty:
+        # Only the diagram's synchronous generators: a STATCOM's voltage-source stand-in stays as it is.
+        machines = {str(el.get("name")): el for el in in_data.values()
+                    if isinstance(el, dict) and str(el.get("typ", "")).startswith("Generator")
+                    and "Asymmetric" not in str(el.get("typ")) and "1ph" not in str(el.get("typ"))}
+        for idx, row in net.gen.iterrows():
+            el = machines.get(str(row.get("name")))
+            if el is None or not _sb(row.get("in_service"), True) or idx not in net.res_gen.index:
+                continue
+            bus = int(row["bus"])
+            name = str(el.get("userFriendlyName") or el.get("name"))
+            z, xd1, sn = _generator_transient_impedance(el, float(net.bus.at[bus, "vn_kv"]), sb)
+            e = _emf(bus, net.res_gen.at[idx, "p_mw"], net.res_gen.at[idx, "q_mvar"], z)
+            if e is None:
+                warnings.append(f"Generator '{name}': no load-flow result; it keeps its voltage during the start.")
+                continue
+            out["generators"].append({"index": idx, "bus": bus, "z": z, "e": e, "name": name, "xd1_pu": xd1,
+                                      "sn_mva": sn})
+    return out
+
+
+@contextlib.contextmanager
+def _sources_behind_impedance(net, sources: Dict[str, List[Dict[str, Any]]], generators: bool):
+    """Within the block each External Grid (and, with ``generators``, each synchronous generator)
+    is a fixed voltage behind its impedance: the source sits on a helper bus at its EMF and the
+    impedance joins that bus to its own. The tables are put back as they were on exit (the
+    load-flow results of the block stay, for the buses and branches of the diagram)."""
+    saved = {name: net[name].copy() for name in ("bus", "ext_grid", "gen", "impedance")}
+
+    def _behind(src: Dict[str, Any]) -> int:
+        aux = pp.create_bus(net, vn_kv=float(net.bus.at[src["bus"], "vn_kv"]), name=f"__motor_start_emf_{src['name']}")
+        pp.create_impedance(net, aux, src["bus"], rft_pu=src["z"].real, xft_pu=src["z"].imag,
+                            sn_mva=float(net.sn_mva), name=f"__motor_start_z_{src['name']}")
+        return aux
+
+    try:
+        for g in sources["grids"]:
+            idx = g["index"]
+            net.ext_grid.at[idx, "bus"] = _behind(g)
+            net.ext_grid.at[idx, "vm_pu"] = abs(g["e"])
+            net.ext_grid.at[idx, "va_degree"] = math.degrees(cmath.phase(g["e"]))
+        if generators:
+            for g in sources["generators"]:
+                aux = _behind(g)
+                net.gen.at[g["index"], "in_service"] = False
+                pp.create_ext_grid(net, aux, vm_pu=abs(g["e"]), va_degree=math.degrees(cmath.phase(g["e"])),
+                                   name=f"__motor_start_emf_{g['name']}")
+        yield
+    finally:
+        for name, table in saved.items():
+            net[name] = table
+
+
+def _source_model_notes(sources: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    notes = [
+        f"External Grid '{g['name']}': a fixed voltage behind its short-circuit impedance during and after the "
+        f"start ({g['case_used']} short-circuit power {g['s_sc_mva']:.0f} MVA, R/X {g['rx']:g})."
+        for g in sources["grids"]
+    ]
+    notes += [
+        f"Generator '{g['name']}': a fixed voltage behind its transient reactance xd' = {g['xd1_pu']:g} pu "
+        f"({g['sn_mva']:g} MVA) during the start; it controls its voltage again after it."
+        for g in sources["generators"]
+    ]
+    return notes
+
+
 def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) -> Dict[str, Any]:
     warnings: List[str] = []
     method = str(params.get("starting_method") or params.get("method") or "dol")
@@ -287,6 +468,13 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
         }
     vm_before = _snapshot_bus_vm(net)
 
+    # From the start on, the sources are their voltage behind impedance from this load flow
+    # (the External Grid's short-circuit impedance, a generator's xd'), as in dynamic mode.
+    grid_case = _grid_sc_case(params)
+    sn_study = _sf(params.get("sn_mva"), 100.0)
+    sources = _source_emfs(net, in_data, grid_case, warnings, sn_study if sn_study > 0 else 100.0)
+    warnings.extend(_grid_source_notes(sources["grids"]))
+
     # --- During: each starting motor is its locked-rotor impedance ---
     # A locked rotor is an impedance, so it is a shunt drawing the locked-rotor P and Q at the
     # motor's rated voltage: its current follows the voltage the motor sees. (A constant-power
@@ -328,27 +516,29 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
         if drop:
             net.shunt.drop(drop, inplace=True)
 
-    err = _run_pp(net)
-    soft = [s for s in starts if s["constant_current"] and s["s_lr"] > 0]
-    for _ in range(30 if soft and not err else 0):
-        worst = 0.0
-        for s in soft:
-            v_kv = float(net.res_bus.at[s["bus"], "vm_pu"]) * s["bus_vn"]
-            if v_kv <= 0:
-                continue
-            vn = s["rated"]["vn_kv"]
-            # The shunt that draws the limit at this voltage, but never more than the motor's own
-            # locked-rotor admittance (a soft starter fully on is DOL).
-            s_ref = min(math.sqrt(3.0) * vn * s["k_m"] * s["i_lr"] * vn / v_kv, s["s_lr"])
-            s_old = math.hypot(float(net.shunt.at[s["shunt"], "p_mw"]), float(net.shunt.at[s["shunt"], "q_mvar"]))
-            worst = max(worst, abs(s_ref - s_old) / s["s_lr"])
-            net.shunt.at[s["shunt"], "p_mw"] = s_ref * s["rated"]["cos_lr"]
-            net.shunt.at[s["shunt"], "q_mvar"] = s_ref * s["rated"]["sin_lr"]
-        if worst < 1e-9:
-            break
+    # The generators' voltage regulators have not acted yet: each is a voltage behind xd'.
+    with _sources_behind_impedance(net, sources, generators=True):
         err = _run_pp(net)
-        if err:
-            break
+        soft = [s for s in starts if s["constant_current"] and s["s_lr"] > 0]
+        for _ in range(30 if soft and not err else 0):
+            worst = 0.0
+            for s in soft:
+                v_kv = float(net.res_bus.at[s["bus"], "vm_pu"]) * s["bus_vn"]
+                if v_kv <= 0:
+                    continue
+                vn = s["rated"]["vn_kv"]
+                # The shunt that draws the limit at this voltage, but never more than the motor's own
+                # locked-rotor admittance (a soft starter fully on is DOL).
+                s_ref = min(math.sqrt(3.0) * vn * s["k_m"] * s["i_lr"] * vn / v_kv, s["s_lr"])
+                s_old = math.hypot(float(net.shunt.at[s["shunt"], "p_mw"]), float(net.shunt.at[s["shunt"], "q_mvar"]))
+                worst = max(worst, abs(s_ref - s_old) / s["s_lr"])
+                net.shunt.at[s["shunt"], "p_mw"] = s_ref * s["rated"]["cos_lr"]
+                net.shunt.at[s["shunt"], "q_mvar"] = s_ref * s["rated"]["sin_lr"]
+            if worst < 1e-9:
+                break
+            err = _run_pp(net)
+            if err:
+                break
 
     if err:
         _remove_start_shunts()
@@ -408,7 +598,10 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
     for idx in selected:
         net.motor.at[idx, "in_service"] = True
 
-    err = _run_pp(net)
+    # After the start the generators control their voltage again; the External Grid stays a
+    # voltage behind its impedance, so its bus settles a little lower with the motor running.
+    with _sources_behind_impedance(net, sources, generators=False):
+        err = _run_pp(net)
     if err:
         warnings.append(f"Post-start (after) load flow failed: {err}")
         vm_after = {}
@@ -476,9 +669,11 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
             "i_limit_pu": _sf(params.get("i_limit_pu"), 3.0),
             "at_tap_pu": _sf(params.get("at_tap_pu"), 0.8),
             "reactor_x_pu": _sf(params.get("reactor_x_pu"), 0.25),
+            "grid_sc_case": grid_case,
         },
         "timeseries": None,
         "warnings": warnings,
+        "defaults_applied": _source_model_notes(sources),
     }
 
 
@@ -734,6 +929,7 @@ def _dynamic_start_rebuild(
         # from the same in_data by calling a helper that adds motors before setup.
         ss, meta, motor_map = _build_system_with_motors(in_data, dyn_params, motors, method, t_start, warnings)
         warnings.extend(meta.get("warnings") or [])
+        warnings.extend(_grid_source_notes(meta.get("grid_sources") or []))
     except Exception as e:
         return {
             "error": True,
@@ -971,6 +1167,7 @@ def _dynamic_start_rebuild(
             "t_start": t_start,
             "t_end": t_end,
             "i_limit_pu": _sf(params.get("i_limit_pu"), 3.0),
+            "grid_sc_case": _grid_sc_case(params),
         },
         "timeseries": {
             "t": [_clean(x) for x in t],
@@ -1014,10 +1211,11 @@ def _build_system_with_motors(
 
     andes.System = SystemNoSetup
     try:
-        # The motors are the dynamics here. With no generator or converter plant in the
-        # network, each External Grid becomes a source behind its short-circuit impedance
-        # (S_sc max, R/X max), as in Transient Stability.
-        ss, meta = andes_electrisim.build_system(in_data, params, dynamic_loads=True)
+        # The motors are the dynamics here. Each External Grid is a source behind its
+        # short-circuit impedance (S"k and R/X of the study's grid_sc_case), with or without a
+        # generator in the network, as in steady-state mode.
+        ss, meta = andes_electrisim.build_system(in_data, params, grid_behind_impedance=True,
+                                                 dynamic_loads=True, grid_sc_case=_grid_sc_case(params))
     finally:
         andes.System = original_system
 

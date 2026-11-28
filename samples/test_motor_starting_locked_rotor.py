@@ -7,11 +7,13 @@ the "Industrial plant 6 kV with motors" template stopped with "Load flow failed 
 locked-rotor (during) snapshot" for "All in-service motors" (6 motors, about 45 MVA
 locked-rotor, on a 16 MVA, 10 % transformer).
 
-1. One motor at the end of a line from a 1.0 pu source. The motor-bus voltage is the exact
-   impedance divider Z_eq / (Z_eq + Z_line), and I start is the current at that voltage.
-   The starter factor k keeps its meaning (current at rated voltage relative to DOL):
-   DOL 1, star-delta 1/3, autotransformer tap^2 and reactor 1/(1 + x) scale the
-   locked-rotor admittance; a soft starter holds its current limit whatever the voltage.
+1. One motor at the end of a line from a 6 kV External Grid. From the start on the grid is its
+   1.0 pu voltage behind its short-circuit impedance Z_grid (S"k min, the default, or S"k max),
+   so the motor-bus voltage is the exact impedance divider Z_eq / (Z_eq + Z_line + Z_grid),
+   and I start is the current at that voltage. The starter factor k keeps its meaning (current
+   at rated voltage relative to DOL): DOL 1, star-delta 1/3, autotransformer tap^2 and reactor
+   1/(1 + x) scale the locked-rotor admittance; a soft starter holds its current limit whatever
+   the voltage.
 2. The template's six motors started together on its 16 MVA, 10 % transformer solve, and each
    motor's current follows the voltage it sees. The dip fails the 15 % limit, as it should.
 
@@ -65,6 +67,12 @@ def solve(data):
 
 PN, COS_N, EFF, LRC, RX, VN = 2.5, 0.89, 96.5, 6.0, 0.1, 6.0
 Z_LINE = complex(0.1, 0.4)  # ohm: 1 km of 0.1 + j0.4 ohm/km, no charging
+S_SC = {"max": 500.0, "min": 400.0}  # MVA, the grid's R/X is 0.1 in both cases
+
+
+def z_grid(case):
+    """The External Grid's short-circuit impedance in ohm: U^2 / S"k split by R/X."""
+    return VN ** 2 / S_SC[case] * complex(0.1, 1.0) / math.sqrt(1.0 + 0.1 ** 2)
 
 
 def divider_network(method, **settings):
@@ -84,37 +92,49 @@ def divider_network(method, **settings):
     return solve(data)
 
 
-def expected(method):
-    """(k, V at the motor bus in pu, I start in kA) from the motor's equivalent locked-rotor impedance."""
+def expected(method, case="min"):
+    """(k, V at the motor bus and at the grid bus in pu, I start in kA) from the motor's equivalent
+    locked-rotor impedance, fed by the grid's 1.0 pu voltage behind Z_grid and the line."""
     sn = PN / (EFF / 100.0) / COS_N
     i_lr = LRC * sn / (math.sqrt(3.0) * VN)
     angle = math.atan2(1.0, RX)  # locked-rotor impedance angle from R/X
     z_lr = VN / (math.sqrt(3.0) * i_lr) * cmath.exp(1j * angle)
-    v_src = VN / math.sqrt(3.0)  # kV per phase at 1.0 pu
+    v_src = VN / math.sqrt(3.0)  # kV per phase at 1.0 pu: no load before the start, so E = 1.0 pu
+    z_src = Z_LINE + z_grid(case)
     if method == "soft_start":
         k = 3.0 / LRC  # current limit 3 x In, held at any voltage
         i = k * i_lr
-        drop = i * cmath.exp(-1j * angle) * Z_LINE  # I lags the motor-bus voltage by the locked-rotor angle
+        drop = i * cmath.exp(-1j * angle) * z_src  # I lags the motor-bus voltage by the locked-rotor angle
         v = math.sqrt(v_src ** 2 - drop.imag ** 2) - drop.real
-        return k, v / v_src, i
+        i_phasor = i * cmath.exp(-1j * angle)  # on the motor-bus voltage as the reference
+        v_grid = abs(v + i_phasor * Z_LINE) / v_src
+        return k, v / v_src, v_grid, i
     k = {"dol": 1.0, "star_delta": 1.0 / 3.0, "autotransformer": 0.8 ** 2, "reactor": 1.0 / 1.25}[method]
     z_eq = z_lr / k
-    v = abs(z_eq / (z_eq + Z_LINE))
-    return k, v, k * i_lr * v
+    v = abs(z_eq / (z_eq + z_src))
+    v_grid = abs((z_eq + Z_LINE) / (z_eq + z_src))
+    return k, v, v_grid, k * i_lr * v
 
 
 def test_divider():
-    for method in ("dol", "star_delta", "autotransformer", "reactor", "soft_start"):
-        result = divider_network(method)
-        k, v_expected, i_expected = expected(method)
+    for case, method in [("min", m) for m in ("dol", "star_delta", "autotransformer", "reactor", "soft_start")] + [
+            ("max", "dol"), ("max", "soft_start")]:
+        # S"k min is the default.
+        result = divider_network(method, **({"grid_sc_case": "max"} if case == "max" else {}))
+        k, v_expected, v_grid_expected, i_expected = expected(method, case)
         m = result["motors"][0]
-        bus = {b["id"]: b for b in result["buses"]}["m"]
-        print(f"{method:16s} k={m['k_method']:.4f}  V={bus['vm_during']:.5f} pu (expected {v_expected:.5f})  "
+        buses = {b["id"]: b for b in result["buses"]}
+        bus, src = buses["m"], buses["src"]
+        print(f"S\"k {case} {method:16s} k={m['k_method']:.4f}  V={bus['vm_during']:.5f} pu (expected "
+              f"{v_expected:.5f}), grid bus {src['vm_during']:.5f} pu ({v_grid_expected:.5f})  "
               f"I start={m['i_start_ka']:.4f} kA (expected {i_expected:.4f})")
+        assert result["parameters"]["grid_sc_case"] == case, result["parameters"]
+        assert len(result["buses"]) == 2, [b["id"] for b in result["buses"]]  # no helper buses
         assert abs(m["k_method"] - k) < 1e-9, (method, m["k_method"], k)
-        assert abs(bus["vm_before"] - 1.0) < 1e-6, bus
-        assert abs(bus["vm_during"] - v_expected) < 2e-4, (method, bus["vm_during"], v_expected)
-        assert abs(m["i_start_ka"] / i_expected - 1.0) < 1e-3, (method, m["i_start_ka"], i_expected)
+        assert abs(bus["vm_before"] - 1.0) < 1e-6 and abs(src["vm_before"] - 1.0) < 1e-6, (bus, src)
+        assert abs(bus["vm_during"] - v_expected) < 2e-4, (case, method, bus["vm_during"], v_expected)
+        assert abs(src["vm_during"] - v_grid_expected) < 2e-4, (case, method, src["vm_during"], v_grid_expected)
+        assert abs(m["i_start_ka"] / i_expected - 1.0) < 1e-3, (case, method, m["i_start_ka"], i_expected)
         assert abs(m["v_start_pu"] - bus["vm_during"]) < 1e-9, m  # motor rated 6 kV on a 6 kV bus
 
 
