@@ -595,10 +595,13 @@ def build_system(
         vn1 = bus_vn.get(bus1, 110.0)
         vn2 = bus_vn.get(bus2, vn1)
         zb = _z_base_ohm(vn1, sn_base)
-        r_ohm = _sf(el.get("r_ohm_per_km")) * length
-        x_ohm = _sf(el.get("x_ohm_per_km")) * length
-        c_nf = _sf(el.get("c_nf_per_km")) * length
-        g_us = _sf(el.get("g_us_per_km")) * length
+        # n parallel circuits, as the load flow takes them: 1/n of the impedance, n times the
+        # charging and conductance.
+        parallel = max(_whole_number(el.get("parallel"), 1.0), 1.0)
+        r_ohm = _sf(el.get("r_ohm_per_km")) * length / parallel
+        x_ohm = _sf(el.get("x_ohm_per_km")) * length / parallel
+        c_nf = _sf(el.get("c_nf_per_km")) * length * parallel
+        g_us = _sf(el.get("g_us_per_km")) * length * parallel
         r_pu = r_ohm / zb if zb else 0.0
         x_pu = x_ohm / zb if zb else 0.01
         # B (S) = 2*pi*f*C; C in F = c_nf * 1e-9; b_pu = B * Zb

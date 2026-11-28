@@ -12,10 +12,16 @@ Now the transformer is the branch pandapower builds: the rated voltages, after t
 own side, give the off-nominal ratio (vn_hv / V_HV bus) / (vn_lv / V_LV bus), and the impedance is
 referred to the LV bus by (vn_lv / V_LV bus)^2 and divided by the parallel count.
 
+Lines had the same gap for parallel circuits: ANDES took one circuit, so the template's
+"Cable to workshop (2x NAYY 4x150)" had twice its impedance and the Workshop bus sat at 1.017 pu
+instead of 1.030 pu. A line of n circuits now has 1/n of the impedance and n times the charging
+and conductance, as in the load flow.
+
 The test network has off-nominal ratings on both windings, taps on the HV and the LV side, a
-tap_neutral that is not 0, two parallel units, and a tap that also turns the phase in a meshed
-part of the network. The ANDES power flow must give the pandapower bus voltages (magnitude and
-angle), and a Transient Stability run without events must start, and stay, at them.
+tap_neutral that is not 0, two parallel transformer units, a tap that also turns the phase in a
+meshed part of the network, and a 20 kV cable of two parallel circuits in that mesh. The ANDES
+power flow must give the pandapower bus voltages (magnitude and angle), and a Transient Stability
+run without events must start, and stay, at them.
 
 Run with ``python samples/test_andes_trafo_ratio.py``.
 """
@@ -95,9 +101,10 @@ def elements(t2_tap=None):
               tap_pos=3, tap_step_percent=1.25),
         trafo(1, "T2 115/21 kV phase-turning tap", "mxCell_b110", "mxCell_b20f", 25, 115, 21, 11, 0.4,
               **dict(T2_TAP, **(t2_tap or {}))),
-        {"typ": "Line0", "name": "mxCell_l1", "id": "l1", "userFriendlyName": "Cable 20 kV",
-         "busFrom": "mxCell_b20", "busTo": "mxCell_b20f", "length_km": "4", "parallel": "1", "df": "1",
-         "r_ohm_per_km": "0.16", "x_ohm_per_km": "0.35", "c_nf_per_km": "10", "g_us_per_km": "0",
+        # Two parallel cable circuits: half the impedance and twice the charging of one.
+        {"typ": "Line0", "name": "mxCell_l1", "id": "l1", "userFriendlyName": "2 x cable 20 kV",
+         "busFrom": "mxCell_b20", "busTo": "mxCell_b20f", "length_km": "4", "parallel": "2", "df": "1",
+         "r_ohm_per_km": "0.16", "x_ohm_per_km": "0.35", "c_nf_per_km": "300", "g_us_per_km": "0",
          "max_i_ka": "0.6", "type": "cs", "in_service": "true"},
         # 20.5/0.42 kV, LV tap -2 x 2.5 %: the tap moves the LV rating, so the impedance too.
         trafo(2, "T3 20.5/0.42 kV LV tap", "mxCell_b20f", "mxCell_b04", 2.5, 20.5, 0.42, 6, 1.0,
