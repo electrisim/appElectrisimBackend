@@ -107,6 +107,15 @@ def _parse_frequency(value, default=50.0):
         raise ValueError(f"Invalid frequency: {value!r}")
 
 
+def _iec_60909_frequency(value):
+    """System frequency of an IEC 60909 short circuit: 50 or 60 Hz.
+
+    IEC 60909 defines both (kappa method C takes fc = 20 or 24 Hz and pandapower refuses any
+    other frequency), so a value such as 59.94 Hz is taken as 60 Hz.
+    """
+    return 60.0 if _parse_frequency(value) >= 55.0 else 50.0
+
+
 def _coerce_export_flag(value):
     """Normalize JSON export checkboxes from the Electrisim frontend."""
     if value is True or value == 1:
@@ -952,9 +961,12 @@ def simulation():
 
                 mode = str(in_data[x].get('mode', 'steady')).lower()
                 if mode in ('dynamic', 'transient', 'tds', 'andes'):
+                    # andes_electrisim.build_system reads the system frequency from the same params.
                     response_data = motor_starting_electrisim.motor_starting(None, in_data[x], in_data)
                 else:
-                    net = pp.create_empty_network()
+                    # The load flows before, during and after the start use the system frequency
+                    # for the line and cable charging, like the dynamic mode.
+                    net = pp.create_empty_network(f_hz=_parse_frequency(in_data[x].get('frequency', '50')))
                     Busbars = pandapower_electrisim.create_busbars(in_data, net)
                     pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
                     response_data = motor_starting_electrisim.motor_starting(net, in_data[x], in_data)
@@ -1316,7 +1328,10 @@ def simulation():
                     'export_results': in_data[x].get('export_results', False),
                 }
 
-                net = pp.create_empty_network()
+                # The fault currents are IEC 60909 short circuits at the system frequency. On an
+                # unearthed or high-resistance-earthed network a single-phase fault drives only the
+                # line charging current (6/5 as large at 60 Hz), which earth-fault relays are set against.
+                net = pp.create_empty_network(f_hz=_iec_60909_frequency(in_data[x].get('frequency', '50')))
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
 

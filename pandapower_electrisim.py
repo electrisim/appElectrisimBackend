@@ -17785,6 +17785,7 @@ def protection_coordination(net, prot_params, in_data):
                 'n_miscoordination': len(miscoord),
                 'fault_type': fault_type,
                 'case': case,
+                'frequency_hz': float(getattr(net, 'f_hz', 50.0) or 50.0),
                 'grading_mode': grading_mode,
                 'fault_location_mode': fault_location_mode,
                 't_diff_s': t_diff,
