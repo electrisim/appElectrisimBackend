@@ -241,6 +241,17 @@ def test_statcom_in_transient_stability():
     no_statcom_out = _tds(data_centre_network(statcom=False), **REMOTE)
     without = _at(no_statcom_out, _campus(no_statcom_out), 1.1)
     assert with_statcom > without + 0.02, (with_statcom, without)
+    # In a partial dip the STATCOM adds k * (dU - deadband) of its rating to the current it had:
+    # ANDES takes Vref0 literally, and with Vref0 = 0 it absorbed reactive current through the
+    # whole dip; Kqv was also applied on the 100 MVA system base instead of the 150 MVA rating.
+    remote = _tds(data_centre_network(), **REMOTE)
+    st_r = remote["statcoms"][0]
+    iq_r = st_r["iq_pu"]
+    dip = [i for i, t_s in enumerate(remote["time"]) if 1.0 < t_s < 1.15]
+    assert min(iq_r[i] for i in dip) >= iq_r[0] - 1e-3, "no absorption at the start of the dip"
+    du = _campus(remote)[0] - _at(remote, _campus(remote), 1.12)
+    expected = iq_r[0] + st_r["kqv"] * (du - st_r["deadband_percent"] / 100.0)
+    assert 0.12 < du < 0.2 and abs(_at(remote, iq_r, 1.12) - expected) < 0.03, (du, _at(remote, iq_r, 1.12), expected)
 
 
 def test_data_centre_ups_in_transient_stability():

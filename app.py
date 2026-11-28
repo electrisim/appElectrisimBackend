@@ -107,6 +107,15 @@ def _parse_frequency(value, default=50.0):
         raise ValueError(f"Invalid frequency: {value!r}")
 
 
+def _iec_60909_frequency(value):
+    """System frequency of an IEC 60909 short circuit: 50 or 60 Hz.
+
+    IEC 60909 defines both (kappa method C takes fc = 20 or 24 Hz and pandapower refuses any
+    other frequency), so a value such as 59.94 Hz is taken as 60 Hz.
+    """
+    return 60.0 if _parse_frequency(value) >= 55.0 else 50.0
+
+
 def _coerce_export_flag(value):
     """Normalize JSON export checkboxes from the Electrisim frontend."""
     if value is True or value == 1:
@@ -863,7 +872,9 @@ def simulation():
                 # Extract user email for logging
                 user_email = in_data[x].get('user_email', 'unknown@user.com')
 
-                net = pp.create_empty_network()
+                # The system frequency sets the DC time constant of the breaking current and the
+                # line charging (C0) that carries single-phase faults on unearthed systems.
+                net = pp.create_empty_network(f_hz=_iec_60909_frequency(in_data[x].get('frequency', '50')))
                 Busbars = pandapower_electrisim.create_busbars(in_data, net)
                 pandapower_electrisim.create_other_elements(in_data, net, x, Busbars)
                 export_python = _coerce_export_flag(in_data[x].get('exportPython', False))
