@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import traceback
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -30,6 +31,9 @@ except ImportError:
 
 
 VALID_METHODS = ("dol", "soft_start", "star_delta", "autotransformer", "reactor")
+
+# Time step of the dynamic (ANDES) motor start: dips and run-up times change by under 1 % below it.
+_TDS_STEP_S = 0.005
 
 
 def _sf(value: Any, default: float = 0.0) -> float:
@@ -283,55 +287,71 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
         }
     vm_before = _snapshot_bus_vm(net)
 
-    # --- During: locked-rotor loads ---
-    motor_results: List[Dict[str, Any]] = []
-    lr_load_indices: List[Any] = []
-
+    # --- During: each starting motor is its locked-rotor impedance ---
+    # A locked rotor is an impedance, so it is a shunt drawing the locked-rotor P and Q at the
+    # motor's rated voltage: its current follows the voltage the motor sees. (A constant-power
+    # load sized at rated voltage overstated the current whenever the voltage sagged, so dips
+    # came out too deep and simultaneous starts had no load-flow solution.)
+    starts: List[Dict[str, Any]] = []
     for idx in selected:
         row = net.motor.loc[idx]
         bus = int(row["bus"])
         bus_vn = float(net.bus.at[bus, "vn_kv"]) if bus in net.bus.index else 0.4
         rated = _motor_rated(row, bus_vn)
         k_m, method_meta = _method_factor(method, params, rated["lrc_pu"])
-        i_start = rated["lrc_pu"] * rated["i_n_ka"] * k_m
-        # S = √3 V I ; P = S cosφ ; Q = S sinφ  (at rated voltage)
-        s_mva = math.sqrt(3.0) * rated["vn_kv"] * i_start if rated["vn_kv"] > 0 else 0.0
-        p_mw = s_mva * rated["cos_lr"]
-        q_mvar = s_mva * rated["sin_lr"]
+        i_lr = rated["lrc_pu"] * rated["i_n_ka"]
+        s_lr = math.sqrt(3.0) * rated["vn_kv"] * i_lr if rated["vn_kv"] > 0 else 0.0
         mid, name = _row_id_name(row, idx)
-        if s_mva <= 0:
+        if s_lr <= 0:
             warnings.append(f"Motor '{name}': zero starting power (check pn_mech_mw, vn_kv, lrc_pu).")
-        load_idx = pp.create_load(
+        # k is the starter's current at rated voltage relative to DOL. Star-delta, autotransformer
+        # and reactor are passive, so they scale the locked-rotor admittance by k. A soft starter
+        # holds its current limit k x I_lr whatever the voltage (re-sized after the load flow).
+        constant_current = method_meta.get("method") == "soft_start"
+        shunt_idx = pp.create_shunt(
             net,
             bus=bus,
-            p_mw=p_mw,
-            q_mvar=q_mvar,
+            p_mw=k_m * s_lr * rated["cos_lr"],
+            q_mvar=k_m * s_lr * rated["sin_lr"],
+            vn_kv=rated["vn_kv"],
             name=f"__motor_start_lr_{name}",
             in_service=True,
         )
-        lr_load_indices.append(load_idx)
-        motor_results.append({
-            "id": mid,
-            "name": name,
-            "bus": str(net.bus.at[bus, "id"]) if "id" in net.bus.columns else str(bus),
-            "bus_name": str(net.bus.at[bus, "name"]) if "name" in net.bus.columns else str(bus),
-            "method": method_meta.get("method", method),
-            "k_method": _clean(k_m),
-            "i_start_ka": _clean(i_start),
-            "i_rated_ka": _clean(rated["i_n_ka"]),
-            "lrc_pu": _clean(rated["lrc_pu"]),
-            "p_start_mw": _clean(p_mw),
-            "q_start_mvar": _clean(q_mvar),
-            "sn_mva": _clean(rated["sn_mva"]),
-            "vn_kv": _clean(rated["vn_kv"]),
-            **{k: _clean(v) for k, v in method_meta.items() if k != "method"},
+        starts.append({
+            "idx": idx, "bus": bus, "bus_vn": bus_vn, "rated": rated, "k_m": k_m, "i_lr": i_lr,
+            "s_lr": s_lr, "shunt": shunt_idx, "constant_current": constant_current,
+            "id": mid, "name": name, "meta": method_meta,
         })
 
+    def _remove_start_shunts() -> None:
+        drop = [s["shunt"] for s in starts if s["shunt"] in net.shunt.index]
+        if drop:
+            net.shunt.drop(drop, inplace=True)
+
     err = _run_pp(net)
+    soft = [s for s in starts if s["constant_current"] and s["s_lr"] > 0]
+    for _ in range(30 if soft and not err else 0):
+        worst = 0.0
+        for s in soft:
+            v_kv = float(net.res_bus.at[s["bus"], "vm_pu"]) * s["bus_vn"]
+            if v_kv <= 0:
+                continue
+            vn = s["rated"]["vn_kv"]
+            # The shunt that draws the limit at this voltage, but never more than the motor's own
+            # locked-rotor admittance (a soft starter fully on is DOL).
+            s_ref = min(math.sqrt(3.0) * vn * s["k_m"] * s["i_lr"] * vn / v_kv, s["s_lr"])
+            s_old = math.hypot(float(net.shunt.at[s["shunt"], "p_mw"]), float(net.shunt.at[s["shunt"], "q_mvar"]))
+            worst = max(worst, abs(s_ref - s_old) / s["s_lr"])
+            net.shunt.at[s["shunt"], "p_mw"] = s_ref * s["rated"]["cos_lr"]
+            net.shunt.at[s["shunt"], "q_mvar"] = s_ref * s["rated"]["sin_lr"]
+        if worst < 1e-9:
+            break
+        err = _run_pp(net)
+        if err:
+            break
+
     if err:
-        for li in lr_load_indices:
-            if li in net.load.index:
-                net.load.drop(li, inplace=True)
+        _remove_start_shunts()
         for idx, v in orig_in_service.items():
             net.motor.at[idx, "in_service"] = v
         for idx, v in orig_loading.items():
@@ -344,10 +364,40 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
     vm_during = _snapshot_bus_vm(net)
     branches = _branch_loadings(net)
 
-    # Remove LR loads
-    for li in lr_load_indices:
-        if li in net.load.index:
-            net.load.drop(li, inplace=True)
+    # I start is the current at the voltage the motor actually sees during the start.
+    motor_results: List[Dict[str, Any]] = []
+    for s in starts:
+        rated = s["rated"]
+        v_kv = float(net.res_bus.at[s["bus"], "vm_pu"]) * s["bus_vn"]
+        p_mw = float(net.res_shunt.at[s["shunt"], "p_mw"])
+        q_mvar = float(net.res_shunt.at[s["shunt"], "q_mvar"])
+        i_start = math.hypot(p_mw, q_mvar) / (math.sqrt(3.0) * v_kv) if v_kv > 0 else 0.0
+        v_start = v_kv / rated["vn_kv"] if rated["vn_kv"] > 0 else None
+        if s["constant_current"] and s["i_lr"] > 0 and i_start < s["k_m"] * s["i_lr"] * (1.0 - 1e-6):
+            warnings.append(
+                f"Motor '{s['name']}': the soft starter cannot hold its current limit at "
+                f"{v_start:.3f} pu; it is fully on and the motor starts as DOL."
+            )
+        motor_results.append({
+            "id": s["id"],
+            "name": s["name"],
+            "bus": str(net.bus.at[s["bus"], "id"]) if "id" in net.bus.columns else str(s["bus"]),
+            "bus_name": str(net.bus.at[s["bus"], "name"]) if "name" in net.bus.columns else str(s["bus"]),
+            "method": s["meta"].get("method", method),
+            "k_method": _clean(s["k_m"]),
+            "i_start_ka": _clean(i_start),
+            "v_start_pu": _clean(v_start),
+            "i_rated_ka": _clean(rated["i_n_ka"]),
+            "lrc_pu": _clean(rated["lrc_pu"]),
+            "p_start_mw": _clean(p_mw),
+            "q_start_mvar": _clean(q_mvar),
+            "sn_mva": _clean(rated["sn_mva"]),
+            "vn_kv": _clean(rated["vn_kv"]),
+            **{k: _clean(v) for k, v in s["meta"].items() if k != "method"},
+        })
+
+    # Remove the locked-rotor shunts
+    _remove_start_shunts()
 
     # --- After: motors online at original loading ---
     for idx, v in orig_in_service.items():
@@ -438,7 +488,8 @@ def _motor_el_from_in_data(in_data: Dict[str, Any], motor_ids: Optional[Set[str]
         if not isinstance(el, dict):
             continue
         typ = str(el.get("typ", ""))
-        if not typ.startswith("Motor"):
+        # The study's own settings entry ("MotorStartingPandaPower Parameters") is not a motor.
+        if not typ.startswith("Motor") or "Parameters" in typ:
             continue
         mid = str(el.get("id") or el.get("name") or "")
         name = str(el.get("name") or mid)
@@ -484,14 +535,21 @@ def _derive_motor3_params(el: Dict[str, Any], warnings: List[str]) -> Dict[str, 
     xm = _sf(el.get("xm"), 3.0)
     if xm <= 0:
         xm = 3.0
-    hm = _sf(el.get("Hm") or el.get("hm"), 0.5)
+    # Hm is on the motor rating (ANDES converts it with Sn). An explicit 0 for a load-torque
+    # coefficient is a value, not "unset".
+    hm = _first_set(el, ("Hm", "hm"), 0.5)
     if hm <= 0:
         hm = 0.5
-    c1 = _sf(el.get("tm_c1") or el.get("c1"), 0.0)
-    c2 = _sf(el.get("tm_c2") or el.get("c2"), 0.0)
-    c3 = _sf(el.get("tm_c3") or el.get("c3"), 1.0)
-    # ANDES uses aa, bb, c2 for tm = aa + bb*slip + c2*slip^2 in some docs;
-    # Motor3 params: c1, c2, c3 for Tm(w)
+    c1 = _first_set(el, ("tm_c1", "c1"), 0.0)
+    c2 = _first_set(el, ("tm_c2", "c2"), 0.0)
+    c3 = _first_set(el, ("tm_c3", "c3"), 1.0)
+    # Load torque Tm(w) = t_load * (c1 + c2 w + c3 w^2), with t_load the motor's torque at its
+    # loading: rated torque is Pn / Sn = efficiency x cos phi on the Sn base. So c3 = 1 is a fan
+    # or pump that takes the motor's loading at full speed.
+    loading = _sf(el.get("loading_percent"), 100.0)
+    if loading <= 0:
+        loading = 100.0
+    t_load = loading / 100.0 * eff / 100.0 * cos_n
     return {
         "Sn": sn,
         "Vn": vn,
@@ -504,9 +562,116 @@ def _derive_motor3_params(el: Dict[str, Any], warnings: List[str]) -> Dict[str, 
         "c1": c1,
         "c2": c2,
         "c3": c3,
+        "t_load": t_load,
         "lrc_pu": lrc,
         "name": name,
     }
+
+
+def _first_set(el: Dict[str, Any], keys: Tuple[str, ...], default: float) -> float:
+    """The first of ``keys`` that holds a number (0 included)."""
+    for key in keys:
+        raw = el.get(key)
+        if raw is None or str(raw).strip().lower() in ("", "none", "null", "nan"):
+            continue
+        return _sf(raw, default)
+    return default
+
+
+def _motor3_torque(mp: Dict[str, Any], v: float, s: float) -> float:
+    """Steady-state electrical torque of the Motor3 equivalent circuit (motor base) at slip ``s``."""
+    z_m = complex(0.0, mp["xm"])
+    z_r = complex(mp["rr1"] / s, mp["xr1"])
+    i_s = v / (complex(mp["rs"], mp["xs"]) + z_m * z_r / (z_m + z_r))
+    i_r = i_s * z_m / (z_m + z_r)
+    return abs(i_r) ** 2 * mp["rr1"] / s
+
+
+def _load_torque(mp: Dict[str, Any], s: float) -> float:
+    w = 1.0 - s
+    return mp["t_load"] * (mp["c1"] + mp["c2"] * w + mp["c3"] * w * w)
+
+
+def _running_slip(mp: Dict[str, Any], v: float) -> Optional[float]:
+    """Slip at which the motor carries its load at voltage ``v`` (pu of its rating).
+
+    None when the load torque exceeds the motor's pull-out torque at that voltage.
+    """
+    if v <= 0:
+        return None
+    # Pull-out (breakdown) slip from the Thevenin equivalent seen by the rotor branch.
+    z_m = complex(0.0, mp["xm"])
+    z_s = complex(mp["rs"], mp["xs"])
+    z_th = z_s * z_m / (z_s + z_m)
+    s_bd = min(1.0, mp["rr1"] / abs(z_th + complex(0.0, mp["xr1"])))
+    lo, hi = 1e-9, s_bd
+    if _motor3_torque(mp, v, lo) >= _load_torque(mp, lo):
+        return 0.0
+    if _motor3_torque(mp, v, hi) < _load_torque(mp, hi):
+        return None
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _motor3_torque(mp, v, mid) >= _load_torque(mp, mid):
+            hi = mid
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+
+def _andes_load_torque(ss, mp: Dict[str, Any], t_base: float, warnings: List[str]) -> Tuple[float, float, float]:
+    """Motor3 c1..c3 for Tm(w) = t_base * (c1 + c2 w + c3 w^2), with t_base on the system base.
+
+    ANDES does not convert c1..c3 to the system base. Motor3 in ANDES 1.10 also builds
+    Tm(slip) = (c1 + c2 + c3) + (-c2 - 2 c3) slip + c2 slip^2, with c2 where c3 belongs, so the
+    coefficients are chosen to give the intended curve through that formula.
+    """
+    c1, c2, c3 = mp["c1"] * t_base, mp["c2"] * t_base, mp["c3"] * t_base
+    v_str = str(getattr(getattr(ss.Motor3, "tm", None), "v_str", "") or "")
+    slip2 = re.search(r"\b(c[123])\s*\*\s*slip\s*\*\s*slip\b", v_str)
+    if slip2 is None or not re.search(r"\baa\s*\+\s*bb\s*\*\s*slip\b", v_str):
+        warnings.append(f"Motor3 load torque formula not recognised ('{v_str}'); c1..c3 passed as given.")
+        return c1, c2, c3
+    if slip2.group(1) == "c3":
+        return c1, c2, c3
+    # Intended Tm(slip) = a + b slip + c slip^2; ANDES gives c' slip^2 with c' its own c2.
+    a, b, c = c1 + c2 + c3, -c2 - 2.0 * c3, c3
+    c2_andes = c
+    c3_andes = (-b - c2_andes) / 2.0
+    return a - c2_andes - c3_andes, c2_andes, c3_andes
+
+
+class _StartAtStandstill:
+    """TDS hook (``TDS.callpert``): the motors wait for their Toggle at rest.
+
+    Motor3 initialises its slip as 1.0 * u, so a motor that is off (u = 0) sat at slip 0 and its
+    "start" began at synchronous speed. Before the first step this sets every switched-off motor
+    to slip 1 with no current and no rotor flux; with u = 0 nothing moves until the Toggle.
+    """
+
+    def __init__(self, motor_model, then=None):
+        self.model = motor_model
+        self.then = then  # a hook that was already set runs after this one
+        self.done = False
+
+    def __call__(self, t, system):
+        if not self.done:
+            self.done = True
+            self._at_rest(system)
+        if self.then is not None:
+            self.then(t, system)
+
+    def _at_rest(self, system):
+        m = self.model
+        off = np.asarray(m.u.v, dtype=float) == 0
+        if not off.any():
+            return
+        dae = system.dae
+        dae.x[np.asarray(m.slip.a)[off]] = 1.0
+        for var in (m.e1d, m.e1q):
+            dae.x[np.asarray(var.a)[off]] = 0.0
+        for var in (m.Id, m.Iq, m.te, m.tm, m.p, m.q):
+            dae.y[np.asarray(var.a)[off]] = 0.0
+        system.vars_to_models()
 
 
 def _dynamic_start(params: Dict[str, Any], in_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -584,6 +749,10 @@ def _dynamic_start_rebuild(
         except Exception:
             pass
         ss.TDS.config.tf = t_end
+        # A starting motor's rotor flux turns at slip x 50 Hz. ANDES's default 1/30 s step does not
+        # resolve it: the current and the dip during the run-up came out about 10 % high.
+        tstep = _sf(params.get("tstep"), 0.0)
+        ss.TDS.config.tstep = tstep if tstep > 0 else _TDS_STEP_S
         # Power flow
         ss.PFlow.run()
         if not ss.PFlow.converged:
@@ -593,7 +762,16 @@ def _dynamic_start_rebuild(
                 "exception": "PFlow not converged",
                 "warnings": warnings,
             }
+        if hasattr(ss, "Motor3") and ss.Motor3.n > 0:
+            ss.TDS.callpert = _StartAtStandstill(ss.Motor3, then=ss.TDS.callpert)
         ss.TDS.run()
+        stored = np.asarray(ss.dae.ts.t, dtype=float)
+        t_last = float(stored[-1]) if stored.size else 0.0
+        if t_last < t_end - 1e-6:
+            warnings.append(
+                f"The time-domain simulation stopped at {t_last:.3f} s instead of {t_end:g} s"
+                + (f": {ss.TDS.err_msg}" if getattr(ss.TDS, "err_msg", "") else " (no convergence).")
+            )
     except Exception as e:
         return {
             "error": True,
@@ -637,68 +815,84 @@ def _dynamic_start_rebuild(
 
     motor_series: Dict[str, Any] = {}
     motor_results: List[Dict[str, Any]] = []
+    # The start is complete when the motor is within this slip of its running speed.
     slip_thresh = _sf(params.get("slip_threshold"), 0.02)
 
     try:
         if hasattr(ss, "Motor3") and ss.Motor3.n > 0:
             m = ss.Motor3
-            # currents
+            sb = float(meta.get("sn_mva") or 100.0)
+            bus_vn = {str(b): float(vn) for b, vn in zip(ss.Bus.idx.v, ss.Bus.Vn.v)}
+            bus_col = {str(b): k for k, b in enumerate(ss.Bus.idx.v)}
+            v_all = andes_electrisim.tds_values(ss, ss.Bus.v)
+            t_arr = np.asarray(t, dtype=float)
+            # The sample at the connect time is recorded before the Toggle switches the motor on.
+            after = np.nonzero(t_arr > t_start + 1e-9)[0]
+
             def _series(var_name):
                 if not hasattr(m, var_name):
                     return None
-                var = getattr(m, var_name)
-                vals = andes_electrisim.tds_values(ss, var)
-                return vals
+                return andes_electrisim.tds_values(ss, getattr(m, var_name))
 
             id_vals = _series("Id")
             iq_vals = _series("Iq")
             slip_vals = _series("slip")
             te_vals = _series("te")
-            tm_vals = _series("tm")
-            p_vals = _series("p")
-            q_vals = _series("q")
 
             for i in range(m.n):
                 midx = str(m.idx.v[i])
                 info = motor_map.get(midx, {"id": midx, "name": str(m.name.v[i])})
-                i_mag = None
-                if id_vals is not None and iq_vals is not None:
-                    idi = id_vals[:, i] if id_vals.ndim == 2 else id_vals
-                    iqi = iq_vals[:, i] if iq_vals.ndim == 2 else iq_vals
-                    i_mag = np.sqrt(np.asarray(idi, dtype=float) ** 2 + np.asarray(iqi, dtype=float) ** 2)
+                mp = info.get("model")
+                bus = str(m.bus.v[i])
+                vb = bus_vn.get(bus) or info.get("vn_kv") or 1.0
+                vn = info.get("vn_kv") or vb
+                sn = info.get("sn_mva") or sb
+                # ANDES currents and torques are on the system base; report them on the motor rating.
+                i_rated_ka = sn / (math.sqrt(3.0) * vn)
+                i_ka = np.hypot(id_vals[:, i], iq_vals[:, i]) * sb / (math.sqrt(3.0) * vb)
+                i_pu = i_ka / i_rated_ka
+                slip = np.asarray(slip_vals[:, i], dtype=float)
+                v_term = np.asarray(v_all[:, bus_col[bus]], dtype=float) * vb / vn if bus in bus_col else None
 
-                slip_list = None
-                if slip_vals is not None:
-                    sli = slip_vals[:, i] if slip_vals.ndim == 2 else slip_vals
-                    slip_list = [_clean(x) for x in np.asarray(sli, dtype=float).tolist()]
-
-                start_time_s = None
-                if slip_list and t:
-                    for ti, s in zip(t, slip_list):
-                        if s is not None and abs(s) <= slip_thresh and ti >= t_start:
-                            start_time_s = float(ti) - t_start
-                            break
-
-                i_list = [_clean(x) for x in i_mag.tolist()] if i_mag is not None else None
-                i_start_pu = None
-                if i_list:
-                    # first sample after t_start
-                    for ti, iv in zip(t, i_list):
-                        if ti >= t_start and iv is not None:
-                            i_start_pu = iv
-                            break
-
-                te_list = None
-                if te_vals is not None:
-                    tei = te_vals[:, i] if te_vals.ndim == 2 else te_vals
-                    te_list = [_clean(x) for x in np.asarray(tei, dtype=float).tolist()]
+                start_time_s = i_start_pu = i_start_ka = v_start = s_run = None
+                stalled = False
+                note = info.get("note")
+                if len(after) and mp is not None and v_term is not None:
+                    first = after[0]
+                    i_start_pu, i_start_ka, v_start = i_pu[first], i_ka[first], v_term[first]
+                    s_run = _running_slip(mp, float(v_term[-1]))
+                    s_done = s_run + slip_thresh * (1.0 - s_run) if s_run is not None else slip_thresh
+                    reached = after[slip[after] <= s_done]
+                    if len(reached):
+                        start_time_s = float(t_arr[reached[0]]) - t_start
+                    if start_time_s is None or slip[-1] > s_done:
+                        # Not running at the end. Still gaining speed over the last fifth of the run
+                        # is a slow start (not started yet); otherwise the motor stalled.
+                        t_check = t_arr[-1] - 0.2 * (t_arr[-1] - t_start)
+                        before_end = after[t_arr[after] <= t_check]
+                        accelerating = (start_time_s is None and len(before_end) > 0
+                                        and slip[-1] < slip[before_end[-1]] - 0.005)
+                        stalled = not accelerating
+                        if start_time_s is not None:
+                            why = (f"reached running speed {start_time_s:.2f} s after the start, then slowed "
+                                   f"down to slip {slip[-1]:.2f} by the end of the simulation.")
+                            start_time_s = None
+                        elif accelerating:
+                            why = (f"still accelerating at the end of the simulation (slip {slip[-1]:.2f}); "
+                                   f"extend the end time.")
+                        else:
+                            why = (f"stalled at slip {slip[-1]:.2f} ({(1.0 - slip[-1]) * 100.0:.0f} % speed): "
+                                   f"its torque cannot overcome the load at the voltage it gets.")
+                        note = f"Not started: {why}" + (f" {note}" if note else "")
+                        warnings.append(f"Motor '{info.get('name')}' {why}")
 
                 motor_series[info["id"]] = {
                     "id": info["id"],
                     "name": info.get("name"),
-                    "i_pu": i_list,
-                    "slip": slip_list,
-                    "te": te_list,
+                    "i_pu": [_clean(x) for x in i_pu.tolist()],
+                    "slip": [_clean(x) for x in slip.tolist()],
+                    "te": [_clean(x) for x in (np.asarray(te_vals[:, i], dtype=float) * sb / sn).tolist()]
+                    if te_vals is not None else None,
                 }
                 motor_results.append({
                     "id": info["id"],
@@ -706,8 +900,17 @@ def _dynamic_start_rebuild(
                     "method": info.get("method", method),
                     "start_time_s": _clean(start_time_s),
                     "i_start_pu": _clean(i_start_pu),
-                    "note": info.get("note"),
-                    "pass": start_time_s is not None,
+                    "i_start_ka": _clean(i_start_ka),
+                    "i_rated_ka": _clean(i_rated_ka),
+                    "v_start_pu": _clean(v_start),
+                    "lrc_pu": _clean(info.get("lrc_pu")),
+                    "sn_mva": _clean(sn),
+                    "vn_kv": _clean(vn),
+                    "running_slip": _clean(s_run),
+                    "slip_end": _clean(slip[-1]) if len(slip) else None,
+                    "stalled": stalled,
+                    "note": note,
+                    "pass": start_time_s is not None and not stalled,
                 })
     except Exception as e:
         warnings.append(f"Could not extract motor series: {e}")
@@ -837,18 +1040,26 @@ def _build_system_with_motors(
         lrc = mparams.pop("lrc_pu")
         note = None
         applied_method = "dol"
+        sn_rated = mparams["Sn"]
+        sn_model = sn_rated
         if method == "soft_start":
             i_limit = _sf(params.get("i_limit_pu"), 3.0)
             if lrc > 0 and i_limit > 0:
                 scale = min(1.0, i_limit / lrc)
-                mparams["Sn"] = mparams["Sn"] * scale
-                note = "Soft-start approximated by scaling motor Sn so initial current ≈ I_limit_pu."
+                # A motor (inertia and load included) scaled to the limit draws the limit at standstill.
+                sn_model = sn_rated * scale
+                note = ("Soft start approximated by a motor (with its load) scaled to the current limit: "
+                        "I start is the limit, but the run-up time is the DOL one and the current after "
+                        "it is scaled down too.")
                 applied_method = "soft_start"
                 warnings.append(f"Motor '{mname}': {note}")
         elif method not in ("dol", "soft_start"):
             note = f"Method '{method}' uses DOL dynamics in ANDES; use steady-state mode for exact method factors."
             warnings.append(f"Motor '{mname}': {note}")
 
+        # The load torque is on the motor rating; Motor3 takes c1..c3 on the system base.
+        sb = float(meta.get("sn_mva") or 100.0)
+        c1, c2, c3 = _andes_load_torque(ss, mparams, mparams["t_load"] * sn_model / sb, warnings)
         midx = f"Motor_{mid}"
         ss.add(
             "Motor3",
@@ -856,7 +1067,7 @@ def _build_system_with_motors(
             name=mname,
             bus=bus_idx,
             u=0,
-            Sn=mparams["Sn"],
+            Sn=sn_model,
             Vn=mparams["Vn"],
             # Motor3 defaults to 60 Hz; use the network frequency so 50 Hz systems are right.
             fn=float(meta.get("frequency") or 50.0),
@@ -866,9 +1077,9 @@ def _build_system_with_motors(
             xr1=mparams["xr1"],
             xm=mparams["xm"],
             Hm=mparams["Hm"],
-            c1=mparams["c1"],
-            c2=mparams["c2"],
-            c3=mparams["c3"],
+            c1=c1,
+            c2=c2,
+            c3=c3,
         )
         toggle_i += 1
         # "model" is also System.add's first parameter, so Toggle's fields go in param_dict.
@@ -885,6 +1096,10 @@ def _build_system_with_motors(
             "method": applied_method,
             "note": note,
             "lrc_pu": lrc,
+            "sn_mva": sn_rated,
+            "sn_model_mva": sn_model,
+            "vn_kv": mparams["Vn"],
+            "model": mparams,
         }
 
     # ss is a SystemNoSetup, whose setup() is the no-op used above; run the real one now
