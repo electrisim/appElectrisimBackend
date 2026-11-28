@@ -417,6 +417,7 @@ def _steady_state_start(net, params: Dict[str, Any], in_data: Dict[str, Any]) ->
             "thermal_limit_percent": thermal_limit,
             "starting_method": (method or "dol").lower().replace("-", "_"),
             "n_motors_started": len(selected),
+            "frequency_hz": float(getattr(net, "f_hz", 50.0) or 50.0),
         },
         "parameters": {
             "mode": "steady",
@@ -757,6 +758,7 @@ def _dynamic_start_rebuild(
             "thermal_limit_percent": thermal_limit,
             "starting_method": method,
             "n_motors_started": len(motor_map),
+            "frequency_hz": _clean(float(meta.get("frequency") or 50.0)),
             "t_start": t_start,
             "t_end": t_end,
         },
