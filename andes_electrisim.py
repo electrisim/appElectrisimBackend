@@ -336,6 +336,62 @@ def _downsample(arr: np.ndarray, max_points: int = 800) -> np.ndarray:
     return arr[idx]
 
 
+def _whole_number(value: Any, default: float) -> float:
+    """A tap position or parallel count read as the load flow reads it (pandapower_electrisim.safe_int)."""
+    if value is None or value in ("", "null", "None"):
+        return default
+    try:
+        return float(int(value))
+    except (TypeError, ValueError):
+        pass
+    v = _sf(value, math.nan)
+    return default if math.isnan(v) else float(round(v))
+
+
+def _trafo_tap_voltages(el: Dict[str, Any], vn_hv: float, vn_lv: float) -> Tuple[float, float, float]:
+    """Rated voltages of a two-winding transformer moved by its tap, and the phase shift the tap adds.
+
+    The tap fields are read with the load flow's defaults (pandapower_electrisim) and applied as
+    pandapower's build_branch does: a "Ratio" or "Symmetrical" tap changer moves the rated voltage
+    of its own side by tap_step_percent per step away from tap_neutral (turned by tap_step_degree);
+    an "Ideal" phase shifter only turns the phase. Returns (vn_hv_kv, vn_lv_kv, shift_degree).
+    """
+    tap_neutral = _whole_number(el.get("tap_neutral"), 0.0)
+    tap_pos = _whole_number(el.get("tap_pos"), tap_neutral)
+    step = _sf(el.get("tap_step_percent"), 0.0)
+    if step == 0.0:
+        # As in the load flow: a tap range without a step size gets 1.5 % per step.
+        tap_max = _whole_number(el.get("tap_max"), 0.0)
+        tap_min = _whole_number(el.get("tap_min"), 0.0)
+        if tap_max != tap_min and tap_max != 0:
+            step = 1.5
+    step_deg = _sf(el.get("tap_step_degree"), 0.0)
+    side = str(el.get("tap_side") or "hv").strip().lower()
+    if side in ("", "null", "none", "nan"):
+        side = "hv"
+    changer = el.get("tap_changer_type")
+    if changer not in ("Ratio", "Symmetrical", "Ideal"):
+        changer = "Ratio"
+    diff = tap_pos - tap_neutral
+    if diff == 0 or side not in ("hv", "lv"):
+        return vn_hv, vn_lv, 0.0
+    direction = 1.0 if side == "hv" else -1.0
+    if changer == "Ideal":
+        if step_deg != 0:
+            return vn_hv, vn_lv, direction * diff * step_deg
+        half = max(-1.0, min(1.0, diff * step / 200.0))
+        return vn_hv, vn_lv, direction * 2.0 * math.degrees(math.asin(half))
+    u1 = vn_hv if side == "hv" else vn_lv
+    du = u1 * step * diff / 100.0
+    du_re = du * math.cos(math.radians(step_deg))
+    du_im = du * math.sin(math.radians(step_deg))
+    u = math.hypot(u1 + du_re, du_im)
+    shift = math.degrees(math.atan(direction * du_im / (u1 + du_re))) if u1 + du_re != 0 else 0.0
+    if side == "hv":
+        return u, vn_lv, shift
+    return vn_hv, u, shift
+
+
 def _z_base_ohm(vn_kv: float, sn_mva: float) -> float:
     if vn_kv <= 0 or sn_mva <= 0:
         return 1.0
@@ -576,6 +632,15 @@ def build_system(
             line_map[str(ufn)] = line_idx
 
     # --- Two-winding transformers as ANDES Line with trans=1 ---
+    # The branch the pandapower load flow builds (pandapower build_branch). ANDES has the same
+    # branch model: an ideal transformer of ratio tap at bus1 (HV) and the series impedance on
+    # the bus2 (LV) side. The rated voltages, after the tap moves its side, give the off-nominal
+    #     tap = (vn_hv_kv / V_HV bus) / (vn_lv_kv / V_LV bus)
+    # and the short-circuit impedance is referred to the LV bus:
+    #     z = vk_percent / 100 * (S_base / sn_mva) * (vn_lv_kv / V_LV bus)^2 / parallel.
+    # Both go to ANDES on the bus bases (Vn1, Vn2 = bus kV, Sn = system base), so ANDES does not
+    # rescale them. The vector-group shift is left out (phi): it turns the angles behind the
+    # transformer but not the voltages or flows; the phase shift of a tap changer is kept.
     for _, el, typ in _iter_elements(in_data):
         if not (
             (typ.startswith("Transformer") or typ.startswith("Two Winding Transformer"))
@@ -588,26 +653,27 @@ def build_system(
         if bus1 is None or bus2 is None:
             warnings.append(f"Skipped Transformer '{el.get('userFriendlyName', name)}': missing HV/LV bus.")
             continue
+        vb1 = bus_vn[bus1]
+        vb2 = bus_vn[bus2]
         sn_t = _sf(el.get("sn_mva"), sn_base)
         if sn_t <= 0:
             sn_t = sn_base
         vk = _sf(el.get("vk_percent"), 6.0)
         vkr = _sf(el.get("vkr_percent"), 1.0)
-        # Impedance on transformer base → system base
+        vn_hv = _sf(el.get("vn_hv_kv"), vb1)
+        vn_lv = _sf(el.get("vn_lv_kv"), vb2)
+        vn_hv = vn_hv if vn_hv > 0 else vb1
+        vn_lv = vn_lv if vn_lv > 0 else vb2
+        vn_hv, vn_lv, tap_shift_deg = _trafo_tap_voltages(el, vn_hv, vn_lv)
+        parallel = max(_whole_number(el.get("parallel"), 1.0), 1.0)
+        tap = (vn_hv / vb1) / (vn_lv / vb2)
+        # Impedance on transformer base → system base on the LV bus
         z_t = vk / 100.0
         r_t = vkr / 100.0
         x_t = math.sqrt(max(z_t ** 2 - r_t ** 2, 0.0)) if z_t >= r_t else z_t
-        scale = sn_base / sn_t
+        scale = sn_base / sn_t * (vn_lv / vb2) ** 2 / parallel
         r_pu = r_t * scale
         x_pu = x_t * scale if x_t > 0 else 0.06 * scale
-        vn1 = _sf(el.get("vn_hv_kv"), bus_vn.get(bus1, 110.0))
-        vn2 = _sf(el.get("vn_lv_kv"), bus_vn.get(bus2, 11.0))
-        tap = 1.0
-        # Approximate tap from tap_pos * tap_step_percent
-        tap_pos = _sf(el.get("tap_pos"), 0.0)
-        tap_step = _sf(el.get("tap_step_percent"), 0.0)
-        if tap_step != 0:
-            tap = 1.0 + (tap_pos * tap_step / 100.0)
         line_idx = f"Trafo_{name}"
         u = 1 if _sb(el.get("in_service"), True) else 0
         ss.add(
@@ -620,13 +686,13 @@ def build_system(
             x=x_pu,
             b=0.0,
             g=0.0,
-            Vn1=vn1,
-            Vn2=vn2,
+            Vn1=vb1,
+            Vn2=vb2,
             Sn=sn_base,
             fn=freq,
             trans=1,
             tap=tap,
-            phi=0.0,
+            phi=math.radians(tap_shift_deg),
             u=u,
         )
         line_map[name] = line_idx
