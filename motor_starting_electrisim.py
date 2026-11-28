@@ -1014,7 +1014,10 @@ def _build_system_with_motors(
 
     andes.System = SystemNoSetup
     try:
-        ss, meta = andes_electrisim.build_system(in_data, params)
+        # The motors are the dynamics here. With no generator or converter plant in the
+        # network, each External Grid becomes a source behind its short-circuit impedance
+        # (S_sc max, R/X max), as in Transient Stability.
+        ss, meta = andes_electrisim.build_system(in_data, params, dynamic_loads=True)
     finally:
         andes.System = original_system
 
