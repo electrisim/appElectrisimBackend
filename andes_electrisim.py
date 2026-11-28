@@ -1197,7 +1197,11 @@ def build_system(
                 PFFLAG=0.0, VFLAG=0.0, QFLAG=1.0 if v_control else 0.0, PFLAG=0.0, PQFLAG=0.0,
                 # the gains are entered on the STATCOM rating; REECA1 works on the system base
                 Vref1=v_set, Kvp=kvp * sn_ssc / sn_base, Kvi=kvi * sn_ssc / sn_base,
-                Vref0=0.0, dbd1=-db, dbd2=db, Vdip=v_set - db, Vup=v_set + max(db, 0.2), Kqv=kqv,
+                # The dip current is Kqv * (Vref0 - U) beyond the deadband. ANDES takes Vref0
+                # literally (0 does not mean "the initial voltage"): with 0 the STATCOM absorbed
+                # reactive current at the start of a dip and gave none once the voltage had fallen.
+                Vref0=v_set, dbd1=-db, dbd2=db, Vdip=v_set - db, Vup=v_set + max(db, 0.2),
+                Kqv=kqv * sn_ssc / sn_base,
                 # Iqh1 / Iql1 are on the system base; the V-Iq table and Imax on the STATCOM rating.
                 # The current limit goes into the flat V-Iq table: with Imax below the table, ANDES
                 # initialises Iqmax from the table and then reports a mismatch.
